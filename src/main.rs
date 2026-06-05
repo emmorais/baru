@@ -248,29 +248,46 @@ fn parse(src: &str) -> Result<Expr, String> {
 }
 
 fn main() {
-    // Parse and evaluate some example s-expressions
-    let examples = [
-        "(+ (* 6 7) (* 3 14))",
-        "(+ 10 32)",
-        "(* 6 7)",
-        "(- 100 58)",
-        "(/ 84 7)",
-    ];
+    use std::io::{self, Write};
 
     let participants: Vec<Participant> = (0..3).map(Participant::new).collect();
 
-    for src in &examples {
+    println!("ABY3 REPL (replicated evaluator). Enter an s-expression using + - * / or 'quit' to exit.");
+
+    let stdin = io::stdin();
+    loop {
+        print!("> ");
+        io::stdout().flush().unwrap();
+
+        let mut input = String::new();
+        let n = stdin.read_line(&mut input).unwrap();
+        if n == 0 {
+            // EOF
+            println!();
+            break;
+        }
+
+        let src = input.trim();
+        if src.is_empty() {
+            continue;
+        }
+        if src == "quit" || src == "exit" {
+            break;
+        }
+
         match parse(src) {
             Ok(expr) => {
-                println!("parsed '{}': {:?}", src, expr);
+                println!("parsed: {:?}", expr);
                 let mut results: Vec<i64> = Vec::new();
                 for p in &participants {
                     let r = p.eval(&expr);
                     results.push(r.value);
                 }
-                println!("final results from participants: {:?}\n", results);
+                // Show primary result and per-participant values
+                println!("result (participant 0): {}", results[0]);
+                println!("all participants: {:?}\n", results);
             }
-            Err(e) => println!("parse error for '{}': {}", src, e),
+            Err(e) => println!("parse error: {}", e),
         }
     }
 }
