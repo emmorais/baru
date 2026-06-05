@@ -274,3 +274,39 @@ fn main() {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn eval(src: &str) -> i64 {
+        let expr = parse(src).expect("parse failed");
+        let p = Participant::new(0);
+        p.eval(&expr).value
+    }
+
+    #[test]
+    fn test_add_mul_nested() {
+        assert_eq!(eval("(+ (* 6 7) (* 3 14))"), 84);
+    }
+
+    #[test]
+    fn test_add() {
+        assert_eq!(eval("(+ 10 32)"), 42);
+    }
+
+    #[test]
+    fn test_mul() {
+        assert_eq!(eval("(* 6 7)"), 42);
+    }
+
+    #[test]
+    fn test_sub() {
+        assert_eq!(eval("(- 100 58)"), 42);
+    }
+
+    #[test]
+    fn test_div_exact() {
+        assert_eq!(eval("(/ 84 7)"), 12);
+    }
+}
