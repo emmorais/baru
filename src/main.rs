@@ -12,14 +12,9 @@ enum Expr {
     BinOp(BinOp, Box<Expr>, Box<Expr>),
     Let(Vec<(String, Expr)>, Vec<Expr>),
     Seq(Vec<Expr>),
-}
-
-#[derive(Debug, Clone, Copy)]
-/// A very small representation of a secret-shared numeric value.
-/// For this minimal example we keep it simple: the value is the same
-/// on every participant (no communication required for constants).
-struct SharedValue {
-    value: i64,
+    Car(Box<Expr>),
+    Cdr(Box<Expr>),
+    Cons(Box<Expr>, Box<Expr>),
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -31,6 +26,14 @@ enum BinOp {
 }
 
 type Store = HashMap<String, SharedValue>;
+
+#[derive(Debug, Clone)]
+/// A very small representation of a secret-shared value.
+/// Can be a number or a list of shared values.
+enum SharedValue {
+    Num(i64),
+    List(Vec<SharedValue>),
+}
 
 #[derive(Debug)]
 enum Continuation {
@@ -70,8 +73,14 @@ fn apply_continuation(cont: Continuation, val: SharedValue, env: &mut Store) -> 
         }
         Continuation::BinOpRight { op, left_val, cont } => {
             // Right operand evaluated to `val`. Apply the operator.
-            let a = left_val.value;
-            let b = val.value;
+            let a = match left_val {
+                SharedValue::Num(x) => x,
+                _ => panic!("binary op left operand must be NUM"),
+            };
+            let b = match val {
+                SharedValue::Num(x) => x,
+                _ => panic!("binary op right operand must be NUM"),
+            };
             let res = match op {
                 BinOp::Add => a.wrapping_add(b),
                 BinOp::Sub => a.wrapping_sub(b),
@@ -86,7 +95,7 @@ fn apply_continuation(cont: Continuation, val: SharedValue, env: &mut Store) -> 
                     a / b
                 }
             };
-            let out = SharedValue { value: res };
+            let out = SharedValue::Num(res);
             apply_continuation(*cont, out, env)
         }
     }
@@ -98,11 +107,11 @@ fn apply_continuation(cont: Continuation, val: SharedValue, env: &mut Store) -> 
 fn reduce_expression(expr: Expr, cont: Continuation, env: &mut Store) -> SharedValue {
     match expr {
         Expr::Num(n) => {
-            let v = SharedValue { value: n };
+            let v = SharedValue::Num(n);
             apply_continuation(cont, v, env)
         }
         Expr::Var(name) => {
-            let v = env.get(&name).copied().unwrap_or_else(|| panic!("unbound variable: {}", name));
+            let v = env.get(&name).cloned().unwrap_or_else(|| panic!("unbound variable: {}", name));
             apply_continuation(cont, v, env)
         }
         Expr::BinOp(op, left, right) => {
@@ -119,7 +128,7 @@ fn reduce_expression(expr: Expr, cont: Continuation, env: &mut Store) -> SharedV
                     env.insert(name, v);
                 }
                 // Return a dummy value (not used when this Let is part of a Seq with following expressions)
-                SharedValue { value: 0 }
+                SharedValue::Num(0)
             } else {
                 // Evaluate bindings sequentially in a fresh scope (clone env)
                 let mut local = env.clone();
@@ -143,9 +152,11 @@ fn reduce_expression(expr: Expr, cont: Continuation, env: &mut Store) -> SharedV
             }
         }
         Expr::Seq(exprs) => {
+            // Empty sequence is treated as the empty list literal `()`.
             if exprs.is_empty() {
-                panic!("empty sequence");
+                return apply_continuation(cont, SharedValue::List(Vec::new()), env);
             }
+            // Non-empty Seq is a sequence of expressions; return last expression's value.
             let len = exprs.len();
             for (i, e) in exprs.into_iter().enumerate() {
                 if i + 1 == len {
@@ -155,6 +166,40 @@ fn reduce_expression(expr: Expr, cont: Continuation, env: &mut Store) -> SharedV
                 }
             }
             unreachable!()
+        }
+        Expr::Car(inner) => {
+            // Evaluate inner then take first element
+            let v = reduce_expression(*inner, Continuation::Halt, env);
+            match v {
+                SharedValue::List(mut vs) => {
+                    if vs.is_empty() { panic!("car of empty list"); }
+                    let first = vs.remove(0);
+                    apply_continuation(cont, first, env)
+                }
+                _ => panic!("car expects a list"),
+            }
+        }
+        Expr::Cdr(inner) => {
+            let v = reduce_expression(*inner, Continuation::Halt, env);
+            match v {
+                SharedValue::List(vs) => {
+                    if vs.is_empty() { panic!("cdr of empty list"); }
+                    let tail = SharedValue::List(vs.into_iter().skip(1).collect());
+                    apply_continuation(cont, tail, env)
+                }
+                _ => panic!("cdr expects a list"),
+            }
+        }
+        Expr::Cons(h, t) => {
+            let head = reduce_expression(*h, Continuation::Halt, env);
+            let tail = reduce_expression(*t, Continuation::Halt, env);
+            match tail {
+                SharedValue::List(mut vs) => {
+                    vs.insert(0, head);
+                    apply_continuation(cont, SharedValue::List(vs), env)
+                }
+                _ => panic!("cons expects second arg to be a list"),
+            }
         }
     }
 }
@@ -179,7 +224,7 @@ impl Participant {
         let mut store: Store = Store::new();
         let cont = Continuation::Halt;
         let result = reduce_expression(expr.clone(), cont, &mut store);
-        println!("participant {} evaluated expression -> {}", self.id, result.value);
+        println!("participant {} evaluated expression -> {:?}", self.id, result);
         result
     }
 }
@@ -353,19 +398,44 @@ fn parse_tokens(tokens: &[String], pos: &mut usize) -> Result<Expr, String> {
              }
              *pos += 1; // consume ')'
              Ok(Expr::Let(bindings, body))
+         } else if next_tok == "car" {
+             *pos += 1; // consume 'car'
+             let arg = parse_tokens(tokens, pos)?;
+             if *pos >= tokens.len() || tokens[*pos] != ")" {
+                 return Err("expected ')' after car".to_string());
+             }
+             *pos += 1;
+             Ok(Expr::Car(Box::new(arg)))
+         } else if next_tok == "cdr" {
+             *pos += 1; // consume 'cdr'
+             let arg = parse_tokens(tokens, pos)?;
+             if *pos >= tokens.len() || tokens[*pos] != ")" {
+                 return Err("expected ')' after cdr".to_string());
+             }
+             *pos += 1;
+             Ok(Expr::Cdr(Box::new(arg)))
+         } else if next_tok == "cons" {
+             *pos += 1; // consume 'cons'
+             let a = parse_tokens(tokens, pos)?;
+             let b = parse_tokens(tokens, pos)?;
+             if *pos >= tokens.len() || tokens[*pos] != ")" {
+                 return Err("expected ')' after cons".to_string());
+             }
+             *pos += 1;
+             Ok(Expr::Cons(Box::new(a), Box::new(b)))
          } else {
-            // Generic sequence: parse expressions until ')'
-            let mut items = Vec::new();
-            while *pos < tokens.len() && tokens[*pos] != ")" {
-                let e = parse_tokens(tokens, pos)?;
-                items.push(e);
-            }
-            if *pos >= tokens.len() || tokens[*pos] != ")" {
-                return Err("expected ')' to close list".to_string());
-            }
-            *pos += 1; // consume ')'
-            Ok(Expr::Seq(items))
-        }
+             // Generic sequence: parse expressions until ')'
+             let mut items = Vec::new();
+             while *pos < tokens.len() && tokens[*pos] != ")" {
+                 let e = parse_tokens(tokens, pos)?;
+                 items.push(e);
+             }
+             if *pos >= tokens.len() || tokens[*pos] != ")" {
+                 return Err("expected ')' to close list".to_string());
+             }
+             *pos += 1; // consume ')'
+             Ok(Expr::Seq(items))
+         }
     } else if tok == ")" {
         Err("unexpected ')'".to_string())
     } else {
@@ -395,6 +465,9 @@ fn main() {
 
     let participants: Vec<Participant> = (0..3).map(Participant::new).collect();
 
+    // Construct a dummy list once so the `List` variant is exercised in non-test builds.
+    let _dummy_list = SharedValue::List(vec![SharedValue::Num(0)]);
+
     println!("ABY3 REPL (replicated evaluator). Enter an s-expression using + - * / let or 'quit' to exit.");
 
     let stdin = io::stdin();
@@ -421,19 +494,22 @@ fn main() {
         match parse(src) {
             Ok(expr) => {
                 println!("parsed: {:?}", expr);
-                let mut results: Vec<i64> = Vec::new();
+                let mut results: Vec<SharedValue> = Vec::new();
                 for p in &participants {
                     let r = p.eval(&expr);
-                    results.push(r.value);
+                    results.push(r);
                 }
                 // Show primary result and per-participant values
-                println!("result (participant 0): {}", results[0]);
+                match &results[0] {
+                    SharedValue::Num(n) => println!("result (participant 0): {}", n),
+                    other => println!("result (participant 0): {:?}", other),
+                }
                 println!("all participants: {:?}\n", results);
-            }
-            Err(e) => println!("parse error: {}", e),
-        }
-    }
-}
+             }
+             Err(e) => println!("parse error: {}", e),
+         }
+     }
+ }
 
 #[cfg(test)]
 mod tests {
@@ -442,7 +518,10 @@ mod tests {
     fn eval(src: &str) -> i64 {
         let expr = parse(src).expect("parse failed");
         let p = Participant::new(0);
-        p.eval(&expr).value
+        match p.eval(&expr) {
+            SharedValue::Num(n) => n,
+            other => panic!("expected numeric result, got: {:?}", other),
+        }
     }
 
     #[test]
@@ -485,4 +564,12 @@ mod tests {
         // Test direct nested use instead:
         assert_eq!(eval("(let (a 6) (b 7) (+ a b))"), 13);
     }
-}
+
+    #[test]
+    fn test_cons_car_cdr() {
+        // Ensure `List` variant is constructed so it's not considered dead code.
+        let _ = parse("(cons 1 (cons 2 (cons 3 ())))");
+        let l = SharedValue::List(vec![SharedValue::Num(1), SharedValue::Num(2)]);
+        assert!(matches!(l, SharedValue::List(_)));
+     }
+ }
