@@ -52,11 +52,13 @@ enum Continuation {
         op: BinOp,
         right: Box<Expr>,
         cont: Box<Continuation>,
+        env: Env,
     },
     BinOpRight {
         op: BinOp,
         left_val: SharedValue,
         cont: Box<Continuation>,
+        env: Env,
     },
 
     // let (top-level bindings) continuation: after evaluating a binding value
@@ -94,8 +96,14 @@ enum Continuation {
         env: Env,
     },
 
-    Car(Box<Continuation>),
-    Cdr(Box<Continuation>),
+    Car {
+        cont: Box<Continuation>,
+        env: Env,
+    },
+    Cdr {
+        cont: Box<Continuation>,
+        env: Env,
+    },
 
     ConsLeft {
         right: Box<Expr>,
@@ -105,6 +113,7 @@ enum Continuation {
     ConsRight {
         left_val: SharedValue,
         cont: Box<Continuation>,
+        env: Env,
     },
 
     // Call: after operator is evaluated, begin evaluating args sequentially.
@@ -125,6 +134,7 @@ enum Continuation {
         then_e: Box<Expr>,
         else_e: Box<Expr>,
         cont: Box<Continuation>,
+        env: Env,
     },
 }
 
@@ -189,7 +199,7 @@ fn reduce_expression(expr: Expr, cont: Continuation, env: Env) -> SharedValue {
                     }
                     Expr::BinOp(op, left, right) => {
                         // Evaluate left first, with a continuation that will evaluate right.
-                        let new_cont = Continuation::BinOpLeft { op, right, cont: Box::new(k) };
+                        let new_cont = Continuation::BinOpLeft { op, right, cont: Box::new(k), env: eenv.clone() };
                         stack.push(Eval(*left, new_cont, eenv.clone()));
                     }
                     Expr::Let(bindings, body) => {
@@ -270,10 +280,10 @@ fn reduce_expression(expr: Expr, cont: Continuation, env: Env) -> SharedValue {
                         }
                     }
                     Expr::Car(inner) => {
-                        stack.push(Eval(*inner, Continuation::Car(Box::new(k)), eenv.clone()));
+                        stack.push(Eval(*inner, Continuation::Car { cont: Box::new(k), env: eenv.clone() }, eenv.clone()));
                     }
                     Expr::Cdr(inner) => {
-                        stack.push(Eval(*inner, Continuation::Cdr(Box::new(k)), eenv.clone()));
+                        stack.push(Eval(*inner, Continuation::Cdr { cont: Box::new(k), env: eenv.clone() }, eenv.clone()));
                     }
                     Expr::Cons(h, t) => {
                         stack.push(Eval(*h, Continuation::ConsLeft { right: t, cont: Box::new(k), env: eenv.clone() }, eenv.clone()));
@@ -286,7 +296,7 @@ fn reduce_expression(expr: Expr, cont: Continuation, env: Env) -> SharedValue {
                         stack.push(Eval(*head, Continuation::CallEvalOperator { args, cont: Box::new(k), env: eenv.clone() }, eenv.clone()));
                     }
                     Expr::If(cond, then_e, else_e) => {
-                        stack.push(Eval(*cond, Continuation::If { then_e, else_e, cont: Box::new(k) }, eenv.clone()));
+                        stack.push(Eval(*cond, Continuation::If { then_e, else_e, cont: Box::new(k), env: eenv.clone() }, eenv.clone()));
                     }
                 }
             }
@@ -301,12 +311,12 @@ fn reduce_expression(expr: Expr, cont: Continuation, env: Env) -> SharedValue {
                             continue;
                         }
                     }
-                    Continuation::BinOpLeft { op, right, cont } => {
+                    Continuation::BinOpLeft { op, right, cont, env } => {
                         // left value is `val`; evaluate right with BinOpRight continuation
-                        let next = Continuation::BinOpRight { op, left_val: val, cont };
-                        stack.push(Eval(*right, next, eenv.clone()));
+                        let next = Continuation::BinOpRight { op, left_val: val, cont, env: env.clone() };
+                        stack.push(Eval(*right, next, env.clone()));
                     }
-                    Continuation::BinOpRight { op, left_val, cont } => {
+                    Continuation::BinOpRight { op, left_val, cont, env } => {
                         let a = match left_val { SharedValue::Num(x) => x, _ => panic!("binary op left operand must be NUM"), };
                         let b = match val { SharedValue::Num(x) => x, _ => panic!("binary op right operand must be NUM"), };
                         let res = match op {
@@ -321,7 +331,7 @@ fn reduce_expression(expr: Expr, cont: Continuation, env: Env) -> SharedValue {
                             BinOp::Eq => if a == b { 1 } else { 0 },
                         };
                         let out = SharedValue::Num(res);
-                        stack.push(Apply(*cont, out, eenv));
+                        stack.push(Apply(*cont, out, env.clone()));
                     }
                     Continuation::LetTop { name, mut remaining, env } => {
                         // insert value into env and continue with remaining bindings
@@ -394,36 +404,36 @@ fn reduce_expression(expr: Expr, cont: Continuation, env: Env) -> SharedValue {
                             }
                         }
                     }
-                    Continuation::Car(cont) => {
+                    Continuation::Car { cont, env } => {
                         match val {
                             SharedValue::List(mut vs) => {
                                 if vs.is_empty() { panic!("car of empty list"); }
                                 let first = vs.remove(0);
-                                stack.push(Apply(*cont, first, eenv.clone()));
+                                stack.push(Apply(*cont, first, env.clone()));
                             }
                             _ => panic!("car expects a list"),
                         }
                     }
-                    Continuation::Cdr(cont) => {
+                    Continuation::Cdr { cont, env } => {
                         match val {
                             SharedValue::List(vs) => {
                                 if vs.is_empty() { panic!("cdr of empty list"); }
                                 let tail = SharedValue::List(vs.into_iter().skip(1).collect());
-                                stack.push(Apply(*cont, tail, eenv.clone()));
+                                stack.push(Apply(*cont, tail, env.clone()));
                             }
                             _ => panic!("cdr expects a list"),
                         }
                     }
                     Continuation::ConsLeft { right, cont, env } => {
                         // left value is available; evaluate right with ConsRight continuation
-                        let next = Continuation::ConsRight { left_val: val, cont };
+                        let next = Continuation::ConsRight { left_val: val, cont, env: env.clone() };
                         stack.push(Eval(*right, next, env.clone()));
                     }
-                    Continuation::ConsRight { left_val, cont } => {
+                    Continuation::ConsRight { left_val, cont, env } => {
                         match val {
                             SharedValue::List(mut vs) => {
                                 vs.insert(0, left_val);
-                                stack.push(Apply(*cont, SharedValue::List(vs), eenv.clone()));
+                                stack.push(Apply(*cont, SharedValue::List(vs), env.clone()));
                             }
                             _ => panic!("cons expects second arg to be a list"),
                         }
@@ -476,13 +486,13 @@ fn reduce_expression(expr: Expr, cont: Continuation, env: Env) -> SharedValue {
                             stack.push(Eval(next, new_cont, env.clone()));
                         }
                     }
-                    Continuation::If { then_e, else_e, cont } => {
+                    Continuation::If { then_e, else_e, cont, env } => {
                         match val {
                             SharedValue::Num(n) => {
                                 if n != 0 {
-                                    stack.push(Eval(*then_e, *cont, eenv.clone()));
+                                    stack.push(Eval(*then_e, *cont, env.clone()));
                                 } else {
-                                    stack.push(Eval(*else_e, *cont, eenv.clone()));
+                                    stack.push(Eval(*else_e, *cont, env.clone()));
                                 }
                             }
                             _ => panic!("if condition must be NUM"),
@@ -1011,8 +1021,8 @@ fn cont_short(c: &Continuation) -> String {
         Continuation::LetLocal { .. } => "LetLocal".to_string(),
         Continuation::LetRecInit { .. } => "LetRecInit".to_string(),
         Continuation::Seq { .. } => "SeqCont".to_string(),
-        Continuation::Car(_) => "CarCont".to_string(),
-        Continuation::Cdr(_) => "CdrCont".to_string(),
+        Continuation::Car { .. } => "CarCont".to_string(),
+        Continuation::Cdr { .. } => "CdrCont".to_string(),
         Continuation::ConsLeft { .. } => "ConsLeft".to_string(),
         Continuation::ConsRight { .. } => "ConsRight".to_string(),
         Continuation::CallEvalOperator { .. } => "CallEvalOperator".to_string(),
