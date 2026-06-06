@@ -32,260 +32,468 @@ enum BinOp {
     Eq,
 }
 
-// Store is now a reference-counted, mutable map so closures can share and see
-// updates performed by `letrec` initializers.
-type Store = Rc<RefCell<HashMap<String, SharedValue>>>;
+// Store/Env: map names to pointers so letrec can prebind placeholders.
+type Ptr = Rc<RefCell<SharedValue>>;
+type Env = Rc<RefCell<HashMap<String, Ptr>>>;
 
 #[derive(Debug, Clone)]
 /// A very small representation of a secret-shared value.
-/// Can be a number or a list of shared values.
+/// Can be a number or a list of shared values or a closure capturing an Env.
 enum SharedValue {
     Num(i64),
     List(Vec<SharedValue>),
-    Closure(Vec<String>, Box<Expr>, Store),
+    Closure(Vec<String>, Box<Expr>, Env),
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 enum Continuation {
-    /// Terminal continuation: evaluation is finished and the contained value
-    /// should be returned to the caller / REPL.
     Halt,
-
-    /// After evaluating the left operand, evaluate the right operand.
-    /// Holds the operator, the right expression and the continuation to run
-    /// after the binary operation finishes.
     BinOpLeft {
         op: BinOp,
         right: Box<Expr>,
         cont: Box<Continuation>,
     },
-
-    /// After evaluating the right operand, apply the binary operator using
-    /// the previously-computed left value, then continue with `cont`.
     BinOpRight {
         op: BinOp,
         left_val: SharedValue,
         cont: Box<Continuation>,
     },
+
+    // let (top-level bindings) continuation: after evaluating a binding value
+    // insert into `env` under `name` and evaluate next binding (if any).
+    LetTop {
+        name: String,
+        remaining: Vec<(String, Expr)>,
+        env: Env,
+    },
+
+    // let with a local scope: after computing a binding value insert into
+    // `local_env` and continue with remaining bindings or evaluate body.
+    LetLocal {
+        name: String,
+        remaining: Vec<(String, Expr)>,
+        local_env: Env,
+        body: Vec<Expr>,
+        cont: Box<Continuation>,
+    },
+
+    // letrec initializer continuation: write initializer result into placeholder ptr
+    LetRecInit {
+        name: String,
+        remaining: Vec<(String, Expr)>,
+        local_env: Env,
+        body: Vec<Expr>,
+        cont: Box<Continuation>,
+    },
+
+    // Sequence continuation: when a subexpression finishes, either evaluate
+    // the next expr or apply the parent continuation using last value.
+    Seq {
+        remaining: Vec<Expr>,
+        cont: Box<Continuation>,
+        env: Env,
+    },
+
+    Car(Box<Continuation>),
+    Cdr(Box<Continuation>),
+
+    ConsLeft {
+        right: Box<Expr>,
+        cont: Box<Continuation>,
+        env: Env,
+    },
+    ConsRight {
+        left_val: SharedValue,
+        cont: Box<Continuation>,
+    },
+
+    // Call: after operator is evaluated, begin evaluating args sequentially.
+    CallEvalOperator {
+        args: Vec<Expr>,
+        cont: Box<Continuation>,
+        env: Env,
+    },
+    CallEvalArgs {
+        operator: SharedValue,
+        remaining: Vec<Expr>,
+        mut_collected: Vec<SharedValue>,
+        cont: Box<Continuation>,
+        env: Env,
+    },
+
+    If {
+        then_e: Box<Expr>,
+        else_e: Box<Expr>,
+        cont: Box<Continuation>,
+    },
 }
 
-/// Apply a continuation to a value. For binary operations we thread the
-/// evaluation: when the left operand is ready we evaluate the right, and
-/// when the right is ready we apply the operator.
-fn apply_continuation(cont: Continuation, val: SharedValue, env: Store) -> SharedValue {
-    match cont {
-        Continuation::Halt => val,
-        Continuation::BinOpLeft { op, right, cont } => {
-            // Left operand is `val`. Now evaluate right under a continuation
-            // that remembers the left value.
-            let next = Continuation::BinOpRight { op, left_val: val, cont };
-            reduce_expression(*right, next, env.clone())
-        }
-        Continuation::BinOpRight { op, left_val, cont } => {
-            // Right operand evaluated to `val`. Apply the operator.
-            let a = match left_val {
-                SharedValue::Num(x) => x,
-                _ => panic!("binary op left operand must be NUM"),
-            };
-            let b = match val {
-                SharedValue::Num(x) => x,
-                _ => panic!("binary op right operand must be NUM"),
-            };
-            let res = match op {
-                BinOp::Add => a.wrapping_add(b),
-                BinOp::Sub => a.wrapping_sub(b),
-                BinOp::Mul => a.wrapping_mul(b),
-                BinOp::DivExact => {
-                    if b == 0 {
-                        panic!("division by zero");
-                    }
-                    if a % b != 0 {
-                        panic!("non-exact division: {} / {}", a, b);
-                    }
-                    a / b
-                }
-                BinOp::Eq => if a == b { 1 } else { 0 },
-            };
-            let out = SharedValue::Num(res);
-            apply_continuation(*cont, out, env.clone())
-        }
-    }
+// Tasks for the evaluator loop.
+enum Task {
+    Eval(Expr, Continuation, Env),
+    Apply(Continuation, SharedValue, Env),
 }
 
-/// Reduce an expression under a continuation, using and mutating `env` as the
-/// current store for variable bindings. Sequences and let-expressions create
-/// inner scopes by cloning the environment.
-fn reduce_expression(expr: Expr, cont: Continuation, env: Store) -> SharedValue {
-    match expr {
-        Expr::Num(n) => {
-            let v = SharedValue::Num(n);
-            apply_continuation(cont, v, env.clone())
-        }
-        Expr::Var(name) => {
-            let v = env.borrow().get(&name).cloned().unwrap_or_else(|| panic!("unbound variable: {}", name));
-            apply_continuation(cont, v, env.clone())
-        }
-        Expr::BinOp(op, left, right) => {
-            // Evaluate left first; after left is ready we will evaluate right.
-            let cont2 = Continuation::BinOpLeft { op, right, cont: Box::new(cont) };
-            reduce_expression(*left, cont2, env.clone())
-        }
-        Expr::Let(bindings, body) => {
-            if body.is_empty() {
-                // Treat as a top-level binding statement: evaluate bindings in the current env
-                // and install them so subsequent expressions in the same sequence can use them.
-                for (name, bind_expr) in bindings {
-                    let v = reduce_expression(bind_expr, Continuation::Halt, env.clone());
-                    env.borrow_mut().insert(name, v);
+const MAX_FRAMES: usize = 1_000_000;
+
+fn reduce_expression(expr: Expr, cont: Continuation, env: Env) -> SharedValue {
+    use Task::*;
+
+    let mut stack: Vec<Task> = Vec::new();
+    stack.push(Eval(expr.clone(), cont, env));
+    let mut frames: usize = 0;
+
+    // tracing setup: if top-level expr mentions "fib", enable trace capture
+    let trace_enabled = expr_contains_name(&expr, "fib");
+    const TRACE_LIMIT: usize = 500;
+    let mut trace: Vec<String> = Vec::new();
+
+    while let Some(task) = stack.pop() {
+        frames = frames.saturating_add(1);
+        if frames > MAX_FRAMES {
+            if trace_enabled {
+                eprintln!("--- trace (first {} events) ---", trace.len());
+                for (i, r) in trace.iter().enumerate() {
+                    eprintln!("{:05}: {}", i, r);
                 }
-                // Return a dummy value (not used when this Let is part of a Seq with following expressions)
-                SharedValue::Num(0)
-            } else {
-                // Evaluate bindings sequentially in a fresh scope (clone env contents)
-                let local = Rc::new(RefCell::new(env.borrow().clone()));
-                for (name, bind_expr) in bindings {
-                    let v = reduce_expression(bind_expr, Continuation::Halt, local.clone());
-                    local.borrow_mut().insert(name, v);
+            }
+            panic!("evaluation exceeded max frames ({})", MAX_FRAMES);
+        }
+        if frames % 10000 == 0 {
+            eprintln!("reduce_expression frames = {}", frames);
+        }
+
+        if trace_enabled && trace.len() < TRACE_LIMIT {
+            match &task {
+                Eval(e, k, _env) => {
+                    trace.push(format!("Popped Eval({}, cont={})", expr_short(e), cont_short(k)));
                 }
-                // Evaluate body sequentially; result of last expression is returned
-                if body.is_empty() {
-                    panic!("let requires at least one body expression");
+                Apply(k, v, _env) => {
+                    let vdesc = match v { SharedValue::Num(n) => format!("Num({})", n), SharedValue::List(l) => format!("List(len={})", l.len()), SharedValue::Closure(_, _, _) => "Closure".to_string(), };
+                    trace.push(format!("Popped Apply(cont={}, val={})", cont_short(k), vdesc));
                 }
-                let len = body.len();
-                for (i, e) in body.into_iter().enumerate() {
-                    if i + 1 == len {
-                        return reduce_expression(e, cont, local.clone());
-                    } else {
-                        let _ = reduce_expression(e, Continuation::Halt, local.clone());
+            }
+        }
+
+        match task {
+            Eval(e, k, eenv) => {
+                match e {
+                    Expr::Num(n) => {
+                        stack.push(Apply(k, SharedValue::Num(n), eenv.clone()));
+                    }
+                    Expr::Var(name) => {
+                        let map = eenv.borrow();
+                        let ptr = map.get(&name).cloned().unwrap_or_else(|| panic!("unbound variable: {}", name));
+                        let v = ptr.borrow().clone();
+                        stack.push(Apply(k, v, eenv.clone()));
+                    }
+                    Expr::BinOp(op, left, right) => {
+                        // Evaluate left first, with a continuation that will evaluate right.
+                        let new_cont = Continuation::BinOpLeft { op, right, cont: Box::new(k) };
+                        stack.push(Eval(*left, new_cont, eenv.clone()));
+                    }
+                    Expr::Let(bindings, body) => {
+                        if body.is_empty() {
+                            // top-level bindings: evaluate each and insert into current env
+                            if bindings.is_empty() {
+                                stack.push(Apply(k, SharedValue::Num(0), eenv.clone()));
+                            } else {
+                                let mut it = bindings.into_iter();
+                                let (name, be) = it.next().unwrap();
+                                let remaining: Vec<(String, Expr)> = it.collect();
+                                stack.push(Eval(be, Continuation::LetTop { name, remaining, env: eenv.clone() }, eenv.clone()));
+                            }
+                        } else {
+                            // create a fresh local scope cloned from env
+                            let local = Rc::new(RefCell::new(eenv.borrow().clone()));
+                            if bindings.is_empty() {
+                                // evaluate body in local
+                                if body.len() == 1 {
+                                    stack.push(Eval(body.into_iter().next().unwrap(), k, local));
+                                } else {
+                                    let mut rest = body;
+                                    let last = rest.pop().unwrap();
+                                    stack.push(Eval(last, k, local.clone()));
+                                    // push preceding expressions as Eval(..., Halt)
+                                    while let Some(pre) = rest.pop() {
+                                        stack.push(Eval(pre, Continuation::Halt, local.clone()));
+                                    }
+                                }
+                            } else {
+                                let mut it = bindings.into_iter();
+                                let (name, be) = it.next().unwrap();
+                                let remaining: Vec<(String, Expr)> = it.collect();
+                                stack.push(Eval(be, Continuation::LetLocal { name, remaining, local_env: local.clone(), body, cont: Box::new(k) }, local.clone()));
+                            }
+                        }
+                    }
+                    Expr::LetRec(bindings, body) => {
+                        // prebind placeholders into a shared local env
+                        let local = Rc::new(RefCell::new(eenv.borrow().clone()));
+                        // insert placeholders (Ptr to dummy values)
+                        for (name, _) in &bindings {
+                            local.borrow_mut().insert(name.clone(), Rc::new(RefCell::new(SharedValue::Num(0))));
+                        }
+                        // start evaluating initializers sequentially
+                        if bindings.is_empty() {
+                            // evaluate body in local
+                            if body.len() == 1 {
+                                stack.push(Eval(body.into_iter().next().unwrap(), k, local));
+                            } else {
+                                let mut rest = body;
+                                let last = rest.pop().unwrap();
+                                stack.push(Eval(last, k, local.clone()));
+                                while let Some(pre) = rest.pop() {
+                                    stack.push(Eval(pre, Continuation::Halt, local.clone()));
+                                }
+                            }
+                        } else {
+                            let mut it = bindings.into_iter();
+                            let (name, be) = it.next().unwrap();
+                            let remaining: Vec<(String, Expr)> = it.collect();
+                            stack.push(Eval(be, Continuation::LetRecInit { name, remaining, local_env: local.clone(), body, cont: Box::new(k) }, local.clone()));
+                        }
+                    }
+                    Expr::Seq(exprs) => {
+                        if exprs.is_empty() {
+                            stack.push(Apply(k, SharedValue::List(Vec::new()), eenv.clone()));
+                        } else if exprs.len() == 1 {
+                            stack.push(Eval(exprs.into_iter().next().unwrap(), k, eenv));
+                        } else {
+                            let mut rest = exprs;
+                            let last = rest.pop().unwrap();
+                            // we want to evaluate leading expressions for side effects under Halt
+                            stack.push(Eval(last, k, eenv.clone()));
+                            while let Some(pre) = rest.pop() {
+                                stack.push(Eval(pre, Continuation::Halt, eenv.clone()));
+                            }
+                        }
+                    }
+                    Expr::Car(inner) => {
+                        stack.push(Eval(*inner, Continuation::Car(Box::new(k)), eenv.clone()));
+                    }
+                    Expr::Cdr(inner) => {
+                        stack.push(Eval(*inner, Continuation::Cdr(Box::new(k)), eenv.clone()));
+                    }
+                    Expr::Cons(h, t) => {
+                        stack.push(Eval(*h, Continuation::ConsLeft { right: t, cont: Box::new(k), env: eenv.clone() }, eenv.clone()));
+                    }
+                    Expr::Lambda(params, body) => {
+                        let closure = SharedValue::Closure(params, body, eenv.clone());
+                        stack.push(Apply(k, closure, eenv.clone()));
+                    }
+                    Expr::Call(head, args) => {
+                        stack.push(Eval(*head, Continuation::CallEvalOperator { args, cont: Box::new(k), env: eenv.clone() }, eenv.clone()));
+                    }
+                    Expr::If(cond, then_e, else_e) => {
+                        stack.push(Eval(*cond, Continuation::If { then_e, else_e, cont: Box::new(k) }, eenv.clone()));
                     }
                 }
-                unreachable!()
             }
-        }
-        Expr::LetRec(bindings, body) => {
-            // letrec semantics: create a shared local environment pre-bound with
-            // placeholders for each name so initializers and closures can refer
-            // to all bindings (mutual recursion). After evaluating initializers
-            // we replace placeholders with actual values.
-            let local = Rc::new(RefCell::new(env.borrow().clone()));
-            // prebind placeholders
-            for (name, _) in &bindings {
-                local.borrow_mut().insert(name.clone(), SharedValue::Num(0));
-            }
-            // evaluate initializers in the shared local env so closures capture it
-            for (name, bind_expr) in bindings {
-                let v = reduce_expression(bind_expr, Continuation::Halt, local.clone());
-                local.borrow_mut().insert(name, v);
-            }
-            // Evaluate body sequentially; result of last expression is returned
-            if body.is_empty() {
-                panic!("letrec requires at least one body expression");
-            }
-            let len = body.len();
-            for (i, e) in body.into_iter().enumerate() {
-                if i + 1 == len {
-                    return reduce_expression(e, cont, local.clone());
-                } else {
-                    let _ = reduce_expression(e, Continuation::Halt, local.clone());
-                }
-            }
-            unreachable!()
-        }
-        Expr::Seq(exprs) => {
-            // Empty sequence is treated as the empty list literal `()`.
-            if exprs.is_empty() {
-                return apply_continuation(cont, SharedValue::List(Vec::new()), env.clone());
-            }
-            // Non-empty Seq is a sequence of expressions; return last expression's value.
-            let len = exprs.len();
-            for (i, e) in exprs.into_iter().enumerate() {
-                if i + 1 == len {
-                    return reduce_expression(e, cont, env.clone());
-                } else {
-                    let _ = reduce_expression(e, Continuation::Halt, env.clone());
-                }
-            }
-            unreachable!()
-        }
-        Expr::Car(inner) => {
-            // Evaluate inner then take first element
-            let v = reduce_expression(*inner, Continuation::Halt, env.clone());
-            match v {
-                SharedValue::List(mut vs) => {
-                    if vs.is_empty() { panic!("car of empty list"); }
-                    let first = vs.remove(0);
-                    apply_continuation(cont, first, env.clone())
-                }
-                _ => panic!("car expects a list"),
-            }
-        }
-        Expr::Cdr(inner) => {
-            let v = reduce_expression(*inner, Continuation::Halt, env.clone());
-            match v {
-                SharedValue::List(vs) => {
-                    if vs.is_empty() { panic!("cdr of empty list"); }
-                    let tail = SharedValue::List(vs.into_iter().skip(1).collect());
-                    apply_continuation(cont, tail, env.clone())
-                }
-                _ => panic!("cdr expects a list"),
-            }
-        }
-        Expr::Cons(h, t) => {
-            let head = reduce_expression(*h, Continuation::Halt, env.clone());
-            let tail = reduce_expression(*t, Continuation::Halt, env.clone());
-            match tail {
-                SharedValue::List(mut vs) => {
-                    vs.insert(0, head);
-                    apply_continuation(cont, SharedValue::List(vs), env.clone())
-                }
-                _ => panic!("cons expects second arg to be a list"),
-            }
-        }
-        Expr::Lambda(params, body) => {
-            // Create a closure capturing current env (shared Store)
-            let closure = SharedValue::Closure(params, body, env.clone());
-            apply_continuation(cont, closure, env.clone())
-        }
-        Expr::Call(head, args) => {
-            // Evaluate operator
-            let func = reduce_expression(*head, Continuation::Halt, env.clone());
-            // Evaluate arguments eagerly
-            let mut arg_vals: Vec<SharedValue> = Vec::new();
-            for a in args {
-                let v = reduce_expression(a, Continuation::Halt, env.clone());
-                arg_vals.push(v);
-            }
-            match func {
-                SharedValue::Closure(params, body, closure_env) => {
-                    if params.len() != arg_vals.len() {
-                        panic!("closure arity mismatch: expected {} got {}", params.len(), arg_vals.len());
+            Apply(k, val, eenv) => {
+                match k {
+                    Continuation::Halt => {
+                        // if no more tasks on stack, this is the final result
+                        if stack.is_empty() {
+                            return val;
+                        } else {
+                            // otherwise this value was produced for side-effect; drop it
+                            continue;
+                        }
                     }
-                    // Create a fresh call-local env cloned from the closure's captured env
-                    // so recursive calls get isolated parameter bindings.
-                    let call_env = Rc::new(RefCell::new(closure_env.borrow().clone()));
-                    for (p, v) in params.into_iter().zip(arg_vals.into_iter()) {
-                        call_env.borrow_mut().insert(p, v);
+                    Continuation::BinOpLeft { op, right, cont } => {
+                        // left value is `val`; evaluate right with BinOpRight continuation
+                        let next = Continuation::BinOpRight { op, left_val: val, cont };
+                        stack.push(Eval(*right, next, eenv.clone()));
                     }
-                    // evaluate body in call_env under cont
-                    reduce_expression(*body, cont, call_env.clone())
-                }
-                _ => panic!("attempt to call non-function: {:?}", func),
-            }
-        }
-        Expr::If(cond, then_e, else_e) => {
-            let c = reduce_expression(*cond, Continuation::Halt, env.clone());
-            match c {
-                SharedValue::Num(n) => {
-                    if n != 0 {
-                        reduce_expression(*then_e, cont, env.clone())
-                    } else {
-                        reduce_expression(*else_e, cont, env.clone())
+                    Continuation::BinOpRight { op, left_val, cont } => {
+                        let a = match left_val { SharedValue::Num(x) => x, _ => panic!("binary op left operand must be NUM"), };
+                        let b = match val { SharedValue::Num(x) => x, _ => panic!("binary op right operand must be NUM"), };
+                        let res = match op {
+                            BinOp::Add => a.wrapping_add(b),
+                            BinOp::Sub => a.wrapping_sub(b),
+                            BinOp::Mul => a.wrapping_mul(b),
+                            BinOp::DivExact => {
+                                if b == 0 { panic!("division by zero"); }
+                                if a % b != 0 { panic!("non-exact division: {} / {}", a, b); }
+                                a / b
+                            }
+                            BinOp::Eq => if a == b { 1 } else { 0 },
+                        };
+                        let out = SharedValue::Num(res);
+                        stack.push(Apply(*cont, out, eenv));
+                    }
+                    Continuation::LetTop { name, mut remaining, env } => {
+                        // insert value into env and continue with remaining bindings
+                        env.borrow_mut().insert(name, Rc::new(RefCell::new(val)));
+                        if remaining.is_empty() {
+                            stack.push(Apply(Continuation::Halt, SharedValue::Num(0), env.clone()));
+                        } else {
+                            let (nxt_name, nxt_expr) = remaining.remove(0);
+                            stack.push(Eval(nxt_expr, Continuation::LetTop { name: nxt_name, remaining, env: env.clone() }, env.clone()));
+                        }
+                    }
+                    Continuation::LetLocal { name, mut remaining, local_env, body, cont } => {
+                        local_env.borrow_mut().insert(name, Rc::new(RefCell::new(val)));
+                        if remaining.is_empty() {
+                            // evaluate body sequentially in local_env
+                            if body.is_empty() {
+                                stack.push(Apply(*cont, SharedValue::Num(0), local_env.clone()));
+                            } else if body.len() == 1 {
+                                stack.push(Eval(body.into_iter().next().unwrap(), *cont, local_env.clone()));
+                            } else {
+                                let mut rest = body;
+                                let last = rest.pop().unwrap();
+                                stack.push(Eval(last, *cont, local_env.clone()));
+                                while let Some(pre) = rest.pop() {
+                                    stack.push(Eval(pre, Continuation::Halt, local_env.clone()));
+                                }
+                            }
+                        } else {
+                            let (nxt_name, nxt_expr) = remaining.remove(0);
+                            stack.push(Eval(nxt_expr, Continuation::LetLocal { name: nxt_name, remaining, local_env: local_env.clone(), body, cont }, local_env.clone()));
+                        }
+                    }
+                    Continuation::LetRecInit { name, mut remaining, local_env, body, cont } => {
+                        // write initializer into placeholder ptr
+                        // we inserted a placeholder earlier; overwrite it by replacing the inner value
+                        if let Some(ptr) = local_env.borrow().get(&name) {
+                            *ptr.borrow_mut() = val;
+                        } else {
+                            // shouldn't happen
+                            local_env.borrow_mut().insert(name.clone(), Rc::new(RefCell::new(val)));
+                        }
+                        if remaining.is_empty() {
+                            // evaluate body in local_env
+                            if body.len() == 1 {
+                                stack.push(Eval(body.into_iter().next().unwrap(), *cont, local_env.clone()));
+                            } else {
+                                let mut rest = body;
+                                let last = rest.pop().unwrap();
+                                stack.push(Eval(last, *cont, local_env.clone()));
+                                while let Some(pre) = rest.pop() {
+                                    stack.push(Eval(pre, Continuation::Halt, local_env.clone()));
+                                }
+                            }
+                        } else {
+                            let (nxt_name, nxt_expr) = remaining.remove(0);
+                            stack.push(Eval(nxt_expr, Continuation::LetRecInit { name: nxt_name, remaining, local_env: local_env.clone(), body, cont: cont.clone() }, local_env.clone()));
+                        }
+                    }
+                    Continuation::Seq { mut remaining, cont, env } => {
+                        if remaining.is_empty() {
+                            stack.push(Apply(*cont, val, env.clone()));
+                        } else {
+                            let next = remaining.remove(0);
+                            if remaining.is_empty() {
+                                // last expr -> apply parent continuation with its value
+                                stack.push(Eval(next, *cont, env.clone()));
+                            } else {
+                                // evaluate next for side effects first
+                                stack.push(Eval(next, Continuation::Seq { remaining, cont, env: env.clone() }, env.clone()));
+                            }
+                        }
+                    }
+                    Continuation::Car(cont) => {
+                        match val {
+                            SharedValue::List(mut vs) => {
+                                if vs.is_empty() { panic!("car of empty list"); }
+                                let first = vs.remove(0);
+                                stack.push(Apply(*cont, first, eenv.clone()));
+                            }
+                            _ => panic!("car expects a list"),
+                        }
+                    }
+                    Continuation::Cdr(cont) => {
+                        match val {
+                            SharedValue::List(vs) => {
+                                if vs.is_empty() { panic!("cdr of empty list"); }
+                                let tail = SharedValue::List(vs.into_iter().skip(1).collect());
+                                stack.push(Apply(*cont, tail, eenv.clone()));
+                            }
+                            _ => panic!("cdr expects a list"),
+                        }
+                    }
+                    Continuation::ConsLeft { right, cont, env } => {
+                        // left value is available; evaluate right with ConsRight continuation
+                        let next = Continuation::ConsRight { left_val: val, cont };
+                        stack.push(Eval(*right, next, env.clone()));
+                    }
+                    Continuation::ConsRight { left_val, cont } => {
+                        match val {
+                            SharedValue::List(mut vs) => {
+                                vs.insert(0, left_val);
+                                stack.push(Apply(*cont, SharedValue::List(vs), eenv.clone()));
+                            }
+                            _ => panic!("cons expects second arg to be a list"),
+                        }
+                    }
+                    Continuation::CallEvalOperator { args, cont, env } => {
+                        // operator value is `val`. Begin evaluating args if any.
+                        if args.is_empty() {
+                            // directly apply
+                            match val {
+                                SharedValue::Closure(params, body, closure_env) => {
+                                    if params.len() != 0 {
+                                        panic!("closure arity mismatch: expected {} got 0", params.len());
+                                    }
+                                    let call_env = Rc::new(RefCell::new(closure_env.borrow().clone()));
+                                    stack.push(Eval(*body, *cont, call_env));
+                                }
+                                _ => panic!("attempt to call non-function: {:?}", val),
+                            }
+                        } else {
+                            let mut rem = args;
+                            let first = rem.remove(0);
+                            let collected: Vec<SharedValue> = Vec::new();
+                            let call_args_cont = Continuation::CallEvalArgs { operator: val, remaining: rem, mut_collected: collected, cont, env: env.clone() };
+                            stack.push(Eval(first, call_args_cont, env.clone()));
+                        }
+                    }
+                    Continuation::CallEvalArgs { operator, mut remaining, mut mut_collected, cont, env } => {
+                        // val is the next argument's evaluated value
+                        mut_collected.push(val);
+                        if remaining.is_empty() {
+                            // perform the call with collected arguments
+                            match operator {
+                                SharedValue::Closure(params, body, closure_env) => {
+                                    if params.len() != mut_collected.len() {
+                                        panic!("closure arity mismatch: expected {} got {}", params.len(), mut_collected.len());
+                                    }
+                                    // create call env cloned from closure_env and bind params to new ptrs
+                                    let call_env = Rc::new(RefCell::new(closure_env.borrow().clone()));
+                                    for (p, v) in params.into_iter().zip(mut_collected.into_iter()) {
+                                        call_env.borrow_mut().insert(p, Rc::new(RefCell::new(v)));
+                                    }
+                                    stack.push(Eval(*body, *cont, call_env));
+                                }
+                                _ => panic!("attempt to call non-function: {:?}", operator),
+                            }
+                        } else {
+                            // evaluate next argument
+                            let next = remaining.remove(0);
+                            let new_cont = Continuation::CallEvalArgs { operator, remaining, mut_collected, cont, env: env.clone() };
+                            stack.push(Eval(next, new_cont, env.clone()));
+                        }
+                    }
+                    Continuation::If { then_e, else_e, cont } => {
+                        match val {
+                            SharedValue::Num(n) => {
+                                if n != 0 {
+                                    stack.push(Eval(*then_e, *cont, eenv.clone()));
+                                } else {
+                                    stack.push(Eval(*else_e, *cont, eenv.clone()));
+                                }
+                            }
+                            _ => panic!("if condition must be NUM"),
+                        }
                     }
                 }
-                _ => panic!("if condition must be NUM"),
             }
         }
     }
+
+    panic!("evaluation fell out of loop without producing a value");
 }
 
 /// A simulated participant in the 3-party REPL. In a real MPC system each
@@ -305,7 +513,7 @@ impl Participant {
     /// Evaluate an expression locally and return the resulting SharedValue.
     fn eval(&self, expr: &Expr) -> SharedValue {
         // Each participant has its own store; start empty for now.
-        let store: Store = Rc::new(RefCell::new(HashMap::new()));
+        let store: Env = Rc::new(RefCell::new(HashMap::new()));
         let cont = Continuation::Halt;
         let result = reduce_expression(expr.clone(), cont, store.clone());
         if !cfg!(test) {
@@ -753,8 +961,62 @@ mod tests {
     #[test]
     fn test_fibonacci_6() {
         // naive recursive fibonacci using letrec and if/==
-        // use n=4 to avoid deep recursion in the recursive evaluator
-        let src = "(letrec ((fib (lambda (n) (if (== n 0) 0 (if (== n 1) 1 (+ (fib (- n 1)) (fib (- n 2)))))))) (fib 4))";
-        assert_eq!(eval(src), 3);
+        // use n=6 to exercise deeper recursion in the trampolined evaluator
+        let src = "(letrec ((fib (lambda (n) (if (== n 0) 0 (if (== n 1) 1 (+ (fib (- n 1)) (fib (- n 2)))))))) (fib 6))";
+        assert_eq!(eval(src), 8);
     }
  }
+
+// Helper: check whether an Expr contains an identifier name (e.g., "fib").
+fn expr_contains_name(e: &Expr, name: &str) -> bool {
+    match e {
+        Expr::Num(_) => false,
+        Expr::Var(n) => n == name,
+        Expr::BinOp(_, l, r) => expr_contains_name(l, name) || expr_contains_name(r, name),
+        Expr::Let(bindings, body) | Expr::LetRec(bindings, body) => {
+            bindings.iter().any(|(n, ex)| n == name || expr_contains_name(ex, name)) || body.iter().any(|ex| expr_contains_name(ex, name))
+        }
+        Expr::Seq(es) => es.iter().any(|ex| expr_contains_name(ex, name)),
+        Expr::Car(i) | Expr::Cdr(i) => expr_contains_name(i, name),
+        Expr::Cons(a, b) => expr_contains_name(a, name) || expr_contains_name(b, name),
+        Expr::Lambda(params, body) => params.iter().any(|p| p == name) || expr_contains_name(body, name),
+        Expr::Call(h, args) => expr_contains_name(h, name) || args.iter().any(|a| expr_contains_name(a, name)),
+        Expr::If(c, t, e) => expr_contains_name(c, name) || expr_contains_name(t, name) || expr_contains_name(e, name),
+    }
+}
+
+fn expr_short(e: &Expr) -> String {
+    match e {
+        Expr::Num(n) => format!("Num({})", n),
+        Expr::Var(s) => format!("Var({})", s),
+        Expr::BinOp(_, _, _) => "BinOp".to_string(),
+        Expr::Let(bs, _) => format!("Let(len={})", bs.len()),
+        Expr::LetRec(bs, _) => format!("LetRec(len={})", bs.len()),
+        Expr::Seq(es) => format!("Seq(len={})", es.len()),
+        Expr::Car(_) => "Car".to_string(),
+        Expr::Cdr(_) => "Cdr".to_string(),
+        Expr::Cons(_, _) => "Cons".to_string(),
+        Expr::Lambda(ps, _) => format!("Lambda(arity={})", ps.len()),
+        Expr::Call(_, args) => format!("Call(arity={})", args.len()),
+        Expr::If(_, _, _) => "If".to_string(),
+    }
+}
+
+fn cont_short(c: &Continuation) -> String {
+    match c {
+        Continuation::Halt => "Halt".to_string(),
+        Continuation::BinOpLeft { .. } => "BinOpLeft".to_string(),
+        Continuation::BinOpRight { .. } => "BinOpRight".to_string(),
+        Continuation::LetTop { .. } => "LetTop".to_string(),
+        Continuation::LetLocal { .. } => "LetLocal".to_string(),
+        Continuation::LetRecInit { .. } => "LetRecInit".to_string(),
+        Continuation::Seq { .. } => "SeqCont".to_string(),
+        Continuation::Car(_) => "CarCont".to_string(),
+        Continuation::Cdr(_) => "CdrCont".to_string(),
+        Continuation::ConsLeft { .. } => "ConsLeft".to_string(),
+        Continuation::ConsRight { .. } => "ConsRight".to_string(),
+        Continuation::CallEvalOperator { .. } => "CallEvalOperator".to_string(),
+        Continuation::CallEvalArgs { .. } => "CallEvalArgs".to_string(),
+        Continuation::If { .. } => "IfCont".to_string(),
+    }
+}
