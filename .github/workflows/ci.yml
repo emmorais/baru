@@ -39,3 +39,34 @@ jobs:
           cargo build --release
           # run tests with a single test thread to avoid cross-test interference
           cargo test --tests -- --test-threads=1 --nocapture
+
+  test-release:
+    name: Test (release)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust (stable)
+        uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+          profile: minimal
+          override: true
+
+      - name: Cache Cargo registry and target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}-release
+
+      - name: Run release-mode tests
+        env:
+          RUST_BACKTRACE: 1
+        run: |
+          # run tests in release mode; this will compile in release profile
+          cargo test --release -- --test-threads=1 --nocapture
