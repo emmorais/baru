@@ -78,3 +78,73 @@ fn test_a2b_and_comparisons() {
     let eq_sh = bits::eq_ab3(&sa, &sb, 8);
     assert_eq!(bits::reconstruct_bit(&eq_sh), a == b);
 }
+
+use rand::{Rng, SeedableRng};
+use rand::rngs::StdRng;
+use baru::crypto::scheduler;
+
+#[test]
+fn prop_mul_randomized() {
+    let mut rng = StdRng::seed_from_u64(0x1234_5678);
+    for _ in 0..200 {
+        let a: Fr = rng.gen();
+        let b: Fr = rng.gen();
+        let sa = arith::share_secret(a);
+        let sb = arith::share_secret(b);
+        let p1 = arith::mul_ab3(&sa, &sb);
+        assert_eq!(arith::reconstruct(&p1), a.wrapping_mul(b));
+        let p2 = party::mul_ab3_simulate(&sa, &sb);
+        assert_eq!(arith::reconstruct(&p2), a.wrapping_mul(b));
+        let (p3, _rounds) = scheduler::mul_with_scheduler(&sa, &sb, None);
+        assert_eq!(arith::reconstruct(&p3), a.wrapping_mul(b));
+    }
+}
+
+#[test]
+fn prop_a2b_and_comparisons_randomized() {
+    let mut rng = StdRng::seed_from_u64(0x8765_4321);
+    for _ in 0..200 {
+        let a: u128 = rng.gen::<u128>() & ((1u128 << 32) - 1);
+        let b: u128 = rng.gen::<u128>() & ((1u128 << 32) - 1);
+        let sa = arith::share_secret(a);
+        let sb = arith::share_secret(b);
+
+        // test a2b decomposition (protocol and simulate)
+        let bits_sim = bits::a2b_simulate(&sa, 32);
+        let mut rec_sim: u128 = 0;
+        for (i, bit_sh) in bits_sim.iter().enumerate() {
+            if bits::reconstruct_bit(bit_sh) {
+                rec_sim |= 1u128 << i;
+            }
+        }
+        assert_eq!(rec_sim, a);
+
+        let bits_proto = bits::a2b_ab3(&sa, 32);
+        let mut rec_proto: u128 = 0;
+        for (i, bit_sh) in bits_proto.iter().enumerate() {
+            if bits::reconstruct_bit(bit_sh) {
+                rec_proto |= 1u128 << i;
+            }
+        }
+        // protocol may operate mod field; assert lower 32 bits match
+        assert_eq!(rec_proto & ((1u128 << 32) - 1), a & ((1u128 << 32) - 1));
+
+        // comparisons: compare protocol to simulated (reconstruct-based) reference
+        let lt_sh = bits::lt_ab3(&sa, &sb, 32);
+        let lt_ref = arith::lt_simulate(&sa, &sb);
+        let lt_res = bits::reconstruct_bit(&lt_sh);
+        let lt_ref_val = arith::reconstruct(&lt_ref) != 0;
+        if lt_res != lt_ref_val {
+            eprintln!("Random mismatch lt: a={} b={} proto={} ref={}", a, b, lt_res, lt_ref_val);
+        }
+        assert_eq!(lt_res, lt_ref_val);
+        let eq_sh = bits::eq_ab3(&sa, &sb, 32);
+        let eq_ref = arith::eq_simulate(&sa, &sb);
+        let eq_res = bits::reconstruct_bit(&eq_sh);
+        let eq_ref_val = arith::reconstruct(&eq_ref) != 0;
+        if eq_res != eq_ref_val {
+            eprintln!("Random mismatch eq: a={} b={} proto={} ref={}", a, b, eq_res, eq_ref_val);
+        }
+        assert_eq!(eq_res, eq_ref_val);
+    }
+}
