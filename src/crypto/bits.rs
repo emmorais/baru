@@ -1,6 +1,7 @@
 use crate::crypto::types::{Share3, Fr};
 use rand::Rng;
 use crate::crypto::arith::{mul_ab3, add_shares, sub_shares, share_secret};
+use crate::crypto::arith::scalar_mul;
 
 /// Very small shared-bit helpers implemented by reconstruct-and-reshare.
 /// These are placeholders that provide a clear API while the true secure
@@ -76,4 +77,73 @@ pub fn eq_simulate(a: &Share3, b: &Share3) -> Share3 {
     let va = a.0.wrapping_add(a.1).wrapping_add(a.2);
     let vb = b.0.wrapping_add(b.1).wrapping_add(b.2);
     share_bool(va == vb)
+}
+
+/// XOR of two shared bits: a XOR b = a + b - 2*(a*b)
+fn xor_shared(a: &Share3, b: &Share3) -> Share3 {
+    let ab = mul_ab3(a, b);
+    let two_ab = scalar_mul(&ab, 2);
+    sub_shares(&add_shares(a, b), &two_ab)
+}
+
+/// ABY3-style arithmetic-to-bits (masked-open simulation).
+///
+/// This simulates per-party preprocessing and online masked opening: a mask r is
+/// sampled, its bit decomposition shared, and d = a - r is opened. Using public
+/// d and shared r_bits we compute shared bits of a without fully reconstructing a
+/// (the simulation still opens d but not a).
+pub fn a2b_ab3(a: &Share3, nbits: usize) -> Vec<Share3> {
+    let mut rng = rand::thread_rng();
+    let r: Fr = rng.gen();
+    let _r_sh = share_secret(r);
+    let mut r_bits: Vec<Share3> = Vec::with_capacity(nbits);
+    for i in 0..nbits {
+        let b = ((r >> i) & 1) != 0;
+        r_bits.push(share_bool(b));
+    }
+
+    let d = a.0.wrapping_add(a.1).wrapping_add(a.2).wrapping_sub(r);
+
+    // compute bits using d and r_bits
+    let mut out: Vec<Share3> = Vec::with_capacity(nbits);
+    let mut carry = share_bool(false);
+    for i in 0..nbits {
+        let d_bit = ((d >> i) & 1) != 0;
+        let d_share = share_bool(d_bit);
+        let r_bit = &r_bits[i];
+        let s1 = xor_shared(r_bit, &d_share);
+        let sum = xor_shared(&s1, &carry);
+        out.push(sum);
+
+        // carry_next = majority(r_i, d_i, carry)
+        let a_and_b = crate::crypto::bits::and(r_bit, &d_share);
+        let a_and_c = crate::crypto::bits::and(r_bit, &carry);
+        let b_and_c = crate::crypto::bits::and(&d_share, &carry);
+        let t = crate::crypto::bits::or(&a_and_c, &b_and_c);
+        carry = crate::crypto::bits::or(&a_and_b, &t);
+    }
+    out
+}
+
+/// Unsigned less-than: compute (a - b) and return MSB of decomposition.
+pub fn lt_ab3(a: &Share3, b: &Share3, nbits: usize) -> Share3 {
+    let diff = sub_shares(a, b);
+    let bits = a2b_ab3(&diff, nbits);
+    bits[nbits - 1].clone()
+}
+
+pub fn le_ab3(a: &Share3, b: &Share3, nbits: usize) -> Share3 {
+    let lt = lt_ab3(a, b, nbits);
+    let eq = eq_ab3(a, b, nbits);
+    crate::crypto::bits::or(&lt, &eq)
+}
+
+pub fn eq_ab3(a: &Share3, b: &Share3, nbits: usize) -> Share3 {
+    let diff = sub_shares(a, b);
+    let bits = a2b_ab3(&diff, nbits);
+    let mut acc = bits[0].clone();
+    for i in 1..bits.len() {
+        acc = crate::crypto::bits::or(&acc, &bits[i]);
+    }
+    crate::crypto::bits::not(&acc)
 }
