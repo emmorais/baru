@@ -134,3 +134,8 @@ fn test_not_numeric() {
 fn test_string_closure_capture() {
     assert_eq!(eval("(let ((s \"hi\")) (== s \"hi\"))"), 1);
 }
+
+#[test]
+fn test_shared_reveal() {
+    assert_eq!(eval("(let ((s:sint32 42)) (== (reveal s) 42))"), 1);
+}
