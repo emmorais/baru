@@ -80,7 +80,7 @@ pub fn eq_simulate(a: &Share3, b: &Share3) -> Share3 {
 }
 
 /// XOR of two shared bits: a XOR b = a + b - 2*(a*b)
-fn xor_shared(a: &Share3, b: &Share3) -> Share3 {
+pub(crate) fn xor_shared(a: &Share3, b: &Share3) -> Share3 {
     let ab = mul_ab3(a, b);
     let two_ab = scalar_mul(&ab, 2);
     sub_shares(&add_shares(a, b), &two_ab)

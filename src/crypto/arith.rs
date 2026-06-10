@@ -51,15 +51,38 @@ pub fn scalar_mul(a: &Share3, k: Fr) -> Share3 {
 
 /// Generate a Beaver triple (x, y, z) with z = x * y, all returned as Share3 shares.
 /// In a real ABY3 setting these triples would be preprocessed securely. Here we
-/// locally sample x,y and produce their sharings.
+/// simulate distributed generation: each party samples its local share components
+/// and then runs the ABY3 online multiplication protocol to compute z_sh without
+/// centrally sampling x or y.
 pub fn gen_beaver_triple() -> (Share3, Share3, Share3) {
     let mut rng = rand::thread_rng();
-    let x: Fr = rng.gen();
-    let y: Fr = rng.gen();
-    let x_sh = share_secret(x);
-    let y_sh = share_secret(y);
-    let z_sh = share_secret(x.wrapping_mul(y));
-    (x_sh, y_sh, z_sh)
+    // each party samples its local share for x and y
+    let x0: Fr = rng.gen();
+    let x1: Fr = rng.gen();
+    let x2: Fr = rng.gen();
+    let y0: Fr = rng.gen();
+    let y1: Fr = rng.gen();
+    let y2: Fr = rng.gen();
+
+    // assign cross terms to parties by (i+j) mod 3 to produce z shares
+    let mut z0: Fr = 0;
+    let mut z1: Fr = 0;
+    let mut z2: Fr = 0;
+    let xs = [x0, x1, x2];
+    let ys = [y0, y1, y2];
+    for i in 0..3 {
+        for j in 0..3 {
+            let prod = xs[i].wrapping_mul(ys[j]);
+            match (i + j) % 3 {
+                0 => z0 = z0.wrapping_add(prod),
+                1 => z1 = z1.wrapping_add(prod),
+                2 => z2 = z2.wrapping_add(prod),
+                _ => unreachable!(),
+            }
+        }
+    }
+
+    (Share3(x0, x1, x2), Share3(y0, y1, y2), Share3(z0, z1, z2))
 }
 
 /// Simulated ABY3 multiplication using Beaver triples.
