@@ -164,46 +164,73 @@ pub fn parse_tokens(tokens: &[String], pos: &mut usize) -> Result<Expr, String> 
             *pos += 1;
             Ok(Expr::BinOp(op, Box::new(left), Box::new(right)))
         } else if next_tok == "let" || next_tok == "letrec" {
-            let is_letrec = next_tok == "letrec"; *pos += 1;
-            let mut bindings = Vec::new();
-            if *pos < tokens.len() && tokens[*pos] == "(" && *pos + 1 < tokens.len() && tokens[*pos + 1] == "(" {
-                *pos += 1;
-                while *pos < tokens.len() && tokens[*pos] == "(" {
-                    *pos += 1; if *pos >= tokens.len() { return Err("unexpected end in binding".to_string()); }
-                    let name = tokens[*pos].clone(); *pos += 1;
-                    let expr = parse_tokens(tokens, pos)?;
-                    if *pos >= tokens.len() || tokens[*pos] != ")" { return Err("expected ')' after binding".to_string()); }
-                    *pos += 1;
-                    bindings.push((name, expr));
-                }
-                if *pos >= tokens.len() || tokens[*pos] != ")" { return Err("expected ')' after bindings list".to_string()); }
-                *pos += 1;
-            } else {
-                while *pos + 1 < tokens.len()
-                    && tokens[*pos] == "("
-                    && tokens[*pos + 1] != "+"
-                    && tokens[*pos + 1] != "-"
-                    && tokens[*pos + 1] != "*"
-                    && tokens[*pos + 1] != "/"
-                    && tokens[*pos + 1] != "let"
-                    && tokens[*pos + 1] != "letrec"
-                    && tokens[*pos + 1] != "("
+             let is_letrec = next_tok == "letrec"; *pos += 1;
+             let mut bindings = Vec::new();
+             if *pos < tokens.len() && tokens[*pos] == "(" && *pos + 1 < tokens.len() && tokens[*pos + 1] == "(" {
+                 *pos += 1;
+                 while *pos < tokens.len() && tokens[*pos] == "(" {
+                     *pos += 1; if *pos >= tokens.len() { return Err("unexpected end in binding".to_string()); }
+                     let name = tokens[*pos].clone(); *pos += 1;
+                     // optional type annotation like :sint32
+                     let mut wrap_with_share = None;
+                     if *pos < tokens.len() && tokens[*pos].starts_with(":") {
+                         let tkn = tokens[*pos].clone(); *pos += 1;
+                         if tkn.starts_with(":sint") {
+                             if let Ok(nbits) = tkn[5..].parse::<i64>() {
+                                wrap_with_share = Some(nbits as i64);
+                             }
+                         }
+                     }
+                     let mut expr = parse_tokens(tokens, pos)?;
+                     if let Some(nbits) = wrap_with_share {
+                         // transform into (share expr nbits)
+                         expr = Expr::Call(Box::new(Expr::Var("share".to_string())), vec![expr, Expr::Num(nbits)]);
+                     }
+                     if *pos >= tokens.len() || tokens[*pos] != ")" { return Err("expected ')' after binding".to_string()); }
+                     *pos += 1;
+                     bindings.push((name, expr));
+                 }
+                 if *pos >= tokens.len() || tokens[*pos] != ")" { return Err("expected ')' after bindings list".to_string()); }
+                 *pos += 1;
+             } else {
+                 while *pos + 1 < tokens.len()
+                     && tokens[*pos] == "("
+                     && tokens[*pos + 1] != "+"
+                     && tokens[*pos + 1] != "-"
+                     && tokens[*pos + 1] != "*"
+                     && tokens[*pos + 1] != "/"
+                     && tokens[*pos + 1] != "let"
+                     && tokens[*pos + 1] != "letrec"
+                     && tokens[*pos + 1] != "("
                 {
                     *pos += 1; if *pos >= tokens.len() { return Err("unexpected end in binding".to_string()); }
                     let name = tokens[*pos].clone(); *pos += 1;
-                    let expr = parse_tokens(tokens, pos)?;
-                    if *pos >= tokens.len() || tokens[*pos] != ")" { return Err("expected ')' after binding".to_string()); }
-                    *pos += 1;
-                    bindings.push((name, expr));
-                }
-            }
-            let mut body = Vec::new();
-            while *pos < tokens.len() && tokens[*pos] != ")" {
+                    // optional type annotation
+                    let mut wrap_with_share = None;
+                    if *pos < tokens.len() && tokens[*pos].starts_with(":") {
+                        let tkn = tokens[*pos].clone(); *pos += 1;
+                        if tkn.starts_with(":sint") {
+                            if let Ok(nbits) = tkn[5..].parse::<i64>() {
+                                wrap_with_share = Some(nbits as i64);
+                            }
+                        }
+                    }
+                    let mut expr = parse_tokens(tokens, pos)?;
+                    if let Some(nbits) = wrap_with_share {
+                        expr = Expr::Call(Box::new(Expr::Var("share".to_string())), vec![expr, Expr::Num(nbits)]);
+                    }
+                     if *pos >= tokens.len() || tokens[*pos] != ")" { return Err("expected ')' after binding".to_string()); }
+                     *pos += 1;
+                     bindings.push((name, expr));
+                 }
+             }
+             let mut body = Vec::new();
+             while *pos < tokens.len() && tokens[*pos] != ")" {
                 let e = parse_tokens(tokens, pos)?; body.push(e);
-            }
-            if *pos >= tokens.len() || tokens[*pos] != ")" { return Err("expected ')' to close let".to_string()); }
-            *pos += 1;
-            if is_letrec { Ok(Expr::LetRec(bindings, body)) } else { Ok(Expr::Let(bindings, body)) }
+             }
+             if *pos >= tokens.len() || tokens[*pos] != ")" { return Err("expected ')' to close let".to_string()); }
+             *pos += 1;
+             if is_letrec { Ok(Expr::LetRec(bindings, body)) } else { Ok(Expr::Let(bindings, body)) }
         } else if next_tok == "if" {
             *pos += 1; let cond = parse_tokens(tokens, pos)?; let th = parse_tokens(tokens, pos)?; let el = parse_tokens(tokens, pos)?;
             if *pos >= tokens.len() || tokens[*pos] != ")" { return Err("expected ')' after if".to_string()); }

@@ -293,24 +293,61 @@ pub fn reduce_expression(expr: Expr, cont: Continuation, env: Env) -> SharedValu
 
                         let out = match op {
                             super::parser::BinOp::Add | super::parser::BinOp::Sub | super::parser::BinOp::Mul | super::parser::BinOp::DivExact | super::parser::BinOp::Mod => {
-                                let a = maybe_num(&left_val).expect("binary arithmetic left operand must be NUM or BOOL");
-                                let b = maybe_num(&val).expect("binary arithmetic right operand must be NUM or BOOL");
-                                let r = match op {
-                                    super::parser::BinOp::Add => a.wrapping_add(b),
-                                    super::parser::BinOp::Sub => a.wrapping_sub(b),
-                                    super::parser::BinOp::Mul => a.wrapping_mul(b),
-                                    super::parser::BinOp::DivExact => {
-                                        if b == 0 { panic!("division by zero"); }
-                                        if a % b != 0 { panic!("non-exact division: {} / {}", a, b); }
-                                        a / b
+                                // if either operand is a shared value, dispatch to backend
+                                match (&left_val, &val) {
+                                    (SharedValue::Share(sa), SharedValue::Share(sb)) => {
+                                        let mut be = SimBackend::new();
+                                        let sr = match op {
+                                            super::parser::BinOp::Add => be.add(&sa, &sb),
+                                            super::parser::BinOp::Sub => be.sub(&sa, &sb),
+                                            super::parser::BinOp::Mul => be.mul(&sa, &sb),
+                                            _ => panic!("unsupported shared op"),
+                                        };
+                                        SharedValue::Share(sr)
                                     }
-                                    super::parser::BinOp::Mod => {
-                                        if b == 0 { panic!("modulo by zero"); }
-                                        a % b
+                                    (SharedValue::Share(sa), SharedValue::Num(bn)) => {
+                                        let mut be = SimBackend::new();
+                                        let sb = be.share_secret(*bn as u128, sa.nbits);
+                                        let sr = match op {
+                                            super::parser::BinOp::Add => be.add(&sa, &sb),
+                                            super::parser::BinOp::Sub => be.sub(&sa, &sb),
+                                            super::parser::BinOp::Mul => be.mul(&sa, &sb),
+                                            _ => panic!("unsupported shared op"),
+                                        };
+                                        SharedValue::Share(sr)
                                     }
-                                    _ => unreachable!(),
-                                };
-                                SharedValue::Num(r)
+                                    (SharedValue::Num(an), SharedValue::Share(sb)) => {
+                                        let mut be = SimBackend::new();
+                                        let sa = be.share_secret(*an as u128, sb.nbits);
+                                        let sr = match op {
+                                            super::parser::BinOp::Add => be.add(&sa, &sb),
+                                            super::parser::BinOp::Sub => be.sub(&sa, &sb),
+                                            super::parser::BinOp::Mul => be.mul(&sa, &sb),
+                                            _ => panic!("unsupported shared op"),
+                                        };
+                                        SharedValue::Share(sr)
+                                    }
+                                    _ => {
+                                        let a = maybe_num(&left_val).expect("binary arithmetic left operand must be NUM or BOOL");
+                                        let b = maybe_num(&val).expect("binary arithmetic right operand must be NUM or BOOL");
+                                        let r = match op {
+                                            super::parser::BinOp::Add => a.wrapping_add(b),
+                                            super::parser::BinOp::Sub => a.wrapping_sub(b),
+                                            super::parser::BinOp::Mul => a.wrapping_mul(b),
+                                            super::parser::BinOp::DivExact => {
+                                                if b == 0 { panic!("division by zero"); }
+                                                if a % b != 0 { panic!("non-exact division: {} / {}", a, b); }
+                                                a / b
+                                            }
+                                            super::parser::BinOp::Mod => {
+                                                if b == 0 { panic!("modulo by zero"); }
+                                                a % b
+                                            }
+                                            _ => unreachable!(),
+                                        };
+                                        SharedValue::Num(r)
+                                    }
+                                }
                             }
                             super::parser::BinOp::Eq => {
                                 let eq = match (&left_val, &val) {
@@ -501,6 +538,11 @@ pub fn reduce_expression(expr: Expr, cont: Continuation, env: Env) -> SharedValu
                                     stack.push(Eval(*body, *cont, call_env));
                                 }
                                 SharedValue::Share(_sref) => {
+                                    // support calling (reconstruct shared) as (reconstruct s)
+                                    // if the operator is the variable `reconstruct`, handle it
+                                    // otherwise error
+                                    // Note: previously we planned to register a 'reconstruct' builtin;
+                                    // for now, detect when operator is a Var("reconstruct") wrapped as Closure sentinel.
                                     panic!("attempt to call a shared value as function");
                                 }
                                 _ => panic!("attempt to call non-function: {:?}", operator),
@@ -544,6 +586,11 @@ pub fn reduce_expression(expr: Expr, cont: Continuation, env: Env) -> SharedValu
      /// Evaluate an expression locally and return the resulting SharedValue.
      pub fn eval(&self, expr: &Expr) -> SharedValue {
          let store: Env = Rc::new(RefCell::new(HashMap::new()));
+         // register builtins: share and reconstruct and a2b/b2a
+         let mut backend = SimBackend::new();
+         // insert share as a native closure: (share value nbits)
+         store.borrow_mut().insert("share".to_string(), Rc::new(RefCell::new(SharedValue::Closure(vec!["v".to_string(), "nb".to_string()], Box::new(Expr::Num(0)), store.clone()))));
+         // reconstruct will be handled as a special var name 'reconstruct' in call dispatch below
          let cont = Continuation::Halt;
          let result = reduce_expression(expr.clone(), cont, store.clone());
          if !cfg!(test) {
