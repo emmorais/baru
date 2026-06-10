@@ -4,7 +4,6 @@ use crate::crypto::bits::{share_bool};
 use crate::crypto::bits;
 use rand::Rng;
 use crate::crypto::net::{Transport, MpcMsg, serialize_msg, deserialize_msg};
-use std::thread;
 
 // Simple helper: split a Share3 into per-party pairs (party i holds s_i, s_{i+1}).
 fn split_to_party_pairs(s: &Share3) -> Vec<(Fr, Fr)> {
