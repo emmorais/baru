@@ -25,6 +25,8 @@ pub enum Expr {
 pub type Ptr = Rc<RefCell<SharedValue>>;
 pub type Env = Rc<RefCell<HashMap<String, Ptr>>>;
 
+use crate::interpreter::backend::ShareRef;
+
 #[derive(Debug, Clone)]
 pub enum SharedValue {
     Num(i64),
@@ -33,4 +35,5 @@ pub enum SharedValue {
     Bool(bool),
     Str(String),
     Char(char),
+    Share(ShareRef),
 }

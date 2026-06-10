@@ -3,6 +3,8 @@ use std::rc::Rc;
 use std::cell::RefCell;
 
 use crate::interpreter::ast::{Expr, Env, SharedValue};
+use crate::interpreter::backend::{ShareRef, SimBackend, Backend};
+use std::sync::Mutex;
 
 #[derive(Debug, Clone)]
 pub enum Continuation {
@@ -134,7 +136,15 @@ pub fn reduce_expression(expr: Expr, cont: Continuation, env: Env) -> SharedValu
                     trace.push(format!("Popped Eval({}, cont={})", expr_short(e), cont_short(k)));
                 }
                 Apply(k, v, _env) => {
-                    let vdesc = match v { SharedValue::Num(n) => format!("Num({})", n), SharedValue::List(l) => format!("List(len={})", l.len()), SharedValue::Closure(_, _, _) => "Closure".to_string(), SharedValue::Bool(b) => format!("Bool({})", b), SharedValue::Str(s) => format!("Str(len={})", s.len()), SharedValue::Char(c) => format!("Char({})", c), };
+                    let vdesc = match v {
+                        SharedValue::Num(n) => format!("Num({})", n),
+                        SharedValue::List(l) => format!("List(len={})", l.len()),
+                        SharedValue::Closure(_, _, _) => "Closure".to_string(),
+                        SharedValue::Bool(b) => format!("Bool({})", b),
+                        SharedValue::Str(s) => format!("Str(len={})", s.len()),
+                        SharedValue::Char(c) => format!("Char({})", c),
+                        SharedValue::Share(sr) => format!("Share(id={}, nbits={})", sr.id, sr.nbits),
+                    };
                     trace.push(format!("Popped Apply(cont={}, val={})", cont_short(k), vdesc));
                 }
             }
@@ -472,8 +482,7 @@ pub fn reduce_expression(expr: Expr, cont: Continuation, env: Env) -> SharedValu
                         } else {
                             let mut rem = args;
                             let first = rem.remove(0);
-                            let collected: Vec<SharedValue> = Vec::new();
-                            let call_args_cont = Continuation::CallEvalArgs { operator: val, remaining: rem, mut_collected: collected, cont, env: env.clone() };
+                            let call_args_cont = Continuation::CallEvalArgs { operator: val, remaining: rem, mut_collected: Vec::new(), cont, env: env.clone() };
                             stack.push(Eval(first, call_args_cont, env.clone()));
                         }
                     }
@@ -490,6 +499,9 @@ pub fn reduce_expression(expr: Expr, cont: Continuation, env: Env) -> SharedValu
                                         call_env.borrow_mut().insert(p, Rc::new(RefCell::new(v)));
                                     }
                                     stack.push(Eval(*body, *cont, call_env));
+                                }
+                                SharedValue::Share(_sref) => {
+                                    panic!("attempt to call a shared value as function");
                                 }
                                 _ => panic!("attempt to call non-function: {:?}", operator),
                             }
@@ -511,95 +523,95 @@ pub fn reduce_expression(expr: Expr, cont: Continuation, env: Env) -> SharedValu
                             _ => panic!("if condition must be NUM"),
                         }
                     }
-                }
-            }
-        }
-    }
+                 }
+             }
+         }
+     }
 
-    panic!("evaluation fell out of loop without producing a value");
-}
+     panic!("evaluation fell out of loop without producing a value");
+ }
+ 
+ // A simulated participant in the 3-party REPL.
+ pub struct Participant {
+     id: usize,
+ }
 
-/// A simulated participant in the 3-party REPL.
-pub struct Participant {
-    id: usize,
-}
+ impl Participant {
+     pub fn new(id: usize) -> Self {
+         Participant { id }
+     }
 
-impl Participant {
-    pub fn new(id: usize) -> Self {
-        Participant { id }
-    }
+     /// Evaluate an expression locally and return the resulting SharedValue.
+     pub fn eval(&self, expr: &Expr) -> SharedValue {
+         let store: Env = Rc::new(RefCell::new(HashMap::new()));
+         let cont = Continuation::Halt;
+         let result = reduce_expression(expr.clone(), cont, store.clone());
+         if !cfg!(test) {
+             println!("participant {} evaluated expression -> {:?}", self.id, result);
+         }
+         result
+     }
+ }
+ 
+ // Helpers
+ fn expr_contains_name(e: &Expr, name: &str) -> bool {
+     match e {
+         Expr::UnOp(_, inner) => expr_contains_name(inner, name),
+         Expr::Str(s) => s == name,
+         Expr::Char(c) => c.to_string() == name,
+         Expr::Bool(_) => false,
+         Expr::Num(_) => false,
+         Expr::Var(n) => n == name,
+         Expr::BinOp(_, l, r) => expr_contains_name(l, name) || expr_contains_name(r, name),
+         Expr::Let(bindings, body) | Expr::LetRec(bindings, body) => {
+             bindings.iter().any(|(n, ex)| n == name || expr_contains_name(ex, name)) || body.iter().any(|ex| expr_contains_name(ex, name))
+         }
+         Expr::Seq(es) => es.iter().any(|ex| expr_contains_name(ex, name)),
+         Expr::Car(i) | Expr::Cdr(i) => expr_contains_name(i, name),
+         Expr::Cons(a, b) => expr_contains_name(a, name) || expr_contains_name(b, name),
+         Expr::Lambda(params, body) => params.iter().any(|p| p == name) || expr_contains_name(body, name),
+         Expr::Call(h, args) => expr_contains_name(h, name) || args.iter().any(|a| expr_contains_name(a, name)),
+         Expr::If(c, t, e) => expr_contains_name(c, name) || expr_contains_name(t, name) || expr_contains_name(e, name),
+     }
+ }
 
-    /// Evaluate an expression locally and return the resulting SharedValue.
-    pub fn eval(&self, expr: &Expr) -> SharedValue {
-        let store: Env = Rc::new(RefCell::new(HashMap::new()));
-        let cont = Continuation::Halt;
-        let result = reduce_expression(expr.clone(), cont, store.clone());
-        if !cfg!(test) {
-            println!("participant {} evaluated expression -> {:?}", self.id, result);
-        }
-        result
-    }
-}
+ fn expr_short(e: &Expr) -> String {
+     match e {
+         Expr::UnOp(_, _) => "UnOp".to_string(),
+         Expr::Str(s) => format!("Str(len={})", s.len()),
+         Expr::Char(_) => "Char".to_string(),
+         Expr::Bool(b) => format!("Bool({})", b),
+         Expr::Num(n) => format!("Num({})", n),
+         Expr::Var(s) => format!("Var({})", s),
+         Expr::BinOp(_, _, _) => "BinOp".to_string(),
+         Expr::Let(bs, _) => format!("Let(len={})", bs.len()),
+         Expr::LetRec(bs, _) => format!("LetRec(len={})", bs.len()),
+         Expr::Seq(es) => format!("Seq(len={})", es.len()),
+         Expr::Car(_) => "Car".to_string(),
+         Expr::Cdr(_) => "Cdr".to_string(),
+         Expr::Cons(_, _) => "Cons".to_string(),
+         Expr::Lambda(ps, _) => format!("Lambda(arity={})", ps.len()),
+         Expr::Call(_, args) => format!("Call(arity={})", args.len()),
+         Expr::If(_, _, _) => "If".to_string(),
+     }
+ }
 
-// Helpers
-fn expr_contains_name(e: &Expr, name: &str) -> bool {
-    match e {
-        Expr::UnOp(_, inner) => expr_contains_name(inner, name),
-        Expr::Str(s) => s == name,
-        Expr::Char(c) => c.to_string() == name,
-        Expr::Bool(_) => false,
-        Expr::Num(_) => false,
-        Expr::Var(n) => n == name,
-        Expr::BinOp(_, l, r) => expr_contains_name(l, name) || expr_contains_name(r, name),
-        Expr::Let(bindings, body) | Expr::LetRec(bindings, body) => {
-            bindings.iter().any(|(n, ex)| n == name || expr_contains_name(ex, name)) || body.iter().any(|ex| expr_contains_name(ex, name))
-        }
-        Expr::Seq(es) => es.iter().any(|ex| expr_contains_name(ex, name)),
-        Expr::Car(i) | Expr::Cdr(i) => expr_contains_name(i, name),
-        Expr::Cons(a, b) => expr_contains_name(a, name) || expr_contains_name(b, name),
-        Expr::Lambda(params, body) => params.iter().any(|p| p == name) || expr_contains_name(body, name),
-        Expr::Call(h, args) => expr_contains_name(h, name) || args.iter().any(|a| expr_contains_name(a, name)),
-        Expr::If(c, t, e) => expr_contains_name(c, name) || expr_contains_name(t, name) || expr_contains_name(e, name),
-    }
-}
-
-fn expr_short(e: &Expr) -> String {
-    match e {
-        Expr::UnOp(_, _) => "UnOp".to_string(),
-        Expr::Str(s) => format!("Str(len={})", s.len()),
-        Expr::Char(_) => "Char".to_string(),
-        Expr::Bool(b) => format!("Bool({})", b),
-        Expr::Num(n) => format!("Num({})", n),
-        Expr::Var(s) => format!("Var({})", s),
-        Expr::BinOp(_, _, _) => "BinOp".to_string(),
-        Expr::Let(bs, _) => format!("Let(len={})", bs.len()),
-        Expr::LetRec(bs, _) => format!("LetRec(len={})", bs.len()),
-        Expr::Seq(es) => format!("Seq(len={})", es.len()),
-        Expr::Car(_) => "Car".to_string(),
-        Expr::Cdr(_) => "Cdr".to_string(),
-        Expr::Cons(_, _) => "Cons".to_string(),
-        Expr::Lambda(ps, _) => format!("Lambda(arity={})", ps.len()),
-        Expr::Call(_, args) => format!("Call(arity={})", args.len()),
-        Expr::If(_, _, _) => "If".to_string(),
-    }
-}
-
-fn cont_short(c: &Continuation) -> String {
-    match c {
-        Continuation::Halt => "Halt".to_string(),
-        Continuation::BinOpLeft { .. } => "BinOpLeft".to_string(),
-        Continuation::BinOpRight { .. } => "BinOpRight".to_string(),
-        Continuation::UnOp { .. } => "UnOp".to_string(),
-        Continuation::LetTop { .. } => "LetTop".to_string(),
-        Continuation::LetLocal { .. } => "LetLocal".to_string(),
-        Continuation::LetRecInit { .. } => "LetRecInit".to_string(),
-        Continuation::Seq { .. } => "SeqCont".to_string(),
-        Continuation::Car { .. } => "CarCont".to_string(),
-        Continuation::Cdr { .. } => "CdrCont".to_string(),
-        Continuation::ConsLeft { .. } => "ConsLeft".to_string(),
-        Continuation::ConsRight { .. } => "ConsRight".to_string(),
-        Continuation::CallEvalOperator { .. } => "CallEvalOperator".to_string(),
-        Continuation::CallEvalArgs { .. } => "CallEvalArgs".to_string(),
-        Continuation::If { .. } => "IfCont".to_string(),
-    }
-}
+ fn cont_short(c: &Continuation) -> String {
+     match c {
+         Continuation::Halt => "Halt".to_string(),
+         Continuation::BinOpLeft { .. } => "BinOpLeft".to_string(),
+         Continuation::BinOpRight { .. } => "BinOpRight".to_string(),
+         Continuation::UnOp { .. } => "UnOp".to_string(),
+         Continuation::LetTop { .. } => "LetTop".to_string(),
+         Continuation::LetLocal { .. } => "LetLocal".to_string(),
+         Continuation::LetRecInit { .. } => "LetRecInit".to_string(),
+         Continuation::Seq { .. } => "SeqCont".to_string(),
+         Continuation::Car { .. } => "CarCont".to_string(),
+         Continuation::Cdr { .. } => "CdrCont".to_string(),
+         Continuation::ConsLeft { .. } => "ConsLeft".to_string(),
+         Continuation::ConsRight { .. } => "ConsRight".to_string(),
+         Continuation::CallEvalOperator { .. } => "CallEvalOperator".to_string(),
+         Continuation::CallEvalArgs { .. } => "CallEvalArgs".to_string(),
+         Continuation::If { .. } => "IfCont".to_string(),
+     }
+ }
