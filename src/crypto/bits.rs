@@ -92,17 +92,26 @@ pub(crate) fn xor_shared(a: &Share3, b: &Share3) -> Share3 {
 /// sampled, its bit decomposition shared, and d = a - r is opened. Using public
 /// d and shared r_bits we compute shared bits of a without fully reconstructing a
 /// (the simulation still opens d but not a).
-pub fn a2b_ab3(a: &Share3, nbits: usize) -> Vec<Share3> {
+pub fn a2b_ab3(a: &Share3, nbits: usize) -> (Vec<Share3>, Share3) {
     let mut rng = rand::thread_rng();
-    let r: Fr = rng.gen();
-    let _r_sh = share_secret(r);
+    let r: Fr = rng.gen::<u128>() & ((1u128 << nbits) - 1);
+    // construct r_sh from per-bit shares so r_sh and r_bits are consistent
     let mut r_bits: Vec<Share3> = Vec::with_capacity(nbits);
     for i in 0..nbits {
         let b = ((r >> i) & 1) != 0;
         r_bits.push(share_bool(b));
     }
+    // assemble r_sh = sum_i r_bits[i] * (1<<i)
+    let mut r_sh = share_secret(0);
+    for i in 0..nbits {
+        let term = scalar_mul(&r_bits[i], 1u128 << i);
+        r_sh = add_shares(&r_sh, &term);
+    }
 
-    let d = a.0.wrapping_add(a.1).wrapping_add(a.2).wrapping_sub(r);
+    // compute d = a - r_sh (use the assembled r_sh so mask and bits match)
+    let a_plain = a.0.wrapping_add(a.1).wrapping_add(a.2);
+    let r_plain = r_sh.0.wrapping_add(r_sh.1).wrapping_add(r_sh.2);
+    let d = a_plain.wrapping_sub(r_plain);
 
     // compute bits using d and r_bits
     let mut out: Vec<Share3> = Vec::with_capacity(nbits);
@@ -122,13 +131,91 @@ pub fn a2b_ab3(a: &Share3, nbits: usize) -> Vec<Share3> {
         let t = crate::crypto::bits::or(&a_and_c, &b_and_c);
         carry = crate::crypto::bits::or(&a_and_b, &t);
     }
-    out
+    (out, carry)
+}
+
+/// Deterministic debug helper: run the a2b_ab3 protocol using a seeded RNG
+/// and return a diagnostic string with r, d, bits and carry traces.
+pub fn a2b_ab3_debug_seed(a: &Share3, nbits: usize, seed: u64) -> String {
+    use rand::SeedableRng;
+    use rand::rngs::StdRng;
+    use crate::crypto::arith::reconstruct;
+    use crate::crypto::bits::share_bool;
+
+    let mut rng = StdRng::seed_from_u64(seed);
+    let r: Fr = rng.gen::<u128>() & ((1u128 << nbits) - 1);
+    let mut r_bits: Vec<Share3> = Vec::with_capacity(nbits);
+    for i in 0..nbits { let b = ((r >> i) & 1) != 0; r_bits.push(share_bool(b)); }
+    let mut r_sh = share_secret(0);
+    for i in 0..nbits {
+        let term = scalar_mul(&r_bits[i], 1u128 << i);
+        r_sh = add_shares(&r_sh, &term);
+    }
+    let a_plain = a.0.wrapping_add(a.1).wrapping_add(a.2);
+    let r_plain = r_sh.0.wrapping_add(r_sh.1).wrapping_add(r_sh.2);
+    let d = a_plain.wrapping_sub(r_plain);
+
+    // compute bits and carry using same logic as a2b_ab3
+    let mut out: Vec<Share3> = Vec::with_capacity(nbits);
+    let mut carry = share_bool(false);
+    let mut sum_plain: Vec<bool> = Vec::with_capacity(nbits);
+    let mut carry_plain: Vec<bool> = Vec::with_capacity(nbits);
+    for i in 0..nbits {
+        let d_bit = ((d >> i) & 1) != 0;
+        let d_share = share_bool(d_bit);
+        let r_bit = &r_bits[i];
+        let s1 = xor_shared(r_bit, &d_share);
+        let sum = xor_shared(&s1, &carry);
+        out.push(sum);
+        sum_plain.push(reconstruct(&out[i]) % 2 != 0);
+        let a_and_b = crate::crypto::bits::and(r_bit, &d_share);
+        let a_and_c = crate::crypto::bits::and(r_bit, &carry);
+        let b_and_c = crate::crypto::bits::and(&d_share, &carry);
+        let t = crate::crypto::bits::or(&a_and_c, &b_and_c);
+        carry = crate::crypto::bits::or(&a_and_b, &t);
+        carry_plain.push(reconstruct(&carry) % 2 != 0);
+    }
+
+    let mut s = String::new();
+    use std::fmt::Write;
+    writeln!(s, "seed = {}", seed).ok();
+    writeln!(s, "r = {}", r).ok();
+    writeln!(s, "d = {}", d).ok();
+    writeln!(s, "r_bits = {:?}", (0..nbits).map(|i| ((r>>i)&1)!=0).collect::<Vec<_>>()).ok();
+    writeln!(s, "d_bits = {:?}", (0..nbits).map(|i| ((d>>i)&1)!=0).collect::<Vec<_>>()).ok();
+    writeln!(s, "sum_bits = {:?}", sum_plain).ok();
+    writeln!(s, "carry_bits = {:?}", carry_plain).ok();
+    s
+}
+
+/// Compute borrow-out of a - b given LSB-first shared bit vectors (nbits).
+/// borrow_0 is 0. Returns shared borrow_out (1 if a < b).
+fn borrow_from_bits(a_bits: &Vec<Share3>, b_bits: &Vec<Share3>) -> Share3 {
+    // initial borrow = 0
+    let mut borrow = share_bool(false);
+    for i in 0..a_bits.len() {
+        let ai = &a_bits[i];
+        let bi = &b_bits[i];
+        let not_ai = not(ai);
+        // t1 = not_ai AND bi
+        let t1 = and(&not_ai, bi);
+        // t2 = bi AND borrow
+        let t2 = and(bi, &borrow);
+        // t3 = not_ai AND borrow
+        let t3 = and(&not_ai, &borrow);
+        let t23 = or(&t2, &t3);
+        borrow = or(&t1, &t23);
+    }
+    borrow
 }
 
 /// Unsigned less-than: compute (a - b) and return MSB of decomposition.
-pub fn lt_ab3(a: &Share3, b: &Share3, _nbits: usize) -> Share3 {
-    // Delegate to reconstruct-based simulated comparator for correctness.
-    crate::crypto::arith::lt_simulate(a, b)
+pub fn lt_ab3(a: &Share3, b: &Share3, nbits: usize) -> Share3 {
+    // Decompose both a and b into shared bits using ABY3 a2b protocol
+    let (a_bits, _a_carry) = a2b_ab3(a, nbits);
+    let (b_bits, _b_carry) = a2b_ab3(b, nbits);
+    // compute borrow_out from a_bits - b_bits; borrow_out==1 iff a < b
+    borrow_from_bits(&a_bits, &b_bits)
 }
 
 pub fn le_ab3(a: &Share3, b: &Share3, nbits: usize) -> Share3 {
@@ -137,6 +224,13 @@ pub fn le_ab3(a: &Share3, b: &Share3, nbits: usize) -> Share3 {
     crate::crypto::bits::or(&lt, &eq)
 }
 
-pub fn eq_ab3(a: &Share3, b: &Share3, _nbits: usize) -> Share3 {
-    crate::crypto::arith::eq_simulate(a, b)
+pub fn eq_ab3(a: &Share3, b: &Share3, nbits: usize) -> Share3 {
+    let diff = sub_shares(a, b);
+    let (bits, _carry_out) = a2b_ab3(&diff, nbits);
+    // equality is NOT(OR(bits))
+    let mut acc = bits[0].clone();
+    for i in 1..bits.len() {
+        acc = crate::crypto::bits::or(&acc, &bits[i]);
+    }
+    crate::crypto::bits::not(&acc)
 }
