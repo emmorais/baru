@@ -1,4 +1,4 @@
-use baru::crypto::{arith, bits, party};
+use baru::crypto::{arith, bits, party, sim};
 use baru::crypto::types::Fr;
 
 #[test]
@@ -23,6 +23,9 @@ fn test_mul_ab3_simulate() {
     assert_eq!(arith::reconstruct(&prod), a.wrapping_mul(b));
     let prod2 = party::mul_ab3_simulate(&sa, &sb);
     assert_eq!(arith::reconstruct(&prod2), a.wrapping_mul(b));
+    // new: run the inproc transport orchestrated protocol
+    let prod3 = sim::mul_ab3_with_inproc(&sa, &sb);
+    assert_eq!(arith::reconstruct(&prod3), a.wrapping_mul(b));
 }
 
 #[test]
@@ -72,6 +75,16 @@ fn test_a2b_and_comparisons() {
     }
     assert_eq!(recovered, a);
 
+    // new: test inproc a2b wrapper
+    let bits_inproc = sim::a2b_with_inproc(&sa, 8);
+    let mut recovered_inproc: u128 = 0;
+    for (i, bit_sh) in bits_inproc.iter().enumerate() {
+        if bits::reconstruct_bit(bit_sh) {
+            recovered_inproc |= 1u128 << i;
+        }
+    }
+    assert_eq!(recovered_inproc & ((1u128 << 8) - 1), a & ((1u128 << 8) - 1));
+
     // comparisons
     let lt_sh = bits::lt_ab3(&sa, &sb, 8);
     assert_eq!(bits::reconstruct_bit(&lt_sh), a < b);
@@ -97,6 +110,9 @@ fn prop_mul_randomized() {
         assert_eq!(arith::reconstruct(&p2), a.wrapping_mul(b));
         let (p3, _rounds) = scheduler::mul_with_scheduler(&sa, &sb, None);
         assert_eq!(arith::reconstruct(&p3), a.wrapping_mul(b));
+        // exercise inproc wrapper as well
+        let p4 = sim::mul_ab3_with_inproc(&sa, &sb);
+        assert_eq!(arith::reconstruct(&p4), a.wrapping_mul(b));
     }
 }
 
@@ -128,6 +144,16 @@ fn prop_a2b_and_comparisons_randomized() {
         }
         // protocol may operate mod field; assert lower 8 bits match
         assert_eq!(rec_proto & ((1u128 << 8) - 1), a & ((1u128 << 8) - 1));
+
+        // new: check inproc a2b
+        let bits_inproc = sim::a2b_with_inproc(&sa, 8);
+        let mut rec_inproc: u128 = 0;
+        for (i, bit_sh) in bits_inproc.iter().enumerate() {
+            if bits::reconstruct_bit(bit_sh) {
+                rec_inproc |= 1u128 << i;
+            }
+        }
+        assert_eq!(rec_inproc & ((1u128 << 8) - 1), a & ((1u128 << 8) - 1));
 
         // comparisons: compare protocol to simulated (reconstruct-based) reference
         let lt_sh = bits::lt_ab3(&sa, &sb, 32);
@@ -186,4 +212,28 @@ fn debug_a2b_failing_case() {
     eprintln!("{}", bits::a2b_ab3_debug_seed(&diff, 32, 42));
     eprintln!("=== sim a2b debug (random) ===");
     eprintln!("{}", sim::a2b_debug(&diff, 32));
+}
+
+#[test]
+fn test_mul_ab3_concurrent() {
+    let a: Fr = 19u128;
+    let b: Fr = 23u128;
+    let sa = arith::share_secret(a);
+    let sb = arith::share_secret(b);
+    let out = sim::mul_ab3_concurrent(&sa, &sb);
+    assert_eq!(arith::reconstruct(&out), a.wrapping_mul(b));
+}
+
+#[test]
+fn test_a2b_concurrent() {
+    let a: Fr = 37u128; // small test value
+    let sa = arith::share_secret(a);
+    let bits = sim::a2b_concurrent(&sa, 8);
+    let mut rec: u128 = 0;
+    for (i, bit_sh) in bits.iter().enumerate() {
+        if bits::reconstruct_bit(bit_sh) {
+            rec |= 1u128 << i;
+        }
+    }
+    assert_eq!(rec & ((1u128 << 8) - 1), a & ((1u128 << 8) - 1));
 }
