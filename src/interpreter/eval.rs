@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::cell::RefCell;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use crate::interpreter::ast::{Expr, Env, SharedValue};
 use crate::interpreter::backend::{SimBackend, Backend};
@@ -103,7 +103,9 @@ enum Task {
 
 const MAX_FRAMES: usize = 1_000_000;
 
-pub fn reduce_expression(expr: Expr, cont: Continuation, env: Env) -> SharedValue {
+// Note: added `owner` parameter so reduce_expression can pass participant id
+// into share_secret and reveal operations.
+pub fn reduce_expression(expr: Expr, cont: Continuation, env: Env, backend: Arc<Mutex<Box<dyn Backend>>>, owner: usize) -> SharedValue {
     use Task::*;
 
     let mut stack: Vec<Task> = Vec::new();
@@ -297,7 +299,7 @@ pub fn reduce_expression(expr: Expr, cont: Continuation, env: Env) -> SharedValu
                                 // if either operand is a shared value, dispatch to backend
                                 match (&left_val, &val) {
                                     (SharedValue::Share(sa), SharedValue::Share(sb)) => {
-                                        let mut be = SimBackend::new();
+                                        let mut be = backend.lock().unwrap();
                                         let sr = match op {
                                             super::parser::BinOp::Add => be.add(&sa, &sb),
                                             super::parser::BinOp::Sub => be.sub(&sa, &sb),
@@ -307,8 +309,8 @@ pub fn reduce_expression(expr: Expr, cont: Continuation, env: Env) -> SharedValu
                                         SharedValue::Share(sr)
                                     }
                                     (SharedValue::Share(sa), SharedValue::Num(bn)) => {
-                                        let mut be = SimBackend::new();
-                                        let sb = be.share_secret(*bn as u128, sa.nbits);
+                                        let mut be = backend.lock().unwrap();
+                                        let sb = be.share_secret(*bn as u128, sa.nbits, owner);
                                         let sr = match op {
                                             super::parser::BinOp::Add => be.add(&sa, &sb),
                                             super::parser::BinOp::Sub => be.sub(&sa, &sb),
@@ -318,8 +320,8 @@ pub fn reduce_expression(expr: Expr, cont: Continuation, env: Env) -> SharedValu
                                         SharedValue::Share(sr)
                                     }
                                     (SharedValue::Num(an), SharedValue::Share(sb)) => {
-                                        let mut be = SimBackend::new();
-                                        let sa = be.share_secret(*an as u128, sb.nbits);
+                                        let mut be = backend.lock().unwrap();
+                                        let sa = be.share_secret(*an as u128, sb.nbits, owner);
                                         let sr = match op {
                                             super::parser::BinOp::Add => be.add(&sa, &sb),
                                             super::parser::BinOp::Sub => be.sub(&sa, &sb),
@@ -357,21 +359,21 @@ pub fn reduce_expression(expr: Expr, cont: Continuation, env: Env) -> SharedValu
                                     (SharedValue::Str(a), SharedValue::Str(b)) => SharedValue::Num(if a == b { 1 } else { 0 }),
                                     (SharedValue::Char(a), SharedValue::Char(b)) => SharedValue::Num(if a == b { 1 } else { 0 }),
                                     (SharedValue::Share(sa), SharedValue::Share(sb)) => {
-                                        // simulated comparison: reconstruct plaintexts and reshare boolean
-                                        let mut be = SimBackend::new();
-                                        let va = be.reconstruct(&sa);
-                                        let vb = be.reconstruct(&sb);
-                                        SharedValue::Share(be.share_secret(if va == vb { 1 } else { 0 }, 1))
+                                        // use backend reveal API (secure reveal implementation provided by backend)
+                                        let mut be = backend.lock().unwrap();
+                                        let va = be.reveal(&sa, Some(owner));
+                                        let vb = be.reveal(&sb, Some(owner));
+                                        SharedValue::Share(be.share_secret(if va == vb { 1 } else { 0 }, 1, owner))
                                     }
                                     (SharedValue::Share(sa), SharedValue::Num(bn)) => {
-                                        let mut be = SimBackend::new();
-                                        let va = be.reconstruct(&sa);
-                                        SharedValue::Share(be.share_secret(if va == (*bn as u128) { 1 } else { 0 }, 1))
+                                        let mut be = backend.lock().unwrap();
+                                        let va = be.reveal(&sa, Some(owner));
+                                        SharedValue::Share(be.share_secret(if va == (*bn as u128) { 1 } else { 0 }, 1, owner))
                                     }
                                     (SharedValue::Num(an), SharedValue::Share(sb)) => {
-                                        let mut be = SimBackend::new();
-                                        let vb = be.reconstruct(&sb);
-                                        SharedValue::Share(be.share_secret(if (*an as u128) == vb { 1 } else { 0 }, 1))
+                                        let mut be = backend.lock().unwrap();
+                                        let vb = be.reveal(&sb, Some(owner));
+                                        SharedValue::Share(be.share_secret(if (*an as u128) == vb { 1 } else { 0 }, 1, owner))
                                     }
                                     _ => SharedValue::Num(0),
                                 }
@@ -389,10 +391,10 @@ pub fn reduce_expression(expr: Expr, cont: Continuation, env: Env) -> SharedValu
                                         SharedValue::Num(if r { 1 } else { 0 })
                                     }
                                     (SharedValue::Share(sa), SharedValue::Share(sb)) => {
-                                        // simulated compare: reconstruct and reshare
-                                        let mut be = SimBackend::new();
-                                        let va = be.reconstruct(&sa);
-                                        let vb = be.reconstruct(&sb);
+                                        // use backend reveal API and re-share boolean
+                                        let mut be = backend.lock().unwrap();
+                                        let va = be.reveal(&sa, Some(owner));
+                                        let vb = be.reveal(&sb, Some(owner));
                                         let cond = match op {
                                             super::parser::BinOp::Lt => va < vb,
                                             super::parser::BinOp::Gt => va > vb,
@@ -400,11 +402,11 @@ pub fn reduce_expression(expr: Expr, cont: Continuation, env: Env) -> SharedValu
                                             super::parser::BinOp::Ge => va >= vb,
                                             _ => unreachable!(),
                                         };
-                                        SharedValue::Share(be.share_secret(if cond { 1 } else { 0 }, 1))
+                                        SharedValue::Share(be.share_secret(if cond { 1 } else { 0 }, 1, owner))
                                     }
                                     (SharedValue::Share(sa), SharedValue::Num(bn)) => {
-                                        let mut be = SimBackend::new();
-                                        let va = be.reconstruct(&sa);
+                                        let mut be = backend.lock().unwrap();
+                                        let va = be.reveal(&sa, Some(owner));
                                         let cond = match op {
                                             super::parser::BinOp::Lt => va < (((*bn) as i64) as u128),
                                             super::parser::BinOp::Gt => va > (((*bn) as i64) as u128),
@@ -412,11 +414,11 @@ pub fn reduce_expression(expr: Expr, cont: Continuation, env: Env) -> SharedValu
                                             super::parser::BinOp::Ge => va >= (((*bn) as i64) as u128),
                                             _ => unreachable!(),
                                         };
-                                        SharedValue::Share(be.share_secret(if cond { 1 } else { 0 }, 1))
+                                        SharedValue::Share(be.share_secret(if cond { 1 } else { 0 }, 1, owner))
                                     }
                                     (SharedValue::Num(an), SharedValue::Share(sb)) => {
-                                        let mut be = SimBackend::new();
-                                        let vb = be.reconstruct(&sb);
+                                        let mut be = backend.lock().unwrap();
+                                        let vb = be.reveal(&sb, Some(owner));
                                         let cond = match op {
                                             super::parser::BinOp::Lt => ((*an as i64) as u128) < vb,
                                             super::parser::BinOp::Gt => ((*an as i64) as u128) > vb,
@@ -424,7 +426,7 @@ pub fn reduce_expression(expr: Expr, cont: Continuation, env: Env) -> SharedValu
                                             super::parser::BinOp::Ge => ((*an as i64) as u128) >= vb,
                                             _ => unreachable!(),
                                         };
-                                        SharedValue::Share(be.share_secret(if cond { 1 } else { 0 }, 1))
+                                        SharedValue::Share(be.share_secret(if cond { 1 } else { 0 }, 1, owner))
                                     }
                                     _ => SharedValue::Num(0),
                                 }
@@ -645,24 +647,36 @@ pub fn reduce_expression(expr: Expr, cont: Continuation, env: Env) -> SharedValu
  // A simulated participant in the 3-party REPL.
  pub struct Participant {
      id: usize,
+     backend: Arc<Mutex<Box<dyn Backend>>>,
  }
 
  impl Participant {
      pub fn new(id: usize) -> Self {
-         Participant { id }
+         let backend: Arc<Mutex<Box<dyn Backend>>> = Arc::new(Mutex::new(Box::new(SimBackend::new())));
+         Participant { id, backend }
+     }
+
+     /// Reveal a shared value to the caller (simulated reveal via backend).
+     pub fn reveal(&self, sref: &crate::interpreter::backend::ShareRef) -> crate::crypto::types::Fr {
+         let mut be = self.backend.lock().unwrap();
+         be.reveal(sref, None)
      }
 
      /// Evaluate an expression locally and return the resulting SharedValue.
      pub fn eval(&self, expr: &Expr) -> SharedValue {
          let store: Env = Rc::new(RefCell::new(HashMap::new()));
+         let backend = self.backend.clone();
+         let owner = self.id;
          // register builtins: share and reconstruct and a2b/b2a
          // insert share as a native builtin: (share value nbits)
-         let share_fn = Arc::new(|args: Vec<SharedValue>| -> SharedValue {
+         let share_backend = backend.clone();
+         let share_owner = owner;
+         let share_fn = Arc::new(move |args: Vec<SharedValue>| -> SharedValue {
              if args.len() != 2 { panic!("share expects 2 args"); }
              match (&args[0], &args[1]) {
                  (SharedValue::Num(n), SharedValue::Num(nb)) => {
-                     let mut be = SimBackend::new();
-                     let sref = be.share_secret(*n as u128, *nb as usize);
+                     let mut be = share_backend.lock().unwrap();
+                     let sref = be.share_secret(*n as u128, *nb as usize, share_owner);
                      SharedValue::Share(sref)
                  }
                  (SharedValue::Share(s), SharedValue::Num(_nb)) => SharedValue::Share(s.clone()),
@@ -671,12 +685,14 @@ pub fn reduce_expression(expr: Expr, cont: Continuation, env: Env) -> SharedValu
          });
          store.borrow_mut().insert("share".to_string(), Rc::new(RefCell::new(SharedValue::NativeFunc(share_fn))));
          // insert reconstruct as native builtin: (reconstruct shared)
-         let reconstruct_fn = Arc::new(|args: Vec<SharedValue>| -> SharedValue {
+         let reconstruct_backend = backend.clone();
+         let reconstruct_owner = owner;
+         let reconstruct_fn = Arc::new(move |args: Vec<SharedValue>| -> SharedValue {
              if args.len() != 1 { panic!("reconstruct expects 1 arg"); }
              match &args[0] {
                  SharedValue::Share(sref) => {
-                     let s3 = sref.local.clone().expect("expected local share for reconstruct");
-                     let plain = crate::crypto::arith::reconstruct(&s3);
+                     let mut be = reconstruct_backend.lock().unwrap();
+                     let plain = be.reveal(&sref, Some(reconstruct_owner));
                      SharedValue::Num(plain as i64)
                  }
                  SharedValue::Num(n) => SharedValue::Num(*n),
@@ -685,11 +701,12 @@ pub fn reduce_expression(expr: Expr, cont: Continuation, env: Env) -> SharedValu
          });
          store.borrow_mut().insert("reconstruct".to_string(), Rc::new(RefCell::new(SharedValue::NativeFunc(reconstruct_fn))));
          // insert a2b/b2a builtins
-         let a2b_fn = Arc::new(|args: Vec<SharedValue>| -> SharedValue {
+         let a2b_backend = backend.clone();
+         let a2b_fn = Arc::new(move |args: Vec<SharedValue>| -> SharedValue {
              if args.len() != 2 { panic!("a2b expects 2 args: (a nbits)"); }
              match (&args[0], &args[1]) {
                  (SharedValue::Share(sref), SharedValue::Num(nbits)) => {
-                     let mut be = SimBackend::new();
+                     let mut be = a2b_backend.lock().unwrap();
                      let bits = be.a2b(&sref, *nbits as usize);
                      let svs: Vec<SharedValue> = bits.into_iter().map(|b| SharedValue::Share(b)).collect();
                      SharedValue::List(svs)
@@ -699,14 +716,15 @@ pub fn reduce_expression(expr: Expr, cont: Continuation, env: Env) -> SharedValu
          });
          store.borrow_mut().insert("a2b".to_string(), Rc::new(RefCell::new(SharedValue::NativeFunc(a2b_fn))));
 
-         let b2a_fn = Arc::new(|args: Vec<SharedValue>| -> SharedValue {
+         let b2a_backend = backend.clone();
+         let b2a_fn = Arc::new(move |args: Vec<SharedValue>| -> SharedValue {
              if args.len() != 1 { panic!("b2a expects 1 arg: (bits-list)"); }
              match &args[0] {
                  SharedValue::List(list) => {
                      let bits_refs: Vec<crate::interpreter::backend::ShareRef> = list.iter().map(|v| {
                          if let SharedValue::Share(sr) = v { sr.clone() } else { panic!("b2a expects list of share bits") }
                      }).collect();
-                     let mut be = SimBackend::new();
+                     let mut be = b2a_backend.lock().unwrap();
                      let out = be.b2a(&bits_refs);
                      SharedValue::Share(out)
                  }
@@ -717,7 +735,7 @@ pub fn reduce_expression(expr: Expr, cont: Continuation, env: Env) -> SharedValu
 
          // run reducer
          let cont = Continuation::Halt;
-         let result = reduce_expression(expr.clone(), cont, store.clone());
+         let result = reduce_expression(expr.clone(), cont, store.clone(), self.backend.clone(), self.id);
          if !cfg!(test) {
              println!("participant {} evaluated expression -> {:?}", self.id, result);
          }

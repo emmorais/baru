@@ -145,9 +145,8 @@ fn test_shared_comparison_select_max() {
     let res = p.eval(&expr);
     match res {
         SharedValue::Share(sr) => {
-            // use backend crypto helper to reconstruct the simulated local share
-            let s3 = sr.local.clone().expect("expected local share");
-            let plain = baru::crypto::arith::reconstruct(&s3);
+            // reveal via participant backend (uses Backend::reveal)
+            let plain = p.reveal(&sr);
             assert_eq!(plain, 30u128);
         }
         other => panic!("expected shared result, got: {:?}", other),
@@ -164,9 +163,7 @@ fn test_shared_comparison_select_min() {
     let res = p.eval(&expr);
     match res {
         SharedValue::Share(sr) => {
-            // use backend crypto helper to reconstruct the simulated local share
-            let s3 = sr.local.clone().expect("expected local share");
-            let plain = baru::crypto::arith::reconstruct(&s3);
+            let plain = p.reveal(&sr);
             assert_eq!(plain, 20u128);
         }
         other => panic!("expected shared result, got: {:?}", other),
@@ -184,12 +181,11 @@ fn test_shared_equality() {
         let res = p.eval(&expr);
         match res {
             SharedValue::Share(sr) => {
-                // use backend crypto helper to reconstruct the simulated local share
-                let s3 = sr.local.clone().expect("expected local share");
-                let plain = baru::crypto::arith::reconstruct(&s3);
+                // reveal via participant backend
+                let plain = p.reveal(&sr);
                 assert_eq!(plain, (*expected) as u128);
             }
-            other => panic!("expected shared result, got: {:?}", other),
-        }
-    }
-}
+             other => panic!("expected shared result, got: {:?}", other),
+         }
+     }
+ }
