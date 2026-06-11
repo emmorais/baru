@@ -4,7 +4,6 @@ use std::cell::RefCell;
 
 use crate::interpreter::ast::{Expr, Env, SharedValue};
 use crate::interpreter::backend::{SimBackend, Backend};
-use std::sync::Arc;
 
 #[derive(Debug, Clone)]
 pub enum Continuation {
@@ -532,10 +531,6 @@ pub fn reduce_expression(expr: Expr, cont: Continuation, env: Env) -> SharedValu
                                     let call_env = Rc::new(RefCell::new(closure_env.borrow().clone()));
                                     stack.push(Eval(*body, *cont, call_env));
                                 }
-                                SharedValue::NativeFunc(f) => {
-                                    let out = f(Vec::new());
-                                    stack.push(Apply(*cont, out, env.clone()));
-                                }
                                 _ => panic!("attempt to call non-function: {:?}", val),
                             }
                         } else {
@@ -558,10 +553,6 @@ pub fn reduce_expression(expr: Expr, cont: Continuation, env: Env) -> SharedValu
                                         call_env.borrow_mut().insert(p, Rc::new(RefCell::new(v)));
                                     }
                                     stack.push(Eval(*body, *cont, call_env));
-                                }
-                                SharedValue::NativeFunc(f) => {
-                                    let out = f(mut_collected);
-                                    stack.push(Apply(*cont, out, env.clone()));
                                 }
                                 SharedValue::Share(_sref) => {
                                     panic!("attempt to call a shared value as function");
@@ -607,40 +598,10 @@ pub fn reduce_expression(expr: Expr, cont: Continuation, env: Env) -> SharedValu
      /// Evaluate an expression locally and return the resulting SharedValue.
      pub fn eval(&self, expr: &Expr) -> SharedValue {
          let store: Env = Rc::new(RefCell::new(HashMap::new()));
-         let share_fn = Arc::new(|args: Vec<SharedValue>| -> SharedValue {
-             if args.len() != 2 {
-                 panic!("share expects 2 arguments");
-             }
-             let value = match &args[0] {
-                 SharedValue::Num(n) => *n as u128,
-                 SharedValue::Bool(b) => if *b { 1 } else { 0 },
-                 _ => panic!("share expects numeric or boolean first argument"),
-             };
-             let nbits = match &args[1] {
-                 SharedValue::Num(n) if *n > 0 => *n as usize,
-                 _ => panic!("share expects positive numeric bit width"),
-             };
-             let mut be = SimBackend::new();
-             SharedValue::Share(be.share_secret(value, nbits))
-         });
-         store.borrow_mut().insert("share".to_string(), Rc::new(RefCell::new(SharedValue::NativeFunc(share_fn))));
-
-         let reveal_fn = Arc::new(|args: Vec<SharedValue>| -> SharedValue {
-             if args.len() != 1 {
-                 panic!("reveal expects 1 argument");
-             }
-             match &args[0] {
-                 SharedValue::Share(sref) => {
-                     let mut be = SimBackend::new();
-                     SharedValue::Num(be.reconstruct(sref) as i64)
-                 }
-                 SharedValue::Num(n) => SharedValue::Num(*n),
-                 SharedValue::Bool(b) => SharedValue::Num(if *b { 1 } else { 0 }),
-                 _ => panic!("reveal expects shared, numeric, or boolean value"),
-             }
-         });
-         store.borrow_mut().insert("reveal".to_string(), Rc::new(RefCell::new(SharedValue::NativeFunc(reveal_fn))));
-
+         // register builtins: share and reconstruct and a2b/b2a
+         // insert share as a native closure: (share value nbits)
+         store.borrow_mut().insert("share".to_string(), Rc::new(RefCell::new(SharedValue::Closure(vec!["v".to_string(), "nb".to_string()], Box::new(Expr::Num(0)), store.clone()))));
+         // reconstruct will be handled as a special var name 'reconstruct' in call dispatch below
          let cont = Continuation::Halt;
          let result = reduce_expression(expr.clone(), cont, store.clone());
          if !cfg!(test) {
