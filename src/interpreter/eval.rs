@@ -5,6 +5,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::interpreter::ast::{Expr, Env, SharedValue};
 use crate::interpreter::backend::{SimBackend, Backend};
+use colored::*;
 
 #[derive(Debug, Clone)]
 pub enum Continuation {
@@ -121,45 +122,108 @@ pub fn reduce_expression(expr: Expr, cont: Continuation, env: Env, backend: Arc<
         frames = frames.saturating_add(1);
         if frames > MAX_FRAMES {
             if trace_enabled {
-                eprintln!("--- trace (first {} events) ---", trace.len());
+                eprintln!("{}", format!("--- trace (first {} events) ---", trace.len()).bright_red());
                 for (i, r) in trace.iter().enumerate() {
-                    eprintln!("{:05}: {}", i, r);
+                    eprintln!("{:05}: {}", i, r.bright_blue());
                 }
             }
-            panic!("evaluation exceeded max frames ({})", MAX_FRAMES);
+            panic!("{}", format!("evaluation exceeded max frames ({})", MAX_FRAMES).bright_red());
         }
         if frames % 10000 == 0 {
-            eprintln!("reduce_expression frames = {}", frames);
+            eprintln!("{}", format!("reduce_expression frames = {}", frames).bright_yellow());
         }
 
         if trace_enabled && trace.len() < TRACE_LIMIT {
-            // Snapshot env helper
-            fn env_to_string(env: &Env) -> String {
+            // Pretty / colored printers for environment, Expr and SharedValue used in traces
+            fn env_pretty(env: &Env, max_entries: usize) -> String {
+                use std::cmp::min;
                 let map = env.borrow();
+                if map.is_empty() { return "{}".to_string(); }
+                // collect and sort keys for stable output
+                let mut keys: Vec<&String> = map.keys().collect();
+                keys.sort();
                 let mut parts: Vec<String> = Vec::new();
-                for (k, vptr) in map.iter() {
-                    let v = vptr.borrow().clone();
-                    parts.push(format!("{}=>{:?}", k, v));
+                let mut count = 0usize;
+                for k in keys.iter().take(min(max_entries, keys.len())) {
+                    if let Some(vptr) = map.get(*k) {
+                        // borrow the inner SharedValue for read-only display
+                        let vref = vptr.borrow();
+                        let sval = colored_value(&*vref);
+                        parts.push(format!("{}: {}", k.bright_blue(), sval));
+                        count += 1;
+                    }
                 }
-                format!("{{{}}}", parts.join(", "))
+                let mut s = String::new();
+                s.push('{');
+                if !parts.is_empty() {
+                    s.push('\n');
+                    for p in parts.iter() {
+                        s.push_str("  ");
+                        s.push_str(p);
+                        s.push_str(",\n");
+                    }
+                    s.push('}');
+                } else {
+                    s.push('}');
+                }
+                if map.len() > max_entries {
+                    s.push_str(&format!("  ... {} more fields", map.len() - max_entries));
+                }
+                s
+            }
+
+            fn colored_expr(e: &Expr) -> String {
+                match e {
+                    Expr::Num(n) => format!("{}", format!("Num({})", n).green()),
+                    Expr::Var(s) => format!("{}", format!("Var({})", s).cyan()),
+                    Expr::Str(s) => format!("{}", format!("Str(\"{}\")", s).magenta()),
+                    Expr::Char(c) => format!("{}", format!("Char({})", c).magenta()),
+                    Expr::Bool(b) => format!("{}", format!("Bool({})", b).yellow()),
+                    Expr::BinOp(_, _, _) => format!("{}", expr_short(e).blue()),
+                    Expr::UnOp(_, _) => format!("{}", expr_short(e).blue()),
+                    Expr::Let(bs, _) => format!("{}", format!("Let(len={})", bs.len()).blue()),
+                    Expr::LetRec(bs, _) => format!("{}", format!("LetRec(len={})", bs.len()).blue()),
+                    Expr::Seq(es) => format!("{}", format!("Seq(len={})", es.len()).blue()),
+                    Expr::Car(_) => "Car".blue().to_string(),
+                    Expr::Cdr(_) => "Cdr".blue().to_string(),
+                    Expr::Cons(_, _) => "Cons".blue().to_string(),
+                    Expr::Lambda(ps, _) => format!("{}", format!("Lambda(arity={})", ps.len()).magenta()),
+                    Expr::Call(_, args) => format!("{}", format!("Call(arity={})", args.len()).magenta()),
+                    Expr::If(_, _, _) => "If".blue().to_string(),
+                }
+            }
+
+            fn colored_value(v: &SharedValue) -> String {
+                match v {
+                    SharedValue::Num(n) => format!("{}", format!("Num({})", n).green()),
+                    SharedValue::Bool(b) => format!("{}", format!("Bool({})", b).yellow()),
+                    SharedValue::Str(s) => format!("{}", format!("Str(\"{}\")", s).magenta()),
+                    SharedValue::Char(c) => format!("{}", format!("Char({})", c).magenta()),
+                    SharedValue::List(l) => format!("{}", format!("List(len={})", l.len()).blue()),
+                    SharedValue::Closure(_, _, _) => "Closure".magenta().to_string(),
+                    SharedValue::Share(sr) => format!("{}", format!("Share(id={},nbits={},owner={})", sr.id, sr.nbits, sr.owner).red()),
+                    SharedValue::NativeFunc(_) => "NativeFunc".cyan().to_string(),
+                }
             }
 
             match &task {
-                Eval(e, k, env_snapshot) => {
-                    trace.push(format!("Eval: expr={} cont={} env={}", expr_short(e), cont_short(k), env_to_string(env_snapshot)));
+                Eval(e, _k, env_snapshot) => {
+                    // quieter eval trace: show expression and a short pretty env
+                    let envs = env_pretty(env_snapshot, 6);
+                    trace.push(format!("{}: {}  env={}",
+                        "Eval".green(),
+                        colored_expr(e),
+                        envs
+                    ));
                 }
-                Apply(k, v, env_snapshot) => {
-                    let vdesc = match v {
-                        SharedValue::Num(n) => format!("Num({})", n),
-                        SharedValue::List(l) => format!("List(len={})", l.len()),
-                        SharedValue::Closure(_, _, _) => "Closure".to_string(),
-                        SharedValue::Bool(b) => format!("Bool({})", b),
-                        SharedValue::Str(s) => format!("Str(len={})", s.len()),
-                        SharedValue::Char(c) => format!("Char({})", c),
-                        SharedValue::Share(sr) => format!("Share(id={}, nbits={}, owner={})", sr.id, sr.nbits, sr.owner),
-                        SharedValue::NativeFunc(_) => "NativeFunc".to_string(),
-                    };
-                    trace.push(format!("Apply: cont={} val={} env={}", cont_short(k), vdesc, env_to_string(env_snapshot)));
+                Apply(k, v, _env_snapshot) => {
+                    // quieter apply trace: show continuation and the single colored value
+                    let vcol = colored_value(v);
+                    trace.push(format!("{}: cont={} val={}",
+                        "Apply".yellow(),
+                        cont_short(k).bright_black(),
+                        vcol
+                    ));
                 }
             }
         }
@@ -287,9 +351,9 @@ pub fn reduce_expression(expr: Expr, cont: Continuation, env: Env, backend: Arc<
                     Continuation::Halt => {
                         if stack.is_empty() {
                             if trace_enabled && !trace.is_empty() {
-                                eprintln!("--- verbose trace (most recent {} events) ---", trace.len());
+                                eprintln!("{}", format!("--- verbose trace (most recent {} events) ---", trace.len()).bright_yellow());
                                 for (i, r) in trace.iter().enumerate() {
-                                    eprintln!("{:05}: {}", i, r);
+                                    eprintln!("{:05}: {}", i, r.bright_blue());
                                 }
                             }
                             return val;

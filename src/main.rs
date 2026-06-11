@@ -10,6 +10,7 @@ use rustyline::highlight::Highlighter;
 use rustyline::validate::Validator;
 
 use baru::interpreter::{parse, Participant, SharedValue};
+use colored::*;
 
 struct ReplHelper {
     words: Vec<String>,
@@ -93,15 +94,14 @@ fn history_path() -> Option<PathBuf> {
 fn main() -> Result<(), Box<dyn Error>> {
     let participants: Vec<Participant> = (0..3).map(Participant::new).collect();
 
-    println!("ABY3 REPL (replicated evaluator). Enter an s-expression using + - * / let letrec or 'quit' to exit.");
-    println!("Special commands:");
-    println!("  :verbose [on|off]   - enable/disable verbose participant eval traces (default off)");
-    println!("  :verbose            - toggle verbose");
-    println!("  :last [pid]         - print last result for participant pid (or all if omitted)");
-    println!("  :results            - print last results for all participants");
-    println!("  :reveal <pid>       - reveal last result for participant pid (if it's a share or list of shares)");
-    println!("  :evalfor <pid> EXPR - evaluate EXPR only for participant pid");
-    println!("  :inspect <pid>      - evaluate '(reconstruct VAR)' for participant pid");
+    println!("{}", "ABY3 REPL (replicated evaluator). Enter an s-expression using + - * / let letrec or 'quit' to exit.".bright_green());
+    println!("{}", "Special commands:".bright_yellow());
+    println!("  {} {}", ":verbose [on|off]".bright_cyan(), "- enable/disable verbose participant eval traces (default off)");
+    println!("  {}{}", ":last [pid]".bright_cyan(), "         - print last result for participant pid (or all if omitted)");
+    println!("  {}{}", ":results".bright_cyan(), "            - print last results for all participants");
+    println!("  {}{}", ":reveal <pid>".bright_cyan(), "       - reveal last result for participant pid (if it's a share or list of shares)");
+    println!("  {}{}", ":evalfor <pid> EXPR".bright_cyan(), " - evaluate EXPR only for participant pid");
+    println!("  {}{}", ":inspect <pid>".bright_cyan(), "      - evaluate '(reconstruct VAR)' for participant pid");
 
     let mut verbose = false;
     let mut last_results: Vec<Option<SharedValue>> = vec![None; participants.len()];
@@ -139,11 +139,11 @@ fn main() -> Result<(), Box<dyn Error>> {
                                 Some(arg) => match arg {
                                     "on" => {
                                         verbose = true;
-                                        println!("verbose: on");
+                                        println!("{}", "verbose: on".bright_green());
                                     }
                                     "off" => {
                                         verbose = false;
-                                        println!("verbose: off");
+                                        println!("{}", "verbose: off".bright_yellow());
                                     }
                                     _ => println!("usage: :verbose [on|off]"),
                                 },
@@ -158,8 +158,8 @@ fn main() -> Result<(), Box<dyn Error>> {
                                 Some(pid_s) => match pid_s.parse::<usize>() {
                                     Ok(pid) if pid < participants.len() => {
                                         match &last_results[pid] {
-                                            Some(v) => println!("last[{}] = {:?}", pid, v),
-                                            None => println!("last[{}] = <none>", pid),
+                                            Some(v) => println!("{} {}", format!("last[{}] =", pid).bright_magenta(), format!("{:?}", v)),
+                                            None => println!("{}", format!("last[{}] = <none>", pid).bright_red()),
                                         }
                                     }
                                     _ => println!("invalid participant id"),
@@ -190,7 +190,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                                             Some(v) => match v {
                                                 SharedValue::Share(sr) => {
                                                     let val = participants[pid].reveal(sr);
-                                                    println!("reveal[{}] -> {}", pid, val);
+                                                    println!("{} {}", format!("reveal[{}] ->", pid).bright_magenta(), format!("{}", val).bright_green());
                                                 }
                                                 SharedValue::List(list) => {
                                                     // try to reveal each share in the list
