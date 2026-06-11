@@ -27,16 +27,6 @@ pub fn tokenize(src: &str) -> Vec<String> {
     while let Some(&ch) = chars.peek() {
         match ch {
             '(' | ')' => { tokens.push(ch.to_string()); chars.next(); }
-            ':' => {
-                chars.next();
-                let mut sym = String::from(":");
-                while let Some(&c2) = chars.peek() {
-                    if c2.is_whitespace() || c2 == '(' || c2 == ')' { break; }
-                    sym.push(c2);
-                    chars.next();
-                }
-                tokens.push(sym);
-            }
             '"' => {
                 // parse string literal
                 chars.next();
@@ -123,7 +113,7 @@ pub fn tokenize(src: &str) -> Vec<String> {
             _ => {
                 let mut sym = String::new();
                 while let Some(&c2) = chars.peek() {
-                    if c2.is_whitespace() || c2 == '(' || c2 == ')' || c2 == ':' { break; }
+                    if c2.is_whitespace() || c2 == '(' || c2 == ')' { break; }
                     sym.push(c2); chars.next();
                 }
                 tokens.push(sym);
