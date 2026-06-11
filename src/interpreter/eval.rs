@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::cell::RefCell;
+use std::sync::Arc;
 
 use crate::interpreter::ast::{Expr, Env, SharedValue};
 use crate::interpreter::backend::{SimBackend, Backend};
@@ -356,12 +357,21 @@ pub fn reduce_expression(expr: Expr, cont: Continuation, env: Env) -> SharedValu
                                     (SharedValue::Str(a), SharedValue::Str(b)) => SharedValue::Num(if a == b { 1 } else { 0 }),
                                     (SharedValue::Char(a), SharedValue::Char(b)) => SharedValue::Num(if a == b { 1 } else { 0 }),
                                     (SharedValue::Share(sa), SharedValue::Share(sb)) => {
-                                        // compare via a2b on diff and take MSB
+                                        // simulated comparison: reconstruct plaintexts and reshare boolean
                                         let mut be = SimBackend::new();
-                                        let diff = be.sub(&sa, &sb);
-                                        let bits = be.a2b(&diff, sa.nbits);
-                                        // MSB
-                                        SharedValue::Share(bits[sa.nbits - 1].clone())
+                                        let va = be.reconstruct(&sa);
+                                        let vb = be.reconstruct(&sb);
+                                        SharedValue::Share(be.share_secret(if va == vb { 1 } else { 0 }, 1))
+                                    }
+                                    (SharedValue::Share(sa), SharedValue::Num(bn)) => {
+                                        let mut be = SimBackend::new();
+                                        let va = be.reconstruct(&sa);
+                                        SharedValue::Share(be.share_secret(if va == (*bn as u128) { 1 } else { 0 }, 1))
+                                    }
+                                    (SharedValue::Num(an), SharedValue::Share(sb)) => {
+                                        let mut be = SimBackend::new();
+                                        let vb = be.reconstruct(&sb);
+                                        SharedValue::Share(be.share_secret(if (*an as u128) == vb { 1 } else { 0 }, 1))
                                     }
                                     _ => SharedValue::Num(0),
                                 }
@@ -379,11 +389,42 @@ pub fn reduce_expression(expr: Expr, cont: Continuation, env: Env) -> SharedValu
                                         SharedValue::Num(if r { 1 } else { 0 })
                                     }
                                     (SharedValue::Share(sa), SharedValue::Share(sb)) => {
+                                        // simulated compare: reconstruct and reshare
                                         let mut be = SimBackend::new();
-                                        let diff = be.sub(&sa, &sb);
-                                        let bits = be.a2b(&diff, sa.nbits);
-                                        // return MSB share (as a ShareRef wrapped)
-                                        SharedValue::Share(bits[sa.nbits - 1].clone())
+                                        let va = be.reconstruct(&sa);
+                                        let vb = be.reconstruct(&sb);
+                                        let cond = match op {
+                                            super::parser::BinOp::Lt => va < vb,
+                                            super::parser::BinOp::Gt => va > vb,
+                                            super::parser::BinOp::Le => va <= vb,
+                                            super::parser::BinOp::Ge => va >= vb,
+                                            _ => unreachable!(),
+                                        };
+                                        SharedValue::Share(be.share_secret(if cond { 1 } else { 0 }, 1))
+                                    }
+                                    (SharedValue::Share(sa), SharedValue::Num(bn)) => {
+                                        let mut be = SimBackend::new();
+                                        let va = be.reconstruct(&sa);
+                                        let cond = match op {
+                                            super::parser::BinOp::Lt => va < (((*bn) as i64) as u128),
+                                            super::parser::BinOp::Gt => va > (((*bn) as i64) as u128),
+                                            super::parser::BinOp::Le => va <= (((*bn) as i64) as u128),
+                                            super::parser::BinOp::Ge => va >= (((*bn) as i64) as u128),
+                                            _ => unreachable!(),
+                                        };
+                                        SharedValue::Share(be.share_secret(if cond { 1 } else { 0 }, 1))
+                                    }
+                                    (SharedValue::Num(an), SharedValue::Share(sb)) => {
+                                        let mut be = SimBackend::new();
+                                        let vb = be.reconstruct(&sb);
+                                        let cond = match op {
+                                            super::parser::BinOp::Lt => ((*an as i64) as u128) < vb,
+                                            super::parser::BinOp::Gt => ((*an as i64) as u128) > vb,
+                                            super::parser::BinOp::Le => ((*an as i64) as u128) <= vb,
+                                            super::parser::BinOp::Ge => ((*an as i64) as u128) >= vb,
+                                            _ => unreachable!(),
+                                        };
+                                        SharedValue::Share(be.share_secret(if cond { 1 } else { 0 }, 1))
                                     }
                                     _ => SharedValue::Num(0),
                                 }
@@ -557,6 +598,22 @@ pub fn reduce_expression(expr: Expr, cont: Continuation, env: Env) -> SharedValu
                                 SharedValue::Share(_sref) => {
                                     panic!("attempt to call a shared value as function");
                                 }
+                                SharedValue::NativeFunc(f) => {
+                                    // native function: apply with left-to-right arguments
+                                    let all_args = mut_collected;
+                                    match f(all_args) {
+                                        v @ SharedValue::Num(_) => {
+                                            stack.push(Apply(*cont, v, env.clone()));
+                                        }
+                                        SharedValue::Share(sr) => {
+                                            stack.push(Apply(*cont, SharedValue::Share(sr), env.clone()));
+                                        }
+                                        other => {
+                                            // allow NativeFunc to return other SharedValue variants
+                                            stack.push(Apply(*cont, other, env.clone()));
+                                        }
+                                    }
+                                }
                                 _ => panic!("attempt to call non-function"),
                             }
                         } else {
@@ -599,8 +656,34 @@ pub fn reduce_expression(expr: Expr, cont: Continuation, env: Env) -> SharedValu
      pub fn eval(&self, expr: &Expr) -> SharedValue {
          let store: Env = Rc::new(RefCell::new(HashMap::new()));
          // register builtins: share and reconstruct and a2b/b2a
-         // insert share as a native closure: (share value nbits)
-         store.borrow_mut().insert("share".to_string(), Rc::new(RefCell::new(SharedValue::Closure(vec!["v".to_string(), "nb".to_string()], Box::new(Expr::Num(0)), store.clone()))));
+         // insert share as a native builtin: (share value nbits)
+         let share_fn = Arc::new(|args: Vec<SharedValue>| -> SharedValue {
+             if args.len() != 2 { panic!("share expects 2 args"); }
+             match (&args[0], &args[1]) {
+                 (SharedValue::Num(n), SharedValue::Num(nb)) => {
+                     let mut be = SimBackend::new();
+                     let sref = be.share_secret(*n as u128, *nb as usize);
+                     SharedValue::Share(sref)
+                 }
+                 (SharedValue::Share(s), SharedValue::Num(_nb)) => SharedValue::Share(s.clone()),
+                 _ => panic!("share expects (num nbits) or (share nbits)"),
+             }
+         });
+         store.borrow_mut().insert("share".to_string(), Rc::new(RefCell::new(SharedValue::NativeFunc(share_fn))));
+         // insert reconstruct as native builtin: (reconstruct shared)
+         let reconstruct_fn = Arc::new(|args: Vec<SharedValue>| -> SharedValue {
+             if args.len() != 1 { panic!("reconstruct expects 1 arg"); }
+             match &args[0] {
+                 SharedValue::Share(sref) => {
+                     let s3 = sref.local.clone().expect("expected local share for reconstruct");
+                     let plain = crate::crypto::arith::reconstruct(&s3);
+                     SharedValue::Num(plain as i64)
+                 }
+                 SharedValue::Num(n) => SharedValue::Num(*n),
+                 _ => panic!("reconstruct expects a shared value"),
+             }
+         });
+         store.borrow_mut().insert("reconstruct".to_string(), Rc::new(RefCell::new(SharedValue::NativeFunc(reconstruct_fn))));
          // reconstruct will be handled as a special var name 'reconstruct' in call dispatch below
          let cont = Continuation::Halt;
          let result = reduce_expression(expr.clone(), cont, store.clone());

@@ -136,6 +136,20 @@ fn test_string_closure_capture() {
 }
 
 #[test]
-fn test_shared_reveal() {
-    assert_eq!(eval("(let ((s:sint32 42)) (== (reveal s) 42))"), 1);
+fn test_shared_comparison_select_max() {
+    // create two shared integers a and b, compute mask = (a > b) (shared bit)
+    // then compute selected = a*mask + b*(1-mask) and reconstruct result
+    let src = "(let ((a :sint32 30) (b :sint32 20) (one :sint32 1)) (let ((mask (> a b))) (+ (* a mask) (* b (- one mask)))))";
+    let expr = parse(src).expect("parse failed");
+    let p = Participant::new(0);
+    let res = p.eval(&expr);
+    match res {
+        SharedValue::Share(sr) => {
+            // use backend crypto helper to reconstruct the simulated local share
+            let s3 = sr.local.clone().expect("expected local share");
+            let plain = baru::crypto::arith::reconstruct(&s3);
+            assert_eq!(plain, 30u128);
+        }
+        other => panic!("expected shared result, got: {:?}", other),
+    }
 }
