@@ -27,6 +27,16 @@ pub fn tokenize(src: &str) -> Vec<String> {
     while let Some(&ch) = chars.peek() {
         match ch {
             '(' | ')' => { tokens.push(ch.to_string()); chars.next(); }
+            ':' => {
+                chars.next();
+                let mut sym = String::from(":");
+                while let Some(&c2) = chars.peek() {
+                    if c2.is_whitespace() || c2 == '(' || c2 == ')' { break; }
+                    sym.push(c2);
+                    chars.next();
+                }
+                tokens.push(sym);
+            }
             '"' => {
                 // parse string literal
                 chars.next();
@@ -113,7 +123,7 @@ pub fn tokenize(src: &str) -> Vec<String> {
             _ => {
                 let mut sym = String::new();
                 while let Some(&c2) = chars.peek() {
-                    if c2.is_whitespace() || c2 == '(' || c2 == ')' { break; }
+                    if c2.is_whitespace() || c2 == '(' || c2 == ')' || c2 == ':' { break; }
                     sym.push(c2); chars.next();
                 }
                 tokens.push(sym);
@@ -141,7 +151,7 @@ pub fn parse_tokens(tokens: &[String], pos: &mut usize) -> Result<Expr, String> 
             *pos += 1;
             return Ok(Expr::UnOp(super::parser::UnOp::Not, Box::new(inner)));
         }
-        if next_tok == "+" || next_tok == "-" || next_tok == "*" || next_tok == "/" || next_tok == "==" || next_tok == "<" || next_tok == ">" || next_tok == "mod" || next_tok == "and" || next_tok == "or" || next_tok == "<=" || next_tok == ">=" {
+        if next_tok == "+" || next_tok == "-" || next_tok == "*" || next_tok == "/" || next_tok == "==" || next_tok == "<" || next_tok == ">" || next_tok == "<=" || next_tok == ">=" || next_tok == "mod" || next_tok == "and" || next_tok == "or" {
             let op_tok = next_tok.clone(); *pos += 1;
             let op = match op_tok.as_str() { 
                 "+" => BinOp::Add,
@@ -246,7 +256,7 @@ pub fn parse_tokens(tokens: &[String], pos: &mut usize) -> Result<Expr, String> 
                 if let Expr::Var(ref s) = items[0] {
                     if s == "lambda" {
                         if items.len() < 3 { return Err("lambda form must be (lambda (args...) body)".to_string()); }
-                        let params = match &items[1] { Expr::Seq(ps) => ps.iter().map(|p| { if let Expr::Var(n) = p { n.clone() } else { panic!("lambda parameter must be identifier") } }).collect(), Expr::Var(n) => vec![n.clone()], Expr::Call(head, v) if v.is_empty() => { if let Expr::Var(n) = *head.clone() { vec![n.clone()] } else { return Err("lambda params must be a list or identifier".to_string()); } }, _ => return Err("lambda params must be a list or identifier".to_string()), };
+                        let params = match &items[1] { Expr::Seq(ps) => ps.iter().map(|p| { if let Expr::Var(n) = p { n.clone() } else { panic!("lambda parameter must be identifier") } }).collect(), _ => return Err("lambda args must be a list".to_string()) };
                         let body = if items.len() == 3 { items.into_iter().nth(2).unwrap() } else { Expr::Seq(items.into_iter().skip(2).collect()) };
                         return Ok(Expr::Lambda(params, Box::new(body)));
                     }
