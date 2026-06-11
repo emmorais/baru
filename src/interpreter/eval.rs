@@ -105,15 +105,15 @@ const MAX_FRAMES: usize = 1_000_000;
 
 // Note: added `owner` parameter so reduce_expression can pass participant id
 // into share_secret and reveal operations.
-pub fn reduce_expression(expr: Expr, cont: Continuation, env: Env, backend: Arc<Mutex<Box<dyn Backend>>>, owner: usize) -> SharedValue {
+pub fn reduce_expression(expr: Expr, cont: Continuation, env: Env, backend: Arc<Mutex<Box<dyn Backend>>>, owner: usize, verbose: bool) -> SharedValue {
     use Task::*;
 
     let mut stack: Vec<Task> = Vec::new();
     stack.push(Eval(expr.clone(), cont, env));
     let mut frames: usize = 0;
 
-    // tracing setup: if top-level expr mentions "fib", enable trace capture
-    let trace_enabled = expr_contains_name(&expr, "fib");
+    // tracing setup: enable when verbose is requested or top-level expr mentions "fib"
+    let trace_enabled = verbose || expr_contains_name(&expr, "fib");
     const TRACE_LIMIT: usize = 500;
     let mut trace: Vec<String> = Vec::new();
 
@@ -133,11 +133,22 @@ pub fn reduce_expression(expr: Expr, cont: Continuation, env: Env, backend: Arc<
         }
 
         if trace_enabled && trace.len() < TRACE_LIMIT {
-            match &task {
-                Eval(e, k, _env) => {
-                    trace.push(format!("Popped Eval({}, cont={})", expr_short(e), cont_short(k)));
+            // Snapshot env helper
+            fn env_to_string(env: &Env) -> String {
+                let map = env.borrow();
+                let mut parts: Vec<String> = Vec::new();
+                for (k, vptr) in map.iter() {
+                    let v = vptr.borrow().clone();
+                    parts.push(format!("{}=>{:?}", k, v));
                 }
-                Apply(k, v, _env) => {
+                format!("{{{}}}", parts.join(", "))
+            }
+
+            match &task {
+                Eval(e, k, env_snapshot) => {
+                    trace.push(format!("Eval: expr={} cont={} env={}", expr_short(e), cont_short(k), env_to_string(env_snapshot)));
+                }
+                Apply(k, v, env_snapshot) => {
                     let vdesc = match v {
                         SharedValue::Num(n) => format!("Num({})", n),
                         SharedValue::List(l) => format!("List(len={})", l.len()),
@@ -145,10 +156,10 @@ pub fn reduce_expression(expr: Expr, cont: Continuation, env: Env, backend: Arc<
                         SharedValue::Bool(b) => format!("Bool({})", b),
                         SharedValue::Str(s) => format!("Str(len={})", s.len()),
                         SharedValue::Char(c) => format!("Char({})", c),
-                        SharedValue::Share(sr) => format!("Share(id={}, nbits={})", sr.id, sr.nbits),
+                        SharedValue::Share(sr) => format!("Share(id={}, nbits={}, owner={})", sr.id, sr.nbits, sr.owner),
                         SharedValue::NativeFunc(_) => "NativeFunc".to_string(),
                     };
-                    trace.push(format!("Popped Apply(cont={}, val={})", cont_short(k), vdesc));
+                    trace.push(format!("Apply: cont={} val={} env={}", cont_short(k), vdesc, env_to_string(env_snapshot)));
                 }
             }
         }
@@ -275,6 +286,12 @@ pub fn reduce_expression(expr: Expr, cont: Continuation, env: Env, backend: Arc<
                 match k {
                     Continuation::Halt => {
                         if stack.is_empty() {
+                            if trace_enabled && !trace.is_empty() {
+                                eprintln!("--- verbose trace (most recent {} events) ---", trace.len());
+                                for (i, r) in trace.iter().enumerate() {
+                                    eprintln!("{:05}: {}", i, r);
+                                }
+                            }
                             return val;
                         } else {
                             continue;
@@ -735,9 +752,27 @@ pub fn reduce_expression(expr: Expr, cont: Continuation, env: Env, backend: Arc<
 
          // run reducer
          let cont = Continuation::Halt;
-         let result = reduce_expression(expr.clone(), cont, store.clone(), self.backend.clone(), self.id);
+         let result = reduce_expression(expr.clone(), cont, store.clone(), self.backend.clone(), self.id, false);
          if !cfg!(test) {
              println!("participant {} evaluated expression -> {:?}", self.id, result);
+         }
+         result
+     }
+
+     /// Evaluate with optional verbose tracing. When verbose=true the REPL will print
+     /// per-frame environment, expression and continuation snapshots.
+     pub fn eval_verbose(&self, expr: &Expr, verbose: bool) -> SharedValue {
+         if verbose {
+             println!("[participant {}] starting eval (verbose)", self.id);
+         }
+         let store: Env = Rc::new(RefCell::new(HashMap::new()));
+         let result = {
+             // reuse existing eval setup but call reducer with verbose flag
+             let cont = Continuation::Halt;
+             reduce_expression(expr.clone(), cont, store.clone(), self.backend.clone(), self.id, verbose)
+         };
+         if verbose {
+             println!("[participant {}] finished eval -> {:?}", self.id, result);
          }
          result
      }
