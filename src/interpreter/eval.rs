@@ -684,7 +684,38 @@ pub fn reduce_expression(expr: Expr, cont: Continuation, env: Env) -> SharedValu
              }
          });
          store.borrow_mut().insert("reconstruct".to_string(), Rc::new(RefCell::new(SharedValue::NativeFunc(reconstruct_fn))));
-         // reconstruct will be handled as a special var name 'reconstruct' in call dispatch below
+         // insert a2b/b2a builtins
+         let a2b_fn = Arc::new(|args: Vec<SharedValue>| -> SharedValue {
+             if args.len() != 2 { panic!("a2b expects 2 args: (a nbits)"); }
+             match (&args[0], &args[1]) {
+                 (SharedValue::Share(sref), SharedValue::Num(nbits)) => {
+                     let mut be = SimBackend::new();
+                     let bits = be.a2b(&sref, *nbits as usize);
+                     let svs: Vec<SharedValue> = bits.into_iter().map(|b| SharedValue::Share(b)).collect();
+                     SharedValue::List(svs)
+                 }
+                 _ => panic!("a2b expects (share nbits)"),
+             }
+         });
+         store.borrow_mut().insert("a2b".to_string(), Rc::new(RefCell::new(SharedValue::NativeFunc(a2b_fn))));
+
+         let b2a_fn = Arc::new(|args: Vec<SharedValue>| -> SharedValue {
+             if args.len() != 1 { panic!("b2a expects 1 arg: (bits-list)"); }
+             match &args[0] {
+                 SharedValue::List(list) => {
+                     let bits_refs: Vec<crate::interpreter::backend::ShareRef> = list.iter().map(|v| {
+                         if let SharedValue::Share(sr) = v { sr.clone() } else { panic!("b2a expects list of share bits") }
+                     }).collect();
+                     let mut be = SimBackend::new();
+                     let out = be.b2a(&bits_refs);
+                     SharedValue::Share(out)
+                 }
+                 _ => panic!("b2a expects a list of bit shares"),
+             }
+         });
+         store.borrow_mut().insert("b2a".to_string(), Rc::new(RefCell::new(SharedValue::NativeFunc(b2a_fn))));
+
+         // run reducer
          let cont = Continuation::Halt;
          let result = reduce_expression(expr.clone(), cont, store.clone());
          if !cfg!(test) {
@@ -715,7 +746,7 @@ pub fn reduce_expression(expr: Expr, cont: Continuation, env: Env) -> SharedValu
          Expr::If(c, t, e) => expr_contains_name(c, name) || expr_contains_name(t, name) || expr_contains_name(e, name),
      }
  }
-
+ 
  fn expr_short(e: &Expr) -> String {
      match e {
          Expr::UnOp(_, _) => "UnOp".to_string(),
@@ -736,7 +767,7 @@ pub fn reduce_expression(expr: Expr, cont: Continuation, env: Env) -> SharedValu
          Expr::If(_, _, _) => "If".to_string(),
      }
  }
-
+ 
  fn cont_short(c: &Continuation) -> String {
      match c {
          Continuation::Halt => "Halt".to_string(),

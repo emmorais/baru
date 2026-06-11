@@ -153,3 +153,43 @@ fn test_shared_comparison_select_max() {
         other => panic!("expected shared result, got: {:?}", other),
     }
 }
+
+#[test]
+fn test_shared_comparison_select_min() {
+    // same as above but with (a < b) mask to select min
+    let src = "(let ((a :sint32 30) (b :sint32 20) (one :sint32 1)) (let ((mask (< a b))) (+ (* a mask) (* b (- one mask)))))";
+    let expr = parse(src).expect("parse failed");
+    let p = Participant::new(0);
+
+    let res = p.eval(&expr);
+    match res {
+        SharedValue::Share(sr) => {
+            // use backend crypto helper to reconstruct the simulated local share
+            let s3 = sr.local.clone().expect("expected local share");
+            let plain = baru::crypto::arith::reconstruct(&s3);
+            assert_eq!(plain, 20u128);
+        }
+        other => panic!("expected shared result, got: {:?}", other),
+    }
+}   
+
+#[test]
+fn test_shared_equality() {
+    // create two shared integers a and b, compute mask = (a == b) (shared bit)
+    // then compute selected = a*mask + b*(1-mask) and reconstruct result; test both equal and not equal cases
+    for (a_val, b_val, expected) in &[(42, 42, 42), (42, 43, 43)] {
+        let src = format!("(let ((a :sint32 {}) (b :sint32 {}) (one :sint32 1)) (let ((mask (== a b))) (+ (* a mask) (* b (- one mask)))))", a_val, b_val);
+        let expr = parse(&src).expect("parse failed");
+        let p = Participant::new(0);
+        let res = p.eval(&expr);
+        match res {
+            SharedValue::Share(sr) => {
+                // use backend crypto helper to reconstruct the simulated local share
+                let s3 = sr.local.clone().expect("expected local share");
+                let plain = baru::crypto::arith::reconstruct(&s3);
+                assert_eq!(plain, (*expected) as u128);
+            }
+            other => panic!("expected shared result, got: {:?}", other),
+        }
+    }
+}
