@@ -25,6 +25,9 @@ impl ReplHelper {
             ":reveal".to_string(),
             ":evalfor".to_string(),
             ":inspect".to_string(),
+            ":save".to_string(),
+            ":load".to_string(),
+            ":reset".to_string(),
             "quit".to_string(),
             "exit".to_string(),
             "share".to_string(),
@@ -101,7 +104,10 @@ fn main() -> Result<(), Box<dyn Error>> {
     println!("  {}{}", ":results".bright_cyan(), "            - print last results for all participants");
     println!("  {}{}", ":reveal <pid>".bright_cyan(), "       - reveal last result for participant pid (if it's a share or list of shares)");
     println!("  {}{}", ":evalfor <pid> EXPR".bright_cyan(), " - evaluate EXPR only for participant pid");
-    println!("  {}{}", ":inspect <pid>".bright_cyan(), "      - evaluate '(reconstruct VAR)' for participant pid");
+    println!("  {}{}", ":inspect <pid> <varname>".bright_cyan(), " - evaluate '(reconstruct VAR)' for participant pid");
+    println!("  {}{}", ":save <pid> [filename]".bright_cyan(), "    - save participant store to file (default: ./store_<pid>.json)");
+    println!("  {}{}", ":load <pid> [filename]".bright_cyan(), "    - load participant store from file and merge bindings (default: ./store_<pid>.json)");
+    println!("  {}{}", ":reset [pid]".bright_cyan(), "       - reset participant store (all if omitted)");
 
     let mut verbose = false;
     let mut last_results: Vec<Option<SharedValue>> = vec![None; participants.len()];
@@ -263,6 +269,55 @@ fn main() -> Result<(), Box<dyn Error>> {
                                     _ => println!("invalid participant id"),
                                 },
                                 None => println!("usage: :inspect <pid> <varname>"),
+                            }
+                        }
+                        ":save" => {
+                            match parts.next() {
+                                Some(pid_s) => match pid_s.parse::<usize>() {
+                                    Ok(pid) if pid < participants.len() => {
+                                        let filename = parts.next().map(|s| s.to_string()).unwrap_or_else(|| format!("store_{}.json", pid));
+                                        let path = std::path::PathBuf::from(filename);
+                                        match participants[pid].save_store(&path) {
+                                            Ok(_) => println!("saved store for participant {} -> {:?}", pid, path),
+                                            Err(e) => println!("error saving store: {}", e),
+                                        }
+                                    }
+                                    _ => println!("invalid participant id"),
+                                },
+                                None => println!("usage: :save <pid> [filename]"),
+                            }
+                        }
+                        ":load" => {
+                            match parts.next() {
+                                Some(pid_s) => match pid_s.parse::<usize>() {
+                                    Ok(pid) if pid < participants.len() => {
+                                        let filename = parts.next().map(|s| s.to_string()).unwrap_or_else(|| format!("store_{}.json", pid));
+                                        let path = std::path::PathBuf::from(filename);
+                                        match participants[pid].load_store(&path) {
+                                            Ok(_) => println!("loaded store for participant {} <- {:?}", pid, path),
+                                            Err(e) => println!("error loading store: {}", e),
+                                        }
+                                    }
+                                    _ => println!("invalid participant id"),
+                                },
+                                None => println!("usage: :load <pid> [filename]"),
+                            }
+                        }
+                        ":reset" => {
+                            match parts.next() {
+                                Some(pid_s) => match pid_s.parse::<usize>() {
+                                    Ok(pid) if pid < participants.len() => {
+                                        participants[pid].reset_store();
+                                        println!("reset store for participant {}", pid);
+                                    }
+                                    _ => println!("invalid participant id"),
+                                },
+                                None => {
+                                    for pid in 0..participants.len() {
+                                        participants[pid].reset_store();
+                                    }
+                                    println!("reset stores for all participants");
+                                }
                             }
                         }
                         _ => println!("unknown command: {}", cmd),

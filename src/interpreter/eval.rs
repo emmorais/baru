@@ -2,6 +2,10 @@ use std::collections::HashMap;
 use std::rc::Rc;
 use std::cell::RefCell;
 use std::sync::{Arc, Mutex};
+use std::fs::File;
+use std::io::{Read, Write};
+use std::path::Path;
+use serde::{Serialize, Deserialize};
 
 use crate::interpreter::ast::{Expr, Env, SharedValue};
 use crate::interpreter::backend::{SimBackend, Backend};
@@ -727,120 +731,224 @@ pub fn reduce_expression(expr: Expr, cont: Continuation, env: Env, backend: Arc<
  
  // A simulated participant in the 3-party REPL.
  pub struct Participant {
-     id: usize,
-     backend: Arc<Mutex<Box<dyn Backend>>>,
- }
+    id: usize,
+    backend: Arc<Mutex<Box<dyn Backend>>>,
+    store: Env,
+}
+
+#[derive(Serialize, Deserialize)]
+enum PersistValue {
+    Num(i64),
+    Bool(bool),
+    Str(String),
+    Char(char),
+    List(Vec<PersistValue>),
+}
 
  impl Participant {
      pub fn new(id: usize) -> Self {
          let backend: Arc<Mutex<Box<dyn Backend>>> = Arc::new(Mutex::new(Box::new(SimBackend::new())));
-         Participant { id, backend }
-     }
-
-     /// Reveal a shared value to the caller (simulated reveal via backend).
-     pub fn reveal(&self, sref: &crate::interpreter::backend::ShareRef) -> crate::crypto::types::Fr {
-         let mut be = self.backend.lock().unwrap();
-         be.reveal(sref, None)
-     }
-
-     /// Evaluate an expression locally and return the resulting SharedValue.
-     pub fn eval(&self, expr: &Expr) -> SharedValue {
          let store: Env = Rc::new(RefCell::new(HashMap::new()));
-         let backend = self.backend.clone();
-         let owner = self.id;
-         // register builtins: share and reconstruct and a2b/b2a
-         // insert share as a native builtin: (share value nbits)
-         let share_backend = backend.clone();
-         let share_owner = owner;
-         let share_fn = Arc::new(move |args: Vec<SharedValue>| -> SharedValue {
-             if args.len() != 2 { panic!("share expects 2 args"); }
-             match (&args[0], &args[1]) {
-                 (SharedValue::Num(n), SharedValue::Num(nb)) => {
-                     let mut be = share_backend.lock().unwrap();
-                     let sref = be.share_secret(*n as u128, *nb as usize, share_owner);
-                     SharedValue::Share(sref)
-                 }
-                 (SharedValue::Share(s), SharedValue::Num(_nb)) => SharedValue::Share(s.clone()),
-                 _ => panic!("share expects (num nbits) or (share nbits)"),
-             }
-         });
-         store.borrow_mut().insert("share".to_string(), Rc::new(RefCell::new(SharedValue::NativeFunc(share_fn))));
-         // insert reconstruct as native builtin: (reconstruct shared)
-         let reconstruct_backend = backend.clone();
-         let reconstruct_owner = owner;
-         let reconstruct_fn = Arc::new(move |args: Vec<SharedValue>| -> SharedValue {
-             if args.len() != 1 { panic!("reconstruct expects 1 arg"); }
-             match &args[0] {
-                 SharedValue::Share(sref) => {
-                     let mut be = reconstruct_backend.lock().unwrap();
-                     let plain = be.reveal(&sref, Some(reconstruct_owner));
-                     SharedValue::Num(plain as i64)
-                 }
-                 SharedValue::Num(n) => SharedValue::Num(*n),
-                 _ => panic!("reconstruct expects a shared value"),
-             }
-         });
-         store.borrow_mut().insert("reconstruct".to_string(), Rc::new(RefCell::new(SharedValue::NativeFunc(reconstruct_fn))));
-         // insert a2b/b2a builtins
-         let a2b_backend = backend.clone();
-         let a2b_fn = Arc::new(move |args: Vec<SharedValue>| -> SharedValue {
-             if args.len() != 2 { panic!("a2b expects 2 args: (a nbits)"); }
-             match (&args[0], &args[1]) {
-                 (SharedValue::Share(sref), SharedValue::Num(nbits)) => {
-                     let mut be = a2b_backend.lock().unwrap();
-                     let bits = be.a2b(&sref, *nbits as usize);
-                     let svs: Vec<SharedValue> = bits.into_iter().map(|b| SharedValue::Share(b)).collect();
-                     SharedValue::List(svs)
-                 }
-                 _ => panic!("a2b expects (share nbits)"),
-             }
-         });
-         store.borrow_mut().insert("a2b".to_string(), Rc::new(RefCell::new(SharedValue::NativeFunc(a2b_fn))));
-
-         let b2a_backend = backend.clone();
-         let b2a_fn = Arc::new(move |args: Vec<SharedValue>| -> SharedValue {
-             if args.len() != 1 { panic!("b2a expects 1 arg: (bits-list)"); }
-             match &args[0] {
-                 SharedValue::List(list) => {
-                     let bits_refs: Vec<crate::interpreter::backend::ShareRef> = list.iter().map(|v| {
-                         if let SharedValue::Share(sr) = v { sr.clone() } else { panic!("b2a expects list of share bits") }
-                     }).collect();
-                     let mut be = b2a_backend.lock().unwrap();
-                     let out = be.b2a(&bits_refs);
-                     SharedValue::Share(out)
-                 }
-                 _ => panic!("b2a expects a list of bit shares"),
-             }
-         });
-         store.borrow_mut().insert("b2a".to_string(), Rc::new(RefCell::new(SharedValue::NativeFunc(b2a_fn))));
-
-         // run reducer
-         let cont = Continuation::Halt;
-         let result = reduce_expression(expr.clone(), cont, store.clone(), self.backend.clone(), self.id, false);
-         if !cfg!(test) {
-             println!("participant {} evaluated expression -> {:?}", self.id, result);
-         }
-         result
+         let participant = Participant { id, backend: backend.clone(), store: store.clone() };
+         // register builtins once into the persistent store
+         participant.register_builtins();
+         participant
      }
 
-     /// Evaluate with optional verbose tracing. When verbose=true the REPL will print
-     /// per-frame environment, expression and continuation snapshots.
-     pub fn eval_verbose(&self, expr: &Expr, verbose: bool) -> SharedValue {
-         if verbose {
-             println!("[participant {}] starting eval (verbose)", self.id);
-         }
-         let store: Env = Rc::new(RefCell::new(HashMap::new()));
-         let result = {
-             // reuse existing eval setup but call reducer with verbose flag
-             let cont = Continuation::Halt;
-             reduce_expression(expr.clone(), cont, store.clone(), self.backend.clone(), self.id, verbose)
-         };
-         if verbose {
-             println!("[participant {}] finished eval -> {:?}", self.id, result);
-         }
-         result
-     }
- }
+     fn register_builtins(&self) {
+        let backend = self.backend.clone();
+        let owner = self.id;
+
+        // share builtin
+        let share_backend = backend.clone();
+        let share_owner = owner;
+        let share_fn = Arc::new(move |args: Vec<SharedValue>| -> SharedValue {
+            if args.len() != 2 { panic!("share expects 2 args"); }
+            match (&args[0], &args[1]) {
+                (SharedValue::Num(n), SharedValue::Num(nb)) => {
+                    let mut be = share_backend.lock().unwrap();
+                    let sref = be.share_secret(*n as u128, *nb as usize, share_owner);
+                    SharedValue::Share(sref)
+                }
+                (SharedValue::Share(s), SharedValue::Num(_nb)) => SharedValue::Share(s.clone()),
+                _ => panic!("share expects (num nbits) or (share nbits)"),
+            }
+        });
+        self.store.borrow_mut().insert("share".to_string(), Rc::new(RefCell::new(SharedValue::NativeFunc(share_fn))));
+
+        // reconstruct builtin
+        let reconstruct_backend = backend.clone();
+        let reconstruct_owner = owner;
+        let reconstruct_fn = Arc::new(move |args: Vec<SharedValue>| -> SharedValue {
+            if args.len() != 1 { panic!("reconstruct expects 1 arg"); }
+            match &args[0] {
+                SharedValue::Share(sref) => {
+                    let mut be = reconstruct_backend.lock().unwrap();
+                    let plain = be.reveal(&sref, Some(reconstruct_owner));
+                    SharedValue::Num(plain as i64)
+                }
+                SharedValue::Num(n) => SharedValue::Num(*n),
+                _ => panic!("reconstruct expects a shared value"),
+            }
+        });
+        self.store.borrow_mut().insert("reconstruct".to_string(), Rc::new(RefCell::new(SharedValue::NativeFunc(reconstruct_fn))));
+
+        // a2b builtin
+        let a2b_backend = backend.clone();
+        let a2b_fn = Arc::new(move |args: Vec<SharedValue>| -> SharedValue {
+            if args.len() != 2 { panic!("a2b expects 2 args: (a nbits)"); }
+            match (&args[0], &args[1]) {
+                (SharedValue::Share(sref), SharedValue::Num(nbits)) => {
+                    let mut be = a2b_backend.lock().unwrap();
+                    let bits = be.a2b(&sref, *nbits as usize);
+                    let svs: Vec<SharedValue> = bits.into_iter().map(|b| SharedValue::Share(b)).collect();
+                    SharedValue::List(svs)
+                }
+                _ => panic!("a2b expects (share nbits)"),
+            }
+        });
+        self.store.borrow_mut().insert("a2b".to_string(), Rc::new(RefCell::new(SharedValue::NativeFunc(a2b_fn))));
+
+        // b2a builtin
+        let b2a_backend = backend.clone();
+        let b2a_fn = Arc::new(move |args: Vec<SharedValue>| -> SharedValue {
+            if args.len() != 1 { panic!("b2a expects 1 arg: (bits-list)"); }
+            match &args[0] {
+                SharedValue::List(list) => {
+                    let bits_refs: Vec<crate::interpreter::backend::ShareRef> = list.iter().map(|v| {
+                        if let SharedValue::Share(sr) = v { sr.clone() } else { panic!("b2a expects list of share bits") }
+                    }).collect();
+                    let mut be = b2a_backend.lock().unwrap();
+                    let out = be.b2a(&bits_refs);
+                    SharedValue::Share(out)
+                }
+                _ => panic!("b2a expects a list of bit shares"),
+            }
+        });
+        self.store.borrow_mut().insert("b2a".to_string(), Rc::new(RefCell::new(SharedValue::NativeFunc(b2a_fn))));
+    }
+
+    /// Reveal a shared value to the caller (simulated reveal via backend).
+    pub fn reveal(&self, sref: &crate::interpreter::backend::ShareRef) -> crate::crypto::types::Fr {
+        let mut be = self.backend.lock().unwrap();
+        be.reveal(sref, None)
+    }
+
+    /// Reset the persistent store (clears user bindings, re-registers builtins)
+    pub fn reset_store(&self) {
+        self.store.borrow_mut().clear();
+        self.register_builtins();
+    }
+
+    /// Save the current store to a JSON file at `path`. Only simple values (num/bool/str/char/list)
+    /// are persisted; closures and native functions are skipped.
+    pub fn save_store<P: AsRef<Path>>(&self, path: P) -> Result<(), String> {
+        let map = self.store.borrow();
+        let mut out: std::collections::HashMap<String, PersistValue> = HashMap::new();
+        for (k, vptr) in map.iter() {
+            let v = vptr.borrow();
+            if let Some(pv) = to_persist_value(&*v) {
+                out.insert(k.clone(), pv);
+            }
+        }
+        match serde_json::to_string_pretty(&out) {
+            Ok(s) => {
+                match File::create(path) {
+                    Ok(mut f) => {
+                        if let Err(e) = f.write_all(s.as_bytes()) { return Err(format!("write error: {}", e)); }
+                        Ok(())
+                    }
+                    Err(e) => Err(format!("create file error: {}", e)),
+                }
+            }
+            Err(e) => Err(format!("serialize error: {}", e)),
+        }
+    }
+
+    /// Load a store from a JSON file, merging persisted bindings into the current store.
+    /// Existing user bindings with the same name will be overwritten; builtins are preserved.
+    pub fn load_store<P: AsRef<Path>>(&self, path: P) -> Result<(), String> {
+        let mut s = String::new();
+        match File::open(path) {
+            Ok(mut f) => {
+                if let Err(e) = f.read_to_string(&mut s) { return Err(format!("read error: {}", e)); }
+            }
+            Err(e) => return Err(format!("open error: {}", e)),
+        }
+        let parsed: std::result::Result<std::collections::HashMap<String, PersistValue>, _> = serde_json::from_str(&s);
+        match parsed {
+            Ok(m) => {
+                for (k, pv) in m.into_iter() {
+                    if let Some(sv) = from_persist_value(pv) {
+                        self.store.borrow_mut().insert(k, Rc::new(RefCell::new(sv)));
+                    }
+                }
+                Ok(())
+            }
+            Err(e) => Err(format!("parse error: {}", e)),
+        }
+    }
+
+    /// Evaluate an expression using the participant's persistent store and return the resulting SharedValue.
+    pub fn eval(&self, expr: &Expr) -> SharedValue {
+        let owner = self.id;
+        // run reducer using the persistent store
+        let cont = Continuation::Halt;
+        let result = reduce_expression(expr.clone(), cont, self.store.clone(), self.backend.clone(), owner, false);
+        if !cfg!(test) {
+            println!("participant {} evaluated expression -> {:?}", self.id, result);
+        }
+        result
+    }
+
+    /// Evaluate with optional verbose tracing. When verbose=true the REPL will print
+    /// per-frame environment, expression and continuation snapshots.
+    pub fn eval_verbose(&self, expr: &Expr, verbose: bool) -> SharedValue {
+        if verbose {
+            println!("[participant {}] starting eval (verbose)", self.id);
+        }
+        let cont = Continuation::Halt;
+        let result = reduce_expression(expr.clone(), cont, self.store.clone(), self.backend.clone(), self.id, verbose);
+        if verbose {
+            println!("[participant {}] finished eval -> {:?}", self.id, result);
+        }
+        result
+    }
+}
+
+// helpers to convert between SharedValue and PersistValue
+fn to_persist_value(v: &SharedValue) -> Option<PersistValue> {
+    match v {
+        SharedValue::Num(n) => Some(PersistValue::Num(*n)),
+        SharedValue::Bool(b) => Some(PersistValue::Bool(*b)),
+        SharedValue::Str(s) => Some(PersistValue::Str(s.clone())),
+        SharedValue::Char(c) => Some(PersistValue::Char(*c)),
+        SharedValue::List(lst) => {
+            let mut out: Vec<PersistValue> = Vec::new();
+            for item in lst.iter() {
+                if let Some(iv) = to_persist_value(item) { out.push(iv); } else { return None; }
+            }
+            Some(PersistValue::List(out))
+        }
+        _ => None,
+    }
+}
+
+fn from_persist_value(p: PersistValue) -> Option<SharedValue> {
+    match p {
+        PersistValue::Num(n) => Some(SharedValue::Num(n)),
+        PersistValue::Bool(b) => Some(SharedValue::Bool(b)),
+        PersistValue::Str(s) => Some(SharedValue::Str(s)),
+        PersistValue::Char(c) => Some(SharedValue::Char(c)),
+        PersistValue::List(vs) => {
+            let mut out: Vec<SharedValue> = Vec::new();
+            for iv in vs.into_iter() {
+                if let Some(sv) = from_persist_value(iv) { out.push(sv); } else { return None; }
+            }
+            Some(SharedValue::List(out))
+        }
+    }
+}
  
  // Helpers
  fn expr_contains_name(e: &Expr, name: &str) -> bool {
