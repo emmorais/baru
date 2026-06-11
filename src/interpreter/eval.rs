@@ -99,6 +99,13 @@ pub enum Continuation {
         cont: Box<Continuation>,
         env: Env,
     },
+    /// After evaluating a branch of an `if` whose condition was a shared boolean,
+    /// normalize a numeric result into a share with the provided (owner, nbits).
+    IfResultNormalize {
+        cont: Box<Continuation>,
+        normalize: Option<(usize, usize)>, // Some(owner, nbits) -> convert NUM -> SHARE
+        env: Env,
+    },
 }
 
 enum Task {
@@ -147,14 +154,12 @@ pub fn reduce_expression(expr: Expr, cont: Continuation, env: Env, backend: Arc<
                 let mut keys: Vec<&String> = map.keys().collect();
                 keys.sort();
                 let mut parts: Vec<String> = Vec::new();
-                let mut count = 0usize;
                 for k in keys.iter().take(min(max_entries, keys.len())) {
                     if let Some(vptr) = map.get(*k) {
                         // borrow the inner SharedValue for read-only display
                         let vref = vptr.borrow();
                         let sval = colored_value(&*vref);
                         parts.push(format!("{}: {}", k.bright_blue(), sval));
-                        count += 1;
                     }
                 }
                 let mut s = String::new();
@@ -395,7 +400,9 @@ pub fn reduce_expression(expr: Expr, cont: Continuation, env: Env, backend: Arc<
                                     }
                                     (SharedValue::Share(sa), SharedValue::Num(bn)) => {
                                         let mut be = backend.lock().unwrap();
-                                        let sb = be.share_secret(*bn as u128, sa.nbits, owner);
+                                        // convert signed immediate into two's-complement field element for sa.nbits
+                                        let imm = int_to_fr_signed(*bn as i64, sa.nbits);
+                                        let sb = be.share_secret(imm, sa.nbits, owner);
                                         let sr = match op {
                                             super::parser::BinOp::Add => be.add(&sa, &sb),
                                             super::parser::BinOp::Sub => be.sub(&sa, &sb),
@@ -406,7 +413,9 @@ pub fn reduce_expression(expr: Expr, cont: Continuation, env: Env, backend: Arc<
                                     }
                                     (SharedValue::Num(an), SharedValue::Share(sb)) => {
                                         let mut be = backend.lock().unwrap();
-                                        let sa = be.share_secret(*an as u128, sb.nbits, owner);
+                                        // convert signed immediate into two's-complement field element for sb.nbits
+                                        let imm = int_to_fr_signed(*an as i64, sb.nbits);
+                                        let sa = be.share_secret(imm, sb.nbits, owner);
                                         let sr = match op {
                                             super::parser::BinOp::Add => be.add(&sa, &sb),
                                             super::parser::BinOp::Sub => be.sub(&sa, &sb),
@@ -448,17 +457,22 @@ pub fn reduce_expression(expr: Expr, cont: Continuation, env: Env, backend: Arc<
                                         let mut be = backend.lock().unwrap();
                                         let va = be.reveal(&sa, Some(owner));
                                         let vb = be.reveal(&sb, Some(owner));
-                                        SharedValue::Share(be.share_secret(if va == vb { 1 } else { 0 }, 1, owner))
+                                        // interpret reconstructed values as signed according to nbits
+                                        let sa_signed = fr_to_signed(va, sa.nbits);
+                                        let sb_signed = fr_to_signed(vb, sb.nbits);
+                                        SharedValue::Share(be.share_secret(if sa_signed == sb_signed { 1 } else { 0 }, 1, owner))
                                     }
                                     (SharedValue::Share(sa), SharedValue::Num(bn)) => {
                                         let mut be = backend.lock().unwrap();
                                         let va = be.reveal(&sa, Some(owner));
-                                        SharedValue::Share(be.share_secret(if va == (*bn as u128) { 1 } else { 0 }, 1, owner))
+                                        let va_signed = fr_to_signed(va, sa.nbits);
+                                        SharedValue::Share(be.share_secret(if va_signed == (*bn as i64 as i128) { 1u128 } else { 0u128 }, 1, owner))
                                     }
                                     (SharedValue::Num(an), SharedValue::Share(sb)) => {
                                         let mut be = backend.lock().unwrap();
                                         let vb = be.reveal(&sb, Some(owner));
-                                        SharedValue::Share(be.share_secret(if (*an as u128) == vb { 1 } else { 0 }, 1, owner))
+                                        let vb_signed = fr_to_signed(vb, sb.nbits);
+                                        SharedValue::Share(be.share_secret(if (*an as i64 as i128) == vb_signed { 1u128 } else { 0u128 }, 1, owner))
                                     }
                                     _ => SharedValue::Num(0),
                                 }
@@ -480,11 +494,13 @@ pub fn reduce_expression(expr: Expr, cont: Continuation, env: Env, backend: Arc<
                                         let mut be = backend.lock().unwrap();
                                         let va = be.reveal(&sa, Some(owner));
                                         let vb = be.reveal(&sb, Some(owner));
+                                        let sa_signed = fr_to_signed(va, sa.nbits);
+                                        let sb_signed = fr_to_signed(vb, sb.nbits);
                                         let cond = match op {
-                                            super::parser::BinOp::Lt => va < vb,
-                                            super::parser::BinOp::Gt => va > vb,
-                                            super::parser::BinOp::Le => va <= vb,
-                                            super::parser::BinOp::Ge => va >= vb,
+                                            super::parser::BinOp::Lt => sa_signed < sb_signed,
+                                            super::parser::BinOp::Gt => sa_signed > sb_signed,
+                                            super::parser::BinOp::Le => sa_signed <= sb_signed,
+                                            super::parser::BinOp::Ge => sa_signed >= sb_signed,
                                             _ => unreachable!(),
                                         };
                                         SharedValue::Share(be.share_secret(if cond { 1 } else { 0 }, 1, owner))
@@ -492,11 +508,12 @@ pub fn reduce_expression(expr: Expr, cont: Continuation, env: Env, backend: Arc<
                                     (SharedValue::Share(sa), SharedValue::Num(bn)) => {
                                         let mut be = backend.lock().unwrap();
                                         let va = be.reveal(&sa, Some(owner));
+                                        let va_signed = fr_to_signed(va, sa.nbits);
                                         let cond = match op {
-                                            super::parser::BinOp::Lt => va < (((*bn) as i64) as u128),
-                                            super::parser::BinOp::Gt => va > (((*bn) as i64) as u128),
-                                            super::parser::BinOp::Le => va <= (((*bn) as i64) as u128),
-                                            super::parser::BinOp::Ge => va >= (((*bn) as i64) as u128),
+                                            super::parser::BinOp::Lt => va_signed < ((*bn as i64) as i128),
+                                            super::parser::BinOp::Gt => va_signed > ((*bn as i64) as i128),
+                                            super::parser::BinOp::Le => va_signed <= ((*bn as i64) as i128),
+                                            super::parser::BinOp::Ge => va_signed >= ((*bn as i64) as i128),
                                             _ => unreachable!(),
                                         };
                                         SharedValue::Share(be.share_secret(if cond { 1 } else { 0 }, 1, owner))
@@ -504,11 +521,12 @@ pub fn reduce_expression(expr: Expr, cont: Continuation, env: Env, backend: Arc<
                                     (SharedValue::Num(an), SharedValue::Share(sb)) => {
                                         let mut be = backend.lock().unwrap();
                                         let vb = be.reveal(&sb, Some(owner));
+                                        let vb_signed = fr_to_signed(vb, sb.nbits);
                                         let cond = match op {
-                                            super::parser::BinOp::Lt => ((*an as i64) as u128) < vb,
-                                            super::parser::BinOp::Gt => ((*an as i64) as u128) > vb,
-                                            super::parser::BinOp::Le => ((*an as i64) as u128) <= vb,
-                                            super::parser::BinOp::Ge => ((*an as i64) as u128) >= vb,
+                                            super::parser::BinOp::Lt => ((*an as i64) as i128) < vb_signed,
+                                            super::parser::BinOp::Gt => ((*an as i64) as i128) > vb_signed,
+                                            super::parser::BinOp::Le => ((*an as i64) as i128) <= vb_signed,
+                                            super::parser::BinOp::Ge => ((*an as i64) as i128) >= vb_signed,
                                             _ => unreachable!(),
                                         };
                                         SharedValue::Share(be.share_secret(if cond { 1 } else { 0 }, 1, owner))
@@ -718,7 +736,53 @@ pub fn reduce_expression(expr: Expr, cont: Continuation, env: Env, backend: Arc<
                                     stack.push(Eval(*else_e, *cont, env.clone()));
                                 }
                             }
-                            _ => panic!("if condition must be NUM"),
+                            SharedValue::Share(sr) => {
+                                // reveal the boolean share to the owner to decide control flow
+                                let mut be = backend.lock().unwrap();
+                                let revealed = be.reveal(&sr, Some(owner));
+                                // choose branch but ensure final result is normalized to a share
+                                let new_cont = Continuation::IfResultNormalize { cont: cont.clone(), normalize: Some((sr.owner, sr.nbits)), env: env.clone() };
+                                if revealed != 0 {
+                                    stack.push(Eval(*then_e, new_cont, env.clone()));
+                                } else {
+                                    stack.push(Eval(*else_e, new_cont, env.clone()));
+                                }
+                            }
+                            _ => panic!("if condition must be NUM or shared boolean"),
+                        }
+                    }
+
+                    Continuation::IfResultNormalize { cont, normalize, env } => {
+                        // When a branch result is produced, optionally normalize NUM->SHARE
+                        match normalize {
+                            Some((norm_owner, norm_nbits)) => {
+                                match val {
+                                    SharedValue::Share(_) => {
+                                        // already a share, just continue
+                                        stack.push(Apply(*cont, val, env.clone()));
+                                    }
+                                    SharedValue::Num(n) => {
+                                        let mut be = backend.lock().unwrap();
+                                        let fr = int_to_fr_signed(n as i64, norm_nbits);
+                                        let sref = be.share_secret(fr, norm_nbits, norm_owner);
+                                        stack.push(Apply(*cont, SharedValue::Share(sref), env.clone()));
+                                    }
+                                    SharedValue::Bool(b) => {
+                                        let mut be = backend.lock().unwrap();
+                                        let fr = if b { 1u128 } else { 0u128 };
+                                        let sref = be.share_secret(fr, norm_nbits, norm_owner);
+                                        stack.push(Apply(*cont, SharedValue::Share(sref), env.clone()));
+                                    }
+                                    _ => {
+                                        // other types not supported for normalization
+                                        panic!("cannot normalize branch result to share: {:?}", val);
+                                    }
+                                }
+                            }
+                            None => {
+                                // no normalization needed, just continue
+                                stack.push(Apply(*cont, val, env.clone()));
+                            }
                         }
                     }
                  }
@@ -767,7 +831,9 @@ enum PersistValue {
             match (&args[0], &args[1]) {
                 (SharedValue::Num(n), SharedValue::Num(nb)) => {
                     let mut be = share_backend.lock().unwrap();
-                    let sref = be.share_secret(*n as u128, *nb as usize, share_owner);
+                    // convert signed immediate into two's-complement field element for nb bits
+                    let imm = int_to_fr_signed(*n as i64, *nb as usize);
+                    let sref = be.share_secret(imm, *nb as usize, share_owner);
                     SharedValue::Share(sref)
                 }
                 (SharedValue::Share(s), SharedValue::Num(_nb)) => SharedValue::Share(s.clone()),
@@ -1010,5 +1076,32 @@ fn from_persist_value(p: PersistValue) -> Option<SharedValue> {
          Continuation::CallEvalOperator { .. } => "CallEvalOperator".to_string(),
          Continuation::CallEvalArgs { .. } => "CallEvalArgs".to_string(),
          Continuation::If { .. } => "IfCont".to_string(),
+         Continuation::IfResultNormalize { .. } => "IfResultNormalize".to_string(),
      }
  }
+ 
+// Interpret a signed integer stored in `fr` with `nbits` bits (two's complement) as i128
+fn fr_to_signed(fr: u128, nbits: usize) -> i128 {
+    if nbits >= 128 {
+        return fr as i128;
+    }
+    let mask = if nbits == 128 { u128::MAX } else { (1u128 << nbits) - 1 };
+    let val = fr & mask;
+    let half = 1u128 << (nbits - 1);
+    if val >= half {
+        (val as i128) - ((mask + 1) as i128)
+    } else {
+        val as i128
+    }
+}
+
+// Convert a signed i64 value into an unsigned field element representing two's complement with `nbits` bits
+fn int_to_fr_signed(n: i64, nbits: usize) -> u128 {
+    if nbits >= 128 {
+        return n as i128 as u128;
+    }
+    let modulus = 1i128.checked_shl(nbits as u32).unwrap_or(0);
+    if modulus == 0 { return n as i128 as u128; }
+    let v = (n as i128).rem_euclid(modulus);
+    v as u128
+}

@@ -189,3 +189,35 @@ fn test_shared_equality() {
          }
      }
  }
+
+ #[test]
+ fn test_very_simple_neural_network() {
+     // test a simple 2-layer NN with shared weights and inputs; just checks that the computation runs and produces some output
+     let src = "(let ((w1 :sint32 2) (w2 :sint32 3) (x :sint32 4)) (+ (* w1 x) (* w2 x)))";
+     let expr = parse(src).expect("parse failed");
+     let p = Participant::new(0);
+     let res = p.eval(&expr);
+     match res {
+         SharedValue::Share(sr) => {
+             let plain = p.reveal(&sr);
+             assert_eq!(plain, 20u128); // (2*4) + (3*4) = 8 + 12 = 20
+         }
+         other => panic!("expected shared result, got: {:?}", other),
+     }
+ }
+
+ #[test]
+ fn test_simple_neural_network(){
+        // test a simple 2-layer NN with shared weights and inputs, including a ReLU activation; just checks that the computation runs and produces some output
+        let src = "(let ((w1 :sint32 2) (w2 :sint32 -3) (x :sint32 4)) (let ((z (+ (* w1 x) (* w2 x)))) (if (> z 0) z 0)))";
+        let expr = parse(src).expect("parse failed");
+        let p = Participant::new(0);
+        let res = p.eval(&expr);
+        match res {
+            SharedValue::Share(sr) => {
+                let plain = p.reveal(&sr);
+                assert_eq!(plain, 0u128); // (2*4) + (-3*4) = 8 - 12 = -4, ReLU(-4) = 0
+            }
+            other => panic!("expected shared result, got: {:?}", other),
+        }
+ }
