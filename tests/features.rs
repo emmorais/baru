@@ -2,7 +2,7 @@ use baru::interpreter::{parse, Participant, SharedValue};
 
 fn eval(src: &str) -> i64 {
     let expr = parse(src).expect("parse failed");
-    let p = Participant::new(0);
+    let p = Participant::new_sim(0);
     match p.eval(&expr) {
         SharedValue::Num(n) => n,
         other => panic!("expected numeric result, got: {:?}", other),
@@ -141,7 +141,7 @@ fn test_shared_comparison_select_max() {
     // then compute selected = a*mask + b*(1-mask) and reconstruct result
     let src = "(let ((a :sint32 30) (b :sint32 20) (one :sint32 1)) (let ((mask (> a b))) (+ (* a mask) (* b (- one mask)))))";
     let expr = parse(src).expect("parse failed");
-    let p = Participant::new(0);
+    let p = Participant::new_sim(0);
     let res = p.eval(&expr);
     match res {
         SharedValue::Share(sr) => {
@@ -158,7 +158,7 @@ fn test_shared_comparison_select_min() {
     // same as above but with (a < b) mask to select min
     let src = "(let ((a :sint32 30) (b :sint32 20) (one :sint32 1)) (let ((mask (< a b))) (+ (* a mask) (* b (- one mask)))))";
     let expr = parse(src).expect("parse failed");
-    let p = Participant::new(0);
+    let p = Participant::new_sim(0);
 
     let res = p.eval(&expr);
     match res {
@@ -177,7 +177,7 @@ fn test_shared_equality() {
     for (a_val, b_val, expected) in &[(42, 42, 42), (42, 43, 43)] {
         let src = format!("(let ((a :sint32 {}) (b :sint32 {}) (one :sint32 1)) (let ((mask (== a b))) (+ (* a mask) (* b (- one mask)))))", a_val, b_val);
         let expr = parse(&src).expect("parse failed");
-        let p = Participant::new(0);
+        let p = Participant::new_sim(0);
         let res = p.eval(&expr);
         match res {
             SharedValue::Share(sr) => {
@@ -195,7 +195,7 @@ fn test_shared_equality() {
      // test a simple 2-layer NN with shared weights and inputs; just checks that the computation runs and produces some output
      let src = "(let ((w1 :sint32 2) (w2 :sint32 3) (x :sint32 4)) (+ (* w1 x) (* w2 x)))";
      let expr = parse(src).expect("parse failed");
-     let p = Participant::new(0);
+    let p = Participant::new_sim(0);
      let res = p.eval(&expr);
      match res {
          SharedValue::Share(sr) => {
@@ -211,7 +211,7 @@ fn test_shared_equality() {
         // test a simple 2-layer NN with shared weights and inputs, including a ReLU activation; just checks that the computation runs and produces some output
         let src = "(let ((w1 :sint32 2) (w2 :sint32 -3) (x :sint32 4)) (let ((z (+ (* w1 x) (* w2 x)))) (if (> z 0) z 0)))";
         let expr = parse(src).expect("parse failed");
-        let p = Participant::new(0);
+        let p = Participant::new_sim(0);
         let res = p.eval(&expr);
         match res {
             SharedValue::Share(sr) => {

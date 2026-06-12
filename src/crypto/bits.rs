@@ -224,6 +224,33 @@ pub fn le_ab3(a: &Share3, b: &Share3, nbits: usize) -> Share3 {
     crate::crypto::bits::or(&lt, &eq)
 }
 
+/// Signed less-than for two's-complement values with `nbits` width.
+///
+/// Let sa/sb be sign bits. Then:
+/// - if signs differ: a < b iff sa=1 and sb=0
+/// - if signs equal: compare as unsigned (same ordering under equal sign)
+pub fn lt_ab3_signed(a: &Share3, b: &Share3, nbits: usize) -> Share3 {
+    let (a_bits, _a_carry) = a2b_ab3(a, nbits);
+    let (b_bits, _b_carry) = a2b_ab3(b, nbits);
+
+    let sign_a = &a_bits[nbits - 1];
+    let sign_b = &b_bits[nbits - 1];
+
+    let unsigned_lt = borrow_from_bits(&a_bits, &b_bits);
+    let sign_diff = xor_shared(sign_a, sign_b);
+    let signs_equal = not(&sign_diff);
+
+    let a_neg_b_nonneg = and(sign_a, &not(sign_b));
+    let same_sign_and_lt = and(&signs_equal, &unsigned_lt);
+    or(&a_neg_b_nonneg, &same_sign_and_lt)
+}
+
+pub fn le_ab3_signed(a: &Share3, b: &Share3, nbits: usize) -> Share3 {
+    let lt = lt_ab3_signed(a, b, nbits);
+    let eq = eq_ab3(a, b, nbits);
+    or(&lt, &eq)
+}
+
 pub fn eq_ab3(a: &Share3, b: &Share3, nbits: usize) -> Share3 {
     let diff = sub_shares(a, b);
     let (bits, _carry_out) = a2b_ab3(&diff, nbits);
