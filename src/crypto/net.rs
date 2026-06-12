@@ -21,12 +21,35 @@ pub trait Transport: Send + Sync {
 }
 
 /// Simple MPC message types for simulator usage.
+///
+/// Each variant that belongs to a specific in-flight operation carries an
+/// `op_id` so that concurrent operations (e.g., multiple multiplications in
+/// the same expression) can be correctly demultiplexed.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub enum MpcMsg {
+    // ---- legacy untagged (kept for tcp_party demo) ----
     D(u128),
     E(u128),
     PublicD(u128),
     PublicE(u128),
+
+    // ---- tagged protocol messages ----
+    /// One share component sent during input sharing.
+    /// `share_id` identifies the share; `value` is the field element for the
+    /// receiving party.
+    InputShare { share_id: u64, value: u128 },
+
+    /// One party's additive share component sent during a reveal round.
+    RevealShare { share_id: u64, value: u128 },
+
+    /// Beaver triple: send party i its two components (left, right) for one
+    /// triple identified by `triple_id`.
+    TripleComponent { triple_id: u64, left: u128, right: u128 },
+
+    /// Masked-open D value tagged with an operation id.
+    TaggedD { op_id: u64, value: u128 },
+    /// Masked-open E value tagged with an operation id.
+    TaggedE { op_id: u64, value: u128 },
 }
 
 /// Serialize a message using bincode.
@@ -99,6 +122,18 @@ impl Transport for InprocHandle {
         } else {
             None
         }
+    }
+}
+
+/// Blocking helpers that poll `recv()` in a spin-sleep loop until a message
+/// matching a predicate arrives. These are used by protocol helpers that need
+/// to wait for a peer's contribution before proceeding.
+pub fn recv_blocking<T: Transport>(t: &T, timeout_ms: u64) -> Option<(PartyId, Message)> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
+    loop {
+        if let Some(m) = t.recv() { return Some(m); }
+        if std::time::Instant::now() >= deadline { return None; }
+        std::thread::sleep(std::time::Duration::from_millis(2));
     }
 }
 

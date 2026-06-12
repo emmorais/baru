@@ -835,6 +835,17 @@ enum PersistValue {
          participant
      }
 
+     /// Create a participant backed by a real `TransportBackend` using an
+     /// existing `Transport` connection (e.g. `TcpTransport` or `InprocHandle`).
+     pub fn new_transport<T: crate::crypto::net::Transport + 'static>(id: usize, transport: T) -> Self {
+         use crate::interpreter::backend::TransportBackend;
+         let backend: Arc<Mutex<Box<dyn Backend>>> = Arc::new(Mutex::new(Box::new(TransportBackend::new(id, transport))));
+         let store: Env = Rc::new(RefCell::new(HashMap::new()));
+         let participant = Participant { id, backend: backend.clone(), store: store.clone() };
+         participant.register_builtins();
+         participant
+     }
+
      fn register_builtins(&self) {
         let backend = self.backend.clone();
         let owner = self.id;
