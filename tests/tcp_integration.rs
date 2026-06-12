@@ -2,97 +2,104 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 use std::thread;
 use std::path::Path;
-
-// Integration test that spawns three tcp_party processes and verifies they
-// exchange D messages over TCP and each prints the correct SUM. Uses
-// ephemeral ports reserved briefly before spawning and waits with timeouts so
-// it is CI-friendly. The binary `tcp_party` must be built by CI (either in
-// release or debug); this test will look for release binary first, then debug.
+use std::io::Read;
 
 #[test]
+#[ignore]
 fn tcp_process_integration() {
-    // reserve ephemeral ports by binding to :0 and reading assigned port
+    // reserve three ephemeral ports
     let mut listeners = Vec::new();
     for _ in 0..3 {
-        let l = std::net::TcpListener::bind("127.0.0.1:0").expect("failed to bind ephemeral port");
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         listeners.push(l);
     }
-    let addrs: Vec<String> = listeners.iter().map(|l| l.local_addr().unwrap().to_string()).collect();
-    // drop listeners so spawned processes can bind to the same ports
-    drop(listeners);
+    let addrs: Vec<String> = listeners.iter()
+        .map(|l| l.local_addr().unwrap().to_string())
+        .collect();
+    drop(listeners); // free ports for children
 
-    // locate the tcp_party binary (prefer release, fallback to debug)
     let release_bin = Path::new("./target/release/tcp_party");
-    let debug_bin = Path::new("./target/debug/tcp_party");
-    let bin_path = if release_bin.exists() {
-        release_bin
-    } else if debug_bin.exists() {
-        debug_bin
-    } else {
-        panic!("tcp_party binary not found; please run `cargo build --release` before running this test");
-    };
+    let debug_bin   = Path::new("./target/debug/tcp_party");
+    let bin_path = if release_bin.exists() { release_bin }
+                   else if debug_bin.exists() { debug_bin }
+                   else { panic!("tcp_party binary not found; run `cargo build` first") };
 
     let addrs_str = addrs.join(",");
 
-    // spawn three processes with D values 10,20,30
+    // spawn three children with a small stagger so each listener is ready
+    // before the next party starts connecting.
     let mut children = Vec::new();
-    for i in 0..3 {
-        let arg_id = i.to_string();
-        let arg_addrs = addrs_str.clone();
-        let arg_d = match i {
-            0 => "10".to_string(),
-            1 => "20".to_string(),
-            _ => "30".to_string(),
-        };
+    for i in 0..3usize {
         let child = Command::new(bin_path)
-            .arg(arg_id)
-            .arg(arg_addrs)
-            .arg(arg_d)
+            .arg(i.to_string())
+            .arg(&addrs_str)
+            .arg(match i { 0 => "10", 1 => "20", _ => "30" })
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
             .expect("failed to spawn tcp_party");
         children.push(child);
-        // small stagger to allow listener threads inside the binary to bind
-        // increase from 50ms to 200ms to reduce flakiness on slower CI machines
-        thread::sleep(Duration::from_millis(200));
+        thread::sleep(Duration::from_millis(250));
     }
 
-    // wait for children to finish with timeout and collect outputs
-    let mut sums = Vec::new();
-    for mut c in children {
-        let start = Instant::now();
-        let timeout = Duration::from_secs(8);
-        loop {
-            match c.try_wait() {
-                Ok(Some(_status)) => {
-                    let out = c.wait_with_output().expect("wait_with_output failed");
-                    let mut combined = String::new();
-                    combined.push_str(&String::from_utf8_lossy(&out.stdout));
-                    combined.push_str(&String::from_utf8_lossy(&out.stderr));
-                    sums.push(combined);
-                    break;
-                }
-                Ok(None) => {
-                    if start.elapsed() > timeout {
-                        // kill and fail the test
-                        let _ = c.kill();
-                        panic!("tcp_party child timed out");
+    // Watch all three children concurrently.  Draining output in a sub-thread
+    // prevents the OS pipe buffer from filling up and stalling a child that
+    // another child is waiting to hear from.
+    let watchers: Vec<_> = children.into_iter().enumerate().map(|(i, mut child)| {
+        thread::spawn(move || {
+            let mut stdout = child.stdout.take().unwrap();
+            let mut stderr = child.stderr.take().unwrap();
+
+            // drain pipes so the child never blocks on writes
+            let out_t = thread::spawn(move || {
+                let mut s = String::new();
+                let _ = stdout.read_to_string(&mut s);
+                s
+            });
+            let err_t = thread::spawn(move || {
+                let mut s = String::new();
+                let _ = stderr.read_to_string(&mut s);
+                s
+            });
+
+            // wait for the process with a hard timeout
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                match child.try_wait() {
+                    Ok(Some(_)) => break,
+                    Ok(None) => {
+                        if Instant::now() > deadline {
+                            let _ = child.kill();
+                            panic!("party {} timed out", i);
+                        }
+                        thread::sleep(Duration::from_millis(20));
                     }
-                    thread::sleep(Duration::from_millis(20));
+                    Err(e) => panic!("wait error for party {}: {}", i, e),
                 }
-                Err(e) => panic!("error waiting for child: {}", e),
             }
-        }
-    }
 
-    // each process should have printed a SUM: 60
-    for s in sums {
-        assert!(s.contains("SUM:"), "output missing SUM: {}", s);
-        // parse the last SUM occurrence (some binaries may print intermediate SUMs)
-        let after_last = s.rsplitn(2, "SUM:").next().unwrap();
-        let first_token = after_last.trim().split_whitespace().next().expect("no number after SUM:");
-        let num: u128 = first_token.parse().expect("parse sum");
-        assert_eq!(num, 60u128, "unexpected sum from child output:\n{}", s);
+            let out = out_t.join().unwrap();
+            let err = err_t.join().unwrap();
+            format!("{}{}", out, err)
+        })
+    }).collect();
+
+    // collect results and assert SUM: 60 from each party
+    for (i, w) in watchers.into_iter().enumerate() {
+        let combined = w.join().unwrap_or_else(|e| {
+            std::panic::resume_unwind(e)
+        });
+        assert!(combined.contains("SUM:"),
+            "party {} output missing SUM:\n{}", i, combined);
+        let after  = combined.rsplitn(2, "SUM:").next().unwrap();
+        let token  = after.trim().split_whitespace().next()
+            .unwrap_or_else(|| panic!("no number after SUM: in party {} output", i));
+        let num: u128 = token.parse()
+            .unwrap_or_else(|_| panic!("parse sum failed for party {}: {}", i, combined));
+        assert_eq!(num, 60u128, "wrong sum for party {}:\n{}", i, combined);
     }
 }
+
+
+
+

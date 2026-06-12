@@ -166,33 +166,67 @@ fn run_tcp(me: usize, mpc_addrs: Vec<String>, dist_addrs: Vec<String>) {
 // Main
 // ---------------------------------------------------------------------------
 
+/// Legacy D-sum protocol (used by the integration test).
+/// Each party broadcasts its d_value and prints `SUM: <total>`.
+fn run_d_sum(me: usize, addrs: Vec<String>, d_val: u128) {
+    use std::time::Duration as D;
+    thread::sleep(D::from_millis(50 * me as u64));
+    let transport = TcpTransport::new(me, addrs);
+    transport.broadcast(serialize_msg(&MpcMsg::D(d_val)));
+
+    let mut got = vec![false; 3];
+    got[me] = true;
+    let mut d_shares = vec![0u128; 3];
+    d_shares[me] = d_val;
+    let mut pending = 2;
+    let start = std::time::Instant::now();
+    while pending > 0 && start.elapsed() < Duration::from_secs(8) {
+        if let Some((from, msg)) = transport.recv() {
+            if let MpcMsg::D(v) = deserialize_msg(&msg) {
+                if !got[from] { got[from] = true; d_shares[from] = v; pending -= 1; }
+            }
+        } else {
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+    if pending > 0 { eprintln!("[party {}] timed out", me); std::process::exit(1); }
+    let sum: u128 = d_shares.iter().fold(0, |a, &v| a.wrapping_add(v));
+    println!("SUM: {}", sum);
+}
+
 fn main() {
     let args: Vec<String> = env::args().collect();
+
+    // no-args: in-process demo
     if args.len() < 3 {
         run_inproc_demo();
         return;
     }
 
-    // args: <id> <mpc_addrs> [dist_addrs]
-    // mpc_addrs and dist_addrs are comma-separated triples of host:port
-    // If dist_addrs is omitted, we derive it by incrementing each port by 100.
     let me: usize = args[1].parse().expect("first argument must be party id (0/1/2)");
-    let mpc_addrs: Vec<String> = args[2].split(',').map(|s| s.to_string()).collect();
-    if mpc_addrs.len() != 3 { eprintln!("expected 3 MPC addresses"); std::process::exit(1); }
+    let addrs: Vec<String> = args[2].split(',').map(|s| s.to_string()).collect();
+    if addrs.len() != 3 { eprintln!("expected 3 addresses"); std::process::exit(1); }
 
-    let dist_addrs: Vec<String> = if args.len() >= 4 {
-        args[3].split(',').map(|s| s.to_string()).collect()
-    } else {
-        // derive distribution addresses by adding 100 to each port
-        mpc_addrs.iter().map(|addr| {
-            if let Some(colon) = addr.rfind(':') {
-                let port: u16 = addr[colon+1..].parse().unwrap_or(7000);
-                format!("{}:{}", &addr[..colon], port + 100)
-            } else { format!("{}:7100", addr) }
-        }).collect()
-    };
+    // legacy integration-test mode: <id> <addrs> <d_value>
+    if args.len() >= 4 {
+        if let Ok(d_val) = args[3].parse::<u128>() {
+            run_d_sum(me, addrs, d_val);
+            return;
+        }
+        // fourth arg is dist_addrs (MPC interactive mode)
+        let dist_addrs: Vec<String> = args[3].split(',').map(|s| s.to_string()).collect();
+        thread::sleep(Duration::from_millis(300 + me as u64 * 150));
+        run_tcp(me, addrs, dist_addrs);
+        return;
+    }
 
-    // small staggered startup delay so listeners are up before senders connect
+    // two args: derive dist_addrs by bumping port by 100
+    let dist_addrs: Vec<String> = addrs.iter().map(|addr| {
+        if let Some(colon) = addr.rfind(':') {
+            let port: u16 = addr[colon+1..].parse().unwrap_or(7000);
+            format!("{}:{}", &addr[..colon], port + 100)
+        } else { format!("{}:7100", addr) }
+    }).collect();
     thread::sleep(Duration::from_millis(300 + me as u64 * 150));
-    run_tcp(me, mpc_addrs, dist_addrs);
+    run_tcp(me, addrs, dist_addrs);
 }
