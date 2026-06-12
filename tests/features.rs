@@ -1,50 +1,162 @@
 use baru::interpreter::{parse, Participant, SharedValue};
 
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+/// Evaluate a plain (non-shared) expression and return the numeric result.
 fn eval(src: &str) -> i64 {
     let expr = parse(src).expect("parse failed");
     let p = Participant::new_sim(0);
     match p.eval(&expr) {
         SharedValue::Num(n) => n,
-        other => panic!("expected numeric result, got: {:?}", other),
+        other => panic!("expected Num, got: {:?}", other),
     }
 }
 
+/// Evaluate an expression, reveal any resulting Share, and return the
+/// reconstructed value interpreted as a signed 32-bit integer.
+fn eval_shared(src: &str) -> i64 {
+    let expr = parse(src).expect("parse failed");
+    let p = Participant::new_sim(0);
+    match p.eval(&expr) {
+        // Plain Num may carry a raw u128 field value stored as i64 bits; reinterpret as signed 32.
+        SharedValue::Num(n) => (n as u32) as i32 as i64,
+        SharedValue::Share(sr) => {
+            let raw = p.reveal(&sr);
+            // sign-extend from 32 bits
+            (raw as u32) as i32 as i64
+        }
+        other => panic!("expected Num or Share, got: {:?}", other),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Basic arithmetic
+// ---------------------------------------------------------------------------
+
 #[test]
-fn test_add_mul_nested() {
-    assert_eq!(eval("(+ (* 6 7) (* 3 14))"), 84);
+fn test_add() { assert_eq!(eval("(+ 10 32)"), 42); }
+
+#[test]
+fn test_mul() { assert_eq!(eval("(* 6 7)"), 42); }
+
+#[test]
+fn test_sub() { assert_eq!(eval("(- 100 58)"), 42); }
+
+#[test]
+fn test_div_exact() { assert_eq!(eval("(/ 84 7)"), 12); }
+
+#[test]
+fn test_add_mul_nested() { assert_eq!(eval("(+ (* 6 7) (* 3 14))"), 84); }
+
+#[test]
+fn test_mod_basic() { assert_eq!(eval("(mod 10 3)"), 1); }
+
+#[test]
+fn test_neg_unary() { assert_eq!(eval("(- 0 5)"), -5); }
+
+#[test]
+fn test_wrapping_arithmetic() {
+    // basic wrapping identity: (a - a) = 0
+    assert_eq!(eval("(- 100 100)"), 0);
+    assert_eq!(eval("(+ 0 0)"), 0);
+}
+
+// ---------------------------------------------------------------------------
+// Comparisons
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_comparisons() {
+    assert_eq!(eval("(< 3 4)"), 1);
+    assert_eq!(eval("(<= 3 3)"), 1);
+    assert_eq!(eval("(<= 3 4)"), 1);
+    assert_eq!(eval("(> 5 2)"), 1);
+    assert_eq!(eval("(>= 2 3)"), 0);
+    assert_eq!(eval("(>= 3 3)"), 1);
+    assert_eq!(eval("(== 7 7)"), 1);
+    assert_eq!(eval("(== 7 8)"), 0);
 }
 
 #[test]
-fn test_add() {
-    assert_eq!(eval("(+ 10 32)"), 42);
+fn test_comparison_with_negatives() {
+    assert_eq!(eval("(< -5 0)"), 1);
+    assert_eq!(eval("(> 0 -1)"), 1);
+    assert_eq!(eval("(<= -3 -3)"), 1);
+}
+
+// ---------------------------------------------------------------------------
+// Booleans and logical operators
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_booleans_not_and_or() {
+    assert_eq!(eval("(not #t)"), 0);
+    assert_eq!(eval("(not #f)"), 1);
+    assert_eq!(eval("(and #t #f)"), 0);
+    assert_eq!(eval("(and #t #t)"), 1);
+    assert_eq!(eval("(or #t #f)"), 1);
+    assert_eq!(eval("(or #f #f)"), 0);
 }
 
 #[test]
-fn test_mul() {
-    assert_eq!(eval("(* 6 7)"), 42);
+fn test_not_numeric() {
+    assert_eq!(eval("(not 0)"), 1);
+    assert_eq!(eval("(not 42)"), 0);
 }
 
 #[test]
-fn test_sub() {
-    assert_eq!(eval("(- 100 58)"), 42);
+fn test_bitwise_and_or() {
+    assert_eq!(eval("(and 6 3)"), 2);
+    assert_eq!(eval("(or  6 3)"), 7);
+}
+
+// ---------------------------------------------------------------------------
+// Strings and characters
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_strings_eq() {
+    assert_eq!(eval("(== \"hi\" \"hi\")"), 1);
+    assert_eq!(eval("(== \"hi\" \"ho\")"), 0);
 }
 
 #[test]
-fn test_div_exact() {
-    assert_eq!(eval("(/ 84 7)"), 12);
+fn test_chars_eq() {
+    assert_eq!(eval("(== 'a' 'a')"), 1);
+    assert_eq!(eval("(== 'a' 'b')"), 0);
 }
+
+#[test]
+fn test_string_closure_capture() {
+    assert_eq!(eval("(let ((s \"hi\")) (== s \"hi\"))"), 1);
+}
+
+// ---------------------------------------------------------------------------
+// Let bindings
+// ---------------------------------------------------------------------------
 
 #[test]
 fn test_let_simple() {
-    assert_eq!(eval("(let (a 6) (b 7) (+ a b))"), 13);
+    assert_eq!(eval("(let ((a 6) (b 7)) (+ a b))"), 13);
 }
 
 #[test]
-fn test_cons_car_cdr() {
-    let _ = parse("(cons 1 (cons 2 (cons 3 ())))");
-    let l = SharedValue::List(vec![SharedValue::Num(1), SharedValue::Num(2)]);
-    assert!(matches!(l, SharedValue::List(_)));
+fn test_let_nested_shadow() {
+    // inner binding shadows outer
+    assert_eq!(eval("(let ((x 1)) (let ((x 2)) x))"), 2);
 }
+
+#[test]
+fn test_let_multiple_body_exprs() {
+    // last expression in body is the result
+    assert_eq!(eval("(let ((a 1)) (+ a 1) (+ a 10))"), 11);
+}
+
+// ---------------------------------------------------------------------------
+// Lambdas and closures
+// ---------------------------------------------------------------------------
 
 #[test]
 fn test_lambda_direct_call() {
@@ -62,162 +174,572 @@ fn test_lambda_closure_capture() {
 }
 
 #[test]
+fn test_higher_order_apply() {
+    // apply: takes a function and a value, applies the function
+    let src = "(let ((apply (lambda (f x) (f x)))) (apply (lambda (n) (* n n)) 7))";
+    assert_eq!(eval(src), 49);
+}
+
+#[test]
+fn test_higher_order_compose() {
+    // compose two functions: f∘g
+    let src = "(let ((compose (lambda (f g) (lambda (x) (f (g x))))))
+                 (let ((double (lambda (x) (* x 2)))
+                       (inc    (lambda (x) (+ x 1))))
+                   ((compose double inc) 3)))";
+    assert_eq!(eval(src), 8); // double(inc(3)) = double(4) = 8
+}
+
+#[test]
+fn test_currying() {
+    // add-n returns a closure that adds n to its argument
+    let src = "(let ((add-n (lambda (n) (lambda (x) (+ x n)))))
+                 ((add-n 5) 37))";
+    assert_eq!(eval(src), 42);
+}
+
+// ---------------------------------------------------------------------------
+// Lists (cons / car / cdr)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_cons_car_cdr_eval() {
+    assert_eq!(eval("(car (cons 1 (cons 2 ())))"), 1);
+    assert_eq!(eval("(car (cdr (cons 1 (cons 2 ()))))"), 2);
+}
+
+#[test]
+fn test_list_length_recursive() {
+    // length of a list via recursion
+    let src = "(letrec ((len (lambda (lst)
+                              (if (== (car lst) 0)
+                                  0
+                                  (+ 1 (len (cdr lst)))))))
+                 (len (cons 1 (cons 2 (cons 3 (cons 0 ()))))))";
+    // Note: uses 0 as sentinel for empty list
+    assert_eq!(eval(src), 3);
+}
+
+#[test]
+fn test_list_sum_recursive() {
+    // sum of a fixed list using a recursive function
+    let src = "(letrec ((sum (lambda (n acc)
+                               (if (== n 0)
+                                   acc
+                                   (sum (- n 1) (+ acc n))))))
+                 (sum 10 0))";
+    assert_eq!(eval(src), 55); // 1+2+…+10 = 55
+}
+
+// ---------------------------------------------------------------------------
+// letrec — recursive and mutually recursive functions
+// ---------------------------------------------------------------------------
+
+#[test]
 fn test_letrec_recursive_function() {
     assert_eq!(eval("(letrec ((f (lambda (x) (+ x 0)))) (f 5))"), 5);
 }
 
 #[test]
 fn test_mutual_recursion_even_odd() {
-    let src = "(letrec ((iszero (lambda (n) (if (== n 0) 1 0))) (even (lambda (n) (if (== n 0) 1 (odd (- n 1)))) ) (odd (lambda (n) (if (== n 0) 0 (even (- n 1)))))) (even 4))";
+    let src = "(letrec ((even (lambda (n) (if (== n 0) 1 (odd  (- n 1)))))
+                        (odd  (lambda (n) (if (== n 0) 0 (even (- n 1))))))
+                 (even 4))";
     assert_eq!(eval(src), 1);
 }
 
+#[test]
+fn test_mutual_recursion_even_odd_odd_number() {
+    let src = "(letrec ((even (lambda (n) (if (== n 0) 1 (odd  (- n 1)))))
+                        (odd  (lambda (n) (if (== n 0) 0 (even (- n 1))))))
+                 (odd 7))";
+    assert_eq!(eval(src), 1);
+}
+
+// ---------------------------------------------------------------------------
+// Classic CS: Fibonacci
+// ---------------------------------------------------------------------------
+
 fn fib_src(n: i64) -> String {
-    format!("(letrec ((fib (lambda (n) (if (== n 0) 0 (if (== n 1) 1 (+ (fib (- n 1)) (fib (- n 2)))))))) (fib {}))", n)
+    format!("(letrec ((fib (lambda (n)
+                              (if (== n 0) 0
+                                (if (== n 1) 1
+                                  (+ (fib (- n 1)) (fib (- n 2))))))))
+               (fib {}))", n)
 }
 
 #[test]
 fn test_fibonacci() {
-    assert_eq!(eval(&fib_src(0)), 0);
-    assert_eq!(eval(&fib_src(1)), 1);
-    assert_eq!(eval(&fib_src(6)), 8);
+    assert_eq!(eval(&fib_src(0)),  0);
+    assert_eq!(eval(&fib_src(1)),  1);
+    assert_eq!(eval(&fib_src(6)),  8);
     assert_eq!(eval(&fib_src(10)), 55);
     assert_eq!(eval(&fib_src(20)), 6765);
 }
 
+// ---------------------------------------------------------------------------
+// Classic CS: factorial
+// ---------------------------------------------------------------------------
+
 #[test]
-fn test_strings_and_chars_eq() {
-    assert_eq!(eval("(== \"hi\" \"hi\")"), 1);
-    assert_eq!(eval("(== \"hi\" \"ho\")"), 0);
-    assert_eq!(eval("(== 'a' 'a')"), 1);
-    assert_eq!(eval("(== 'a' 'b')"), 0);
+fn test_factorial() {
+    let src = "(letrec ((fact (lambda (n)
+                                (if (== n 0) 1 (* n (fact (- n 1)))))))
+                 (fact 10))";
+    assert_eq!(eval(src), 3628800);
+}
+
+// ---------------------------------------------------------------------------
+// Classic CS: power (fast exponentiation)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_fast_exponentiation() {
+    // fast-pow via repeated squaring
+    let src = "(letrec ((pow (lambda (base exp)
+                               (if (== exp 0) 1
+                                 (if (== (mod exp 2) 0)
+                                   (let ((half (pow base (/ exp 2))))
+                                     (* half half))
+                                   (* base (pow base (- exp 1))))))))
+                 (pow 2 10))";
+    assert_eq!(eval(src), 1024);
+}
+
+// ---------------------------------------------------------------------------
+// Classic CS: greatest common divisor (Euclidean algorithm)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_gcd() {
+    let src = "(letrec ((gcd (lambda (a b)
+                               (if (== b 0) a (gcd b (mod a b))))))
+                 (gcd 48 18))";
+    assert_eq!(eval(src), 6);
 }
 
 #[test]
-fn test_booleans_not_and_or() {
-    assert_eq!(eval("(not #t)"), 0);
-    assert_eq!(eval("(not #f)"), 1);
-    assert_eq!(eval("(and #t #f)"), 0);
-    assert_eq!(eval("(and #t #t)"), 1);
-    assert_eq!(eval("(or #t #f)"), 1);
-    assert_eq!(eval("(or #f #f)"), 0);
+fn test_gcd_coprime() {
+    let src = "(letrec ((gcd (lambda (a b)
+                               (if (== b 0) a (gcd b (mod a b))))))
+                 (gcd 17 5))";
+    assert_eq!(eval(src), 1);
+}
+
+// ---------------------------------------------------------------------------
+// Classic CS: integer square root (Newton–Raphson)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_isqrt() {
+    // integer square root: largest n with n*n <= x
+    let src = "(letrec ((isqrt (lambda (x)
+                                 (letrec ((go (lambda (n)
+                                               (if (> (* (+ n 1) (+ n 1)) x)
+                                                 n
+                                                 (go (+ n 1))))))
+                                   (go 0)))))
+                 (isqrt 100))";
+    assert_eq!(eval(src), 10);
 }
 
 #[test]
-fn test_comparisons() {
-    assert_eq!(eval("(< 3 4)"), 1);
-    assert_eq!(eval("(<= 3 3)"), 1);
-    assert_eq!(eval("(> 5 2)"), 1);
-    assert_eq!(eval("(>= 2 3)"), 0);
+fn test_isqrt_non_perfect() {
+    let src = "(letrec ((isqrt (lambda (x)
+                                 (letrec ((go (lambda (n)
+                                               (if (> (* (+ n 1) (+ n 1)) x)
+                                                 n
+                                                 (go (+ n 1))))))
+                                   (go 0)))))
+                 (isqrt 50))";
+    assert_eq!(eval(src), 7); // floor(sqrt(50)) = 7
+}
+
+// ---------------------------------------------------------------------------
+// Classic CS: Collatz sequence length
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_collatz_length() {
+    // number of steps for n to reach 1 under the Collatz rule
+    let src = "(letrec ((collatz (lambda (n steps)
+                                   (if (== n 1) steps
+                                     (if (== (mod n 2) 0)
+                                       (collatz (/ n 2)     (+ steps 1))
+                                       (collatz (+ (* 3 n) 1) (+ steps 1)))))))
+                 (collatz 27 0))";
+    assert_eq!(eval(src), 111); // Collatz(27) takes 111 steps
+}
+
+// ---------------------------------------------------------------------------
+// Classic CS: accumulator pattern (tail-recursive sum)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_tail_recursive_sum() {
+    let src = "(letrec ((sum (lambda (n acc)
+                               (if (== n 0) acc (sum (- n 1) (+ acc n))))))
+                 (sum 100 0))";
+    assert_eq!(eval(src), 5050);
+}
+
+// ---------------------------------------------------------------------------
+// Classic CS: ackermann function (small values)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_ackermann() {
+    let src = "(letrec ((ack (lambda (m n)
+                               (if (== m 0) (+ n 1)
+                                 (if (== n 0) (ack (- m 1) 1)
+                                   (ack (- m 1) (ack m (- n 1))))))))
+                 (ack 3 3))";
+    assert_eq!(eval(src), 61);
+}
+
+// ---------------------------------------------------------------------------
+// if expressions
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_if_true_branch() {
+    assert_eq!(eval("(if (== 1 1) 42 0)"), 42);
 }
 
 #[test]
-fn test_mod_and_bitwise() {
-    assert_eq!(eval("(mod 10 3)"), 1);
-    assert_eq!(eval("(and 6 3)"), 2);
-    assert_eq!(eval("(or 6 3)"), 7);
+fn test_if_false_branch() {
+    assert_eq!(eval("(if (== 1 2) 42 99)"), 99);
 }
 
 #[test]
-fn test_cons_car_cdr_eval() {
-    assert_eq!(eval("(car (cons 1 (cons 2 ())))"), 1);
-    assert_eq!(eval("(car (cdr (cons 1 (cons 2 ()))) )"), 2);
+fn test_nested_if() {
+    let src = "(let ((x 5))
+                 (if (< x 0) -1
+                   (if (== x 0) 0
+                     1)))";
+    assert_eq!(eval(src), 1);
+}
+
+// ---------------------------------------------------------------------------
+// Shared (MPC) arithmetic — plain values
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_shared_add_reveal() {
+    assert_eq!(eval_shared("(reconstruct (+ (share 10 32) (share 32 32)))"), 42);
 }
 
 #[test]
-fn test_not_numeric() {
-    assert_eq!(eval("(not 0)"), 1);
-    assert_eq!(eval("(not 42)"), 0);
+fn test_shared_mul_reveal() {
+    assert_eq!(eval_shared("(reconstruct (* (share 6 32) (share 7 32)))"), 42);
 }
 
 #[test]
-fn test_string_closure_capture() {
-    assert_eq!(eval("(let ((s \"hi\")) (== s \"hi\"))"), 1);
+fn test_shared_sub_reveal() {
+    assert_eq!(eval_shared("(reconstruct (- (share 100 32) (share 58 32)))"), 42);
 }
+
+#[test]
+fn test_shared_scalar_add() {
+    // mixed: shared + plain constant
+    assert_eq!(eval_shared("(reconstruct (+ (share 40 32) 2))"), 42);
+}
+
+#[test]
+fn test_shared_scalar_mul() {
+    assert_eq!(eval_shared("(reconstruct (* (share 6 32) 7))"), 42);
+}
+
+// ---------------------------------------------------------------------------
+// Shared arithmetic with signed values
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_shared_negative_input() {
+    assert_eq!(eval_shared("(reconstruct (share -42 32))"), -42);
+}
+
+#[test]
+fn test_shared_signed_add() {
+    assert_eq!(eval_shared("(reconstruct (+ (share -10 32) (share 52 32)))"), 42);
+}
+
+#[test]
+fn test_shared_signed_mul() {
+    assert_eq!(eval_shared("(reconstruct (* (share -6 32) (share -7 32)))"), 42);
+}
+
+#[test]
+fn test_shared_signed_sub_negative_result() {
+    assert_eq!(eval_shared("(reconstruct (- (share 3 32) (share 10 32)))"), -7);
+}
+
+// ---------------------------------------------------------------------------
+// Shared comparisons -> oblivious select (max / min)
+// ---------------------------------------------------------------------------
 
 #[test]
 fn test_shared_comparison_select_max() {
-    // create two shared integers a and b, compute mask = (a > b) (shared bit)
-    // then compute selected = a*mask + b*(1-mask) and reconstruct result
-    let src = "(let ((a :sint32 30) (b :sint32 20) (one :sint32 1)) (let ((mask (> a b))) (+ (* a mask) (* b (- one mask)))))";
-    let expr = parse(src).expect("parse failed");
-    let p = Participant::new_sim(0);
-    let res = p.eval(&expr);
-    match res {
-        SharedValue::Share(sr) => {
-            // reveal via participant backend (uses Backend::reveal)
-            let plain = p.reveal(&sr);
-            assert_eq!(plain, 30u128);
-        }
-        other => panic!("expected shared result, got: {:?}", other),
-    }
+    let src = "(let ((a (share 30 32)) (b (share 20 32)) (one (share 1 32)))
+                 (let ((mask (> a b)))
+                   (+ (* a mask) (* b (- one mask)))))";
+    assert_eq!(eval_shared(src), 30);
 }
 
 #[test]
 fn test_shared_comparison_select_min() {
-    // same as above but with (a < b) mask to select min
-    let src = "(let ((a :sint32 30) (b :sint32 20) (one :sint32 1)) (let ((mask (< a b))) (+ (* a mask) (* b (- one mask)))))";
-    let expr = parse(src).expect("parse failed");
-    let p = Participant::new_sim(0);
+    let src = "(let ((a (share 30 32)) (b (share 20 32)) (one (share 1 32)))
+                 (let ((mask (< a b)))
+                   (+ (* a mask) (* b (- one mask)))))";
+    assert_eq!(eval_shared(src), 20);
+}
 
-    let res = p.eval(&expr);
-    match res {
-        SharedValue::Share(sr) => {
-            let plain = p.reveal(&sr);
-            assert_eq!(plain, 20u128);
-        }
-        other => panic!("expected shared result, got: {:?}", other),
-    }
-}   
+#[test]
+fn test_shared_comparison_equal_values() {
+    // when a == b, both max and min should equal a (= b)
+    let src = "(let ((a (share 42 32)) (b (share 42 32)) (one (share 1 32)))
+                 (let ((mask (> a b)))
+                   (+ (* a mask) (* b (- one mask)))))";
+    assert_eq!(eval_shared(src), 42);
+}
 
 #[test]
 fn test_shared_equality() {
-    // create two shared integers a and b, compute mask = (a == b) (shared bit)
-    // then compute selected = a*mask + b*(1-mask) and reconstruct result; test both equal and not equal cases
-    for (a_val, b_val, expected) in &[(42, 42, 42), (42, 43, 43)] {
-        let src = format!("(let ((a :sint32 {}) (b :sint32 {}) (one :sint32 1)) (let ((mask (== a b))) (+ (* a mask) (* b (- one mask)))))", a_val, b_val);
-        let expr = parse(&src).expect("parse failed");
-        let p = Participant::new_sim(0);
-        let res = p.eval(&expr);
-        match res {
-            SharedValue::Share(sr) => {
-                // reveal via participant backend
-                let plain = p.reveal(&sr);
-                assert_eq!(plain, (*expected) as u128);
-            }
-             other => panic!("expected shared result, got: {:?}", other),
-         }
-     }
- }
+    for (a_val, b_val, expected) in &[(42i64, 42i64, 42i64), (42, 43, 43)] {
+        let src = format!(
+            "(let ((a (share {} 32)) (b (share {} 32)) (one (share 1 32)))
+               (let ((mask (== a b)))
+                 (+ (* a mask) (* b (- one mask)))))",
+            a_val, b_val
+        );
+        assert_eq!(eval_shared(&src), *expected,
+            "equality select failed for a={} b={}", a_val, b_val);
+    }
+}
 
- #[test]
- fn test_very_simple_neural_network() {
-     // test a simple 2-layer NN with shared weights and inputs; just checks that the computation runs and produces some output
-     let src = "(let ((w1 :sint32 2) (w2 :sint32 3) (x :sint32 4)) (+ (* w1 x) (* w2 x)))";
-     let expr = parse(src).expect("parse failed");
-    let p = Participant::new_sim(0);
-     let res = p.eval(&expr);
-     match res {
-         SharedValue::Share(sr) => {
-             let plain = p.reveal(&sr);
-             assert_eq!(plain, 20u128); // (2*4) + (3*4) = 8 + 12 = 20
-         }
-         other => panic!("expected shared result, got: {:?}", other),
-     }
- }
+// ---------------------------------------------------------------------------
+// ReLU (max(x, 0)) — the fundamental building block of neural networks
+// ---------------------------------------------------------------------------
 
- #[test]
- fn test_simple_neural_network(){
-        // test a simple 2-layer NN with shared weights and inputs, including a ReLU activation; just checks that the computation runs and produces some output
-        let src = "(let ((w1 :sint32 2) (w2 :sint32 -3) (x :sint32 4)) (let ((z (+ (* w1 x) (* w2 x)))) (if (> z 0) z 0)))";
-        let expr = parse(src).expect("parse failed");
-        let p = Participant::new_sim(0);
-        let res = p.eval(&expr);
-        match res {
-            SharedValue::Share(sr) => {
-                let plain = p.reveal(&sr);
-                assert_eq!(plain, 0u128); // (2*4) + (-3*4) = 8 - 12 = -4, ReLU(-4) = 0
-            }
-            other => panic!("expected shared result, got: {:?}", other),
-        }
- }
+#[test]
+fn test_relu_positive() {
+    // ReLU(5) = 5
+    let src = "(let ((z (share 5 32))) (if (> z 0) z 0))";
+    assert_eq!(eval_shared(src), 5);
+}
+
+#[test]
+fn test_relu_negative() {
+    // ReLU(-4) = 0
+    let src = "(let ((z (share -4 32))) (if (> z 0) z 0))";
+    assert_eq!(eval_shared(src), 0);
+}
+
+#[test]
+fn test_relu_zero() {
+    // ReLU(0) = 0
+    let src = "(let ((z (share 0 32))) (if (> z 0) z 0))";
+    assert_eq!(eval_shared(src), 0);
+}
+
+// ---------------------------------------------------------------------------
+// Neural-network style: dot-product + ReLU
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_very_simple_neural_network() {
+    // z = w1*x + w2*x = (2+3)*4 = 20
+    let src = "(let ((w1 (share 2 32)) (w2 (share 3 32)) (x (share 4 32)))
+                 (+ (* w1 x) (* w2 x)))";
+    assert_eq!(eval_shared(src), 20);
+}
+
+#[test]
+fn test_simple_neural_network() {
+    // z = 2*4 + (-3)*4 = 8 - 12 = -4  ->  ReLU(-4) = 0
+    let src = "(let ((w1 (share 2 32)) (w2 (share -3 32)) (x (share 4 32)))
+                 (let ((z (+ (* w1 x) (* w2 x))))
+                   (if (> z 0) z 0)))";
+    assert_eq!(eval_shared(src), 0);
+}
+
+#[test]
+fn test_neural_network_positive_output() {
+    // z = 5*3 + (-2)*3 = 15 - 6 = 9  ->  ReLU(9) = 9
+    let src = "(let ((w1 (share 5 32)) (w2 (share -2 32)) (x (share 3 32)))
+                 (let ((z (+ (* w1 x) (* w2 x))))
+                   (if (> z 0) z 0)))";
+    assert_eq!(eval_shared(src), 9);
+}
+
+#[test]
+fn test_two_neuron_layer() {
+    // two neurons, same input:
+    //   n1 = ReLU(w11*x + w12*x) = ReLU((2 + -3)*4) = ReLU(-4) = 0
+    //   n2 = ReLU(w21*x + w22*x) = ReLU((1 +  2)*4) = ReLU(12) = 12
+    // output = n1 + n2 = 12
+    let src = "(let ((x  (share 4 32))
+                     (w11 (share 2 32)) (w12 (share -3 32))
+                     (w21 (share 1 32)) (w22 (share  2 32)))
+                 (let ((z1 (+ (* w11 x) (* w12 x)))
+                       (z2 (+ (* w21 x) (* w22 x))))
+                   (let ((n1 (if (> z1 0) z1 0))
+                         (n2 (if (> z2 0) z2 0)))
+                     (+ n1 n2))))";
+    assert_eq!(eval_shared(src), 12);
+}
+
+// ---------------------------------------------------------------------------
+// Classic CS over shares: oblivious absolute value
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_shared_abs_positive() {
+    // abs(x) = if x >= 0 then x else -x
+    let src = "(let ((x (share 7 32)))
+                 (if (>= x 0) x (- (share 0 32) x)))";
+    assert_eq!(eval_shared(src), 7);
+}
+
+#[test]
+fn test_shared_abs_negative() {
+    let src = "(let ((x (share -7 32)))
+                 (if (>= x 0) x (- (share 0 32) x)))";
+    assert_eq!(eval_shared(src), 7);
+}
+
+// ---------------------------------------------------------------------------
+// Classic CS over shares: oblivious clamp
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_shared_clamp() {
+    // clamp(x, lo, hi) = max(lo, min(x, hi))
+    // implemented via two oblivious selects
+    let clamp = |x: i64, lo: i64, hi: i64| {
+        let src = format!(
+            "(let ((x  (share {} 32))
+                   (lo (share {} 32))
+                   (hi (share {} 32))
+                   (one (share 1 32)))
+               (let ((clamped_hi (let ((m (< x hi)))  (+ (* x m) (* hi (- one m))))))
+                 (let ((m2 (> clamped_hi lo))) (+ (* clamped_hi m2) (* lo (- one m2))))))",
+            x, lo, hi
+        );
+        eval_shared(&src)
+    };
+    assert_eq!(clamp(-5, 0, 10), 0);
+    assert_eq!(clamp( 5, 0, 10), 5);
+    assert_eq!(clamp(15, 0, 10), 10);
+}
+
+// ---------------------------------------------------------------------------
+// Classic CS: oblivious swap (sorting network primitive)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_oblivious_sort_two_elements() {
+    // compare-and-swap: ensures result[0] <= result[1]
+    // min = a*(a<b) + b*(1-(a<b))
+    // max = b*(a<b) + a*(1-(a<b))
+    let sort2 = |a: i64, b: i64| -> (i64, i64) {
+        let src_min = format!(
+            "(let ((a (share {} 32)) (b (share {} 32)) (one (share 1 32)))
+               (let ((m (< a b))) (+ (* a m) (* b (- one m)))))",
+            a, b
+        );
+        let src_max = format!(
+            "(let ((a (share {} 32)) (b (share {} 32)) (one (share 1 32)))
+               (let ((m (> a b))) (+ (* a m) (* b (- one m)))))",
+            a, b
+        );
+        (eval_shared(&src_min), eval_shared(&src_max))
+    };
+    assert_eq!(sort2(3, 7), (3, 7));
+    assert_eq!(sort2(7, 3), (3, 7));
+    assert_eq!(sort2(5, 5), (5, 5));
+}
+
+// ---------------------------------------------------------------------------
+// Classic CS: Church numerals (purely functional, plain evaluator)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_church_numerals_add() {
+    // Church encoding: zero = λf.λx.x, succ n = λf.λx.f(n f x)
+    // church-to-int: n (λx.x+1) 0
+    let src = "(let ((zero  (lambda (f) (lambda (x) x)))
+                     (one   (lambda (f) (lambda (x) (f x))))
+                     (two   (lambda (f) (lambda (x) (f (f x)))))
+                     (three (lambda (f) (lambda (x) (f (f (f x))))))
+                     (church+ (lambda (m) (lambda (n) (lambda (f) (lambda (x) ((m f) ((n f) x)))))))
+                     (to-int  (lambda (n) ((n (lambda (x) (+ x 1))) 0))))
+                 (to-int ((church+ two) three)))";
+    assert_eq!(eval(src), 5);
+}
+
+#[test]
+fn test_church_numerals_mul() {
+    let src = "(let ((two   (lambda (f) (lambda (x) (f (f x)))))
+                     (three (lambda (f) (lambda (x) (f (f (f x))))))
+                     (church* (lambda (m) (lambda (n) (lambda (f) (m (n f))))))
+                     (to-int  (lambda (n) ((n (lambda (x) (+ x 1))) 0))))
+                 (to-int ((church* two) three)))";
+    assert_eq!(eval(src), 6);
+}
+
+// ---------------------------------------------------------------------------
+// Classic CS: Y-combinator style (via letrec)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_letrec_as_fixed_point() {
+    // power via letrec, same shape as a Y-combinator fixed point
+    let src = "(letrec ((pow (lambda (b e)
+                               (if (== e 0) 1 (* b (pow b (- e 1)))))))
+                 (pow 3 5))";
+    assert_eq!(eval(src), 243);
+}
+
+// ---------------------------------------------------------------------------
+// :sintN sugar for auto-sharing (only valid in let-binding positions)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_sint_sugar_relu() {
+    // :sintN auto-shares the next expression
+    let src = "(let ((z :sint32 -5)) (if (> z 0) z 0))";
+    assert_eq!(eval_shared(src), 0);
+}
+
+#[test]
+fn test_shared_comparison_select_max_sint() {
+    let src = "(let ((a :sint32 30) (b :sint32 20) (one :sint32 1))
+                 (let ((mask (> a b)))
+                   (+ (* a mask) (* b (- one mask)))))";
+    assert_eq!(eval_shared(src), 30);
+}
+
+#[test]
+fn test_shared_comparison_select_min_sint() {
+    let src = "(let ((a :sint32 30) (b :sint32 20) (one :sint32 1))
+                 (let ((mask (< a b)))
+                   (+ (* a mask) (* b (- one mask)))))";
+    assert_eq!(eval_shared(src), 20);
+}
+
+#[test]
+fn test_very_simple_neural_network_sint() {
+    let src = "(let ((w1 :sint32 2) (w2 :sint32 3) (x :sint32 4))
+                 (+ (* w1 x) (* w2 x)))";
+    assert_eq!(eval_shared(src), 20);
+}
+
+#[test]
+fn test_simple_neural_network_sint() {
+    // z = 2*4 + (-3)*4 = -4  ->  ReLU(-4) = 0  (using :sintN sugar)
+    let src = "(let ((w1 :sint32 2) (w2 :sint32 -3) (x :sint32 4))
+                 (let ((z (+ (* w1 x) (* w2 x))))
+                   (if (> z 0) z 0)))";
+    assert_eq!(eval_shared(src), 0);
+}

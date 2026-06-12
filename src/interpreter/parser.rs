@@ -246,7 +246,30 @@ pub fn parse_tokens(tokens: &[String], pos: &mut usize) -> Result<Expr, String> 
                 if let Expr::Var(ref s) = items[0] {
                     if s == "lambda" {
                         if items.len() < 3 { return Err("lambda form must be (lambda (args...) body)".to_string()); }
-                        let params = match &items[1] { Expr::Seq(ps) => ps.iter().map(|p| { if let Expr::Var(n) = p { n.clone() } else { panic!("lambda parameter must be identifier") } }).collect(), Expr::Var(n) => vec![n.clone()], Expr::Call(head, v) if v.is_empty() => { if let Expr::Var(n) = *head.clone() { vec![n.clone()] } else { return Err("lambda params must be a list or identifier".to_string()); } }, _ => return Err("lambda params must be a list or identifier".to_string()), };
+                        let params = match &items[1] {
+                            Expr::Seq(ps) => ps.iter().map(|p| {
+                                if let Expr::Var(n) = p { n.clone() }
+                                else { panic!("lambda parameter must be identifier") }
+                            }).collect(),
+                            Expr::Var(n) => vec![n.clone()],
+                            // (lambda (f) ...) — zero or one arg wrapped in a Call
+                            Expr::Call(head, v) if v.is_empty() => {
+                                if let Expr::Var(n) = *head.clone() { vec![n.clone()] }
+                                else { return Err("lambda params must be a list or identifier".to_string()); }
+                            },
+                            // (lambda (f x y ...) ...) — multiple params parsed as a Call
+                            Expr::Call(head, args) => {
+                                let mut params = Vec::new();
+                                if let Expr::Var(n) = *head.clone() { params.push(n); }
+                                else { return Err("lambda params must be identifiers".to_string()); }
+                                for a in args {
+                                    if let Expr::Var(n) = a { params.push(n.clone()); }
+                                    else { return Err("lambda params must be identifiers".to_string()); }
+                                }
+                                params
+                            },
+                            _ => return Err("lambda params must be a list or identifier".to_string()),
+                        };
                         let body = if items.len() == 3 { items.into_iter().nth(2).unwrap() } else { Expr::Seq(items.into_iter().skip(2).collect()) };
                         return Ok(Expr::Lambda(params, Box::new(body)));
                     }
