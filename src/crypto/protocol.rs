@@ -415,30 +415,39 @@ pub fn a2b_party<T: Transport>(
     let d: Fr = d_shares.iter().fold(0u128, |acc, &v| acc.wrapping_add(v));
 
     // compute shared bit decomposition using public d and shared r_bits
-    // carry adder: sum_i = r_i XOR d_i XOR carry_i
+    // ripple-carry adder: a = d + r, where d is a public integer and r is secret-shared bit-by-bit
+    //
+    // For each bit position i:
+    //   sum_i  = r_i XOR d_i XOR carry_i
+    //   carry_{i+1} = majority(r_i, d_i, carry_i)
+    //
+    // Since r_i and d_i are both PUBLIC (r is the agreed mask, d = a - r is broadcast),
+    // majority(r_i, d_i, carry_i) = r_i*d_i + (r_i XOR d_i)*carry_i
+    // — a local computation: r_i*d_i is a scalar-scalar product, (r_i XOR d_i) is
+    //   a public bit, so the carry update requires NO communication.
     let mut out: Vec<PartyShare> = Vec::with_capacity(nbits);
     let mut carry = share_public(0, me); // carry starts at 0
 
     for i in 0..nbits {
-        let d_bit: Fr = (d >> i) & 1;
-        let d_share = share_public(d_bit, me); // d_bit is public
-        let r_bit = &r_bits[i];
+        let d_bit: Fr = (d >> i) & 1;   // public
+        let r_bit_val: Fr = (r >> i) & 1; // public (same r for all parties since seeded rng)
+        let r_bit = &r_bits[i];           // secret-shared form of r_bit_val
 
-        // XOR = a + b - 2*a*b  (no communication since d is public)
-        // sum = r_i XOR d_i XOR carry
-        let s1 = xor_public_party(r_bit, &d_share, me);
+        // sum = r_i XOR d_i XOR carry  (local, no communication)
+        let s1  = xor_public_party(r_bit, &share_public(d_bit, me), me);
         let sum = xor_public_party(&s1, &carry, me);
         out.push(sum);
 
-        // carry = majority(r_i, d_i, carry) = r_i*d_i + d_i*carry + r_i*carry - 2*r_i*d_i*carry
-        // Since d is public we can use scalar multiplication for d-terms
-        let r_and_d = scalar_mul_party(r_bit, d_bit); // r_i * d_bit (public scalar)
-        let d_and_c = scalar_mul_party(&carry, d_bit);
-        let r_and_c = xor_public_party(r_bit, &carry, me); // we'll use OR logic
-        // carry_next = OR(r_and_d, d_and_c, r_and_c)  simplified:
-        // majority = r_and_d XOR d_and_c XOR r_and_c  (works for bits)
-        let t1 = xor_public_party(&r_and_d, &d_and_c, me);
-        carry = xor_public_party(&t1, &r_and_c, me);
+        // majority(r_i, d_i, carry) = r_i*d_i + (r_i XOR d_i)*carry
+        //   r_i*d_i = scalar (both public)
+        //   (r_i XOR d_i) = public scalar
+        //   (r_i XOR d_i)*carry = scalar_mul on a secret-shared carry
+        let r_and_d: Fr = r_bit_val.wrapping_mul(d_bit);                  // scalar
+        let r_xor_d: Fr = r_bit_val ^ d_bit;                               // scalar
+        let xor_times_carry = scalar_mul_party(&carry, r_xor_d);           // local scalar mul
+        // carry_{i+1} = r_and_d_public + (r_xor_d)*carry
+        let carry_base = share_public(r_and_d, me);
+        carry = add_party(&carry_base, &xor_times_carry);
     }
 
     out

@@ -16,6 +16,7 @@ use std::env;
 use std::path::PathBuf;
 use std::time::Duration;
 use std::thread;
+use std::panic;
 
 use colored::*;
 use rustyline::Editor;
@@ -225,14 +226,28 @@ fn run_tcp(me: usize, mpc_addrs: Vec<String>, dist_addrs: Vec<String>) {
                                 broadcast_expr(ex.code, &dist_transport);
                                 match parse(ex.code) {
                                     Ok(expr) => {
-                                        let result = if verbose {
-                                            participant.eval_quiet_verbose(&expr)
-                                        } else {
-                                            participant.eval_quiet(&expr)
-                                        };
-                                        println!("{} {}", "=>".bright_yellow(), display_result(&result, &participant));
+                                        let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
+                                            if verbose {
+                                                participant.eval_quiet_verbose(&expr)
+                                            } else {
+                                                participant.eval_quiet(&expr)
+                                            }
+                                        }));
+                                        match result {
+                                            Ok(val) => println!("{} {}", "=>".bright_yellow(), display_result(&val, &participant)),
+                                            Err(e) => {
+                                                let msg = if let Some(s) = e.downcast_ref::<String>() { s.clone() }
+                                                          else if let Some(s) = e.downcast_ref::<&str>() { s.to_string() }
+                                                          else { "unknown runtime error".to_string() };
+                                                println!("{} {}", "runtime error:".bright_red(), msg);
+                                                broadcast_expr(":abort", &dist_transport);
+                                            }
+                                        }
                                     }
-                                    Err(e) => println!("{} {}", "parse error:".bright_red(), e),
+                                    Err(e) => {
+                                        println!("{} {}", "parse error:".bright_red(), e);
+                                        broadcast_expr(":abort", &dist_transport);
+                                    }
                                 }
                             }
                             _ => println!("usage: :example <n>  (use ':examples' to list, 1–{})", EXAMPLES.len()),
@@ -264,16 +279,33 @@ fn run_tcp(me: usize, mpc_addrs: Vec<String>, dist_addrs: Vec<String>) {
             match parse(&src) {
                 Err(e) => {
                     println!("{} {}", "parse error:".bright_red(), e);
-                    // broadcast a no-op so peers don't hang waiting
-                    broadcast_expr("0", &dist_transport);
+                    // Workers already received the expression and got the same parse error.
+                    // Broadcast :abort so they skip any pending reveal and return to wait.
+                    broadcast_expr(":abort", &dist_transport);
                 }
                 Ok(expr) => {
-                    let result = if verbose {
-                        participant.eval_quiet_verbose(&expr)
-                    } else {
-                        participant.eval_quiet(&expr)
-                    };
-                    println!("{} {}", "=>".bright_yellow(), display_result(&result, &participant));
+                    // Wrap evaluation in catch_unwind so a panic (e.g. MPC protocol
+                    // timeout, out-of-field value) doesn't crash the whole process.
+                    let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
+                        if verbose {
+                            participant.eval_quiet_verbose(&expr)
+                        } else {
+                            participant.eval_quiet(&expr)
+                        }
+                    }));
+                    match result {
+                        Ok(val) => {
+                            println!("{} {}", "=>".bright_yellow(), display_result(&val, &participant));
+                        }
+                        Err(e) => {
+                            let msg = if let Some(s) = e.downcast_ref::<String>() { s.clone() }
+                                      else if let Some(s) = e.downcast_ref::<&str>() { s.to_string() }
+                                      else { "unknown runtime error".to_string() };
+                            println!("{} {}", "runtime error:".bright_red(), msg);
+                            // Broadcast :abort so workers re-sync to the wait loop.
+                            broadcast_expr(":abort", &dist_transport);
+                        }
+                    }
                 }
             }
         }
@@ -290,30 +322,49 @@ fn run_tcp(me: usize, mpc_addrs: Vec<String>, dist_addrs: Vec<String>) {
                 eprintln!("{}", format!("[party {}] received :quit, exiting.", me).bright_yellow());
                 break;
             }
+            if src == ":abort" {
+                // Party 0 had a parse or runtime error; skip this round.
+                eprintln!("{}", format!("[party {}] received :abort, skipping expression.", me).bright_yellow());
+                continue;
+            }
             eprintln!("{}", format!("[party {}] evaluating: {}", me, src).bright_black());
             match parse(&src) {
                 Ok(expr) => {
-                    let result = participant.eval_quiet(&expr);
-                    // Mirror party 0's display_result so the reveal protocol stays in sync.
-                    // If the expression returns a bare Share (no reconstruct), party 0 calls
-                    // participant.reveal() inside display_result — we must participate too.
-                    // If it returned a Num (reconstruct already ran), no extra reveal needed.
-                    let display = match &result {
-                        SharedValue::Share(sr) => {
-                            // participate in the extra reveal party 0 is doing in display_result
-                            let raw = participant.reveal(sr);
-                            let signed = (raw as u32) as i32 as i64;
-                            signed.to_string()
+                    // Wrap in catch_unwind so a protocol panic doesn't crash the worker.
+                    let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
+                        participant.eval_quiet(&expr)
+                    }));
+                    match result {
+                        Ok(val) => {
+                            // Mirror party 0's display_result to stay in sync on reveals.
+                            let display = match &val {
+                                SharedValue::Share(sr) => {
+                                    let raw = participant.reveal(sr);
+                                    ((raw as u32) as i32 as i64).to_string()
+                                }
+                                SharedValue::Num(n) => ((*n as u32) as i32 as i64).to_string(),
+                                other => format!("{:?}", other),
+                            };
+                            eprintln!("{}", format!("[party {}] => {}  (waiting for next expression)", me, display).bright_black());
                         }
-                        SharedValue::Num(n) => {
-                            let signed = (*n as u32) as i32 as i64;
-                            signed.to_string()
+                        Err(e) => {
+                            let msg = if let Some(s) = e.downcast_ref::<String>() { s.clone() }
+                                      else if let Some(s) = e.downcast_ref::<&str>() { s.to_string() }
+                                      else { "unknown runtime error".to_string() };
+                            eprintln!("{}", format!("[party {}] runtime error: {}  (recovered, waiting for next)", me, msg).bright_red());
+                            // Wait for the :abort that party 0 will broadcast.
+                            let abort = receive_expr(&dist_transport);
+                            if abort.trim() == ":quit" { break; }
+                            // any other message (including :abort) — continue the loop
                         }
-                        other => format!("{:?}", other),
-                    };
-                    eprintln!("{}", format!("[party {}] => {}  (waiting for next expression)", me, display).bright_black());
+                    }
                 }
-                Err(e) => eprintln!("{}", format!("[party {}] parse error: {}", me, e).bright_red()),
+                Err(e) => {
+                    eprintln!("{}", format!("[party {}] parse error: {}  (waiting for :abort)", me, e).bright_red());
+                    // Wait for :abort from party 0 before re-entering the wait loop.
+                    let abort = receive_expr(&dist_transport);
+                    if abort.trim() == ":quit" { break; }
+                }
             }
         }
     }
