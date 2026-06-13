@@ -223,6 +223,7 @@ fn run_tcp(me: usize, mpc_addrs: Vec<String>, dist_addrs: Vec<String>) {
                                 println!("{} {}", "Expected:".bright_yellow(), ex.expected.bright_magenta());
                                 println!();
                                 // broadcast and fall through to normal eval below
+                                participant.reset_per_expression();
                                 broadcast_expr(ex.code, &dist_transport);
                                 match parse(ex.code) {
                                     Ok(expr) => {
@@ -275,6 +276,9 @@ fn run_tcp(me: usize, mpc_addrs: Vec<String>, dist_addrs: Vec<String>) {
             }
 
             // ── Normal expression ────────────────────────────────────────────
+            // Reset per-expression backend state so all parties' ID counters start
+            // at the same value for this expression (crucial after error recovery).
+            participant.reset_per_expression();
             broadcast_expr(&src, &dist_transport);
             match parse(&src) {
                 Err(e) => {
@@ -332,6 +336,7 @@ fn run_tcp(me: usize, mpc_addrs: Vec<String>, dist_addrs: Vec<String>) {
                 Ok(expr) => {
                     // Wrap in catch_unwind so a protocol panic doesn't crash the worker.
                     let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
+                        participant.reset_per_expression();
                         participant.eval_quiet(&expr)
                     }));
                     match result {

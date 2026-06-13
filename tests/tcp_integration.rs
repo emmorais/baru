@@ -3,6 +3,12 @@ use std::time::{Duration, Instant};
 use std::thread;
 use std::path::Path;
 use std::io::{Read, Write};
+use std::sync::Mutex;
+
+// Serialize all integration tests even when `--test-threads > 1`.
+// Each test spawns real processes on dynamically allocated TCP ports; running
+// them in parallel causes port-reuse races and message cross-contamination.
+static TEST_MUTEX: Mutex<()> = Mutex::new(());
 
 // ── helpers ──────────────────────────────────────────────────────────────────
 

@@ -38,6 +38,10 @@ pub trait Backend: Send + Sync {
     fn reveal(&mut self, a: &ShareRef, reveal_to: Option<usize>) -> Fr;
     fn a2b(&mut self, a: &ShareRef, nbits: usize) -> Vec<ShareRef>;
     fn b2a(&mut self, bits: &[ShareRef]) -> ShareRef;
+    /// Reset per-expression state (share map, ID counter) so the next expression
+    /// starts with a clean slate.  Called by the REPL before each expression to
+    /// keep all parties' ID counters in sync even after an error/abort.
+    fn reset_per_expression(&mut self) {}
 }
 
 /// Single-process simulation backend backed by current sim/inproc wrappers.
@@ -347,5 +351,10 @@ impl<T: Transport + 'static> Backend for TransportBackend<T> {
             acc = protocol::add_party(&acc, &term);
         }
         self.store(id, acc, bits.get(0).map(|s| s.nbits).unwrap_or(0), bits.get(0).map(|s| s.owner).unwrap_or(0))
+    }
+
+    fn reset_per_expression(&mut self) {
+        self.shares.clear();
+        self.next_id = 1;
     }
 }

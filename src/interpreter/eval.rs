@@ -389,7 +389,7 @@ pub fn reduce_expression(expr: Expr, cont: Continuation, env: Env, backend: Arc<
                                 // if either operand is a shared value, dispatch to backend
                                 match (&left_val, &val) {
                                     (SharedValue::Share(sa), SharedValue::Share(sb)) => {
-                                        let mut be = backend.lock().unwrap();
+                                        let mut be = backend.lock().unwrap_or_else(|e| e.into_inner());
                                         let sr = match op {
                                             super::parser::BinOp::Add => be.add(&sa, &sb),
                                             super::parser::BinOp::Sub => be.sub(&sa, &sb),
@@ -399,7 +399,7 @@ pub fn reduce_expression(expr: Expr, cont: Continuation, env: Env, backend: Arc<
                                         SharedValue::Share(sr)
                                     }
                                     (SharedValue::Share(sa), SharedValue::Num(bn)) => {
-                                        let mut be = backend.lock().unwrap();
+                                        let mut be = backend.lock().unwrap_or_else(|e| e.into_inner());
                                         // convert signed immediate into two's-complement field element for sa.nbits
                                         let imm = int_to_fr_signed(*bn as i64, sa.nbits);
                                         let sb = be.share_secret(imm, sa.nbits, 0);
@@ -412,7 +412,7 @@ pub fn reduce_expression(expr: Expr, cont: Continuation, env: Env, backend: Arc<
                                         SharedValue::Share(sr)
                                     }
                                     (SharedValue::Num(an), SharedValue::Share(sb)) => {
-                                        let mut be = backend.lock().unwrap();
+                                        let mut be = backend.lock().unwrap_or_else(|e| e.into_inner());
                                         // convert signed immediate into two's-complement field element for sb.nbits
                                         let imm = int_to_fr_signed(*an as i64, sb.nbits);
                                         let sa = be.share_secret(imm, sb.nbits, 0);
@@ -453,17 +453,17 @@ pub fn reduce_expression(expr: Expr, cont: Continuation, env: Env, backend: Arc<
                                     (SharedValue::Str(a), SharedValue::Str(b)) => SharedValue::Num(if a == b { 1 } else { 0 }),
                                     (SharedValue::Char(a), SharedValue::Char(b)) => SharedValue::Num(if a == b { 1 } else { 0 }),
                                     (SharedValue::Share(sa), SharedValue::Share(sb)) => {
-                                        let mut be = backend.lock().unwrap();
+                                        let mut be = backend.lock().unwrap_or_else(|e| e.into_inner());
                                         SharedValue::Share(be.eq(&sa, &sb))
                                     }
                                     (SharedValue::Share(sa), SharedValue::Num(bn)) => {
-                                        let mut be = backend.lock().unwrap();
+                                        let mut be = backend.lock().unwrap_or_else(|e| e.into_inner());
                                         let imm = int_to_fr_signed(*bn as i64, sa.nbits);
                                         let sb = be.share_secret(imm, sa.nbits, 0);
                                         SharedValue::Share(be.eq(&sa, &sb))
                                     }
                                     (SharedValue::Num(an), SharedValue::Share(sb)) => {
-                                        let mut be = backend.lock().unwrap();
+                                        let mut be = backend.lock().unwrap_or_else(|e| e.into_inner());
                                         let imm = int_to_fr_signed(*an as i64, sb.nbits);
                                         let sa = be.share_secret(imm, sb.nbits, 0);
                                         SharedValue::Share(be.eq(&sa, &sb))
@@ -484,7 +484,7 @@ pub fn reduce_expression(expr: Expr, cont: Continuation, env: Env, backend: Arc<
                                         SharedValue::Num(if r { 1 } else { 0 })
                                     }
                                     (SharedValue::Share(sa), SharedValue::Share(sb)) => {
-                                        let mut be = backend.lock().unwrap();
+                                        let mut be = backend.lock().unwrap_or_else(|e| e.into_inner());
                                         let out = match op {
                                             super::parser::BinOp::Lt => be.lt(&sa, &sb),
                                             super::parser::BinOp::Gt => be.lt(&sb, &sa),
@@ -495,7 +495,7 @@ pub fn reduce_expression(expr: Expr, cont: Continuation, env: Env, backend: Arc<
                                         SharedValue::Share(out)
                                     }
                                     (SharedValue::Share(sa), SharedValue::Num(bn)) => {
-                                        let mut be = backend.lock().unwrap();
+                                        let mut be = backend.lock().unwrap_or_else(|e| e.into_inner());
                                         let imm = int_to_fr_signed(*bn as i64, sa.nbits);
                                         let sb = be.share_secret(imm, sa.nbits, 0);
                                         let out = match op {
@@ -508,7 +508,7 @@ pub fn reduce_expression(expr: Expr, cont: Continuation, env: Env, backend: Arc<
                                         SharedValue::Share(out)
                                     }
                                     (SharedValue::Num(an), SharedValue::Share(sb)) => {
-                                        let mut be = backend.lock().unwrap();
+                                        let mut be = backend.lock().unwrap_or_else(|e| e.into_inner());
                                         let imm = int_to_fr_signed(*an as i64, sb.nbits);
                                         let sa = be.share_secret(imm, sb.nbits, 0);
                                         let out = match op {
@@ -736,7 +736,7 @@ pub fn reduce_expression(expr: Expr, cont: Continuation, env: Env, backend: Arc<
                                 // reveal the boolean share to all parties so they all
                                 // take the same control-flow branch (leaks 1 bit)
                                 let revealed = {
-                                    let mut be = backend.lock().unwrap();
+                                    let mut be = backend.lock().unwrap_or_else(|e| e.into_inner());
                                     be.reveal(&sr, None)
                                 };
                                 let cond = revealed != 0;
@@ -770,13 +770,13 @@ pub fn reduce_expression(expr: Expr, cont: Continuation, env: Env, backend: Arc<
                                         stack.push(Apply(*cont, val, env.clone()));
                                     }
                                     SharedValue::Num(n) => {
-                                        let mut be = backend.lock().unwrap();
+                                        let mut be = backend.lock().unwrap_or_else(|e| e.into_inner());
                                         let fr = int_to_fr_signed(n as i64, norm_nbits);
                                         let sref = be.share_secret(fr, norm_nbits, 0);
                                         stack.push(Apply(*cont, SharedValue::Share(sref), env.clone()));
                                     }
                                     SharedValue::Bool(b) => {
-                                        let mut be = backend.lock().unwrap();
+                                        let mut be = backend.lock().unwrap_or_else(|e| e.into_inner());
                                         let fr = if b { 1u128 } else { 0u128 };
                                         let sref = be.share_secret(fr, norm_nbits, 0);
                                         stack.push(Apply(*cont, SharedValue::Share(sref), env.clone()));
@@ -857,7 +857,7 @@ enum PersistValue {
             if args.len() != 2 { panic!("share expects 2 args"); }
             match (&args[0], &args[1]) {
                 (SharedValue::Num(n), SharedValue::Num(nb)) => {
-                    let mut be = share_backend.lock().unwrap();
+                    let mut be = share_backend.lock().unwrap_or_else(|e| e.into_inner());
                     // convert signed immediate into two's-complement field element for nb bits
                     let imm = int_to_fr_signed(*n as i64, *nb as usize);
                     // Always pass the actual value. SimBackend uses it directly.
@@ -881,7 +881,7 @@ enum PersistValue {
             if args.len() != 3 { panic!("share-from expects 3 args: (share-from owner-id value nbits)"); }
             match (&args[0], &args[1], &args[2]) {
                 (SharedValue::Num(owner_id), SharedValue::Num(n), SharedValue::Num(nb)) => {
-                    let mut be = share_from_backend.lock().unwrap();
+                    let mut be = share_from_backend.lock().unwrap_or_else(|e| e.into_inner());
                     let explicit_owner = *owner_id as usize;
                     let imm = int_to_fr_signed(*n as i64, *nb as usize);
                     // Same as share: pass the actual value; protocol::share_input enforces
@@ -900,7 +900,7 @@ enum PersistValue {
             if args.len() != 1 { panic!("reconstruct expects 1 arg"); }
             match &args[0] {
                 SharedValue::Share(sref) => {
-                    let mut be = reconstruct_backend.lock().unwrap();
+                    let mut be = reconstruct_backend.lock().unwrap_or_else(|e| e.into_inner());
                     // reveal_to = None means broadcast: all parties participate and
                     // everyone reconstructs.  This is correct for both SimBackend
                     // and TransportBackend (in the single-party REPL, SimBackend
@@ -920,7 +920,7 @@ enum PersistValue {
             if args.len() != 2 { panic!("a2b expects 2 args: (a nbits)"); }
             match (&args[0], &args[1]) {
                 (SharedValue::Share(sref), SharedValue::Num(nbits)) => {
-                    let mut be = a2b_backend.lock().unwrap();
+                    let mut be = a2b_backend.lock().unwrap_or_else(|e| e.into_inner());
                     let bits = be.a2b(&sref, *nbits as usize);
                     let svs: Vec<SharedValue> = bits.into_iter().map(|b| SharedValue::Share(b)).collect();
                     SharedValue::List(svs)
@@ -939,7 +939,7 @@ enum PersistValue {
                     let bits_refs: Vec<crate::interpreter::backend::ShareRef> = list.iter().map(|v| {
                         if let SharedValue::Share(sr) = v { sr.clone() } else { panic!("b2a expects list of share bits") }
                     }).collect();
-                    let mut be = b2a_backend.lock().unwrap();
+                    let mut be = b2a_backend.lock().unwrap_or_else(|e| e.into_inner());
                     let out = be.b2a(&bits_refs);
                     SharedValue::Share(out)
                 }
@@ -951,8 +951,16 @@ enum PersistValue {
 
     /// Reveal a shared value to the caller (simulated reveal via backend).
     pub fn reveal(&self, sref: &crate::interpreter::backend::ShareRef) -> crate::crypto::types::Fr {
-        let mut be = self.backend.lock().unwrap();
+        let mut be = self.backend.lock().unwrap_or_else(|e| e.into_inner());
         be.reveal(sref, None)
+    }
+
+    /// Reset per-expression backend state (share map + ID counter).
+    /// Call this before evaluating each new top-level expression so that all
+    /// parties start with matching ID counters, even after an error/abort.
+    pub fn reset_per_expression(&self) {
+        let mut be = self.backend.lock().unwrap_or_else(|e| e.into_inner());
+        be.reset_per_expression();
     }
 
     /// Reset the persistent store (clears user bindings, re-registers builtins)
