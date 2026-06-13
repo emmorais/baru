@@ -18,7 +18,7 @@ use std::thread;
 
 use baru::crypto::net::{
     Transport, TcpTransport, InprocHandle,
-    serialize_msg, deserialize_msg, MpcMsg, recv_blocking,
+    serialize_msg, deserialize_msg, MpcMsg, recv_blocking, recv_forever,
 };
 use baru::interpreter::{parse, Participant};
 
@@ -37,12 +37,14 @@ fn broadcast_expr<T: Transport>(src: &str, transport: &T) {
 }
 
 fn receive_expr<T: Transport>(transport: &T) -> String {
+    // Wait indefinitely for the length header — no timeout between expressions.
     let len = loop {
-        if let Some((_from, msg)) = recv_blocking(transport, 60_000) {
-            if let MpcMsg::RevealShare { share_id: 0, value: l } = deserialize_msg(&msg) {
-                break l as usize;
-            }
-        } else { panic!("receive_expr: timeout waiting for length"); }
+        let (_from, msg) = recv_forever(transport);
+        if let MpcMsg::RevealShare { share_id: 0, value: l } = deserialize_msg(&msg) {
+            break l as usize;
+        }
+        // Any other message that arrived before the length header is ignored;
+        // this can happen if a stray MPC message lingers in the queue.
     };
     let chunks = (len + 15) / 16;
     let mut bytes = vec![0u8; len];

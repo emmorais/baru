@@ -137,6 +137,16 @@ pub fn recv_blocking<T: Transport>(t: &T, timeout_ms: u64) -> Option<(PartyId, M
     }
 }
 
+/// Block indefinitely until a message arrives.  Use this only for
+/// the outer wait between REPL expressions so parties 1/2 don't
+/// time out while the human is still typing.
+pub fn recv_forever<T: Transport>(t: &T) -> (PartyId, Message) {
+    loop {
+        if let Some(m) = t.recv() { return m; }
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+}
+
 /// TCP wire format: include sender id and raw payload bytes.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 struct Wire {
