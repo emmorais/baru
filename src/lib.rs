@@ -2,3 +2,5 @@
 pub mod interpreter;
 
 pub mod crypto;
+
+pub mod repl;

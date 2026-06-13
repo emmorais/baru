@@ -6,21 +6,29 @@
 //!   party 1: tcp_party 1 127.0.0.1:7001,127.0.0.1:7001,127.0.0.1:7002
 //!   party 2: tcp_party 2 127.0.0.1:7002,127.0.0.1:7001,127.0.0.1:7002
 //!
-//! Party 0 reads expressions from stdin and broadcasts them to peers.
+//! Party 0 reads expressions from a full-featured REPL (colours, tab-completion,
+//! history, :help, :examples, :example <n>) and broadcasts them to peers.
 //! All parties evaluate jointly via `TransportBackend`.
 //!
 //! Run with no arguments for an in-process 3-party demo.
 
 use std::env;
-use std::io::{self, BufRead, Write};
+use std::path::PathBuf;
 use std::time::Duration;
 use std::thread;
+
+use colored::*;
+use rustyline::Editor;
+use rustyline::error::ReadlineError;
 
 use baru::crypto::net::{
     Transport, TcpTransport, InprocHandle,
     serialize_msg, deserialize_msg, MpcMsg, recv_blocking, recv_forever,
 };
-use baru::interpreter::{parse, Participant};
+use baru::interpreter::{parse, Participant, SharedValue};
+use baru::repl::{
+    EXAMPLES, print_help, print_examples_list, print_examples_for, ReplHelper,
+};
 
 // ---------------------------------------------------------------------------
 // Expression broadcast helpers (use share_id=0 for len + sequential ids for chunks)
@@ -118,48 +126,195 @@ fn run_inproc_demo() {
 // TCP multi-party mode
 // ---------------------------------------------------------------------------
 
+fn history_path() -> Option<PathBuf> {
+    if let Ok(home) = std::env::var("HOME") {
+        let mut p = PathBuf::from(home);
+        p.push(".baru_tcp_history");
+        Some(p)
+    } else {
+        None
+    }
+}
+
+/// Display a SharedValue result with sign-extension for 32-bit MPC field values.
+fn display_result(result: &SharedValue, participant: &Participant) -> String {
+    match result {
+        SharedValue::Share(sr) => {
+            let raw = participant.reveal(sr);
+            let signed = (raw as u32) as i32 as i64;
+            format!("{}", signed.to_string().bright_green())
+        }
+        SharedValue::Num(n) => {
+            // sign-extend through 32 bits for MPC field values
+            let signed = (*n as u32) as i32 as i64;
+            format!("{}", signed.to_string().bright_green())
+        }
+        other => format!("{}", format!("{:?}", other).bright_green()),
+    }
+}
+
 fn run_tcp(me: usize, mpc_addrs: Vec<String>, dist_addrs: Vec<String>) {
-    // Two transports: one consumed by TransportBackend, one for expression distribution
     let mpc_transport = TcpTransport::new(me, mpc_addrs);
     let dist_transport = TcpTransport::new(me, dist_addrs);
-    eprintln!("[party {}] TCP transports ready", me);
+    eprintln!("{}", format!("[party {}] TCP transports ready", me).bright_yellow());
 
     let participant = Participant::new_transport(me, mpc_transport);
 
     if me == 0 {
-        let stdin = io::stdin();
-        print!("baru[party-0]> ");
-        let _ = io::stdout().flush();
-        for line in stdin.lock().lines() {
-            let src = match line { Ok(l) => l.trim().to_string(), Err(_) => break };
-            if src.is_empty() || src.starts_with(';') {
-                print!("baru[party-0]> ");
-                let _ = io::stdout().flush();
-                continue;
-            }
-            if src == ":quit" {
-                broadcast_expr(":quit", &dist_transport);
-                break;
-            }
-            broadcast_expr(&src, &dist_transport);
-            let expr = match parse(&src) {
-                Ok(e) => e,
-                Err(err) => { eprintln!("parse error: {}", err); continue; }
-            };
-            let result = participant.eval(&expr);
-            println!("=> {:?}", result);
-            print!("baru[party-0]> ");
-            let _ = io::stdout().flush();
+        // ── Party 0: full interactive REPL ──────────────────────────────────
+        println!("{}", "ABY3 distributed MPC — party 0 (evaluator + broadcaster)".bright_green());
+        println!("{}", "Type ':help' for language reference, ':examples' to browse examples, or ':quit' to exit.".bright_yellow());
+
+        let helper = ReplHelper::new_tcp();
+        let mut rl = Editor::new().expect("failed to create line editor");
+        rl.set_helper(Some(helper));
+
+        if let Some(p) = history_path() {
+            if p.exists() { let _ = rl.load_history(&p); }
         }
+
+        let mut verbose = false;
+
+        loop {
+            let readline = rl.readline(&format!("{}{}{}",
+                "baru[party-0]".bright_cyan(), "> ".bright_white(), ""));
+            let src = match readline {
+                Ok(line) => line.trim().to_string(),
+                Err(ReadlineError::Interrupted) => { println!("^C"); continue; }
+                Err(ReadlineError::Eof) | Err(_) => {
+                    broadcast_expr(":quit", &dist_transport);
+                    break;
+                }
+            };
+
+            if src.is_empty() || src.starts_with(';') { continue; }
+            let _ = rl.add_history_entry(&src);
+
+            // ── Special commands ────────────────────────────────────────────
+            if src.starts_with(':') || src == "quit" || src == "exit" {
+                let mut parts = src.splitn(3, ' ');
+                let cmd = parts.next().unwrap_or("");
+                match cmd {
+                    ":quit" | "quit" | "exit" => {
+                        broadcast_expr(":quit", &dist_transport);
+                        println!("{}", "Signalled all parties to quit.".bright_yellow());
+                        break;
+                    }
+                    ":help" => { print_help(true); continue; }
+                    ":examples" => {
+                        match parts.next() {
+                            None => print_examples_list(),
+                            Some(cat) => print_examples_for(cat),
+                        }
+                        continue;
+                    }
+                    ":example" => {
+                        match parts.next().and_then(|s| s.parse::<usize>().ok()) {
+                            Some(n) if n >= 1 && n <= EXAMPLES.len() => {
+                                let ex = &EXAMPLES[n - 1];
+                                println!();
+                                println!("{} [{}] {} ({})",
+                                    "Running example".bright_yellow(),
+                                    n.to_string().bright_white(),
+                                    ex.name.bright_cyan(),
+                                    ex.category);
+                                println!("{} {}", "Code:    ".bright_yellow(), ex.code.bright_green());
+                                println!("{} {}", "Expected:".bright_yellow(), ex.expected.bright_magenta());
+                                println!();
+                                // broadcast and fall through to normal eval below
+                                broadcast_expr(ex.code, &dist_transport);
+                                match parse(ex.code) {
+                                    Ok(expr) => {
+                                        let result = if verbose {
+                                            participant.eval_quiet_verbose(&expr)
+                                        } else {
+                                            participant.eval_quiet(&expr)
+                                        };
+                                        println!("{} {}", "=>".bright_yellow(), display_result(&result, &participant));
+                                    }
+                                    Err(e) => println!("{} {}", "parse error:".bright_red(), e),
+                                }
+                            }
+                            _ => println!("usage: :example <n>  (use ':examples' to list, 1–{})", EXAMPLES.len()),
+                        }
+                        continue;
+                    }
+                    ":verbose" => {
+                        match parts.next() {
+                            Some("on")  => { verbose = true;  println!("{}", "verbose: on".bright_green()); }
+                            Some("off") => { verbose = false; println!("{}", "verbose: off".bright_yellow()); }
+                            _ => {
+                                verbose = !verbose;
+                                println!("verbose: {}", if verbose { "on".bright_green() } else { "off".bright_yellow() });
+                            }
+                        }
+                        continue;
+                    }
+                    _ => {
+                        println!("{} {}  (type '{}' for reference)",
+                            "unknown command:".bright_red(), cmd,
+                            ":help".bright_cyan());
+                        continue;
+                    }
+                }
+            }
+
+            // ── Normal expression ────────────────────────────────────────────
+            broadcast_expr(&src, &dist_transport);
+            match parse(&src) {
+                Err(e) => {
+                    println!("{} {}", "parse error:".bright_red(), e);
+                    // broadcast a no-op so peers don't hang waiting
+                    broadcast_expr("0", &dist_transport);
+                }
+                Ok(expr) => {
+                    let result = if verbose {
+                        participant.eval_quiet_verbose(&expr)
+                    } else {
+                        participant.eval_quiet(&expr)
+                    };
+                    println!("{} {}", "=>".bright_yellow(), display_result(&result, &participant));
+                }
+            }
+        }
+
+        if let Some(p) = history_path() { let _ = rl.save_history(&p); }
+
     } else {
-        eprintln!("[party {}] ready, waiting for expressions from party 0...", me);
+        // ── Parties 1/2: silent workers ──────────────────────────────────────
+        eprintln!("{}", format!("[party {}] ready, waiting for expressions from party 0...", me).bright_yellow());
         loop {
             let src = receive_expr(&dist_transport);
-            if src.trim() == ":quit" { break; }
-            eprintln!("[party {}] evaluating: {}", me, src.trim());
-            let expr = match parse(src.trim()) { Ok(e) => e, Err(e) => { eprintln!("parse error: {}", e); continue; } };
-            let result = participant.eval(&expr);
-            eprintln!("[party {}] result: {:?}", me, result);
+            let src = src.trim().to_string();
+            if src == ":quit" {
+                eprintln!("{}", format!("[party {}] received :quit, exiting.", me).bright_yellow());
+                break;
+            }
+            eprintln!("{}", format!("[party {}] evaluating: {}", me, src).bright_black());
+            match parse(&src) {
+                Ok(expr) => {
+                    let result = participant.eval_quiet(&expr);
+                    // Mirror party 0's display_result so the reveal protocol stays in sync.
+                    // If the expression returns a bare Share (no reconstruct), party 0 calls
+                    // participant.reveal() inside display_result — we must participate too.
+                    // If it returned a Num (reconstruct already ran), no extra reveal needed.
+                    let display = match &result {
+                        SharedValue::Share(sr) => {
+                            // participate in the extra reveal party 0 is doing in display_result
+                            let raw = participant.reveal(sr);
+                            let signed = (raw as u32) as i32 as i64;
+                            signed.to_string()
+                        }
+                        SharedValue::Num(n) => {
+                            let signed = (*n as u32) as i32 as i64;
+                            signed.to_string()
+                        }
+                        other => format!("{:?}", other),
+                    };
+                    eprintln!("{}", format!("[party {}] => {}  (waiting for next expression)", me, display).bright_black());
+                }
+                Err(e) => eprintln!("{}", format!("[party {}] parse error: {}", me, e).bright_red()),
+            }
         }
     }
 }

@@ -171,20 +171,33 @@ pub fn parse_tokens(tokens: &[String], pos: &mut usize) -> Result<Expr, String> 
                  while *pos < tokens.len() && tokens[*pos] == "(" {
                      *pos += 1; if *pos >= tokens.len() { return Err("unexpected end in binding".to_string()); }
                      let name = tokens[*pos].clone(); *pos += 1;
-                     // optional type annotation like :sint32
+                     // optional type annotation like :sint32 or :sint32-from-1
                      let mut wrap_with_share = None;
+                     let mut share_owner_override: Option<i64> = None;
                      if *pos < tokens.len() && tokens[*pos].starts_with(":") {
                          let tkn = tokens[*pos].clone(); *pos += 1;
                          if tkn.starts_with(":sint") {
-                             if let Ok(nbits) = tkn[5..].parse::<i64>() {
-                                wrap_with_share = Some(nbits as i64);
+                             let rest = &tkn[5..]; // e.g. "32" or "32-from-1"
+                             if let Some(dash) = rest.find("-from-") {
+                                 if let Ok(nbits) = rest[..dash].parse::<i64>() {
+                                     wrap_with_share = Some(nbits);
+                                     share_owner_override = rest[dash+6..].parse::<i64>().ok();
+                                 }
+                             } else if let Ok(nbits) = rest.parse::<i64>() {
+                                 wrap_with_share = Some(nbits);
                              }
                          }
                      }
                      let mut expr = parse_tokens(tokens, pos)?;
                      if let Some(nbits) = wrap_with_share {
-                         // transform into (share expr nbits)
-                         expr = Expr::Call(Box::new(Expr::Var("share".to_string())), vec![expr, Expr::Num(nbits)]);
+                         // transform into (share expr nbits) or (share-from owner expr nbits)
+                         expr = if let Some(oid) = share_owner_override {
+                             Expr::Call(Box::new(Expr::Var("share-from".to_string())),
+                                        vec![Expr::Num(oid), expr, Expr::Num(nbits)])
+                         } else {
+                             Expr::Call(Box::new(Expr::Var("share".to_string())),
+                                        vec![expr, Expr::Num(nbits)])
+                         };
                      }
                      if *pos >= tokens.len() || tokens[*pos] != ")" { return Err("expected ')' after binding".to_string()); }
                      *pos += 1;
@@ -207,17 +220,30 @@ pub fn parse_tokens(tokens: &[String], pos: &mut usize) -> Result<Expr, String> 
                     let name = tokens[*pos].clone(); *pos += 1;
                     // optional type annotation
                     let mut wrap_with_share = None;
+                    let mut share_owner_override: Option<i64> = None;
                     if *pos < tokens.len() && tokens[*pos].starts_with(":") {
                         let tkn = tokens[*pos].clone(); *pos += 1;
                         if tkn.starts_with(":sint") {
-                            if let Ok(nbits) = tkn[5..].parse::<i64>() {
-                                wrap_with_share = Some(nbits as i64);
+                            let rest = &tkn[5..];
+                            if let Some(dash) = rest.find("-from-") {
+                                if let Ok(nbits) = rest[..dash].parse::<i64>() {
+                                    wrap_with_share = Some(nbits);
+                                    share_owner_override = rest[dash+6..].parse::<i64>().ok();
+                                }
+                            } else if let Ok(nbits) = rest.parse::<i64>() {
+                                wrap_with_share = Some(nbits);
                             }
                         }
                     }
                     let mut expr = parse_tokens(tokens, pos)?;
                     if let Some(nbits) = wrap_with_share {
-                        expr = Expr::Call(Box::new(Expr::Var("share".to_string())), vec![expr, Expr::Num(nbits)]);
+                        expr = if let Some(oid) = share_owner_override {
+                            Expr::Call(Box::new(Expr::Var("share-from".to_string())),
+                                       vec![Expr::Num(oid), expr, Expr::Num(nbits)])
+                        } else {
+                            Expr::Call(Box::new(Expr::Var("share".to_string())),
+                                       vec![expr, Expr::Num(nbits)])
+                        };
                     }
                      if *pos >= tokens.len() || tokens[*pos] != ")" { return Err("expected ')' after binding".to_string()); }
                      *pos += 1;

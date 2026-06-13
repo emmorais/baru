@@ -743,3 +743,77 @@ fn test_simple_neural_network_sint() {
                    (if (> z 0) z 0)))";
     assert_eq!(eval_shared(src), 0);
 }
+
+// ---------------------------------------------------------------------------
+// Private inputs via share-from / :sintN-from-M
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_share_from_add() {
+    // Party 0 contributes 10, party 1 contributes 32 → sum = 42
+    let src = "(reconstruct (+ (share-from 0 10 32) (share-from 1 32 32)))";
+    assert_eq!(eval_shared(src), 42);
+}
+
+#[test]
+fn test_share_from_mul() {
+    // Party 0 contributes 6, party 1 contributes 7 → product = 42
+    let src = "(reconstruct (* (share-from 0 6 32) (share-from 1 7 32)))";
+    assert_eq!(eval_shared(src), 42);
+}
+
+#[test]
+fn test_share_from_three_parties() {
+    // All three parties contribute → sum = 10 + 20 + 30 = 60
+    let src = "(reconstruct (+ (share-from 0 10 32) (+ (share-from 1 20 32) (share-from 2 30 32))))";
+    assert_eq!(eval_shared(src), 60);
+}
+
+#[test]
+fn test_share_from_signed_negative() {
+    // Party 1 contributes -7, party 2 contributes 10 → 10 + (-7) = 3
+    let src = "(reconstruct (+ (share-from 1 -7 32) (share-from 2 10 32)))";
+    assert_eq!(eval_shared(src), 3);
+}
+
+#[test]
+fn test_sint_from_sugar_add() {
+    // :sintN-from-M syntax in let bindings
+    let src = "(let ((a :sint32-from-0 30) (b :sint32-from-1 12))
+                 (reconstruct (+ a b)))";
+    assert_eq!(eval_shared(src), 42);
+}
+
+#[test]
+fn test_sint_from_sugar_comparison() {
+    // salary-threshold: party 0 has salary, party 1 has threshold
+    // 75 < 80 → comparison result = 0
+    let src = "(let ((salary :sint32-from-0 75) (threshold :sint32-from-1 80))
+                 (> salary threshold))";
+    assert_eq!(eval_shared(src), 0);
+}
+
+#[test]
+fn test_sint_from_sugar_comparison_greater() {
+    // salary > threshold → 1
+    let src = "(let ((salary :sint32-from-0 90) (threshold :sint32-from-1 80))
+                 (> salary threshold))";
+    assert_eq!(eval_shared(src), 1);
+}
+
+#[test]
+fn test_share_from_private_max() {
+    // Oblivious max: neither party reveals their value, result is the larger one
+    let src = "(let ((a :sint32-from-0 30) (b :sint32-from-1 42) (one (share-from 0 1 32)))
+                 (let ((m (> a b)))
+                   (reconstruct (+ (* a m) (* b (- one m))))))";
+    assert_eq!(eval_shared(src), 42);
+}
+
+#[test]
+fn test_share_from_private_min() {
+    let src = "(let ((a :sint32-from-0 30) (b :sint32-from-1 42) (one (share-from 0 1 32)))
+                 (let ((m (< a b)))
+                   (reconstruct (+ (* a m) (* b (- one m))))))";
+    assert_eq!(eval_shared(src), 30);
+}

@@ -849,11 +849,10 @@ enum PersistValue {
 
      fn register_builtins(&self) {
         let backend = self.backend.clone();
-        let owner = self.id;
+        let _owner = self.id;
 
         // share builtin
         let share_backend = backend.clone();
-        let share_owner = owner;
         let share_fn = Arc::new(move |args: Vec<SharedValue>| -> SharedValue {
             if args.len() != 2 { panic!("share expects 2 args"); }
             match (&args[0], &args[1]) {
@@ -861,12 +860,11 @@ enum PersistValue {
                     let mut be = share_backend.lock().unwrap();
                     // convert signed immediate into two's-complement field element for nb bits
                     let imm = int_to_fr_signed(*n as i64, *nb as usize);
-                    // In distributed mode party 0 is always the canonical owner of
-                    // a (share v nbits) expression: it holds the plaintext; other
-                    // parties supply value=0 which share_input ignores for non-owners.
+                    // Always pass the actual value. SimBackend uses it directly.
+                    // TransportBackend passes it to protocol::share_input which ignores
+                    // it for non-owner parties, so the owner check is enforced there.
                     let canonical_owner = 0usize;
-                    let value_for_me = if share_owner == canonical_owner { imm } else { 0 };
-                    let sref = be.share_secret(value_for_me, *nb as usize, canonical_owner);
+                    let sref = be.share_secret(imm, *nb as usize, canonical_owner);
                     SharedValue::Share(sref)
                 }
                 (SharedValue::Share(s), SharedValue::Num(_nb)) => SharedValue::Share(s.clone()),
@@ -874,6 +872,27 @@ enum PersistValue {
             }
         });
         self.store.borrow_mut().insert("share".to_string(), Rc::new(RefCell::new(SharedValue::NativeFunc(share_fn))));
+
+        // share-from builtin: (share-from owner-id value nbits)
+        // Like (share value nbits) but the owner is explicitly specified, so each
+        // party can provide their own private input.
+        let share_from_backend = backend.clone();
+        let share_from_fn = Arc::new(move |args: Vec<SharedValue>| -> SharedValue {
+            if args.len() != 3 { panic!("share-from expects 3 args: (share-from owner-id value nbits)"); }
+            match (&args[0], &args[1], &args[2]) {
+                (SharedValue::Num(owner_id), SharedValue::Num(n), SharedValue::Num(nb)) => {
+                    let mut be = share_from_backend.lock().unwrap();
+                    let explicit_owner = *owner_id as usize;
+                    let imm = int_to_fr_signed(*n as i64, *nb as usize);
+                    // Same as share: pass the actual value; protocol::share_input enforces
+                    // the owner check in distributed mode.
+                    let sref = be.share_secret(imm, *nb as usize, explicit_owner);
+                    SharedValue::Share(sref)
+                }
+                _ => panic!("share-from expects (owner-id value nbits) all as numbers"),
+            }
+        });
+        self.store.borrow_mut().insert("share-from".to_string(), Rc::new(RefCell::new(SharedValue::NativeFunc(share_from_fn))));
 
         // reconstruct builtin
         let reconstruct_backend = backend.clone();
@@ -994,13 +1013,27 @@ enum PersistValue {
     /// Evaluate an expression using the participant's persistent store and return the resulting SharedValue.
     pub fn eval(&self, expr: &Expr) -> SharedValue {
         let owner = self.id;
-        // run reducer using the persistent store
         let cont = Continuation::Halt;
         let result = reduce_expression(expr.clone(), cont, self.store.clone(), self.backend.clone(), owner, false);
         if !cfg!(test) {
             println!("participant {} evaluated expression -> {:?}", self.id, result);
         }
         result
+    }
+
+    /// Like `eval` but never prints anything.  Used by the TCP party-0 REPL where
+    /// output is handled by the caller with colours.
+    pub fn eval_quiet(&self, expr: &Expr) -> SharedValue {
+        let owner = self.id;
+        let cont = Continuation::Halt;
+        reduce_expression(expr.clone(), cont, self.store.clone(), self.backend.clone(), owner, false)
+    }
+
+    /// Like `eval_quiet` but also emits verbose frame-level tracing to stderr.
+    pub fn eval_quiet_verbose(&self, expr: &Expr) -> SharedValue {
+        let owner = self.id;
+        let cont = Continuation::Halt;
+        reduce_expression(expr.clone(), cont, self.store.clone(), self.backend.clone(), owner, true)
     }
 
     /// Evaluate with optional verbose tracing. When verbose=true the REPL will print
