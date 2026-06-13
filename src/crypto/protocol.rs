@@ -5,8 +5,6 @@
 //! the protocol.  The functions are synchronous (blocking) and use
 //! `recv_blocking` with a generous timeout.
 
-use std::sync::atomic::{AtomicU64, Ordering};
-
 use rand::Rng;
 
 use crate::crypto::types::{Share3, Fr};
@@ -15,12 +13,6 @@ use crate::crypto::net::{Transport, MpcMsg, PartyId, serialize_msg, deserialize_
 
 const N: usize = 3;
 const TIMEOUT_MS: u64 = 5_000;
-
-static OP_COUNTER: AtomicU64 = AtomicU64::new(1);
-
-fn next_op_id() -> u64 {
-    OP_COUNTER.fetch_add(1, Ordering::SeqCst)
-}
 
 // ---------------------------------------------------------------------------
 // Per-party share storage type
@@ -62,18 +54,19 @@ pub fn share_input<T: Transport>(
             [s0, s1, s2]
         };
         // party i holds (s_i, s_{i+1 mod 3})
-        // send each party its right component
+        // send each party its left component first, then right component
         for i in 0..N {
             let right_idx = (i + 1) % N;
             if i != me {
-                transport.send(i, serialize_msg(&MpcMsg::InputShare {
-                    share_id,
-                    value: s[right_idx],
-                }));
-                // also send party i its left component
+                // left component first
                 transport.send(i, serialize_msg(&MpcMsg::InputShare {
                     share_id,
                     value: s[i],
+                }));
+                // then right component
+                transport.send(i, serialize_msg(&MpcMsg::InputShare {
+                    share_id,
+                    value: s[right_idx],
                 }));
             }
         }
@@ -293,10 +286,10 @@ pub fn receive_triple<T: Transport>(
 pub fn mul_party<T: Transport>(
     a: &PartyShare,
     b: &PartyShare,
+    op_id: u64,
     me: PartyId,
     transport: &T,
 ) -> PartyShare {
-    let op_id = next_op_id();
     let triple_id = op_id * 3; // reserve 3 ids for x/y/z
 
     // obtain triple
@@ -366,10 +359,10 @@ pub fn mul_party<T: Transport>(
 pub fn a2b_party<T: Transport>(
     a: &PartyShare,
     nbits: usize,
+    op_id: u64,
     me: PartyId,
     transport: &T,
 ) -> Vec<PartyShare> {
-    let op_id = next_op_id();
 
     // Sample mask r (each party samples its own random r for its left component).
     // We use a shared-seed approach: all parties use op_id as seed so r is consistent.
