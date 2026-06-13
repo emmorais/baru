@@ -9,9 +9,15 @@ use std::io::{Read, Write};
 fn find_bin() -> &'static Path {
     let release = Path::new("./target/release/tcp_party");
     let debug   = Path::new("./target/debug/tcp_party");
-    if release.exists() { release }
-    else if debug.exists() { debug }
-    else { panic!("tcp_party binary not found; run `cargo build` first") }
+    if release.exists() { return release; }
+    if debug.exists()   { return debug; }
+    // Binary not found — build it automatically so tests work without a prior `cargo build`.
+    let status = Command::new("cargo")
+        .args(["build", "--bin", "tcp_party"])
+        .status()
+        .expect("failed to run cargo build");
+    assert!(status.success(), "cargo build --bin tcp_party failed");
+    if debug.exists() { debug } else { panic!("tcp_party binary still missing after build") }
 }
 
 /// Reserve `n` consecutive free ports and return their addresses.
