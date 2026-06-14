@@ -7,7 +7,7 @@ use std::io::{Read, Write};
 use std::path::Path;
 use serde::{Serialize, Deserialize};
 
-use crate::interpreter::ast::{Expr, Env, SharedValue};
+use crate::interpreter::ast::{Expr, Env, Types};
 use crate::interpreter::backend::{Aby3Backend, Backend, SimBackend};
 use colored::*;
 
@@ -22,7 +22,7 @@ pub enum Continuation {
     },
     BinOpRight {
         op: super::parser::BinOp,
-        left_val: SharedValue,
+        left_val: Types,
         cont: Box<Continuation>,
         env: Env,
     },
@@ -75,7 +75,7 @@ pub enum Continuation {
         env: Env,
     },
     ConsRight {
-        left_val: SharedValue,
+        left_val: Types,
         cont: Box<Continuation>,
         env: Env,
     },
@@ -86,9 +86,9 @@ pub enum Continuation {
         env: Env,
     },
     CallEvalArgs {
-        operator: SharedValue,
+        operator: Types,
         remaining: Vec<Expr>,
-        mut_collected: Vec<SharedValue>,
+        mut_collected: Vec<Types>,
         cont: Box<Continuation>,
         env: Env,
     },
@@ -110,22 +110,22 @@ pub enum Continuation {
 
 enum Task {
     Eval(Expr, Continuation, Env),
-    Apply(Continuation, SharedValue, Env),
+    Apply(Continuation, Types, Env),
 }
 
 const MAX_FRAMES: usize = 1_000_000;
 
 // Note: added `owner` parameter so reduce_expression can pass participant id
 // into share_secret and reveal operations.
-pub fn reduce_expression(expr: Expr, cont: Continuation, env: Env, backend: Arc<Mutex<Box<dyn Backend>>>, _owner: usize, verbose: bool) -> SharedValue {
+pub fn reduce_expression(expr: Expr, cont: Continuation, env: Env, backend: Arc<Mutex<Box<dyn Backend>>>, _owner: usize, verbose: bool) -> Types {
     use Task::*;
 
     let mut stack: Vec<Task> = Vec::new();
     stack.push(Eval(expr.clone(), cont, env));
     let mut frames: usize = 0;
 
-    // tracing setup: enable when verbose is requested or top-level expr mentions "fib"
-    let trace_enabled = verbose || expr_contains_name(&expr, "fib");
+    // tracing setup: enable when verbose is requested
+    let trace_enabled = verbose; 
     const TRACE_LIMIT: usize = 500;
     let mut trace: Vec<String> = Vec::new();
 
@@ -202,16 +202,16 @@ pub fn reduce_expression(expr: Expr, cont: Continuation, env: Env, backend: Arc<
                 }
             }
 
-            fn colored_value(v: &SharedValue) -> String {
+            fn colored_value(v: &Types) -> String {
                 match v {
-                    SharedValue::Num(n) => format!("{}", format!("Num({})", n).green()),
-                    SharedValue::Bool(b) => format!("{}", format!("Bool({})", b).yellow()),
-                    SharedValue::Str(s) => format!("{}", format!("Str(\"{}\")", s).magenta()),
-                    SharedValue::Char(c) => format!("{}", format!("Char({})", c).magenta()),
-                    SharedValue::List(l) => format!("{}", format!("List(len={})", l.len()).blue()),
-                    SharedValue::Closure(_, _, _) => "Closure".magenta().to_string(),
-                    SharedValue::Share(sr) => format!("{}", format!("Share(id={},nbits={},owner={})", sr.id, sr.nbits, sr.owner).red()),
-                    SharedValue::NativeFunc(_) => "NativeFunc".cyan().to_string(),
+                    Types::Num(n) => format!("{}", format!("Num({})", n).green()),
+                    Types::Bool(b) => format!("{}", format!("Bool({})", b).yellow()),
+                    Types::Str(s) => format!("{}", format!("Str(\"{}\")", s).magenta()),
+                    Types::Char(c) => format!("{}", format!("Char({})", c).magenta()),
+                    Types::List(l) => format!("{}", format!("List(len={})", l.len()).blue()),
+                    Types::Closure(_, _, _) => "Closure".magenta().to_string(),
+                    Types::Share(sr) => format!("{}", format!("Share(id={},nbits={},owner={})", sr.id, sr.nbits, sr.owner).red()),
+                    Types::NativeFunc(_) => "NativeFunc".cyan().to_string(),
                 }
             }
 
@@ -241,16 +241,16 @@ pub fn reduce_expression(expr: Expr, cont: Continuation, env: Env, backend: Arc<
             Eval(e, k, eenv) => {
                 match e {
                     Expr::Num(n) => {
-                        stack.push(Apply(k, SharedValue::Num(n), eenv.clone()));
+                        stack.push(Apply(k, Types::Num(n), eenv.clone()));
                     }
                     Expr::Str(s) => {
-                        stack.push(Apply(k, SharedValue::Str(s), eenv.clone()));
+                        stack.push(Apply(k, Types::Str(s), eenv.clone()));
                     }
                     Expr::Char(c) => {
-                        stack.push(Apply(k, SharedValue::Char(c), eenv.clone()));
+                        stack.push(Apply(k, Types::Char(c), eenv.clone()));
                     }
                     Expr::Bool(b) => {
-                        stack.push(Apply(k, SharedValue::Bool(b), eenv.clone()));
+                        stack.push(Apply(k, Types::Bool(b), eenv.clone()));
                     }
                     Expr::UnOp(op, inner) => {
                         let new_cont = Continuation::UnOp { op, cont: Box::new(k), env: eenv.clone() };
@@ -269,7 +269,7 @@ pub fn reduce_expression(expr: Expr, cont: Continuation, env: Env, backend: Arc<
                     Expr::Let(bindings, body) => {
                         if body.is_empty() {
                             if bindings.is_empty() {
-                                stack.push(Apply(k, SharedValue::Num(0), eenv.clone()));
+                                stack.push(Apply(k, Types::Num(0), eenv.clone()));
                             } else {
                                 let mut it = bindings.into_iter();
                                 let (name, be) = it.next().unwrap();
@@ -300,7 +300,7 @@ pub fn reduce_expression(expr: Expr, cont: Continuation, env: Env, backend: Arc<
                     Expr::LetRec(bindings, body) => {
                         let local = Rc::new(RefCell::new(eenv.borrow().clone()));
                         for (name, _) in &bindings {
-                            local.borrow_mut().insert(name.clone(), Rc::new(RefCell::new(SharedValue::Num(0))));
+                            local.borrow_mut().insert(name.clone(), Rc::new(RefCell::new(Types::Num(0))));
                         }
                         if bindings.is_empty() {
                             if body.len() == 1 {
@@ -322,7 +322,7 @@ pub fn reduce_expression(expr: Expr, cont: Continuation, env: Env, backend: Arc<
                     }
                     Expr::Seq(exprs) => {
                         if exprs.is_empty() {
-                            stack.push(Apply(k, SharedValue::List(Vec::new()), eenv.clone()));
+                            stack.push(Apply(k, Types::List(Vec::new()), eenv.clone()));
                         } else if exprs.len() == 1 {
                             stack.push(Eval(exprs.into_iter().next().unwrap(), k, eenv));
                         } else {
@@ -344,7 +344,7 @@ pub fn reduce_expression(expr: Expr, cont: Continuation, env: Env, backend: Arc<
                         stack.push(Eval(*h, Continuation::ConsLeft { right: t, cont: Box::new(k), env: eenv.clone() }, eenv.clone()));
                     }
                     Expr::Lambda(params, body) => {
-                        let closure = SharedValue::Closure(params, body, eenv.clone());
+                        let closure = Types::Closure(params, body, eenv.clone());
                         stack.push(Apply(k, closure, eenv.clone()));
                     }
                     Expr::Call(head, args) => {
@@ -376,10 +376,10 @@ pub fn reduce_expression(expr: Expr, cont: Continuation, env: Env, backend: Arc<
                     }
                     Continuation::BinOpRight { op, left_val, cont, env } => {
                         // helper to view a value as an i64 when reasonable (Num or Bool)
-                        let maybe_num = |v: &SharedValue| -> Option<i64> {
+                        let maybe_num = |v: &Types| -> Option<i64> {
                             match v {
-                                SharedValue::Num(n) => Some(*n),
-                                SharedValue::Bool(b) => Some(if *b { 1 } else { 0 }),
+                                Types::Num(n) => Some(*n),
+                                Types::Bool(b) => Some(if *b { 1 } else { 0 }),
                                 _ => None,
                             }
                         };
@@ -388,7 +388,7 @@ pub fn reduce_expression(expr: Expr, cont: Continuation, env: Env, backend: Arc<
                             super::parser::BinOp::Add | super::parser::BinOp::Sub | super::parser::BinOp::Mul | super::parser::BinOp::DivExact | super::parser::BinOp::Mod => {
                                 // if either operand is a shared value, dispatch to backend
                                 match (&left_val, &val) {
-                                    (SharedValue::Share(sa), SharedValue::Share(sb)) => {
+                                    (Types::Share(sa), Types::Share(sb)) => {
                                         let mut be = backend.lock().unwrap_or_else(|e| e.into_inner());
                                         let sr = match op {
                                             super::parser::BinOp::Add => be.add(&sa, &sb),
@@ -396,9 +396,9 @@ pub fn reduce_expression(expr: Expr, cont: Continuation, env: Env, backend: Arc<
                                             super::parser::BinOp::Mul => be.mul(&sa, &sb),
                                             _ => panic!("unsupported shared op"),
                                         };
-                                        SharedValue::Share(sr)
+                                        Types::Share(sr)
                                     }
-                                    (SharedValue::Share(sa), SharedValue::Num(bn)) => {
+                                    (Types::Share(sa), Types::Num(bn)) => {
                                         let mut be = backend.lock().unwrap_or_else(|e| e.into_inner());
                                         // convert signed immediate into two's-complement field element for sa.nbits
                                         let imm = int_to_fr_signed(*bn as i64, sa.nbits);
@@ -409,9 +409,9 @@ pub fn reduce_expression(expr: Expr, cont: Continuation, env: Env, backend: Arc<
                                             super::parser::BinOp::Mul => be.mul(&sa, &sb),
                                             _ => panic!("unsupported shared op"),
                                         };
-                                        SharedValue::Share(sr)
+                                        Types::Share(sr)
                                     }
-                                    (SharedValue::Num(an), SharedValue::Share(sb)) => {
+                                    (Types::Num(an), Types::Share(sb)) => {
                                         let mut be = backend.lock().unwrap_or_else(|e| e.into_inner());
                                         // convert signed immediate into two's-complement field element for sb.nbits
                                         let imm = int_to_fr_signed(*an as i64, sb.nbits);
@@ -422,7 +422,7 @@ pub fn reduce_expression(expr: Expr, cont: Continuation, env: Env, backend: Arc<
                                             super::parser::BinOp::Mul => be.mul(&sa, &sb),
                                             _ => panic!("unsupported shared op"),
                                         };
-                                        SharedValue::Share(sr)
+                                        Types::Share(sr)
                                     }
                                     _ => {
                                         let a = maybe_num(&left_val).expect("binary arithmetic left operand must be NUM or BOOL");
@@ -442,38 +442,38 @@ pub fn reduce_expression(expr: Expr, cont: Continuation, env: Env, backend: Arc<
                                             }
                                             _ => unreachable!(),
                                         };
-                                        SharedValue::Num(r)
+                                        Types::Num(r)
                                     }
                                 }
                             }
                             super::parser::BinOp::Eq => {
                                 match (&left_val, &val) {
-                                    (SharedValue::Num(a), SharedValue::Num(b)) => SharedValue::Num(if a == b { 1 } else { 0 }),
-                                    (SharedValue::Bool(a), SharedValue::Bool(b)) => SharedValue::Num(if a == b { 1 } else { 0 }),
-                                    (SharedValue::Str(a), SharedValue::Str(b)) => SharedValue::Num(if a == b { 1 } else { 0 }),
-                                    (SharedValue::Char(a), SharedValue::Char(b)) => SharedValue::Num(if a == b { 1 } else { 0 }),
-                                    (SharedValue::Share(sa), SharedValue::Share(sb)) => {
+                                    (Types::Num(a), Types::Num(b)) => Types::Num(if a == b { 1 } else { 0 }),
+                                    (Types::Bool(a), Types::Bool(b)) => Types::Num(if a == b { 1 } else { 0 }),
+                                    (Types::Str(a), Types::Str(b)) => Types::Num(if a == b { 1 } else { 0 }),
+                                    (Types::Char(a), Types::Char(b)) => Types::Num(if a == b { 1 } else { 0 }),
+                                    (Types::Share(sa), Types::Share(sb)) => {
                                         let mut be = backend.lock().unwrap_or_else(|e| e.into_inner());
-                                        SharedValue::Share(be.eq(&sa, &sb))
+                                        Types::Share(be.eq(&sa, &sb))
                                     }
-                                    (SharedValue::Share(sa), SharedValue::Num(bn)) => {
+                                    (Types::Share(sa), Types::Num(bn)) => {
                                         let mut be = backend.lock().unwrap_or_else(|e| e.into_inner());
                                         let imm = int_to_fr_signed(*bn as i64, sa.nbits);
                                         let sb = be.share_secret(imm, sa.nbits, 0);
-                                        SharedValue::Share(be.eq(&sa, &sb))
+                                        Types::Share(be.eq(&sa, &sb))
                                     }
-                                    (SharedValue::Num(an), SharedValue::Share(sb)) => {
+                                    (Types::Num(an), Types::Share(sb)) => {
                                         let mut be = backend.lock().unwrap_or_else(|e| e.into_inner());
                                         let imm = int_to_fr_signed(*an as i64, sb.nbits);
                                         let sa = be.share_secret(imm, sb.nbits, 0);
-                                        SharedValue::Share(be.eq(&sa, &sb))
+                                        Types::Share(be.eq(&sa, &sb))
                                     }
-                                    _ => SharedValue::Num(0),
+                                    _ => Types::Num(0),
                                 }
                             }
                             super::parser::BinOp::Lt | super::parser::BinOp::Gt | super::parser::BinOp::Le | super::parser::BinOp::Ge => {
                                 match (&left_val, &val) {
-                                    (SharedValue::Num(a), SharedValue::Num(b)) => {
+                                    (Types::Num(a), Types::Num(b)) => {
                                         let r = match op {
                                             super::parser::BinOp::Lt => a < b,
                                             super::parser::BinOp::Gt => a > b,
@@ -481,9 +481,9 @@ pub fn reduce_expression(expr: Expr, cont: Continuation, env: Env, backend: Arc<
                                             super::parser::BinOp::Ge => a >= b,
                                             _ => unreachable!(),
                                         };
-                                        SharedValue::Num(if r { 1 } else { 0 })
+                                        Types::Num(if r { 1 } else { 0 })
                                     }
-                                    (SharedValue::Share(sa), SharedValue::Share(sb)) => {
+                                    (Types::Share(sa), Types::Share(sb)) => {
                                         let mut be = backend.lock().unwrap_or_else(|e| e.into_inner());
                                         let out = match op {
                                             super::parser::BinOp::Lt => be.lt(&sa, &sb),
@@ -492,9 +492,9 @@ pub fn reduce_expression(expr: Expr, cont: Continuation, env: Env, backend: Arc<
                                             super::parser::BinOp::Ge => be.le(&sb, &sa),
                                             _ => unreachable!(),
                                         };
-                                        SharedValue::Share(out)
+                                        Types::Share(out)
                                     }
-                                    (SharedValue::Share(sa), SharedValue::Num(bn)) => {
+                                    (Types::Share(sa), Types::Num(bn)) => {
                                         let mut be = backend.lock().unwrap_or_else(|e| e.into_inner());
                                         let imm = int_to_fr_signed(*bn as i64, sa.nbits);
                                         let sb = be.share_secret(imm, sa.nbits, 0);
@@ -505,9 +505,9 @@ pub fn reduce_expression(expr: Expr, cont: Continuation, env: Env, backend: Arc<
                                             super::parser::BinOp::Ge => be.le(&sb, &sa),
                                             _ => unreachable!(),
                                         };
-                                        SharedValue::Share(out)
+                                        Types::Share(out)
                                     }
-                                    (SharedValue::Num(an), SharedValue::Share(sb)) => {
+                                    (Types::Num(an), Types::Share(sb)) => {
                                         let mut be = backend.lock().unwrap_or_else(|e| e.into_inner());
                                         let imm = int_to_fr_signed(*an as i64, sb.nbits);
                                         let sa = be.share_secret(imm, sb.nbits, 0);
@@ -518,28 +518,28 @@ pub fn reduce_expression(expr: Expr, cont: Continuation, env: Env, backend: Arc<
                                             super::parser::BinOp::Ge => be.le(&sb, &sa),
                                             _ => unreachable!(),
                                         };
-                                        SharedValue::Share(out)
+                                        Types::Share(out)
                                     }
-                                    _ => SharedValue::Num(0),
+                                    _ => Types::Num(0),
                                 }
                             }
                             super::parser::BinOp::And => {
                                 match (&left_val, &val) {
-                                    (SharedValue::Num(a), SharedValue::Num(b)) => SharedValue::Num(a & b),
+                                    (Types::Num(a), Types::Num(b)) => Types::Num(a & b),
                                     _ => {
                                         let a = maybe_num(&left_val).expect("and expects NUM/BOOL");
                                         let b = maybe_num(&val).expect("and expects NUM/BOOL");
-                                        SharedValue::Num(if a != 0 && b != 0 { 1 } else { 0 })
+                                        Types::Num(if a != 0 && b != 0 { 1 } else { 0 })
                                     }
                                 }
                             }
                             super::parser::BinOp::Or => {
                                 match (&left_val, &val) {
-                                    (SharedValue::Num(a), SharedValue::Num(b)) => SharedValue::Num(a | b),
+                                    (Types::Num(a), Types::Num(b)) => Types::Num(a | b),
                                     _ => {
                                         let a = maybe_num(&left_val).expect("or expects NUM/BOOL");
                                         let b = maybe_num(&val).expect("or expects NUM/BOOL");
-                                        SharedValue::Num(if a != 0 || b != 0 { 1 } else { 0 })
+                                        Types::Num(if a != 0 || b != 0 { 1 } else { 0 })
                                     }
                                 }
                             }
@@ -549,12 +549,12 @@ pub fn reduce_expression(expr: Expr, cont: Continuation, env: Env, backend: Arc<
                     Continuation::UnOp { op, cont, env } => {
                         let out = match op {
                             super::parser::UnOp::Not => match val {
-                                SharedValue::Num(n) => SharedValue::Num(if n == 0 { 1 } else { 0 }),
-                                SharedValue::Bool(b) => SharedValue::Num(if !b { 1 } else { 0 }),
+                                Types::Num(n) => Types::Num(if n == 0 { 1 } else { 0 }),
+                                Types::Bool(b) => Types::Num(if !b { 1 } else { 0 }),
                                 _ => panic!("not expects numeric or boolean value"),
                             },
                             super::parser::UnOp::Neg => match val {
-                                SharedValue::Num(n) => SharedValue::Num(n.wrapping_neg()),
+                                Types::Num(n) => Types::Num(n.wrapping_neg()),
                                 _ => panic!("negation expects numeric value"),
                             },
                         };
@@ -563,7 +563,7 @@ pub fn reduce_expression(expr: Expr, cont: Continuation, env: Env, backend: Arc<
                     Continuation::LetTop { name, mut remaining, env } => {
                         env.borrow_mut().insert(name, Rc::new(RefCell::new(val)));
                         if remaining.is_empty() {
-                            stack.push(Apply(Continuation::Halt, SharedValue::Num(0), env.clone()));
+                            stack.push(Apply(Continuation::Halt, Types::Num(0), env.clone()));
                         } else {
                             let (nxt_name, nxt_expr) = remaining.remove(0);
                             stack.push(Eval(nxt_expr, Continuation::LetTop { name: nxt_name, remaining, env: env.clone() }, env.clone()));
@@ -573,7 +573,7 @@ pub fn reduce_expression(expr: Expr, cont: Continuation, env: Env, backend: Arc<
                         local_env.borrow_mut().insert(name, Rc::new(RefCell::new(val)));
                         if remaining.is_empty() {
                             if body.is_empty() {
-                                stack.push(Apply(*cont, SharedValue::Num(0), local_env.clone()));
+                                stack.push(Apply(*cont, Types::Num(0), local_env.clone()));
                             } else if body.len() == 1 {
                                 stack.push(Eval(body.into_iter().next().unwrap(), *cont, local_env.clone()));
                             } else {
@@ -625,7 +625,7 @@ pub fn reduce_expression(expr: Expr, cont: Continuation, env: Env, backend: Arc<
                     }
                     Continuation::Car { cont, env } => {
                         match val {
-                            SharedValue::List(mut vs) => {
+                            Types::List(mut vs) => {
                                 if vs.is_empty() { panic!("car of empty list"); }
                                 let first = vs.remove(0);
                                 stack.push(Apply(*cont, first, env.clone()));
@@ -635,9 +635,9 @@ pub fn reduce_expression(expr: Expr, cont: Continuation, env: Env, backend: Arc<
                     }
                     Continuation::Cdr { cont, env } => {
                         match val {
-                            SharedValue::List(vs) => {
+                            Types::List(vs) => {
                                 if vs.is_empty() { panic!("cdr of empty list"); }
-                                let tail = SharedValue::List(vs.into_iter().skip(1).collect());
+                                let tail = Types::List(vs.into_iter().skip(1).collect());
                                 stack.push(Apply(*cont, tail, env.clone()));
                             }
                             _ => panic!("cdr expects a list"),
@@ -649,9 +649,9 @@ pub fn reduce_expression(expr: Expr, cont: Continuation, env: Env, backend: Arc<
                     }
                     Continuation::ConsRight { left_val, cont, env } => {
                         match val {
-                            SharedValue::List(mut vs) => {
+                            Types::List(mut vs) => {
                                 vs.insert(0, left_val);
-                                stack.push(Apply(*cont, SharedValue::List(vs), env.clone()));
+                                stack.push(Apply(*cont, Types::List(vs), env.clone()));
                             }
                             _ => panic!("cons expects second arg to be a list"),
                         }
@@ -659,7 +659,7 @@ pub fn reduce_expression(expr: Expr, cont: Continuation, env: Env, backend: Arc<
                     Continuation::CallEvalOperator { args, cont, env } => {
                         if args.is_empty() {
                             match val {
-                                SharedValue::Closure(params, body, closure_env) => {
+                                Types::Closure(params, body, closure_env) => {
                                     if params.len() != 0 {
                                         panic!("closure arity mismatch: expected {} got 0", params.len());
                                     }
@@ -679,7 +679,7 @@ pub fn reduce_expression(expr: Expr, cont: Continuation, env: Env, backend: Arc<
                         mut_collected.push(val);
                         if remaining.is_empty() {
                             match operator {
-                                SharedValue::Closure(params, body, closure_env) => {
+                                Types::Closure(params, body, closure_env) => {
                                     if params.len() != mut_collected.len() {
                                         panic!("closure arity mismatch: expected {} got {}", params.len(), mut_collected.len());
                                     }
@@ -689,18 +689,18 @@ pub fn reduce_expression(expr: Expr, cont: Continuation, env: Env, backend: Arc<
                                     }
                                     stack.push(Eval(*body, *cont, call_env));
                                 }
-                                SharedValue::Share(_sref) => {
+                                Types::Share(_sref) => {
                                     panic!("attempt to call a shared value as function");
                                 }
-                                SharedValue::NativeFunc(f) => {
+                                Types::NativeFunc(f) => {
                                     // native function: apply with left-to-right arguments
                                     let all_args = mut_collected;
                                     match f(all_args) {
-                                        v @ SharedValue::Num(_) => {
+                                        v @ Types::Num(_) => {
                                             stack.push(Apply(*cont, v, env.clone()));
                                         }
-                                        SharedValue::Share(sr) => {
-                                            stack.push(Apply(*cont, SharedValue::Share(sr), env.clone()));
+                                        Types::Share(sr) => {
+                                            stack.push(Apply(*cont, Types::Share(sr), env.clone()));
                                         }
                                         other => {
                                             // allow NativeFunc to return other SharedValue variants
@@ -718,21 +718,21 @@ pub fn reduce_expression(expr: Expr, cont: Continuation, env: Env, backend: Arc<
                     }
                     Continuation::If { then_e, else_e, cont, env } => {
                         match val {
-                            SharedValue::Num(n) => {
+                            Types::Num(n) => {
                                 if n != 0 {
                                     stack.push(Eval(*then_e, *cont, env.clone()));
                                 } else {
                                     stack.push(Eval(*else_e, *cont, env.clone()));
                                 }
                             }
-                            SharedValue::Bool(b) => {
+                            Types::Bool(b) => {
                                 if b {
                                     stack.push(Eval(*then_e, *cont, env.clone()));
                                 } else {
                                     stack.push(Eval(*else_e, *cont, env.clone()));
                                 }
                             }
-                            SharedValue::Share(sr) => {
+                            Types::Share(sr) => {
                                 // reveal the boolean share to all parties so they all
                                 // take the same control-flow branch (leaks 1 bit)
                                 let revealed = {
@@ -765,21 +765,21 @@ pub fn reduce_expression(expr: Expr, cont: Continuation, env: Env, backend: Arc<
                         match normalize {
                             Some((_norm_owner, norm_nbits)) => {
                                 match val {
-                                    SharedValue::Share(_) => {
+                                    Types::Share(_) => {
                                         // already a share, just continue
                                         stack.push(Apply(*cont, val, env.clone()));
                                     }
-                                    SharedValue::Num(n) => {
+                                    Types::Num(n) => {
                                         let mut be = backend.lock().unwrap_or_else(|e| e.into_inner());
                                         let fr = int_to_fr_signed(n as i64, norm_nbits);
                                         let sref = be.share_secret(fr, norm_nbits, 0);
-                                        stack.push(Apply(*cont, SharedValue::Share(sref), env.clone()));
+                                        stack.push(Apply(*cont, Types::Share(sref), env.clone()));
                                     }
-                                    SharedValue::Bool(b) => {
+                                    Types::Bool(b) => {
                                         let mut be = backend.lock().unwrap_or_else(|e| e.into_inner());
                                         let fr = if b { 1u128 } else { 0u128 };
                                         let sref = be.share_secret(fr, norm_nbits, 0);
-                                        stack.push(Apply(*cont, SharedValue::Share(sref), env.clone()));
+                                        stack.push(Apply(*cont, Types::Share(sref), env.clone()));
                                     }
                                     _ => {
                                         // other types not supported for normalization
@@ -853,10 +853,10 @@ enum PersistValue {
 
         // share builtin
         let share_backend = backend.clone();
-        let share_fn = Arc::new(move |args: Vec<SharedValue>| -> SharedValue {
+        let share_fn = Arc::new(move |args: Vec<Types>| -> Types {
             if args.len() != 2 { panic!("share expects 2 args"); }
             match (&args[0], &args[1]) {
-                (SharedValue::Num(n), SharedValue::Num(nb)) => {
+                (Types::Num(n), Types::Num(nb)) => {
                     let mut be = share_backend.lock().unwrap_or_else(|e| e.into_inner());
                     // convert signed immediate into two's-complement field element for nb bits
                     let imm = int_to_fr_signed(*n as i64, *nb as usize);
@@ -865,88 +865,88 @@ enum PersistValue {
                     // it for non-owner parties, so the owner check is enforced there.
                     let canonical_owner = 0usize;
                     let sref = be.share_secret(imm, *nb as usize, canonical_owner);
-                    SharedValue::Share(sref)
+                    Types::Share(sref)
                 }
-                (SharedValue::Share(s), SharedValue::Num(_nb)) => SharedValue::Share(s.clone()),
+                (Types::Share(s), Types::Num(_nb)) => Types::Share(s.clone()),
                 _ => panic!("share expects (num nbits) or (share nbits)"),
             }
         });
-        self.store.borrow_mut().insert("share".to_string(), Rc::new(RefCell::new(SharedValue::NativeFunc(share_fn))));
+        self.store.borrow_mut().insert("share".to_string(), Rc::new(RefCell::new(Types::NativeFunc(share_fn))));
 
         // share-from builtin: (share-from owner-id value nbits)
         // Like (share value nbits) but the owner is explicitly specified, so each
         // party can provide their own private input.
         let share_from_backend = backend.clone();
-        let share_from_fn = Arc::new(move |args: Vec<SharedValue>| -> SharedValue {
+        let share_from_fn = Arc::new(move |args: Vec<Types>| -> Types {
             if args.len() != 3 { panic!("share-from expects 3 args: (share-from owner-id value nbits)"); }
             match (&args[0], &args[1], &args[2]) {
-                (SharedValue::Num(owner_id), SharedValue::Num(n), SharedValue::Num(nb)) => {
+                (Types::Num(owner_id), Types::Num(n), Types::Num(nb)) => {
                     let mut be = share_from_backend.lock().unwrap_or_else(|e| e.into_inner());
                     let explicit_owner = *owner_id as usize;
                     let imm = int_to_fr_signed(*n as i64, *nb as usize);
                     // Same as share: pass the actual value; protocol::share_input enforces
                     // the owner check in distributed mode.
                     let sref = be.share_secret(imm, *nb as usize, explicit_owner);
-                    SharedValue::Share(sref)
+                    Types::Share(sref)
                 }
                 _ => panic!("share-from expects (owner-id value nbits) all as numbers"),
             }
         });
-        self.store.borrow_mut().insert("share-from".to_string(), Rc::new(RefCell::new(SharedValue::NativeFunc(share_from_fn))));
+        self.store.borrow_mut().insert("share-from".to_string(), Rc::new(RefCell::new(Types::NativeFunc(share_from_fn))));
 
         // reconstruct builtin
         let reconstruct_backend = backend.clone();
-        let reconstruct_fn = Arc::new(move |args: Vec<SharedValue>| -> SharedValue {
+        let reconstruct_fn = Arc::new(move |args: Vec<Types>| -> Types {
             if args.len() != 1 { panic!("reconstruct expects 1 arg"); }
             match &args[0] {
-                SharedValue::Share(sref) => {
+                Types::Share(sref) => {
                     let mut be = reconstruct_backend.lock().unwrap_or_else(|e| e.into_inner());
                     // reveal_to = None means broadcast: all parties participate and
                     // everyone reconstructs.  This is correct for both SimBackend
                     // and TransportBackend (in the single-party REPL, SimBackend
                     // ignores reveal_to anyway).
                     let plain = be.reveal(&sref, None);
-                    SharedValue::Num(plain as i64)
+                    Types::Num(plain as i64)
                 }
-                SharedValue::Num(n) => SharedValue::Num(*n),
+                Types::Num(n) => Types::Num(*n),
                 _ => panic!("reconstruct expects a shared value"),
             }
         });
-        self.store.borrow_mut().insert("reconstruct".to_string(), Rc::new(RefCell::new(SharedValue::NativeFunc(reconstruct_fn))));
+        self.store.borrow_mut().insert("reconstruct".to_string(), Rc::new(RefCell::new(Types::NativeFunc(reconstruct_fn))));
 
         // a2b builtin
         let a2b_backend = backend.clone();
-        let a2b_fn = Arc::new(move |args: Vec<SharedValue>| -> SharedValue {
+        let a2b_fn = Arc::new(move |args: Vec<Types>| -> Types {
             if args.len() != 2 { panic!("a2b expects 2 args: (a nbits)"); }
             match (&args[0], &args[1]) {
-                (SharedValue::Share(sref), SharedValue::Num(nbits)) => {
+                (Types::Share(sref), Types::Num(nbits)) => {
                     let mut be = a2b_backend.lock().unwrap_or_else(|e| e.into_inner());
                     let bits = be.a2b(&sref, *nbits as usize);
-                    let svs: Vec<SharedValue> = bits.into_iter().map(|b| SharedValue::Share(b)).collect();
-                    SharedValue::List(svs)
+                    let svs: Vec<Types> = bits.into_iter().map(|b| Types::Share(b)).collect();
+                    Types::List(svs)
                 }
                 _ => panic!("a2b expects (share nbits)"),
             }
         });
-        self.store.borrow_mut().insert("a2b".to_string(), Rc::new(RefCell::new(SharedValue::NativeFunc(a2b_fn))));
+        self.store.borrow_mut().insert("a2b".to_string(), Rc::new(RefCell::new(Types::NativeFunc(a2b_fn))));
 
         // b2a builtin
         let b2a_backend = backend.clone();
-        let b2a_fn = Arc::new(move |args: Vec<SharedValue>| -> SharedValue {
+        let b2a_fn = Arc::new(move |args: Vec<Types>| -> Types {
             if args.len() != 1 { panic!("b2a expects 1 arg: (bits-list)"); }
             match &args[0] {
-                SharedValue::List(list) => {
+                Types::List(list) => {
                     let bits_refs: Vec<crate::interpreter::backend::ShareRef> = list.iter().map(|v| {
-                        if let SharedValue::Share(sr) = v { sr.clone() } else { panic!("b2a expects list of share bits") }
+                        if let Types::Share(sr) = v { sr.clone() } else { panic!("b2a expects list of share bits") }
                     }).collect();
                     let mut be = b2a_backend.lock().unwrap_or_else(|e| e.into_inner());
                     let out = be.b2a(&bits_refs);
-                    SharedValue::Share(out)
+                    Types::Share(out)
                 }
                 _ => panic!("b2a expects a list of bit shares"),
             }
         });
-        self.store.borrow_mut().insert("b2a".to_string(), Rc::new(RefCell::new(SharedValue::NativeFunc(b2a_fn))));
+        self.store.borrow_mut().insert("b2a".to_string(), Rc::new(RefCell::new(Types::NativeFunc(b2a_fn))));
     }
 
     /// Reveal a shared value to the caller (simulated reveal via backend).
@@ -1019,7 +1019,7 @@ enum PersistValue {
     }
 
     /// Evaluate an expression using the participant's persistent store and return the resulting SharedValue.
-    pub fn eval(&self, expr: &Expr) -> SharedValue {
+    pub fn eval(&self, expr: &Expr) -> Types {
         let owner = self.id;
         let cont = Continuation::Halt;
         let result = reduce_expression(expr.clone(), cont, self.store.clone(), self.backend.clone(), owner, false);
@@ -1031,14 +1031,14 @@ enum PersistValue {
 
     /// Like `eval` but never prints anything.  Used by the TCP party-0 REPL where
     /// output is handled by the caller with colours.
-    pub fn eval_quiet(&self, expr: &Expr) -> SharedValue {
+    pub fn eval_quiet(&self, expr: &Expr) -> Types {
         let owner = self.id;
         let cont = Continuation::Halt;
         reduce_expression(expr.clone(), cont, self.store.clone(), self.backend.clone(), owner, false)
     }
 
     /// Like `eval_quiet` but also emits verbose frame-level tracing to stderr.
-    pub fn eval_quiet_verbose(&self, expr: &Expr) -> SharedValue {
+    pub fn eval_quiet_verbose(&self, expr: &Expr) -> Types {
         let owner = self.id;
         let cont = Continuation::Halt;
         reduce_expression(expr.clone(), cont, self.store.clone(), self.backend.clone(), owner, true)
@@ -1046,7 +1046,7 @@ enum PersistValue {
 
     /// Evaluate with optional verbose tracing. When verbose=true the REPL will print
     /// per-frame environment, expression and continuation snapshots.
-    pub fn eval_verbose(&self, expr: &Expr, verbose: bool) -> SharedValue {
+    pub fn eval_verbose(&self, expr: &Expr, verbose: bool) -> Types {
         if verbose {
             println!("[participant {}] starting eval (verbose)", self.id);
         }
@@ -1060,13 +1060,13 @@ enum PersistValue {
 }
 
 // helpers to convert between SharedValue and PersistValue
-fn to_persist_value(v: &SharedValue) -> Option<PersistValue> {
+fn to_persist_value(v: &Types) -> Option<PersistValue> {
     match v {
-        SharedValue::Num(n) => Some(PersistValue::Num(*n)),
-        SharedValue::Bool(b) => Some(PersistValue::Bool(*b)),
-        SharedValue::Str(s) => Some(PersistValue::Str(s.clone())),
-        SharedValue::Char(c) => Some(PersistValue::Char(*c)),
-        SharedValue::List(lst) => {
+        Types::Num(n) => Some(PersistValue::Num(*n)),
+        Types::Bool(b) => Some(PersistValue::Bool(*b)),
+        Types::Str(s) => Some(PersistValue::Str(s.clone())),
+        Types::Char(c) => Some(PersistValue::Char(*c)),
+        Types::List(lst) => {
             let mut out: Vec<PersistValue> = Vec::new();
             for item in lst.iter() {
                 if let Some(iv) = to_persist_value(item) { out.push(iv); } else { return None; }
@@ -1077,43 +1077,21 @@ fn to_persist_value(v: &SharedValue) -> Option<PersistValue> {
     }
 }
 
-fn from_persist_value(p: PersistValue) -> Option<SharedValue> {
+fn from_persist_value(p: PersistValue) -> Option<Types> {
     match p {
-        PersistValue::Num(n) => Some(SharedValue::Num(n)),
-        PersistValue::Bool(b) => Some(SharedValue::Bool(b)),
-        PersistValue::Str(s) => Some(SharedValue::Str(s)),
-        PersistValue::Char(c) => Some(SharedValue::Char(c)),
+        PersistValue::Num(n) => Some(Types::Num(n)),
+        PersistValue::Bool(b) => Some(Types::Bool(b)),
+        PersistValue::Str(s) => Some(Types::Str(s)),
+        PersistValue::Char(c) => Some(Types::Char(c)),
         PersistValue::List(vs) => {
-            let mut out: Vec<SharedValue> = Vec::new();
+            let mut out: Vec<Types> = Vec::new();
             for iv in vs.into_iter() {
                 if let Some(sv) = from_persist_value(iv) { out.push(sv); } else { return None; }
             }
-            Some(SharedValue::List(out))
+            Some(Types::List(out))
         }
     }
 }
- 
- // Helpers
- fn expr_contains_name(e: &Expr, name: &str) -> bool {
-     match e {
-         Expr::UnOp(_, inner) => expr_contains_name(inner, name),
-         Expr::Str(s) => s == name,
-         Expr::Char(c) => c.to_string() == name,
-         Expr::Bool(_) => false,
-         Expr::Num(_) => false,
-         Expr::Var(n) => n == name,
-         Expr::BinOp(_, l, r) => expr_contains_name(l, name) || expr_contains_name(r, name),
-         Expr::Let(bindings, body) | Expr::LetRec(bindings, body) => {
-             bindings.iter().any(|(n, ex)| n == name || expr_contains_name(ex, name)) || body.iter().any(|ex| expr_contains_name(ex, name))
-         }
-         Expr::Seq(es) => es.iter().any(|ex| expr_contains_name(ex, name)),
-         Expr::Car(i) | Expr::Cdr(i) => expr_contains_name(i, name),
-         Expr::Cons(a, b) => expr_contains_name(a, name) || expr_contains_name(b, name),
-         Expr::Lambda(params, body) => params.iter().any(|p| p == name) || expr_contains_name(body, name),
-         Expr::Call(h, args) => expr_contains_name(h, name) || args.iter().any(|a| expr_contains_name(a, name)),
-         Expr::If(c, t, e) => expr_contains_name(c, name) || expr_contains_name(t, name) || expr_contains_name(e, name),
-     }
- }
  
  fn expr_short(e: &Expr) -> String {
      match e {

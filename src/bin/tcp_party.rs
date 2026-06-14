@@ -26,7 +26,7 @@ use baru::crypto::net::{
     Transport, TcpTransport, InprocHandle,
     serialize_msg, deserialize_msg, MpcMsg, recv_blocking, recv_forever,
 };
-use baru::interpreter::{parse, Participant, SharedValue};
+use baru::interpreter::{parse, Participant, Types};
 use baru::repl::{
     EXAMPLES, print_help, print_examples_list, print_examples_for, ReplHelper,
 };
@@ -138,14 +138,14 @@ fn history_path() -> Option<PathBuf> {
 }
 
 /// Display a SharedValue result with sign-extension for 32-bit MPC field values.
-fn display_result(result: &SharedValue, participant: &Participant) -> String {
+fn display_result(result: &Types, participant: &Participant) -> String {
     match result {
-        SharedValue::Share(sr) => {
+        Types::Share(sr) => {
             let raw = participant.reveal(sr);
             let signed = (raw as u32) as i32 as i64;
             format!("{}", signed.to_string().bright_green())
         }
-        SharedValue::Num(n) => {
+        Types::Num(n) => {
             // sign-extend through 32 bits for MPC field values
             let signed = (*n as u32) as i32 as i64;
             format!("{}", signed.to_string().bright_green())
@@ -343,11 +343,11 @@ fn run_tcp(me: usize, mpc_addrs: Vec<String>, dist_addrs: Vec<String>) {
                         Ok(val) => {
                             // Mirror party 0's display_result to stay in sync on reveals.
                             let display = match &val {
-                                SharedValue::Share(sr) => {
+                                Types::Share(sr) => {
                                     let raw = participant.reveal(sr);
                                     ((raw as u32) as i32 as i64).to_string()
                                 }
-                                SharedValue::Num(n) => ((*n as u32) as i32 as i64).to_string(),
+                                Types::Num(n) => ((*n as u32) as i32 as i64).to_string(),
                                 other => format!("{:?}", other),
                             };
                             eprintln!("{}", format!("[party {}] => {}  (waiting for next expression)", me, display).bright_black());

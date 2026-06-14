@@ -1,4 +1,4 @@
-use baru::interpreter::{parse, Participant, SharedValue};
+use baru::interpreter::{parse, Participant, Types};
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -9,7 +9,7 @@ fn eval(src: &str) -> i64 {
     let expr = parse(src).expect("parse failed");
     let p = Participant::new_sim(0);
     match p.eval(&expr) {
-        SharedValue::Num(n) => n,
+        Types::Num(n) => n,
         other => panic!("expected Num, got: {:?}", other),
     }
 }
@@ -21,8 +21,8 @@ fn eval_shared(src: &str) -> i64 {
     let p = Participant::new_sim(0);
     match p.eval(&expr) {
         // Plain Num may carry a raw u128 field value stored as i64 bits; reinterpret as signed 32.
-        SharedValue::Num(n) => (n as u32) as i32 as i64,
-        SharedValue::Share(sr) => {
+        Types::Num(n) => (n as u32) as i32 as i64,
+        Types::Share(sr) => {
             let raw = p.reveal(&sr);
             // sign-extend from 32 bits
             (raw as u32) as i32 as i64
@@ -816,4 +816,12 @@ fn test_share_from_private_min() {
                  (let ((m (< a b)))
                    (reconstruct (+ (* a m) (* b (- one m))))))";
     assert_eq!(eval_shared(src), 30);
+}
+
+// unit test to verify that the test framework correctly handles panics (e.g. from parse errors or type errors)
+#[test]
+fn test_panics() {
+    let src = "(let ((a :sint32-from-0 30) (b :sint32-from-1 42))
+                 (if (> a b) a b))";
+    assert_eq!(eval_shared(src), 42);
 }

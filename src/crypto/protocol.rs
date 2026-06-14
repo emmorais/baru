@@ -363,7 +363,6 @@ pub fn a2b_party<T: Transport>(
     me: PartyId,
     transport: &T,
 ) -> Vec<PartyShare> {
-
     // Sample mask r (each party samples its own random r for its left component).
     // We use a shared-seed approach: all parties use op_id as seed so r is consistent.
     let mut rng_seed = [0u8; 32];

@@ -5,7 +5,7 @@ use std::error::Error;
 use rustyline::error::ReadlineError;
 use rustyline::{Editor};
 
-use baru::interpreter::{parse, Participant, SharedValue};
+use baru::interpreter::{parse, Participant, Types};
 use baru::repl::{EXAMPLES, print_help, print_examples_list, print_examples_for, ReplHelper};
 use colored::*;
 
@@ -29,7 +29,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     println!("{}", "Type ':help' for language reference, ':examples' to browse built-in examples, or 'quit' to exit.".bright_yellow());
 
     let mut verbose = false;
-    let mut last_results: Vec<Option<SharedValue>> = vec![None; participants.len()];
+    let mut last_results: Vec<Option<Types>> = vec![None; participants.len()];
 
     let helper = ReplHelper::new();
     let mut rl = Editor::new()?;
@@ -85,19 +85,19 @@ fn main() -> Result<(), Box<dyn Error>> {
                                         println!();
                                         match parse(ex.code) {
                                             Ok(expr) => {
-                                                let mut results: Vec<SharedValue> = Vec::new();
+                                                let mut results: Vec<Types> = Vec::new();
                                                 for (i, p) in participants.iter().enumerate() {
                                                     let r = p.eval(&expr);
                                                     last_results[i] = Some(r.clone());
                                                     results.push(r);
                                                 }
                                                 match &results[0] {
-                                                    SharedValue::Share(sr) => {
+                                                    Types::Share(sr) => {
                                                         let raw = participants[0].reveal(sr);
                                                         let val = (raw as u32) as i32 as i64;
                                                         println!("{} {} (revealed, signed)", "result:".bright_cyan(), val.to_string().bright_green());
                                                     }
-                                                    SharedValue::Num(n) => {
+                                                    Types::Num(n) => {
                                                         // sign-extend through 32 bits so MPC field values display correctly
                                                         let val = (*n as u32) as i32 as i64;
                                                         println!("{} {}", "result:".bright_cyan(), val.to_string().bright_green());
@@ -167,26 +167,26 @@ fn main() -> Result<(), Box<dyn Error>> {
                                     Ok(pid) if pid < participants.len() => {
                                         match &last_results[pid] {
                                             Some(v) => match v {
-                                                SharedValue::Share(sr) => {
+                                                Types::Share(sr) => {
                                                     let val = participants[pid].reveal(sr);
                                                     println!("{} {}", format!("reveal[{}] ->", pid).bright_magenta(), format!("{}", val).bright_green());
                                                 }
-                                                SharedValue::List(list) => {
+                                                Types::List(list) => {
                                                     // try to reveal each share in the list
                                                     let mut revealed: Vec<String> = Vec::new();
                                                     for item in list {
                                                         match item {
-                                                            SharedValue::Share(sr) => {
+                                                            Types::Share(sr) => {
                                                                 let val = participants[pid].reveal(sr);
                                                                 revealed.push(format!("{}", val));
                                                             }
-                                                            SharedValue::Num(n) => revealed.push(format!("Num({})", n)),
+                                                            Types::Num(n) => revealed.push(format!("Num({})", n)),
                                                             other => revealed.push(format!("{:?}", other)),
                                                         }
                                                     }
                                                     println!("reveal[{}] -> {:?}", pid, revealed);
                                                 }
-                                                SharedValue::Num(n) => println!("reveal[{}] -> Num({})", pid, n),
+                                                Types::Num(n) => println!("reveal[{}] -> Num({})", pid, n),
                                                 other => println!("reveal[{}] -> {:?}", pid, other),
                                             },
                                             None => println!("no last result for participant {}", pid),
@@ -301,14 +301,14 @@ fn main() -> Result<(), Box<dyn Error>> {
                 match parse(src) {
                     Ok(expr) => {
                         println!("parsed: {:?}", expr);
-                        let mut results: Vec<SharedValue> = Vec::new();
+                        let mut results: Vec<Types> = Vec::new();
                         for (i, p) in participants.iter().enumerate() {
                             let r = if verbose { p.eval_verbose(&expr, verbose) } else { p.eval(&expr) };
                             last_results[i] = Some(r.clone());
                             results.push(r);
                         }
                         match &results[0] {
-                            SharedValue::Num(n) => println!("result (participant 0): {}", n),
+                            Types::Num(n) => println!("result (participant 0): {}", n),
                             other => println!("result (participant 0): {:?}", other),
                         }
                         println!("all participants: {:?}\n", results);
