@@ -29,7 +29,7 @@ cargo build
 cargo test
 
 # single-process REPL (SimBackend, no networking)
-cargo run --release
+cargo run --bin baru
 ```
 
 ---
