@@ -373,9 +373,9 @@ pub fn mul_party<T: Transport>(
 
     // broadcast d_i and e_i to all other parties
     transport.broadcast(serialize_msg(&MpcMsg::TaggedD { op_id, value: d_i }));
-    println!("broadcast d_i for op_id={}", op_id);  
+    println!("broadcast d_i for op_id={}", op_id);
     transport.broadcast(serialize_msg(&MpcMsg::TaggedE { op_id, value: e_i }));
-    println!("broadcast e_i for op_id={}", op_id);  
+    println!("broadcast e_i for op_id={}", op_id);
 
     // collect d and e from the other two parties
     let mut d_shares = [0u128; N];
@@ -391,7 +391,10 @@ pub fn mul_party<T: Transport>(
     while remaining > 0 {
         println!("remaining = {}", remaining);
         if let Some((from, msg)) = recv_blocking(transport, TIMEOUT_MS) {
-            println!("mul_party: op_id={}, me={}, received from {}", op_id, me, from);
+            println!(
+                "mul_party: op_id={}, me={}, received from {}",
+                op_id, me, from
+            );
             let m: MpcMsg = deserialize_msg(&msg);
             println!("m: {:?}", m);
             match m {
@@ -484,7 +487,10 @@ pub fn a2b_party<T: Transport>(
 
     while remaining > 0 {
         if let Some((from, msg)) = recv_blocking(transport, TIMEOUT_MS) {
-            println!("a2b_party: op_id={}, me={}, received from {}", op_id, me, from);
+            println!(
+                "a2b_party: op_id={}, me={}, received from {}",
+                op_id, me, from
+            );
             let m: MpcMsg = deserialize_msg(&msg);
             if let MpcMsg::TaggedD {
                 op_id: oid,

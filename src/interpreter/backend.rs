@@ -319,7 +319,10 @@ impl<T: Transport + 'static> Backend for TransportBackend<T> {
     }
 
     fn eq(&mut self, a: &ShareRef, b: &ShareRef) -> ShareRef {
-        println!("TransportBackend: computing eq for share ids {} and {}", a.id, b.id);
+        println!(
+            "TransportBackend: computing eq for share ids {} and {}",
+            a.id, b.id
+        );
         // eq(a,b) = NOT(OR(bits of a-b))
         let nbits = a.nbits.max(b.nbits);
         let diff = self.sub(a, b);
