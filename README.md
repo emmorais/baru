@@ -1,4 +1,4 @@
-# baru
+# Baru
 
 [![CI](https://github.com/emmorais/baru/actions/workflows/ci.yml/badge.svg)](https://github.com/emmorais/baru/actions/workflows/ci.yml)
 
