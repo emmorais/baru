@@ -27,7 +27,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     println!(
         "{}",
-        "ABY3 REPL — Secure Multi-Party Computation (replicated 3-party evaluation)."
+        "Baru REPL — Secure Multi-Party Computation (replicated 3-party evaluation)."
             .bright_green()
     );
     println!("{}", "Type ':help' for language reference, ':examples' to browse built-in examples, or 'quit' to exit.".bright_yellow());

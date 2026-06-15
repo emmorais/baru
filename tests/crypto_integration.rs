@@ -211,25 +211,6 @@ fn prop_a2b_and_comparisons_randomized() {
 }
 
 #[test]
-#[ignore]
-fn debug_a2b_failing_case() {
-    use baru::crypto::arith;
-    use baru::crypto::bits;
-    use baru::crypto::sim;
-    // failing example observed during randomized runs
-    let a: u128 = 3679497250;
-    let b: u128 = 1456850268;
-    let sa = arith::share_secret(a);
-    let sb = arith::share_secret(b);
-    let diff = arith::sub_shares(&sa, &sb);
-
-    eprintln!("=== a2b_ab3 deterministic debug ===");
-    eprintln!("{}", bits::a2b_ab3_debug_seed(&diff, 32, 42));
-    eprintln!("=== sim a2b debug (random) ===");
-    eprintln!("{}", sim::a2b_debug(&diff, 32));
-}
-
-#[test]
 fn test_mul_ab3_concurrent() {
     let a: Fr = 19u128;
     let b: Fr = 23u128;

@@ -352,6 +352,7 @@ pub fn mul_party<T: Transport>(
     me: PartyId,
     transport: &T,
 ) -> PartyShare {
+    println!("mul_party: op_id={}, me={}", op_id, me);
     let triple_id = op_id * 3; // reserve 3 ids for x/y/z
 
     // obtain triple
@@ -382,6 +383,7 @@ pub fn mul_party<T: Transport>(
 
     while remaining > 0 {
         if let Some((from, msg)) = recv_blocking(transport, TIMEOUT_MS) {
+            println!("mul_party: op_id={}, me={}, received from {}", op_id, me, from);
             let m: MpcMsg = deserialize_msg(&msg);
             match m {
                 MpcMsg::TaggedD {
@@ -437,6 +439,7 @@ pub fn a2b_party<T: Transport>(
     me: PartyId,
     transport: &T,
 ) -> Vec<PartyShare> {
+    println!("a2b_party: op_id={}, me={}", op_id, me);
     // Sample mask r (each party samples its own random r for its left component).
     // We use a shared-seed approach: all parties use op_id as seed so r is consistent.
     let mut rng_seed = [0u8; 32];
@@ -472,6 +475,7 @@ pub fn a2b_party<T: Transport>(
 
     while remaining > 0 {
         if let Some((from, msg)) = recv_blocking(transport, TIMEOUT_MS) {
+            println!("a2b_party: op_id={}, me={}, received from {}", op_id, me, from);
             let m: MpcMsg = deserialize_msg(&msg);
             if let MpcMsg::TaggedD {
                 op_id: oid,
