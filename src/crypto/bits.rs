@@ -6,7 +6,7 @@ use rand::Rng;
 /// Very small shared-bit helpers implemented by reconstruct-and-reshare.
 /// These are placeholders that provide a clear API while the true secure
 /// bit-protocol (and conversions) are implemented.
-
+///////////////////////////////////////////////////////////////////////////
 /// Share a boolean as a bit (0/1) in Share3 form.
 pub fn share_bool(b: bool) -> Share3 {
     let v: Fr = if b { 1 } else { 0 };
@@ -22,7 +22,7 @@ pub fn share_bool(b: bool) -> Share3 {
 /// are left to the caller; here we treat non-zero as true).
 pub fn reconstruct_bit(s: &Share3) -> bool {
     let v = s.0.wrapping_add(s.1).wrapping_add(s.2);
-    v % 2 != 0
+    !v.is_multiple_of(2)
 }
 
 /// Bitwise AND implemented using ABY3 multiplication (Beaver triples).
@@ -103,8 +103,8 @@ pub fn a2b_ab3(a: &Share3, nbits: usize) -> (Vec<Share3>, Share3) {
     }
     // assemble r_sh = sum_i r_bits[i] * (1<<i)
     let mut r_sh = share_secret(0);
-    for i in 0..nbits {
-        let term = scalar_mul(&r_bits[i], 1u128 << i);
+    for (i, r_bit) in r_bits.iter().enumerate() {
+        let term = scalar_mul(r_bit, 1u128 << i);
         r_sh = add_shares(&r_sh, &term);
     }
 
@@ -116,10 +116,9 @@ pub fn a2b_ab3(a: &Share3, nbits: usize) -> (Vec<Share3>, Share3) {
     // compute bits using d and r_bits
     let mut out: Vec<Share3> = Vec::with_capacity(nbits);
     let mut carry = share_bool(false);
-    for i in 0..nbits {
+    for (i, r_bit) in r_bits.iter().enumerate() {
         let d_bit = ((d >> i) & 1) != 0;
         let d_share = share_bool(d_bit);
-        let r_bit = &r_bits[i];
         let s1 = xor_shared(r_bit, &d_share);
         let sum = xor_shared(&s1, &carry);
         out.push(sum);
@@ -150,8 +149,8 @@ pub fn a2b_ab3_debug_seed(a: &Share3, nbits: usize, seed: u64) -> String {
         r_bits.push(share_bool(b));
     }
     let mut r_sh = share_secret(0);
-    for i in 0..nbits {
-        let term = scalar_mul(&r_bits[i], 1u128 << i);
+    for (i, r_bit) in r_bits.iter().enumerate() {
+        let term = scalar_mul(r_bit, 1u128 << i);
         r_sh = add_shares(&r_sh, &term);
     }
     let a_plain = a.0.wrapping_add(a.1).wrapping_add(a.2);
@@ -163,20 +162,19 @@ pub fn a2b_ab3_debug_seed(a: &Share3, nbits: usize, seed: u64) -> String {
     let mut carry = share_bool(false);
     let mut sum_plain: Vec<bool> = Vec::with_capacity(nbits);
     let mut carry_plain: Vec<bool> = Vec::with_capacity(nbits);
-    for i in 0..nbits {
+    for (i, r_bit) in r_bits.iter().enumerate() {
         let d_bit = ((d >> i) & 1) != 0;
         let d_share = share_bool(d_bit);
-        let r_bit = &r_bits[i];
         let s1 = xor_shared(r_bit, &d_share);
         let sum = xor_shared(&s1, &carry);
         out.push(sum);
-        sum_plain.push(reconstruct(&out[i]) % 2 != 0);
+        sum_plain.push(reconstruct(&out[i]).is_multiple_of(2));
         let a_and_b = crate::crypto::bits::and(r_bit, &d_share);
         let a_and_c = crate::crypto::bits::and(r_bit, &carry);
         let b_and_c = crate::crypto::bits::and(&d_share, &carry);
         let t = crate::crypto::bits::or(&a_and_c, &b_and_c);
         carry = crate::crypto::bits::or(&a_and_b, &t);
-        carry_plain.push(reconstruct(&carry) % 2 != 0);
+        carry_plain.push(reconstruct(&carry).is_multiple_of(2));
     }
 
     let mut s = String::new();
@@ -203,7 +201,7 @@ pub fn a2b_ab3_debug_seed(a: &Share3, nbits: usize, seed: u64) -> String {
 
 /// Compute borrow-out of a - b given LSB-first shared bit vectors (nbits).
 /// borrow_0 is 0. Returns shared borrow_out (1 if a < b).
-fn borrow_from_bits(a_bits: &Vec<Share3>, b_bits: &Vec<Share3>) -> Share3 {
+fn borrow_from_bits(a_bits: &[Share3], b_bits: &[Share3]) -> Share3 {
     // initial borrow = 0
     let mut borrow = share_bool(false);
     for i in 0..a_bits.len() {
@@ -269,8 +267,8 @@ pub fn eq_ab3(a: &Share3, b: &Share3, nbits: usize) -> Share3 {
     let (bits, _carry_out) = a2b_ab3(&diff, nbits);
     // equality is NOT(OR(bits))
     let mut acc = bits[0].clone();
-    for i in 1..bits.len() {
-        acc = crate::crypto::bits::or(&acc, &bits[i]);
+    for bit in bits.iter().skip(1) {
+        acc = crate::crypto::bits::or(&acc, bit);
     }
     crate::crypto::bits::not(&acc)
 }

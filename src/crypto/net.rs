@@ -253,14 +253,10 @@ impl TcpTransport {
         for _ in 0..attempts {
             match TcpStream::connect(addr) {
                 Ok(mut s) => {
-                    if let Err(e) = s
-                        .write_all(&len)
+                    s.write_all(&len)
                         .and_then(|_| s.write_all(&bytes))
-                        .and_then(|_| s.flush())
-                    {
-                        // writing failed even though we connected; return the error
-                        return Err(e);
-                    }
+                        .and_then(|_| s.flush())?;
+                    // writing failed even though we connected; return the error
                     return Ok(());
                 }
                 Err(e) => {

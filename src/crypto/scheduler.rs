@@ -58,15 +58,15 @@ impl Scheduler {
             if m.tag != tag {
                 continue;
             }
-            let idx = m.from as usize;
+            let idx = m.from;
             if sums[idx].is_none() {
                 sums[idx] = Some(m.value);
             }
         }
         let mut total: Fr = 0;
-        for i in 0..3 {
-            if let Some(v) = sums[i] {
-                total = total.wrapping_add(v);
+        for (i, sum) in sums.iter().enumerate() {
+            if let Some(v) = sum {
+                total = total.wrapping_add(*v);
             } else {
                 panic!("missing broadcast from party {} for tag {}", i, tag);
             }

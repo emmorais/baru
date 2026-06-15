@@ -7,7 +7,7 @@ use crate::crypto::types::{Fr, Share3};
 /// party i is considered to hold the pair (s_i, s_{i+1 mod 3}). To open a
 /// public value (like d = a - x) we simulate each party revealing its first
 /// component (s_i) and reconstructing the public value by summing those.
-
+//////////////////////////////////////////////////////////////////////////////////
 /// Split a Share3 into per-party pairs: party i gets (s_i, s_{i+1}).
 fn split_to_party_pairs(s: &Share3) -> Vec<(Fr, Fr)> {
     vec![(s.0, s.1), (s.1, s.2), (s.2, s.0)]

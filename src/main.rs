@@ -21,6 +21,7 @@ fn history_path() -> Option<PathBuf> {
     }
 }
 
+#[allow(clippy::format_in_format_args)]
 fn main() -> Result<(), Box<dyn Error>> {
     let participants: Vec<Participant> = (0..3).map(Participant::new).collect();
 
@@ -341,8 +342,8 @@ fn main() -> Result<(), Box<dyn Error>> {
                                 _ => println!("invalid participant id"),
                             },
                             None => {
-                                for pid in 0..participants.len() {
-                                    participants[pid].reset_store();
+                                for p in &participants {
+                                    p.reset_store();
                                 }
                                 println!("reset stores for all participants");
                             }

@@ -60,6 +60,13 @@ impl SimBackend {
     }
 }
 
+// Default implementation for SimBackend
+impl Default for SimBackend {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Backend for SimBackend {
     fn share_secret(&mut self, value: Fr, nbits: usize, owner: usize) -> ShareRef {
         let s = arith::share_secret(value);
@@ -123,8 +130,8 @@ impl Backend for SimBackend {
         }
         ShareRef::new_local(
             out,
-            bits.get(0).map(|s| s.nbits).unwrap_or(0),
-            bits.get(0).map(|s| s.owner).unwrap_or(0),
+            bits.first().map(|s| s.nbits).unwrap_or(0),
+            bits.first().map(|s| s.owner).unwrap_or(0),
         )
     }
 }
@@ -136,6 +143,13 @@ pub struct Aby3Backend {}
 impl Aby3Backend {
     pub fn new() -> Self {
         Aby3Backend {}
+    }
+}
+
+// Default implementation for Aby3Backend
+impl Default for Aby3Backend {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -209,8 +223,8 @@ impl Backend for Aby3Backend {
         }
         ShareRef::new_local(
             out,
-            bits.get(0).map(|s| s.nbits).unwrap_or(0),
-            bits.get(0).map(|s| s.owner).unwrap_or(0),
+            bits.first().map(|s| s.nbits).unwrap_or(0),
+            bits.first().map(|s| s.owner).unwrap_or(0),
         )
     }
 }
@@ -409,8 +423,8 @@ impl<T: Transport + 'static> Backend for TransportBackend<T> {
         self.store(
             id,
             acc,
-            bits.get(0).map(|s| s.nbits).unwrap_or(0),
-            bits.get(0).map(|s| s.owner).unwrap_or(0),
+            bits.first().map(|s| s.nbits).unwrap_or(0),
+            bits.first().map(|s| s.owner).unwrap_or(0),
         )
     }
 

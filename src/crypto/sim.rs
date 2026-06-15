@@ -39,8 +39,8 @@ pub fn mul_ab3_protocol<T: Transport + Clone>(a: &Share3, b: &Share3, transport:
     }
 
     // collect broadcasts from others (non-blocking loop until we've got 3 contributions each)
-    let mut got_d = vec![false; 3];
-    let mut got_e = vec![false; 3];
+    let mut got_d = [false; 3];
+    let mut got_e = [false; 3];
     got_d[transport.id()] = true;
     got_e[transport.id()] = true;
     let mut pending = 2;
@@ -55,12 +55,10 @@ pub fn mul_ab3_protocol<T: Transport + Clone>(a: &Share3, b: &Share3, transport:
                         pending -= 1;
                     }
                 }
-                MpcMsg::E(v) => {
-                    if !got_e[from] {
-                        e_shares[from] = v;
-                        got_e[from] = true;
-                        pending -= 1;
-                    }
+                MpcMsg::E(v) if !got_e[from] => {
+                    e_shares[from] = v;
+                    got_e[from] = true;
+                    pending -= 1;
                 }
                 _ => {}
             }
@@ -96,8 +94,8 @@ pub fn a2b_protocol<T: Transport + Clone>(a: &Share3, nbits: usize, transport: &
     }
     // assemble r_sh = sum_i r_bits[i] * (1<<i)
     let mut r_sh = share_secret(0);
-    for i in 0..nbits {
-        let term = scalar_mul(&r_bits[i], 1u128 << i);
+    for (i, r_bit) in r_bits.iter().enumerate().take(nbits) {
+        let term = scalar_mul(r_bit, 1u128 << i);
         r_sh = add_shares(&r_sh, &term);
     }
 
@@ -116,7 +114,7 @@ pub fn a2b_protocol<T: Transport + Clone>(a: &Share3, nbits: usize, transport: &
     }
 
     // collect contributions
-    let mut got_d = vec![false; 3];
+    let mut got_d = [false; 3];
     got_d[transport.id()] = true;
     let mut pending = 2;
     while pending > 0 {
@@ -133,14 +131,14 @@ pub fn a2b_protocol<T: Transport + Clone>(a: &Share3, nbits: usize, transport: &
     }
 
     let mut d: Fr = 0;
-    for i in 0..3 {
-        d = d.wrapping_add(d_shares[i]);
+    for dshare in &d_shares {
+        d = d.wrapping_add(*dshare);
     }
 
     // compute bits LSB-first using public d and r_bits
     let mut out: Vec<Share3> = Vec::with_capacity(nbits);
     let mut carry = share_bool(false);
-    for i in 0..nbits {
+    for (i, _) in d_shares.iter().enumerate() {
         let d_bit = ((d >> i) & 1) != 0;
         let d_share = share_bool(d_bit);
         let r_bit = &r_bits[i];
@@ -193,8 +191,8 @@ pub fn eq_protocol<T: Transport + Clone>(
     let diff = crate::crypto::arith::sub_shares(a, b);
     let bits = a2b_protocol(&diff, nbits, transport);
     let mut acc = bits[0].clone();
-    for i in 1..bits.len() {
-        acc = crate::crypto::bits::or(&acc, &bits[i]);
+    for bit in &bits {
+        acc = crate::crypto::bits::or(&acc, bit);
     }
     crate::crypto::bits::not(&acc)
 }
@@ -211,8 +209,8 @@ pub fn a2b_debug(a: &Share3, nbits: usize) -> String {
         r_bits.push(share_bool(bit));
     }
     let mut r_sh = share_secret(0);
-    for i in 0..nbits {
-        let term = scalar_mul(&r_bits[i], 1u128 << i);
+    for (i, r_bit) in r_bits.iter().enumerate().take(nbits) {
+        let term = scalar_mul(r_bit, 1u128 << i);
         r_sh = add_shares(&r_sh, &term);
     }
 
@@ -226,8 +224,8 @@ pub fn a2b_debug(a: &Share3, nbits: usize) -> String {
         d_shares[i] = a_pairs[i].0.wrapping_sub(r_pairs[i].0);
     }
     let mut d: Fr = 0;
-    for i in 0..3 {
-        d = d.wrapping_add(d_shares[i]);
+    for dshare in &d_shares {
+        d = d.wrapping_add(*dshare);
     }
 
     // prepare r_bits plain
@@ -253,7 +251,7 @@ pub fn a2b_debug(a: &Share3, nbits: usize) -> String {
         // sum bit = r_i XOR d_i XOR carry
         let s1 = crate::crypto::bits::xor_shared(&r_bit_share, &d_share);
         let sum = crate::crypto::bits::xor_shared(&s1, &carry);
-        out_plain.push(reconstruct(&sum) % 2 != 0);
+        out_plain.push(reconstruct(&sum).is_multiple_of(2));
 
         // carry_next = majority(r_i, d_i, carry)
         let a_and_b = crate::crypto::bits::and(&r_bit_share, &d_share);
@@ -261,7 +259,7 @@ pub fn a2b_debug(a: &Share3, nbits: usize) -> String {
         let b_and_c = crate::crypto::bits::and(&d_share, &carry);
         let t = crate::crypto::bits::or(&a_and_c, &b_and_c);
         carry = crate::crypto::bits::or(&a_and_b, &t);
-        carry_plain.push(reconstruct(&carry) % 2 != 0);
+        carry_plain.push(reconstruct(&carry).is_multiple_of(2));
     }
 
     let mut s = String::new();
@@ -308,8 +306,8 @@ pub fn mul_ab3_with_inproc(a: &Share3, b: &Share3) -> Share3 {
     for i in 0..3 {
         let handle = &handles[i];
         // each party should see 2 incoming D and 2 incoming E messages from others
-        let mut got_d = vec![false; 3];
-        let mut got_e = vec![false; 3];
+        let mut got_d = [false; 3];
+        let mut got_e = [false; 3];
         let mut pending = 4; // expecting D and E from two other parties
                              // also include own contributions by recomputing them
         let own_d = a_pairs[i].0.wrapping_sub(x_pairs[i].0);
@@ -329,12 +327,10 @@ pub fn mul_ab3_with_inproc(a: &Share3, b: &Share3) -> Share3 {
                             pending -= 1;
                         }
                     }
-                    MpcMsg::E(v) => {
-                        if !got_e[from] {
-                            e_shares[from] = v;
-                            got_e[from] = true;
-                            pending -= 1;
-                        }
+                    MpcMsg::E(v) if !got_e[from] => {
+                        e_shares[from] = v;
+                        got_e[from] = true;
+                        pending -= 1;
                     }
                     _ => {}
                 }
@@ -378,8 +374,8 @@ pub fn a2b_with_inproc(a: &Share3, nbits: usize) -> Vec<Share3> {
         r_bits.push(share_bool(bit));
     }
     let mut r_sh = share_secret(0);
-    for i in 0..nbits {
-        let term = scalar_mul(&r_bits[i], 1u128 << i);
+    for (i, r_bit) in r_bits.iter().enumerate().take(nbits) {
+        let term = scalar_mul(r_bit, 1u128 << i);
         r_sh = add_shares(&r_sh, &term);
     }
 
@@ -397,7 +393,7 @@ pub fn a2b_with_inproc(a: &Share3, nbits: usize) -> Vec<Share3> {
     let mut d_shares = [0u128; 3];
     for i in 0..3 {
         let handle = &handles[i];
-        let mut got_d = vec![false; 3];
+        let mut got_d = [false; 3];
         let mut pending = 2; // expecting D from two other parties
         let own_d = a_pairs[i].0.wrapping_sub(r_pairs[i].0);
         d_shares[i] = own_d;
@@ -419,17 +415,16 @@ pub fn a2b_with_inproc(a: &Share3, nbits: usize) -> Vec<Share3> {
     }
 
     let mut d: Fr = 0;
-    for i in 0..3 {
-        d = d.wrapping_add(d_shares[i]);
+    for d_share in &d_shares {
+        d = d.wrapping_add(*d_share);
     }
 
     // compute bits using public d and shared r_bits
     let mut out: Vec<Share3> = Vec::with_capacity(nbits);
     let mut carry = share_bool(false);
-    for i in 0..nbits {
+    for (i, r_bit) in r_bits.iter().enumerate().take(nbits) {
         let d_bit = ((d >> i) & 1) != 0;
         let d_share = share_bool(d_bit);
-        let r_bit = &r_bits[i];
         let s1 = bits::xor_shared(r_bit, &d_share);
         let sum = bits::xor_shared(&s1, &carry);
         out.push(sum);
@@ -485,8 +480,8 @@ pub fn mul_ab3_concurrent(a: &Share3, b: &Share3) -> Share3 {
         // include own contributions
         d_shares[i] = a_pairs[i].0.wrapping_sub(x_pairs[i].0);
         e_shares[i] = b_pairs[i].0.wrapping_sub(y_pairs[i].0);
-        let mut got_d = vec![false; 3];
-        let mut got_e = vec![false; 3];
+        let mut got_d = [false; 3];
+        let mut got_e = [false; 3];
         got_d[i] = true;
         got_e[i] = true;
         let mut pending = 4; // expecting D and E from two other parties
@@ -501,12 +496,10 @@ pub fn mul_ab3_concurrent(a: &Share3, b: &Share3) -> Share3 {
                             pending -= 1;
                         }
                     }
-                    MpcMsg::E(v) => {
-                        if !got_e[from] {
-                            e_shares[from] = v;
-                            got_e[from] = true;
-                            pending -= 1;
-                        }
+                    MpcMsg::E(v) if !got_e[from] => {
+                        e_shares[from] = v;
+                        got_e[from] = true;
+                        pending -= 1;
                     }
                     _ => {}
                 }
@@ -549,8 +542,8 @@ pub fn a2b_concurrent(a: &Share3, nbits: usize) -> Vec<Share3> {
         r_bits.push(share_bool(bit));
     }
     let mut r_sh = share_secret(0);
-    for i in 0..nbits {
-        let term = scalar_mul(&r_bits[i], 1u128 << i);
+    for (i, r_bit) in r_bits.iter().enumerate() {
+        let term = scalar_mul(r_bit, 1u128 << i);
         r_sh = add_shares(&r_sh, &term);
     }
 
@@ -578,7 +571,7 @@ pub fn a2b_concurrent(a: &Share3, nbits: usize) -> Vec<Share3> {
         let handle = &handles[i];
         let own_d = a_pairs[i].0.wrapping_sub(r_pairs[i].0);
         d_shares[i] = own_d;
-        let mut got_d = vec![false; 3];
+        let mut got_d = [false; 3];
         got_d[i] = true;
         let mut pending = 2; // expecting D from two other parties
         while pending > 0 {
@@ -598,17 +591,16 @@ pub fn a2b_concurrent(a: &Share3, nbits: usize) -> Vec<Share3> {
     }
 
     let mut d: Fr = 0;
-    for i in 0..3 {
-        d = d.wrapping_add(d_shares[i]);
+    for d_share in d_shares.iter() {
+        d = d.wrapping_add(*d_share);
     }
 
     // compute bits using public d and shared r_bits
     let mut out: Vec<Share3> = Vec::with_capacity(nbits);
     let mut carry = share_bool(false);
-    for i in 0..nbits {
+    for (i, r_bit) in r_bits.iter().enumerate().take(nbits) {
         let d_bit = ((d >> i) & 1) != 0;
         let d_share = share_bool(d_bit);
-        let r_bit = &r_bits[i];
         let s1 = bits::xor_shared(r_bit, &d_share);
         let sum = bits::xor_shared(&s1, &carry);
         out.push(sum);

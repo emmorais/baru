@@ -153,7 +153,7 @@ pub fn reduce_expression(
                 format!("evaluation exceeded max frames ({})", MAX_FRAMES).bright_red()
             );
         }
-        if frames % 10000 == 0 {
+        if frames.is_multiple_of(10000) {
             eprintln!(
                 "{}",
                 format!("reduce_expression frames = {}", frames).bright_yellow()
@@ -484,9 +484,9 @@ pub fn reduce_expression(
                                         let mut be =
                                             backend.lock().unwrap_or_else(|e| e.into_inner());
                                         let sr = match op {
-                                            super::parser::BinOp::Add => be.add(&sa, &sb),
-                                            super::parser::BinOp::Sub => be.sub(&sa, &sb),
-                                            super::parser::BinOp::Mul => be.mul(&sa, &sb),
+                                            super::parser::BinOp::Add => be.add(sa, sb),
+                                            super::parser::BinOp::Sub => be.sub(sa, sb),
+                                            super::parser::BinOp::Mul => be.mul(sa, sb),
                                             _ => panic!("unsupported shared op"),
                                         };
                                         Types::Share(sr)
@@ -495,12 +495,12 @@ pub fn reduce_expression(
                                         let mut be =
                                             backend.lock().unwrap_or_else(|e| e.into_inner());
                                         // convert signed immediate into two's-complement field element for sa.nbits
-                                        let imm = int_to_fr_signed(*bn as i64, sa.nbits);
+                                        let imm = int_to_fr_signed(*bn, sa.nbits);
                                         let sb = be.share_secret(imm, sa.nbits, 0);
                                         let sr = match op {
-                                            super::parser::BinOp::Add => be.add(&sa, &sb),
-                                            super::parser::BinOp::Sub => be.sub(&sa, &sb),
-                                            super::parser::BinOp::Mul => be.mul(&sa, &sb),
+                                            super::parser::BinOp::Add => be.add(sa, &sb),
+                                            super::parser::BinOp::Sub => be.sub(sa, &sb),
+                                            super::parser::BinOp::Mul => be.mul(sa, &sb),
                                             _ => panic!("unsupported shared op"),
                                         };
                                         Types::Share(sr)
@@ -509,12 +509,12 @@ pub fn reduce_expression(
                                         let mut be =
                                             backend.lock().unwrap_or_else(|e| e.into_inner());
                                         // convert signed immediate into two's-complement field element for sb.nbits
-                                        let imm = int_to_fr_signed(*an as i64, sb.nbits);
+                                        let imm = int_to_fr_signed(*an, sb.nbits);
                                         let sa = be.share_secret(imm, sb.nbits, 0);
                                         let sr = match op {
-                                            super::parser::BinOp::Add => be.add(&sa, &sb),
-                                            super::parser::BinOp::Sub => be.sub(&sa, &sb),
-                                            super::parser::BinOp::Mul => be.mul(&sa, &sb),
+                                            super::parser::BinOp::Add => be.add(&sa, sb),
+                                            super::parser::BinOp::Sub => be.sub(&sa, sb),
+                                            super::parser::BinOp::Mul => be.mul(&sa, sb),
                                             _ => panic!("unsupported shared op"),
                                         };
                                         Types::Share(sr)
@@ -566,19 +566,19 @@ pub fn reduce_expression(
                                 }
                                 (Types::Share(sa), Types::Share(sb)) => {
                                     let mut be = backend.lock().unwrap_or_else(|e| e.into_inner());
-                                    Types::Share(be.eq(&sa, &sb))
+                                    Types::Share(be.eq(sa, sb))
                                 }
                                 (Types::Share(sa), Types::Num(bn)) => {
                                     let mut be = backend.lock().unwrap_or_else(|e| e.into_inner());
-                                    let imm = int_to_fr_signed(*bn as i64, sa.nbits);
+                                    let imm = int_to_fr_signed(*bn, sa.nbits);
                                     let sb = be.share_secret(imm, sa.nbits, 0);
-                                    Types::Share(be.eq(&sa, &sb))
+                                    Types::Share(be.eq(sa, &sb))
                                 }
                                 (Types::Num(an), Types::Share(sb)) => {
                                     let mut be = backend.lock().unwrap_or_else(|e| e.into_inner());
-                                    let imm = int_to_fr_signed(*an as i64, sb.nbits);
+                                    let imm = int_to_fr_signed(*an, sb.nbits);
                                     let sa = be.share_secret(imm, sb.nbits, 0);
-                                    Types::Share(be.eq(&sa, &sb))
+                                    Types::Share(be.eq(&sa, sb))
                                 }
                                 _ => Types::Num(0),
                             },
@@ -599,36 +599,36 @@ pub fn reduce_expression(
                                 (Types::Share(sa), Types::Share(sb)) => {
                                     let mut be = backend.lock().unwrap_or_else(|e| e.into_inner());
                                     let out = match op {
-                                        super::parser::BinOp::Lt => be.lt(&sa, &sb),
-                                        super::parser::BinOp::Gt => be.lt(&sb, &sa),
-                                        super::parser::BinOp::Le => be.le(&sa, &sb),
-                                        super::parser::BinOp::Ge => be.le(&sb, &sa),
+                                        super::parser::BinOp::Lt => be.lt(sa, sb),
+                                        super::parser::BinOp::Gt => be.lt(sb, sa),
+                                        super::parser::BinOp::Le => be.le(sa, sb),
+                                        super::parser::BinOp::Ge => be.le(sb, sa),
                                         _ => unreachable!(),
                                     };
                                     Types::Share(out)
                                 }
                                 (Types::Share(sa), Types::Num(bn)) => {
                                     let mut be = backend.lock().unwrap_or_else(|e| e.into_inner());
-                                    let imm = int_to_fr_signed(*bn as i64, sa.nbits);
+                                    let imm = int_to_fr_signed(*bn, sa.nbits);
                                     let sb = be.share_secret(imm, sa.nbits, 0);
                                     let out = match op {
-                                        super::parser::BinOp::Lt => be.lt(&sa, &sb),
-                                        super::parser::BinOp::Gt => be.lt(&sb, &sa),
-                                        super::parser::BinOp::Le => be.le(&sa, &sb),
-                                        super::parser::BinOp::Ge => be.le(&sb, &sa),
+                                        super::parser::BinOp::Lt => be.lt(sa, &sb),
+                                        super::parser::BinOp::Gt => be.lt(&sb, sa),
+                                        super::parser::BinOp::Le => be.le(sa, &sb),
+                                        super::parser::BinOp::Ge => be.le(&sb, sa),
                                         _ => unreachable!(),
                                     };
                                     Types::Share(out)
                                 }
                                 (Types::Num(an), Types::Share(sb)) => {
                                     let mut be = backend.lock().unwrap_or_else(|e| e.into_inner());
-                                    let imm = int_to_fr_signed(*an as i64, sb.nbits);
+                                    let imm = int_to_fr_signed(*an, sb.nbits);
                                     let sa = be.share_secret(imm, sb.nbits, 0);
                                     let out = match op {
-                                        super::parser::BinOp::Lt => be.lt(&sa, &sb),
-                                        super::parser::BinOp::Gt => be.lt(&sb, &sa),
-                                        super::parser::BinOp::Le => be.le(&sa, &sb),
-                                        super::parser::BinOp::Ge => be.le(&sb, &sa),
+                                        super::parser::BinOp::Lt => be.lt(&sa, sb),
+                                        super::parser::BinOp::Gt => be.lt(sb, &sa),
+                                        super::parser::BinOp::Le => be.le(&sa, sb),
+                                        super::parser::BinOp::Ge => be.le(sb, &sa),
                                         _ => unreachable!(),
                                     };
                                     Types::Share(out)
@@ -842,7 +842,7 @@ pub fn reduce_expression(
                         if args.is_empty() {
                             match val {
                                 Types::Closure(params, body, closure_env) => {
-                                    if params.len() != 0 {
+                                    if !params.is_empty() {
                                         panic!(
                                             "closure arity mismatch: expected {} got 0",
                                             params.len()
@@ -887,8 +887,7 @@ pub fn reduce_expression(
                                     }
                                     let call_env =
                                         Rc::new(RefCell::new(closure_env.borrow().clone()));
-                                    for (p, v) in params.into_iter().zip(mut_collected.into_iter())
-                                    {
+                                    for (p, v) in params.into_iter().zip(mut_collected) {
                                         call_env.borrow_mut().insert(p, Rc::new(RefCell::new(v)));
                                     }
                                     stack.push(Eval(*body, *cont, call_env));
@@ -991,7 +990,7 @@ pub fn reduce_expression(
                                     Types::Num(n) => {
                                         let mut be =
                                             backend.lock().unwrap_or_else(|e| e.into_inner());
-                                        let fr = int_to_fr_signed(n as i64, norm_nbits);
+                                        let fr = int_to_fr_signed(n, norm_nbits);
                                         let sref = be.share_secret(fr, norm_nbits, 0);
                                         stack.push(Apply(*cont, Types::Share(sref), env.clone()));
                                     }
@@ -1103,7 +1102,7 @@ impl Participant {
                 (Types::Num(n), Types::Num(nb)) => {
                     let mut be = share_backend.lock().unwrap_or_else(|e| e.into_inner());
                     // convert signed immediate into two's-complement field element for nb bits
-                    let imm = int_to_fr_signed(*n as i64, *nb as usize);
+                    let imm = int_to_fr_signed(*n, *nb as usize);
                     // Always pass the actual value. SimBackend uses it directly.
                     // TransportBackend passes it to protocol::share_input which ignores
                     // it for non-owner parties, so the owner check is enforced there.
@@ -1132,7 +1131,7 @@ impl Participant {
                 (Types::Num(owner_id), Types::Num(n), Types::Num(nb)) => {
                     let mut be = share_from_backend.lock().unwrap_or_else(|e| e.into_inner());
                     let explicit_owner = *owner_id as usize;
-                    let imm = int_to_fr_signed(*n as i64, *nb as usize);
+                    let imm = int_to_fr_signed(*n, *nb as usize);
                     // Same as share: pass the actual value; protocol::share_input enforces
                     // the owner check in distributed mode.
                     let sref = be.share_secret(imm, *nb as usize, explicit_owner);
@@ -1161,7 +1160,7 @@ impl Participant {
                     // everyone reconstructs.  This is correct for both SimBackend
                     // and TransportBackend (in the single-party REPL, SimBackend
                     // ignores reveal_to anyway).
-                    let plain = be.reveal(&sref, None);
+                    let plain = be.reveal(sref, None);
                     Types::Num(plain as i64)
                 }
                 Types::Num(n) => Types::Num(*n),
@@ -1182,8 +1181,8 @@ impl Participant {
             match (&args[0], &args[1]) {
                 (Types::Share(sref), Types::Num(nbits)) => {
                     let mut be = a2b_backend.lock().unwrap_or_else(|e| e.into_inner());
-                    let bits = be.a2b(&sref, *nbits as usize);
-                    let svs: Vec<Types> = bits.into_iter().map(|b| Types::Share(b)).collect();
+                    let bits = be.a2b(sref, *nbits as usize);
+                    let svs: Vec<Types> = bits.into_iter().map(Types::Share).collect();
                     Types::List(svs)
                 }
                 _ => panic!("a2b expects (share nbits)"),
@@ -1263,7 +1262,7 @@ impl Participant {
         let mut out: std::collections::HashMap<String, PersistValue> = HashMap::new();
         for (k, vptr) in map.iter() {
             let v = vptr.borrow();
-            if let Some(pv) = to_persist_value(&*v) {
+            if let Some(pv) = to_persist_value(&v) {
                 out.insert(k.clone(), pv);
             }
         }

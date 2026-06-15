@@ -233,14 +233,15 @@ pub fn parse_tokens(tokens: &[String], pos: &mut usize) -> Result<Expr, String> 
                         let tkn = tokens[*pos].clone();
                         *pos += 1;
                         if tkn.starts_with(":sint") {
-                            let rest = &tkn[5..]; // e.g. "32" or "32-from-1"
-                            if let Some(dash) = rest.find("-from-") {
-                                if let Ok(nbits) = rest[..dash].parse::<i64>() {
+                            if let Some(rest) = tkn.strip_prefix(":sint") {
+                                if let Some(dash) = rest.find("-from-") {
+                                    if let Ok(nbits) = rest[..dash].parse::<i64>() {
+                                        wrap_with_share = Some(nbits);
+                                        share_owner_override = rest[dash + 6..].parse::<i64>().ok();
+                                    }
+                                } else if let Ok(nbits) = rest.parse::<i64>() {
                                     wrap_with_share = Some(nbits);
-                                    share_owner_override = rest[dash + 6..].parse::<i64>().ok();
                                 }
-                            } else if let Ok(nbits) = rest.parse::<i64>() {
-                                wrap_with_share = Some(nbits);
                             }
                         }
                     }
@@ -292,8 +293,7 @@ pub fn parse_tokens(tokens: &[String], pos: &mut usize) -> Result<Expr, String> 
                     if *pos < tokens.len() && tokens[*pos].starts_with(":") {
                         let tkn = tokens[*pos].clone();
                         *pos += 1;
-                        if tkn.starts_with(":sint") {
-                            let rest = &tkn[5..];
+                        if let Some(rest) = tkn.strip_prefix(":sint") {
                             if let Some(dash) = rest.find("-from-") {
                                 if let Ok(nbits) = rest[..dash].parse::<i64>() {
                                     wrap_with_share = Some(nbits);

@@ -37,7 +37,7 @@ fn test_bits_ops() {
     let orv = bits::or(&t, &f);
     assert_eq!(bits::reconstruct_bit(&orv), true | false);
     let notv = bits::not(&t);
-    assert_eq!(bits::reconstruct_bit(&notv), !true);
+    assert!(!bits::reconstruct_bit(&notv));
 }
 
 #[test]
@@ -172,11 +172,11 @@ fn prop_a2b_and_comparisons_randomized() {
             let diff = arith::sub_shares(&sa, &sb);
             // call the a2b implementation used by bits::lt_ab3 to inspect its actual output
             let (bits_exact, carry_exact) = bits::a2b_ab3(&diff, 32);
-            let carry_plain = arith::reconstruct(&carry_exact) % 2 != 0;
+            let carry_plain = arith::reconstruct(&carry_exact).is_multiple_of(2);
             eprintln!("a2b_ab3 carry (reconstructed) = {}", carry_plain);
             let mut bits_plain_vec: Vec<bool> = Vec::new();
-            for i in 0..bits_exact.len() {
-                bits_plain_vec.push(bits::reconstruct_bit(&bits_exact[i]));
+            for bit in &bits_exact {
+                bits_plain_vec.push(bits::reconstruct_bit(bit));
             }
             eprintln!("a2b_ab3 bits (reconstructed) = {:?}", bits_plain_vec);
             // reconstruct numeric diff from protocol bits

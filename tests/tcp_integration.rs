@@ -112,9 +112,8 @@ fn tcp_process_integration() {
             i,
             combined
         );
-        let after = combined.rsplitn(2, "SUM:").next().unwrap();
+        let after = combined.rsplit("SUM:").next().unwrap();
         let token = after
-            .trim()
             .split_whitespace()
             .next()
             .unwrap_or_else(|| panic!("no number after SUM: in party {} output", i));
@@ -521,7 +520,7 @@ fn tcp_mpc_error_recovery() {
         .filter_map(|line| {
             let t = line.trim();
             let t = t.strip_prefix("=>")?;
-            t.trim().split_whitespace().next()?.parse::<i64>().ok()
+            t.split_whitespace().next()?.parse::<i64>().ok()
         })
         .collect();
 

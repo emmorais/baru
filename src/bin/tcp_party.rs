@@ -65,7 +65,7 @@ fn receive_expr<T: Transport>(transport: &T) -> String {
         // Any other message that arrived before the length header is ignored;
         // this can happen if a stray MPC message lingers in the queue.
     };
-    let chunks = (len + 15) / 16;
+    let chunks = len.div_ceil(16);
     let mut bytes = vec![0u8; len];
     let mut received = 0usize;
     while received < chunks {
@@ -518,9 +518,9 @@ fn run_d_sum(me: usize, addrs: Vec<String>, d_val: u128) {
     let transport = TcpTransport::new(me, addrs);
     transport.broadcast(serialize_msg(&MpcMsg::D(d_val)));
 
-    let mut got = vec![false; 3];
+    let mut got = [false; 3];
     got[me] = true;
-    let mut d_shares = vec![0u128; 3];
+    let mut d_shares = [0u128; 3];
     d_shares[me] = d_val;
     let mut pending = 2;
     let start = std::time::Instant::now();

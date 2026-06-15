@@ -7,7 +7,7 @@ use rand::Rng;
 /// Real ABY3 multiplication is interactive and requires communication. These
 /// implementations reconstruct-and-reshare (insecure) to provide a usable API
 /// while the real protocol is implemented later.
-
+//////////////////////////////////////////////////////////////////////////////
 /// Secret-share a plain value into a random Share3.
 pub fn share_secret(x: Fr) -> Share3 {
     let mut rng = rand::thread_rng();
@@ -74,8 +74,8 @@ pub fn gen_beaver_triple() -> (Share3, Share3, Share3) {
     let mut z2: Fr = 0;
     let xs = [x0, x1, x2];
     let ys = [y0, y1, y2];
-    for i in 0..3 {
-        for j in 0..3 {
+    for (i, _) in xs.iter().enumerate() {
+        for (j, _) in ys.iter().enumerate() {
             let prod = xs[i].wrapping_mul(ys[j]);
             match (i + j) % 3 {
                 0 => z0 = z0.wrapping_add(prod),

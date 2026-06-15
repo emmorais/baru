@@ -397,12 +397,10 @@ pub fn mul_party<T: Transport>(
                 MpcMsg::TaggedE {
                     op_id: oid,
                     value: v,
-                } if oid == op_id => {
-                    if !got_e[from] {
-                        e_shares[from] = v;
-                        got_e[from] = true;
-                        remaining -= 1;
-                    }
+                } if oid == op_id && !got_e[from] => {
+                    e_shares[from] = v;
+                    got_e[from] = true;
+                    remaining -= 1;
                 }
                 _ => {}
             }
@@ -457,8 +455,8 @@ pub fn a2b_party<T: Transport>(
 
     // assemble r_sh from r_bits
     let mut r_sh = share_public(0, me);
-    for i in 0..nbits {
-        let term = scalar_mul_party(&r_bits[i], 1u128 << i);
+    for (i, r_bit) in r_bits.iter().enumerate() {
+        let term = scalar_mul_party(r_bit, 1u128 << i);
         r_sh = add_party(&r_sh, &term);
     }
 
@@ -507,10 +505,9 @@ pub fn a2b_party<T: Transport>(
     let mut out: Vec<PartyShare> = Vec::with_capacity(nbits);
     let mut carry = share_public(0, me); // carry starts at 0
 
-    for i in 0..nbits {
+    for (i, r_bit) in r_bits.iter().enumerate() {
         let d_bit: Fr = (d >> i) & 1; // public
         let r_bit_val: Fr = (r >> i) & 1; // public (same r for all parties since seeded rng)
-        let r_bit = &r_bits[i]; // secret-shared form of r_bit_val
 
         // sum = r_i XOR d_i XOR carry  (local, no communication)
         let s1 = xor_public_party(r_bit, &share_public(d_bit, me), me);
