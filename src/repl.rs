@@ -225,7 +225,7 @@ pub fn distinct_categories() -> Vec<&'static str> {
 pub fn print_help(tcp_mode: bool) {
     println!();
     println!("{}", "╔══════════════════════════════════════════════════════════════╗".bright_cyan());
-    println!("{}", "║      baru — a Lisp-like Secure Multi-Party Computation REPL  ║".bright_cyan());
+    println!("{}", "║      Baru — a Lisp-like Secure Multi-Party Computation REPL  ║".bright_cyan());
     println!("{}", "╚══════════════════════════════════════════════════════════════╝".bright_cyan());
     println!();
 
