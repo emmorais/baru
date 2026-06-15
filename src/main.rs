@@ -293,6 +293,17 @@ fn main() -> Result<(), Box<dyn Error>> {
                                 }
                             }
                         }
+                        ":env" => {
+                            match parts.next() {
+                                Some(pid_s) => match pid_s.parse::<usize>() {
+                                    Ok(pid) if pid < participants.len() => {
+                                        participants[pid].print_env();
+                                    }
+                                    _ => println!("invalid participant id"),
+                                },
+                                None => println!("usage: :env <participant-id>"),
+                            }
+                        }
                         _ => println!("unknown command: {}  (type ':help' for command reference)", cmd),
                     }
                     continue;

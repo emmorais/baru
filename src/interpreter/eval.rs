@@ -146,40 +146,6 @@ pub fn reduce_expression(expr: Expr, cont: Continuation, env: Env, backend: Arc<
 
         if trace_enabled && trace.len() < TRACE_LIMIT {
             // Pretty / colored printers for environment, Expr and SharedValue used in traces
-            fn env_pretty(env: &Env, max_entries: usize) -> String {
-                use std::cmp::min;
-                let map = env.borrow();
-                if map.is_empty() { return "{}".to_string(); }
-                // collect and sort keys for stable output
-                let mut keys: Vec<&String> = map.keys().collect();
-                keys.sort();
-                let mut parts: Vec<String> = Vec::new();
-                for k in keys.iter().take(min(max_entries, keys.len())) {
-                    if let Some(vptr) = map.get(*k) {
-                        // borrow the inner SharedValue for read-only display
-                        let vref = vptr.borrow();
-                        let sval = colored_value(&*vref);
-                        parts.push(format!("{}: {}", k.bright_blue(), sval));
-                    }
-                }
-                let mut s = String::new();
-                s.push('{');
-                if !parts.is_empty() {
-                    s.push('\n');
-                    for p in parts.iter() {
-                        s.push_str("  ");
-                        s.push_str(p);
-                        s.push_str(",\n");
-                    }
-                    s.push('}');
-                } else {
-                    s.push('}');
-                }
-                if map.len() > max_entries {
-                    s.push_str(&format!("  ... {} more fields", map.len() - max_entries));
-                }
-                s
-            }
 
             fn colored_expr(e: &Expr) -> String {
                 match e {
@@ -216,13 +182,11 @@ pub fn reduce_expression(expr: Expr, cont: Continuation, env: Env, backend: Arc<
             }
 
             match &task {
-                Eval(e, _k, env_snapshot) => {
+                Eval(e, _k, _env) => {
                     // quieter eval trace: show expression and a short pretty env
-                    let envs = env_pretty(env_snapshot, 6);
-                    trace.push(format!("{}: {}  env={}",
+                    trace.push(format!("{}: {}",
                         "Eval".green(),
                         colored_expr(e),
-                        envs
                     ));
                 }
                 Apply(k, v, _env_snapshot) => {
@@ -953,6 +917,17 @@ enum PersistValue {
     pub fn reveal(&self, sref: &crate::interpreter::backend::ShareRef) -> crate::crypto::types::Fr {
         let mut be = self.backend.lock().unwrap_or_else(|e| e.into_inner());
         be.reveal(sref, None)
+    }
+
+    /// Print env
+    pub fn print_env(&self) {
+        let map = self.store.borrow();
+        println!("=== participant {} environment ===", self.id);
+        for (k, vptr) in map.iter() {
+            let v = vptr.borrow();
+            println!("{} => {:?}", k, *v);
+        }
+        println!("=== end environment ===");
     }
 
     /// Reset per-expression backend state (share map + ID counter).

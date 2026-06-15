@@ -744,6 +744,23 @@ fn test_simple_neural_network_sint() {
     assert_eq!(eval_shared(src), 0);
 }
 
+#[test]
+fn test_non_trivial_neural_network_sint() {
+    // two neurons, same input:
+    //   n1 = ReLU(w11*x + w12*x) = ReLU((2 + -3)*4) = ReLU(-4) = 0
+    //   n2 = ReLU(w21*x + w22*x) = ReLU((1 +  2)*4) = ReLU(12) = 12
+    // output = n1 + n2 = 12
+    let src = "(let ((x  :sint32 4)
+                     (w11 :sint32 2) (w12 :sint32 -3)
+                     (w21 :sint32 1) (w22 :sint32  2))
+                 (let ((z1 (+ (* w11 x) (* w12 x)))
+                       (z2 (+ (* w21 x) (* w22 x))))
+                   (let ((n1 (if (> z1 0) z1 0))
+                         (n2 (if (> z2 0) z2 0)))
+                     (+ n1 n2))))";
+    assert_eq!(eval_shared(src), 12);
+}
+
 // ---------------------------------------------------------------------------
 // Private inputs via share-from / :sintN-from-M
 // ---------------------------------------------------------------------------
