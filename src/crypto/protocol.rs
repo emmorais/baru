@@ -363,7 +363,7 @@ pub fn mul_party<T: Transport>(
     let (x, y, z) = if me == 0 {
         deal_triple(triple_id, me, transport)
     } else {
-        sleep(std::time::Duration::from_millis(100)); // give the dealer a chance to send before we start recv'ing
+        sleep(std::time::Duration::from_millis(500)); // give the dealer a chance to send before we start recv'ing
         receive_triple(triple_id, transport)
     };
 

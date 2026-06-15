@@ -47,6 +47,7 @@ pub trait Backend: Send + Sync {
     /// starts with a clean slate.  Called by the REPL before each expression to
     /// keep all parties' ID counters in sync even after an error/abort.
     fn reset_per_expression(&mut self) {}
+    fn and(&mut self, a: &ShareRef, b: &ShareRef) -> ShareRef;
 }
 
 /// Single-process simulation backend backed by current sim/inproc wrappers.
@@ -133,6 +134,17 @@ impl Backend for SimBackend {
             bits.first().map(|s| s.nbits).unwrap_or(0),
             bits.first().map(|s| s.owner).unwrap_or(0),
         )
+    }
+
+    fn and(&mut self, a: &ShareRef, b: &ShareRef) -> ShareRef {
+        let bit_refs_a = self.a2b(&a, a.nbits);
+        let bit_refs_b = self.a2b(&b, b.nbits);
+        let mut and_bits = Vec::new();
+        for (bit_a, bit_b) in bit_refs_a.iter().zip(bit_refs_b.iter()) {
+            let and_bit = self.mul(bit_a, bit_b);
+            and_bits.push(and_bit);
+        }
+        self.b2a(&and_bits)
     }
 }
 
@@ -226,6 +238,17 @@ impl Backend for Aby3Backend {
             bits.first().map(|s| s.nbits).unwrap_or(0),
             bits.first().map(|s| s.owner).unwrap_or(0),
         )
+    }
+
+    fn and(&mut self, a: &ShareRef, b: &ShareRef) -> ShareRef {
+        let bit_refs_a = self.a2b(&a, a.nbits);
+        let bit_refs_b = self.a2b(&b, b.nbits);
+        let mut and_bits = Vec::new();
+        for (bit_a, bit_b) in bit_refs_a.iter().zip(bit_refs_b.iter()) {
+            let and_bit = self.mul(bit_a, bit_b);
+            and_bits.push(and_bit);
+        }
+        self.b2a(&and_bits)
     }
 }
 
@@ -441,5 +464,16 @@ impl<T: Transport + 'static> Backend for TransportBackend<T> {
     fn reset_per_expression(&mut self) {
         self.shares.clear();
         self.next_id = 1;
+    }
+
+    fn and(&mut self, a: &ShareRef, b: &ShareRef) -> ShareRef {
+        let bit_refs_a = self.a2b(&a, a.nbits);
+        let bit_refs_b = self.a2b(&b, b.nbits);
+        let mut and_bits = Vec::new();
+        for (bit_a, bit_b) in bit_refs_a.iter().zip(bit_refs_b.iter()) {
+            let and_bit = self.mul(bit_a, bit_b);
+            and_bits.push(and_bit);
+        }
+        self.b2a(&and_bits)
     }
 }
