@@ -660,6 +660,22 @@ pub fn reduce_expression(
                                 }
                             },
                             super::parser::BinOp::Or => match (&left_val, &val) {
+                                (Types::Share(sa), Types::Share(sb)) => {
+                                    let mut be = backend.lock().unwrap_or_else(|e| e.into_inner());
+                                    Types::Share(be.or(sa, sb))
+                                }
+                                (Types::Share(sa), Types::Num(b)) => {
+                                    let mut be = backend.lock().unwrap_or_else(|e| e.into_inner());
+                                    let imm = int_to_fr_signed(*b, sa.nbits);
+                                    let sb = be.share_secret(imm, sa.nbits, 0);
+                                    Types::Share(be.or(sa, &sb))
+                                }
+                                (Types::Num(a), Types::Share(sb)) => {
+                                    let mut be = backend.lock().unwrap_or_else(|e| e.into_inner());
+                                    let imm = int_to_fr_signed(*a, sb.nbits);
+                                    let sa = be.share_secret(imm, sb.nbits, 0);
+                                    Types::Share(be.or(&sa, sb))
+                                }
                                 (Types::Num(a), Types::Num(b)) => Types::Num(a | b),
                                 _ => {
                                     let a = maybe_num(&left_val).expect("or expects NUM/BOOL");

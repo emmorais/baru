@@ -48,6 +48,7 @@ pub trait Backend: Send + Sync {
     /// keep all parties' ID counters in sync even after an error/abort.
     fn reset_per_expression(&mut self) {}
     fn and(&mut self, a: &ShareRef, b: &ShareRef) -> ShareRef;
+    fn or(&mut self, a: &ShareRef, b: &ShareRef) -> ShareRef;
 }
 
 /// Single-process simulation backend backed by current sim/inproc wrappers.
@@ -145,6 +146,17 @@ impl Backend for SimBackend {
             and_bits.push(and_bit);
         }
         self.b2a(&and_bits)
+    }
+
+    fn or(&mut self, a: &ShareRef, b: &ShareRef) -> ShareRef {
+        let bit_refs_a = self.a2b(a, a.nbits);
+        let bit_refs_b = self.a2b(b, b.nbits);
+        let mut or_bits = Vec::new();
+        for (bit_a, bit_b) in bit_refs_a.iter().zip(bit_refs_b.iter()) {
+            let or_bit = self.add(bit_a, bit_b);
+            or_bits.push(or_bit);
+        }
+        self.b2a(&or_bits)
     }
 }
 
@@ -249,6 +261,17 @@ impl Backend for Aby3Backend {
             and_bits.push(and_bit);
         }
         self.b2a(&and_bits)
+    }
+
+    fn or(&mut self, a: &ShareRef, b: &ShareRef) -> ShareRef {
+        let bit_refs_a = self.a2b(a, a.nbits);
+        let bit_refs_b = self.a2b(b, b.nbits);
+        let mut or_bits = Vec::new();
+        for (bit_a, bit_b) in bit_refs_a.iter().zip(bit_refs_b.iter()) {
+            let or_bit = self.add(bit_a, bit_b);
+            or_bits.push(or_bit);
+        }
+        self.b2a(&or_bits)
     }
 }
 
@@ -475,5 +498,18 @@ impl<T: Transport + 'static> Backend for TransportBackend<T> {
             and_bits.push(and_bit);
         }
         self.b2a(&and_bits)
+    }
+
+    fn or(&mut self, a: &ShareRef, b: &ShareRef) -> ShareRef {
+        let bit_refs_a = self.a2b(a, a.nbits);
+        let bit_refs_b = self.a2b(b, b.nbits);
+        let mut or_bits = Vec::new();
+        for (bit_a, bit_b) in bit_refs_a.iter().zip(bit_refs_b.iter()) {
+            let sum = self.add(bit_a, bit_b);
+            let prod = self.mul(bit_a, bit_b);
+            let ps = self.sub(&sum, &prod);
+            or_bits.push(ps);
+        }
+        self.b2a(&or_bits)
     }
 }
