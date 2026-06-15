@@ -319,6 +319,7 @@ impl<T: Transport + 'static> Backend for TransportBackend<T> {
     }
 
     fn eq(&mut self, a: &ShareRef, b: &ShareRef) -> ShareRef {
+        println!("TransportBackend: computing eq for share ids {} and {}", a.id, b.id);
         // eq(a,b) = NOT(OR(bits of a-b))
         let nbits = a.nbits.max(b.nbits);
         let diff = self.sub(a, b);
@@ -326,6 +327,7 @@ impl<T: Transport + 'static> Backend for TransportBackend<T> {
         // OR all bits via a+b-a*b
         let zero = protocol::share_public(0, self.me);
         let mut acc_id = self.alloc_id();
+        println!("TransportBackend: inserting zero share id {}", acc_id);
         self.shares.insert(acc_id, zero);
         for br in &bit_refs {
             let pa = self.get_cloned(&ShareRef {
@@ -337,9 +339,14 @@ impl<T: Transport + 'static> Backend for TransportBackend<T> {
             let pb = self.get_cloned(br);
             let sum = protocol::add_party(&pa, &pb);
             let mul_id = self.alloc_id();
+            let _mul_id_triple = self.alloc_id();
+            let _mul_id_triple2 = self.alloc_id();
+            let _mul_id_triple3 = self.alloc_id();
+            println!("TransportBackend: computing mul for OR, mul_id={}", mul_id);
             let prod = protocol::mul_party(&pa, &pb, mul_id, self.me, &self.transport);
             let or_ps = protocol::sub_party(&sum, &prod);
             let new_id = self.alloc_id();
+            println!("TransportBackend: inserting OR share id {}", new_id);
             self.shares.insert(new_id, or_ps);
             acc_id = new_id;
         }

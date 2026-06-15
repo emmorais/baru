@@ -5,6 +5,8 @@
 //! the protocol.  The functions are synchronous (blocking) and use
 //! `recv_blocking` with a generous timeout.
 
+use std::thread::sleep;
+
 use rand::Rng;
 
 use crate::crypto::arith::gen_beaver_triple;
@@ -267,6 +269,7 @@ pub fn deal_triple<T: Transport>(
 
     // send each party its components
     for i in 0..N {
+        println!("Dealer sending triple_id={} to party {}", triple_id, i);
         if i == me {
             continue;
         }
@@ -353,12 +356,14 @@ pub fn mul_party<T: Transport>(
     transport: &T,
 ) -> PartyShare {
     println!("mul_party: op_id={}, me={}", op_id, me);
-    let triple_id = op_id * 3; // reserve 3 ids for x/y/z
+    //let triple_id = op_id + 3; // reserve 3 ids for x/y/z
+    let triple_id = op_id + 1; // get a fresh triple_id for this multiplication instance
 
     // obtain triple
     let (x, y, z) = if me == 0 {
         deal_triple(triple_id, me, transport)
     } else {
+        sleep(std::time::Duration::from_millis(100)); // give the dealer a chance to send before we start recv'ing
         receive_triple(triple_id, transport)
     };
 
@@ -368,7 +373,9 @@ pub fn mul_party<T: Transport>(
 
     // broadcast d_i and e_i to all other parties
     transport.broadcast(serialize_msg(&MpcMsg::TaggedD { op_id, value: d_i }));
+    println!("broadcast d_i for op_id={}", op_id);  
     transport.broadcast(serialize_msg(&MpcMsg::TaggedE { op_id, value: e_i }));
+    println!("broadcast e_i for op_id={}", op_id);  
 
     // collect d and e from the other two parties
     let mut d_shares = [0u128; N];
