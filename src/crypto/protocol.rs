@@ -382,14 +382,16 @@ pub fn mul_party<T: Transport>(
     let mut remaining = (N - 1) * 2;
 
     while remaining > 0 {
+        println!("remaining = {}", remaining);
         if let Some((from, msg)) = recv_blocking(transport, TIMEOUT_MS) {
             println!("mul_party: op_id={}, me={}, received from {}", op_id, me, from);
             let m: MpcMsg = deserialize_msg(&msg);
+            println!("m: {:?}", m);
             match m {
                 MpcMsg::TaggedD {
                     op_id: oid,
                     value: v,
-                } if oid == op_id => {
+                } if (oid == op_id) => {
                     if !got_d[from] {
                         d_shares[from] = v;
                         got_d[from] = true;
