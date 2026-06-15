@@ -7,9 +7,11 @@
 
 use rand::Rng;
 
-use crate::crypto::types::{Share3, Fr};
 use crate::crypto::arith::gen_beaver_triple;
-use crate::crypto::net::{Transport, MpcMsg, PartyId, serialize_msg, deserialize_msg, recv_blocking};
+use crate::crypto::net::{
+    deserialize_msg, recv_blocking, serialize_msg, MpcMsg, PartyId, Transport,
+};
+use crate::crypto::types::{Fr, Share3};
 
 const N: usize = 3;
 const TIMEOUT_MS: u64 = 5_000;
@@ -22,8 +24,8 @@ const TIMEOUT_MS: u64 = 5_000;
 /// In ABY3, party i holds (s_i, s_{(i+1) mod 3}).
 #[derive(Clone, Debug)]
 pub struct PartyShare {
-    pub left: Fr,   // s_i
-    pub right: Fr,  // s_{(i+1) mod 3}
+    pub left: Fr,  // s_i
+    pub right: Fr, // s_{(i+1) mod 3}
 }
 
 // ---------------------------------------------------------------------------
@@ -59,36 +61,55 @@ pub fn share_input<T: Transport>(
             let right_idx = (i + 1) % N;
             if i != me {
                 // left component first
-                transport.send(i, serialize_msg(&MpcMsg::InputShare {
-                    share_id,
-                    value: s[i],
-                }));
+                transport.send(
+                    i,
+                    serialize_msg(&MpcMsg::InputShare {
+                        share_id,
+                        value: s[i],
+                    }),
+                );
                 // then right component
-                transport.send(i, serialize_msg(&MpcMsg::InputShare {
-                    share_id,
-                    value: s[right_idx],
-                }));
+                transport.send(
+                    i,
+                    serialize_msg(&MpcMsg::InputShare {
+                        share_id,
+                        value: s[right_idx],
+                    }),
+                );
             }
         }
         // owner's own share
-        PartyShare { left: s[me], right: s[(me + 1) % N] }
+        PartyShare {
+            left: s[me],
+            right: s[(me + 1) % N],
+        }
     } else {
         // wait for two InputShare messages for this share_id
         let mut components: Vec<Fr> = Vec::new();
         while components.len() < 2 {
             if let Some((_from, msg)) = recv_blocking(transport, TIMEOUT_MS) {
                 let m: MpcMsg = deserialize_msg(&msg);
-                if let MpcMsg::InputShare { share_id: sid, value: v } = m {
+                if let MpcMsg::InputShare {
+                    share_id: sid,
+                    value: v,
+                } = m
+                {
                     if sid == share_id {
                         components.push(v);
                     }
                 }
             } else {
-                panic!("share_input: timeout waiting for InputShare share_id={}", share_id);
+                panic!(
+                    "share_input: timeout waiting for InputShare share_id={}",
+                    share_id
+                );
             }
         }
         // first received = left, second = right (owner sends left first then right for each peer)
-        PartyShare { left: components[0], right: components[1] }
+        PartyShare {
+            left: components[0],
+            right: components[1],
+        }
     }
 }
 
@@ -155,10 +176,13 @@ pub fn reveal<T: Transport>(
         Some(target) => {
             // send our left component to the target
             if me != target {
-                transport.send(target, serialize_msg(&MpcMsg::RevealShare {
-                    share_id,
-                    value: share.left,
-                }));
+                transport.send(
+                    target,
+                    serialize_msg(&MpcMsg::RevealShare {
+                        share_id,
+                        value: share.left,
+                    }),
+                );
                 return 0;
             }
             // we are the target: collect from the other two parties
@@ -167,14 +191,21 @@ pub fn reveal<T: Transport>(
             while received < N - 1 {
                 if let Some((_from, msg)) = recv_blocking(transport, TIMEOUT_MS) {
                     let m: MpcMsg = deserialize_msg(&msg);
-                    if let MpcMsg::RevealShare { share_id: sid, value: v } = m {
+                    if let MpcMsg::RevealShare {
+                        share_id: sid,
+                        value: v,
+                    } = m
+                    {
                         if sid == share_id {
                             sum = sum.wrapping_add(v);
                             received += 1;
                         }
                     }
                 } else {
-                    panic!("reveal: timeout waiting for RevealShare share_id={}", share_id);
+                    panic!(
+                        "reveal: timeout waiting for RevealShare share_id={}",
+                        share_id
+                    );
                 }
             }
             sum
@@ -190,14 +221,21 @@ pub fn reveal<T: Transport>(
             while received < N - 1 {
                 if let Some((_from, msg)) = recv_blocking(transport, TIMEOUT_MS) {
                     let m: MpcMsg = deserialize_msg(&msg);
-                    if let MpcMsg::RevealShare { share_id: sid, value: v } = m {
+                    if let MpcMsg::RevealShare {
+                        share_id: sid,
+                        value: v,
+                    } = m
+                    {
                         if sid == share_id {
                             sum = sum.wrapping_add(v);
                             received += 1;
                         }
                     }
                 } else {
-                    panic!("reveal: timeout waiting for RevealShare share_id={}", share_id);
+                    panic!(
+                        "reveal: timeout waiting for RevealShare share_id={}",
+                        share_id
+                    );
                 }
             }
             sum
@@ -229,26 +267,41 @@ pub fn deal_triple<T: Transport>(
 
     // send each party its components
     for i in 0..N {
-        if i == me { continue; }
-        transport.send(i, serialize_msg(&MpcMsg::TripleComponent {
-            triple_id,
-            left: x_parts[i].left,
-            right: x_parts[i].right,
-        }));
+        if i == me {
+            continue;
+        }
+        transport.send(
+            i,
+            serialize_msg(&MpcMsg::TripleComponent {
+                triple_id,
+                left: x_parts[i].left,
+                right: x_parts[i].right,
+            }),
+        );
         // encode y and z in subsequent messages; use triple_id+1 and triple_id+2
-        transport.send(i, serialize_msg(&MpcMsg::TripleComponent {
-            triple_id: triple_id + 1,
-            left: y_parts[i].left,
-            right: y_parts[i].right,
-        }));
-        transport.send(i, serialize_msg(&MpcMsg::TripleComponent {
-            triple_id: triple_id + 2,
-            left: z_parts[i].left,
-            right: z_parts[i].right,
-        }));
+        transport.send(
+            i,
+            serialize_msg(&MpcMsg::TripleComponent {
+                triple_id: triple_id + 1,
+                left: y_parts[i].left,
+                right: y_parts[i].right,
+            }),
+        );
+        transport.send(
+            i,
+            serialize_msg(&MpcMsg::TripleComponent {
+                triple_id: triple_id + 2,
+                left: z_parts[i].left,
+                right: z_parts[i].right,
+            }),
+        );
     }
 
-    (x_parts[me].clone(), y_parts[me].clone(), z_parts[me].clone())
+    (
+        x_parts[me].clone(),
+        y_parts[me].clone(),
+        z_parts[me].clone(),
+    )
 }
 
 /// Receive a triple that was dealt by another party.
@@ -263,10 +316,19 @@ pub fn receive_triple<T: Transport>(
     while x.is_none() || y.is_none() || z.is_none() {
         if let Some((_from, msg)) = recv_blocking(transport, TIMEOUT_MS) {
             let m: MpcMsg = deserialize_msg(&msg);
-            if let MpcMsg::TripleComponent { triple_id: tid, left, right } = m {
-                if tid == triple_id { x = Some(PartyShare { left, right }); }
-                else if tid == triple_id + 1 { y = Some(PartyShare { left, right }); }
-                else if tid == triple_id + 2 { z = Some(PartyShare { left, right }); }
+            if let MpcMsg::TripleComponent {
+                triple_id: tid,
+                left,
+                right,
+            } = m
+            {
+                if tid == triple_id {
+                    x = Some(PartyShare { left, right });
+                } else if tid == triple_id + 1 {
+                    y = Some(PartyShare { left, right });
+                } else if tid == triple_id + 2 {
+                    z = Some(PartyShare { left, right });
+                }
             }
         } else {
             panic!("receive_triple: timeout for triple_id={}", triple_id);
@@ -322,11 +384,25 @@ pub fn mul_party<T: Transport>(
         if let Some((from, msg)) = recv_blocking(transport, TIMEOUT_MS) {
             let m: MpcMsg = deserialize_msg(&msg);
             match m {
-                MpcMsg::TaggedD { op_id: oid, value: v } if oid == op_id => {
-                    if !got_d[from] { d_shares[from] = v; got_d[from] = true; remaining -= 1; }
+                MpcMsg::TaggedD {
+                    op_id: oid,
+                    value: v,
+                } if oid == op_id => {
+                    if !got_d[from] {
+                        d_shares[from] = v;
+                        got_d[from] = true;
+                        remaining -= 1;
+                    }
                 }
-                MpcMsg::TaggedE { op_id: oid, value: v } if oid == op_id => {
-                    if !got_e[from] { e_shares[from] = v; got_e[from] = true; remaining -= 1; }
+                MpcMsg::TaggedE {
+                    op_id: oid,
+                    value: v,
+                } if oid == op_id => {
+                    if !got_e[from] {
+                        e_shares[from] = v;
+                        got_e[from] = true;
+                        remaining -= 1;
+                    }
                 }
                 _ => {}
             }
@@ -399,7 +475,11 @@ pub fn a2b_party<T: Transport>(
     while remaining > 0 {
         if let Some((from, msg)) = recv_blocking(transport, TIMEOUT_MS) {
             let m: MpcMsg = deserialize_msg(&msg);
-            if let MpcMsg::TaggedD { op_id: oid, value: v } = m {
+            if let MpcMsg::TaggedD {
+                op_id: oid,
+                value: v,
+            } = m
+            {
                 if oid == op_id && !got_d[from] {
                     d_shares[from] = v;
                     got_d[from] = true;
@@ -428,12 +508,12 @@ pub fn a2b_party<T: Transport>(
     let mut carry = share_public(0, me); // carry starts at 0
 
     for i in 0..nbits {
-        let d_bit: Fr = (d >> i) & 1;   // public
+        let d_bit: Fr = (d >> i) & 1; // public
         let r_bit_val: Fr = (r >> i) & 1; // public (same r for all parties since seeded rng)
-        let r_bit = &r_bits[i];           // secret-shared form of r_bit_val
+        let r_bit = &r_bits[i]; // secret-shared form of r_bit_val
 
         // sum = r_i XOR d_i XOR carry  (local, no communication)
-        let s1  = xor_public_party(r_bit, &share_public(d_bit, me), me);
+        let s1 = xor_public_party(r_bit, &share_public(d_bit, me), me);
         let sum = xor_public_party(&s1, &carry, me);
         out.push(sum);
 
@@ -441,10 +521,10 @@ pub fn a2b_party<T: Transport>(
         //   r_i*d_i = scalar (both public)
         //   (r_i XOR d_i) = public scalar
         //   (r_i XOR d_i)*carry = scalar_mul on a secret-shared carry
-        let r_and_d: Fr = r_bit_val.wrapping_mul(d_bit);                  // scalar
-        let r_xor_d: Fr = r_bit_val ^ d_bit;                               // scalar
-        let xor_times_carry = scalar_mul_party(&carry, r_xor_d);           // local scalar mul
-        // carry_{i+1} = r_and_d_public + (r_xor_d)*carry
+        let r_and_d: Fr = r_bit_val.wrapping_mul(d_bit); // scalar
+        let r_xor_d: Fr = r_bit_val ^ d_bit; // scalar
+        let xor_times_carry = scalar_mul_party(&carry, r_xor_d); // local scalar mul
+                                                                 // carry_{i+1} = r_and_d_public + (r_xor_d)*carry
         let carry_base = share_public(r_and_d, me);
         carry = add_party(&carry_base, &xor_times_carry);
     }
@@ -459,7 +539,7 @@ fn xor_public_party(a: &PartyShare, b: &PartyShare, _me: PartyId) -> PartyShare 
     // treat as local: left_a + left_b - 2 * left_a * left_b ... but mod 2 for bits
     // For field arithmetic: result = a + b - 2ab (additive, not modular-2)
     let two_ab = PartyShare {
-        left:  a.left.wrapping_mul(2).wrapping_mul(b.left),
+        left: a.left.wrapping_mul(2).wrapping_mul(b.left),
         right: a.right.wrapping_mul(2).wrapping_mul(b.right),
     };
     let ab = add_party(a, b);
@@ -488,8 +568,17 @@ pub fn reveal_bit_to_all<T: Transport>(
 
 fn party_pairs(s: &Share3) -> Vec<PartyShare> {
     vec![
-        PartyShare { left: s.0, right: s.1 },
-        PartyShare { left: s.1, right: s.2 },
-        PartyShare { left: s.2, right: s.0 },
+        PartyShare {
+            left: s.0,
+            right: s.1,
+        },
+        PartyShare {
+            left: s.1,
+            right: s.2,
+        },
+        PartyShare {
+            left: s.2,
+            right: s.0,
+        },
     ]
 }

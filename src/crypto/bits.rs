@@ -1,7 +1,7 @@
-use crate::crypto::types::{Share3, Fr};
-use rand::Rng;
-use crate::crypto::arith::{mul_ab3, add_shares, sub_shares, share_secret};
 use crate::crypto::arith::scalar_mul;
+use crate::crypto::arith::{add_shares, mul_ab3, share_secret, sub_shares};
+use crate::crypto::types::{Fr, Share3};
+use rand::Rng;
 
 /// Very small shared-bit helpers implemented by reconstruct-and-reshare.
 /// These are placeholders that provide a clear API while the true secure
@@ -137,15 +137,18 @@ pub fn a2b_ab3(a: &Share3, nbits: usize) -> (Vec<Share3>, Share3) {
 /// Deterministic debug helper: run the a2b_ab3 protocol using a seeded RNG
 /// and return a diagnostic string with r, d, bits and carry traces.
 pub fn a2b_ab3_debug_seed(a: &Share3, nbits: usize, seed: u64) -> String {
-    use rand::SeedableRng;
-    use rand::rngs::StdRng;
     use crate::crypto::arith::reconstruct;
     use crate::crypto::bits::share_bool;
+    use rand::rngs::StdRng;
+    use rand::SeedableRng;
 
     let mut rng = StdRng::seed_from_u64(seed);
     let r: Fr = rng.gen::<u128>() & ((1u128 << nbits) - 1);
     let mut r_bits: Vec<Share3> = Vec::with_capacity(nbits);
-    for i in 0..nbits { let b = ((r >> i) & 1) != 0; r_bits.push(share_bool(b)); }
+    for i in 0..nbits {
+        let b = ((r >> i) & 1) != 0;
+        r_bits.push(share_bool(b));
+    }
     let mut r_sh = share_secret(0);
     for i in 0..nbits {
         let term = scalar_mul(&r_bits[i], 1u128 << i);
@@ -181,8 +184,18 @@ pub fn a2b_ab3_debug_seed(a: &Share3, nbits: usize, seed: u64) -> String {
     writeln!(s, "seed = {}", seed).ok();
     writeln!(s, "r = {}", r).ok();
     writeln!(s, "d = {}", d).ok();
-    writeln!(s, "r_bits = {:?}", (0..nbits).map(|i| ((r>>i)&1)!=0).collect::<Vec<_>>()).ok();
-    writeln!(s, "d_bits = {:?}", (0..nbits).map(|i| ((d>>i)&1)!=0).collect::<Vec<_>>()).ok();
+    writeln!(
+        s,
+        "r_bits = {:?}",
+        (0..nbits).map(|i| ((r >> i) & 1) != 0).collect::<Vec<_>>()
+    )
+    .ok();
+    writeln!(
+        s,
+        "d_bits = {:?}",
+        (0..nbits).map(|i| ((d >> i) & 1) != 0).collect::<Vec<_>>()
+    )
+    .ok();
     writeln!(s, "sum_bits = {:?}", sum_plain).ok();
     writeln!(s, "carry_bits = {:?}", carry_plain).ok();
     s

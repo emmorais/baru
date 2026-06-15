@@ -1,6 +1,6 @@
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
-use std::cell::RefCell;
 
 #[derive(Debug, Clone)]
 pub enum Expr {
@@ -26,8 +26,8 @@ pub type Ptr = Rc<RefCell<Types>>;
 pub type Env = Rc<RefCell<HashMap<String, Ptr>>>;
 
 use crate::interpreter::backend::ShareRef;
-use std::sync::Arc;
 use std::fmt;
+use std::sync::Arc;
 
 pub enum Types {
     Num(i64),

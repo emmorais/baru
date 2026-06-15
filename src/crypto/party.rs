@@ -1,5 +1,5 @@
-use crate::crypto::types::{Share3, Fr};
-use crate::crypto::arith::{gen_beaver_triple, share_secret, scalar_mul, add_shares};
+use crate::crypto::arith::{add_shares, gen_beaver_triple, scalar_mul, share_secret};
+use crate::crypto::types::{Fr, Share3};
 
 /// Simple per-party view simulator for ABY3-style multiplication.
 ///
@@ -10,11 +10,7 @@ use crate::crypto::arith::{gen_beaver_triple, share_secret, scalar_mul, add_shar
 
 /// Split a Share3 into per-party pairs: party i gets (s_i, s_{i+1}).
 fn split_to_party_pairs(s: &Share3) -> Vec<(Fr, Fr)> {
-    vec![
-        (s.0, s.1),
-        (s.1, s.2),
-        (s.2, s.0),
-    ]
+    vec![(s.0, s.1), (s.1, s.2), (s.2, s.0)]
 }
 
 /// Simulate ABY3 multiplication across three parties using Beaver triples.
@@ -35,8 +31,8 @@ pub fn mul_ab3_simulate(a: &Share3, b: &Share3) -> Share3 {
 
     // Each party computes its local difference share (we reveal the first
     // component of each pair as part of the opening): d_i = a_i - x_i
-    let mut d_shares: [Fr; 3] = [0,0,0];
-    let mut e_shares: [Fr; 3] = [0,0,0];
+    let mut d_shares: [Fr; 3] = [0, 0, 0];
+    let mut e_shares: [Fr; 3] = [0, 0, 0];
     for i in 0..3 {
         let a_i = a_pairs[i].0; // first component
         let x_i = x_pairs[i].0;

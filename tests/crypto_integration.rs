@@ -1,5 +1,5 @@
-use baru::crypto::{arith, bits, party, sim};
 use baru::crypto::types::Fr;
+use baru::crypto::{arith, bits, party, sim};
 
 #[test]
 fn test_share_add_mul_insecure() {
@@ -83,7 +83,10 @@ fn test_a2b_and_comparisons() {
             recovered_inproc |= 1u128 << i;
         }
     }
-    assert_eq!(recovered_inproc & ((1u128 << 8) - 1), a & ((1u128 << 8) - 1));
+    assert_eq!(
+        recovered_inproc & ((1u128 << 8) - 1),
+        a & ((1u128 << 8) - 1)
+    );
 
     // comparisons
     let lt_sh = bits::lt_ab3(&sa, &sb, 8);
@@ -92,9 +95,9 @@ fn test_a2b_and_comparisons() {
     assert_eq!(bits::reconstruct_bit(&eq_sh), a == b);
 }
 
-use rand::{Rng, SeedableRng};
-use rand::rngs::StdRng;
 use baru::crypto::scheduler;
+use rand::rngs::StdRng;
+use rand::{Rng, SeedableRng};
 
 #[test]
 fn prop_mul_randomized() {
@@ -161,7 +164,10 @@ fn prop_a2b_and_comparisons_randomized() {
         let lt_res = bits::reconstruct_bit(&lt_sh);
         let lt_ref_val = arith::reconstruct(&lt_ref) != 0;
         if lt_res != lt_ref_val {
-            eprintln!("Random mismatch lt: a={} b={} proto={} ref={}", a, b, lt_res, lt_ref_val);
+            eprintln!(
+                "Random mismatch lt: a={} b={} proto={} ref={}",
+                a, b, lt_res, lt_ref_val
+            );
             // Dump a2b protocol internals for the exact diff used by bits::lt_ab3
             let diff = arith::sub_shares(&sa, &sb);
             // call the a2b implementation used by bits::lt_ab3 to inspect its actual output
@@ -176,12 +182,18 @@ fn prop_a2b_and_comparisons_randomized() {
             // reconstruct numeric diff from protocol bits
             let mut proto_diff: u128 = 0;
             for (i, &b) in bits_plain_vec.iter().enumerate() {
-                if b { proto_diff |= 1u128 << i; }
+                if b {
+                    proto_diff |= 1u128 << i;
+                }
             }
             let diff_plain = arith::reconstruct(&diff);
-            eprintln!("diff_plain = {} proto_diff(lower 32) = {}", diff_plain, proto_diff & ((1u128<<32)-1));
-             // Dump the sim trace as well (may use different randomness)
-             eprintln!("a2b debug:\n{}", baru::crypto::sim::a2b_debug(&diff, 32));
+            eprintln!(
+                "diff_plain = {} proto_diff(lower 32) = {}",
+                diff_plain,
+                proto_diff & ((1u128 << 32) - 1)
+            );
+            // Dump the sim trace as well (may use different randomness)
+            eprintln!("a2b debug:\n{}", baru::crypto::sim::a2b_debug(&diff, 32));
         }
         assert_eq!(lt_res, lt_ref_val);
         let eq_sh = bits::eq_ab3(&sa, &sb, 32);
@@ -189,7 +201,10 @@ fn prop_a2b_and_comparisons_randomized() {
         let eq_res = bits::reconstruct_bit(&eq_sh);
         let eq_ref_val = arith::reconstruct(&eq_ref) != 0;
         if eq_res != eq_ref_val {
-            eprintln!("Random mismatch eq: a={} b={} proto={} ref={}", a, b, eq_res, eq_ref_val);
+            eprintln!(
+                "Random mismatch eq: a={} b={} proto={} ref={}",
+                a, b, eq_res, eq_ref_val
+            );
         }
         assert_eq!(eq_res, eq_ref_val);
     }

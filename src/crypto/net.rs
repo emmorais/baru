@@ -1,7 +1,7 @@
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
-use serde::{Serialize, Deserialize};
+use serde::{Deserialize, Serialize};
 
 pub type Message = Vec<u8>;
 pub type PartyId = usize;
@@ -37,19 +37,35 @@ pub enum MpcMsg {
     /// One share component sent during input sharing.
     /// `share_id` identifies the share; `value` is the field element for the
     /// receiving party.
-    InputShare { share_id: u64, value: u128 },
+    InputShare {
+        share_id: u64,
+        value: u128,
+    },
 
     /// One party's additive share component sent during a reveal round.
-    RevealShare { share_id: u64, value: u128 },
+    RevealShare {
+        share_id: u64,
+        value: u128,
+    },
 
     /// Beaver triple: send party i its two components (left, right) for one
     /// triple identified by `triple_id`.
-    TripleComponent { triple_id: u64, left: u128, right: u128 },
+    TripleComponent {
+        triple_id: u64,
+        left: u128,
+        right: u128,
+    },
 
     /// Masked-open D value tagged with an operation id.
-    TaggedD { op_id: u64, value: u128 },
+    TaggedD {
+        op_id: u64,
+        value: u128,
+    },
     /// Masked-open E value tagged with an operation id.
-    TaggedE { op_id: u64, value: u128 },
+    TaggedE {
+        op_id: u64,
+        value: u128,
+    },
 }
 
 /// Serialize a message using bincode.
@@ -90,7 +106,11 @@ impl InprocHandle {
     pub fn create(nparties: usize) -> Vec<InprocHandle> {
         let net = Arc::new(InprocNetwork::new(nparties));
         (0..nparties)
-            .map(|id| InprocHandle { id, net: net.clone(), nparties })
+            .map(|id| InprocHandle {
+                id,
+                net: net.clone(),
+                nparties,
+            })
             .collect()
     }
 }
@@ -101,7 +121,9 @@ impl Transport for InprocHandle {
     }
 
     fn send(&self, to: PartyId, msg: Message) {
-        if to >= self.nparties { return; }
+        if to >= self.nparties {
+            return;
+        }
         if let Ok(mut q) = self.net.queues[to].lock() {
             q.push_back((self.id, msg));
         }
@@ -109,7 +131,9 @@ impl Transport for InprocHandle {
 
     fn broadcast(&self, msg: Message) {
         for p in 0..self.nparties {
-            if p == self.id { continue; }
+            if p == self.id {
+                continue;
+            }
             if let Ok(mut q) = self.net.queues[p].lock() {
                 q.push_back((self.id, msg.clone()));
             }
@@ -131,8 +155,12 @@ impl Transport for InprocHandle {
 pub fn recv_blocking<T: Transport>(t: &T, timeout_ms: u64) -> Option<(PartyId, Message)> {
     let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
     loop {
-        if let Some(m) = t.recv() { return Some(m); }
-        if std::time::Instant::now() >= deadline { return None; }
+        if let Some(m) = t.recv() {
+            return Some(m);
+        }
+        if std::time::Instant::now() >= deadline {
+            return None;
+        }
         std::thread::sleep(std::time::Duration::from_millis(2));
     }
 }
@@ -142,7 +170,9 @@ pub fn recv_blocking<T: Transport>(t: &T, timeout_ms: u64) -> Option<(PartyId, M
 /// time out while the human is still typing.
 pub fn recv_forever<T: Transport>(t: &T) -> (PartyId, Message) {
     loop {
-        if let Some(m) = t.recv() { return m; }
+        if let Some(m) = t.recv() {
+            return m;
+        }
         std::thread::sleep(std::time::Duration::from_millis(2));
     }
 }
@@ -154,8 +184,8 @@ struct Wire {
     payload: Message,
 }
 
-use std::net::{TcpListener, TcpStream};
 use std::io::{Read, Write};
+use std::net::{TcpListener, TcpStream};
 use std::thread;
 
 /// TCP-based Transport implementation. Creates a listener (background thread)
@@ -185,10 +215,14 @@ impl TcpTransport {
                         Ok(mut s) => {
                             // read length prefix
                             let mut lenbuf = [0u8; 4];
-                            if s.read_exact(&mut lenbuf).is_err() { continue; }
+                            if s.read_exact(&mut lenbuf).is_err() {
+                                continue;
+                            }
                             let len = u32::from_be_bytes(lenbuf) as usize;
                             let mut buf = vec![0u8; len];
-                            if s.read_exact(&mut buf).is_err() { continue; }
+                            if s.read_exact(&mut buf).is_err() {
+                                continue;
+                            }
                             if let Ok(wire) = bincode::deserialize::<Wire>(&buf) {
                                 if let Ok(mut q) = inbox_clone.lock() {
                                     q.push_back((wire.from, wire.payload));
@@ -207,7 +241,8 @@ impl TcpTransport {
     /// Helper: connect and send a Wire to an address (best-effort).
     fn send_to_addr(addr: &str, wire: &Wire) -> std::io::Result<()> {
         // serialize once outside the retry loop
-        let bytes = bincode::serialize(wire).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
+        let bytes = bincode::serialize(wire)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
         let len = (bytes.len() as u32).to_be_bytes();
 
         // retry connecting/sending a few times to tolerate races where the
@@ -218,7 +253,11 @@ impl TcpTransport {
         for _ in 0..attempts {
             match TcpStream::connect(addr) {
                 Ok(mut s) => {
-                    if let Err(e) = s.write_all(&len).and_then(|_| s.write_all(&bytes)).and_then(|_| s.flush()) {
+                    if let Err(e) = s
+                        .write_all(&len)
+                        .and_then(|_| s.write_all(&bytes))
+                        .and_then(|_| s.flush())
+                    {
                         // writing failed even though we connected; return the error
                         return Err(e);
                     }
@@ -241,18 +280,27 @@ impl TcpTransport {
 }
 
 impl Transport for TcpTransport {
-    fn id(&self) -> PartyId { self.id }
+    fn id(&self) -> PartyId {
+        self.id
+    }
 
     fn send(&self, to: PartyId, msg: Message) {
-        if to >= self.addrs.len() { return; }
-        let wire = Wire { from: self.id, payload: msg };
+        if to >= self.addrs.len() {
+            return;
+        }
+        let wire = Wire {
+            from: self.id,
+            payload: msg,
+        };
         // best-effort send; ignore result
         let _ = Self::send_to_addr(&self.addrs[to], &wire);
     }
 
     fn broadcast(&self, msg: Message) {
         for p in 0..self.addrs.len() {
-            if p == self.id { continue; }
+            if p == self.id {
+                continue;
+            }
             self.send(p, msg.clone());
         }
     }
@@ -260,6 +308,8 @@ impl Transport for TcpTransport {
     fn recv(&self) -> Option<(PartyId, Message)> {
         if let Ok(mut q) = self.inbox.lock() {
             q.pop_front()
-        } else { None }
+        } else {
+            None
+        }
     }
 }

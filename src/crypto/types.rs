@@ -1,5 +1,5 @@
 use rand::Rng;
-use std::ops::{Add, Sub, Mul};
+use std::ops::{Add, Mul, Sub};
 
 /// Field modulus used for arithmetic sharing. For simplicity use a 128-bit
 /// unsigned integer for local simulation.
@@ -11,12 +11,14 @@ pub type Fr = u128;
 pub struct Share3(pub Fr, pub Fr, pub Fr);
 
 impl Share3 {
-    pub fn zero() -> Self { Share3(0,0,0) }
+    pub fn zero() -> Self {
+        Share3(0, 0, 0)
+    }
     pub fn random<R: Rng + ?Sized>(rng: &mut R) -> Self {
         let a: u128 = rng.gen();
         let b: u128 = rng.gen();
         let c: u128 = rng.gen();
-        Share3(a,b,c)
+        Share3(a, b, c)
     }
 
     pub fn to_plain(&self) -> Fr {
@@ -28,14 +30,22 @@ impl Share3 {
 impl Add for Share3 {
     type Output = Share3;
     fn add(self, rhs: Share3) -> Share3 {
-        Share3(self.0.wrapping_add(rhs.0), self.1.wrapping_add(rhs.1), self.2.wrapping_add(rhs.2))
+        Share3(
+            self.0.wrapping_add(rhs.0),
+            self.1.wrapping_add(rhs.1),
+            self.2.wrapping_add(rhs.2),
+        )
     }
 }
 
 impl Sub for Share3 {
     type Output = Share3;
     fn sub(self, rhs: Share3) -> Share3 {
-        Share3(self.0.wrapping_sub(rhs.0), self.1.wrapping_sub(rhs.1), self.2.wrapping_sub(rhs.2))
+        Share3(
+            self.0.wrapping_sub(rhs.0),
+            self.1.wrapping_sub(rhs.1),
+            self.2.wrapping_sub(rhs.2),
+        )
     }
 }
 
@@ -52,6 +62,6 @@ impl Mul for Share3 {
         let s0: u128 = rng.gen();
         let s1: u128 = rng.gen();
         let s2 = prod.wrapping_sub(s0).wrapping_sub(s1);
-        Share3(s0,s1,s2)
+        Share3(s0, s1, s2)
     }
 }

@@ -13,23 +13,21 @@
 //! Run with no arguments for an in-process 3-party demo.
 
 use std::env;
-use std::path::PathBuf;
-use std::time::Duration;
-use std::thread;
 use std::panic;
+use std::path::PathBuf;
+use std::thread;
+use std::time::Duration;
 
 use colored::*;
-use rustyline::Editor;
 use rustyline::error::ReadlineError;
+use rustyline::Editor;
 
 use baru::crypto::net::{
-    Transport, TcpTransport, InprocHandle,
-    serialize_msg, deserialize_msg, MpcMsg, recv_blocking, recv_forever,
+    deserialize_msg, recv_blocking, recv_forever, serialize_msg, InprocHandle, MpcMsg,
+    TcpTransport, Transport,
 };
 use baru::interpreter::{parse, Participant, Types};
-use baru::repl::{
-    EXAMPLES, print_help, print_examples_list, print_examples_for, ReplHelper,
-};
+use baru::repl::{print_examples_for, print_examples_list, print_help, ReplHelper, EXAMPLES};
 
 // ---------------------------------------------------------------------------
 // Expression broadcast helpers (use share_id=0 for len + sequential ids for chunks)
@@ -37,11 +35,19 @@ use baru::repl::{
 
 fn broadcast_expr<T: Transport>(src: &str, transport: &T) {
     let bytes = src.as_bytes();
-    transport.broadcast(serialize_msg(&MpcMsg::RevealShare { share_id: 0, value: bytes.len() as u128 }));
+    transport.broadcast(serialize_msg(&MpcMsg::RevealShare {
+        share_id: 0,
+        value: bytes.len() as u128,
+    }));
     for (i, chunk) in bytes.chunks(16).enumerate() {
         let mut v: u128 = 0;
-        for (j, &b) in chunk.iter().enumerate() { v |= (b as u128) << (j * 8); }
-        transport.broadcast(serialize_msg(&MpcMsg::RevealShare { share_id: (i + 1) as u64, value: v }));
+        for (j, &b) in chunk.iter().enumerate() {
+            v |= (b as u128) << (j * 8);
+        }
+        transport.broadcast(serialize_msg(&MpcMsg::RevealShare {
+            share_id: (i + 1) as u64,
+            value: v,
+        }));
     }
 }
 
@@ -49,7 +55,11 @@ fn receive_expr<T: Transport>(transport: &T) -> String {
     // Wait indefinitely for the length header — no timeout between expressions.
     let len = loop {
         let (_from, msg) = recv_forever(transport);
-        if let MpcMsg::RevealShare { share_id: 0, value: l } = deserialize_msg(&msg) {
+        if let MpcMsg::RevealShare {
+            share_id: 0,
+            value: l,
+        } = deserialize_msg(&msg)
+        {
             break l as usize;
         }
         // Any other message that arrived before the length header is ignored;
@@ -64,12 +74,16 @@ fn receive_expr<T: Transport>(transport: &T) -> String {
                 if share_id >= 1 {
                     let start = (share_id as usize - 1) * 16;
                     for j in 0..16 {
-                        if start + j < len { bytes[start + j] = ((value >> (j * 8)) & 0xff) as u8; }
+                        if start + j < len {
+                            bytes[start + j] = ((value >> (j * 8)) & 0xff) as u8;
+                        }
                     }
                     received += 1;
                 }
             }
-        } else { panic!("receive_expr: timeout waiting for chunk"); }
+        } else {
+            panic!("receive_expr: timeout waiting for chunk");
+        }
     }
     String::from_utf8(bytes).expect("expression not valid UTF-8")
 }
@@ -118,7 +132,9 @@ fn run_inproc_demo() {
                 println!("  party {} => {:?}", i, result);
             }));
         }
-        for j in joins { j.join().expect("thread panicked"); }
+        for j in joins {
+            j.join().expect("thread panicked");
+        }
         println!();
     }
 }
@@ -157,13 +173,19 @@ fn display_result(result: &Types, participant: &Participant) -> String {
 fn run_tcp(me: usize, mpc_addrs: Vec<String>, dist_addrs: Vec<String>) {
     let mpc_transport = TcpTransport::new(me, mpc_addrs);
     let dist_transport = TcpTransport::new(me, dist_addrs);
-    eprintln!("{}", format!("[party {}] TCP transports ready", me).bright_yellow());
+    eprintln!(
+        "{}",
+        format!("[party {}] TCP transports ready", me).bright_yellow()
+    );
 
     let participant = Participant::new_transport(me, mpc_transport);
 
     if me == 0 {
         // ── Party 0: full interactive REPL ──────────────────────────────────
-        println!("{}", "ABY3 distributed MPC — party 0 (evaluator + broadcaster)".bright_green());
+        println!(
+            "{}",
+            "ABY3 distributed MPC — party 0 (evaluator + broadcaster)".bright_green()
+        );
         println!("{}", "Type ':help' for language reference, ':examples' to browse examples, or ':quit' to exit.".bright_yellow());
 
         let helper = ReplHelper::new_tcp();
@@ -171,24 +193,35 @@ fn run_tcp(me: usize, mpc_addrs: Vec<String>, dist_addrs: Vec<String>) {
         rl.set_helper(Some(helper));
 
         if let Some(p) = history_path() {
-            if p.exists() { let _ = rl.load_history(&p); }
+            if p.exists() {
+                let _ = rl.load_history(&p);
+            }
         }
 
         let mut verbose = false;
 
         loop {
-            let readline = rl.readline(&format!("{}{}{}",
-                "baru[party-0]".bright_cyan(), "> ".bright_white(), ""));
+            let readline = rl.readline(&format!(
+                "{}{}{}",
+                "baru[party-0]".bright_cyan(),
+                "> ".bright_white(),
+                ""
+            ));
             let src = match readline {
                 Ok(line) => line.trim().to_string(),
-                Err(ReadlineError::Interrupted) => { println!("^C"); continue; }
+                Err(ReadlineError::Interrupted) => {
+                    println!("^C");
+                    continue;
+                }
                 Err(ReadlineError::Eof) | Err(_) => {
                     broadcast_expr(":quit", &dist_transport);
                     break;
                 }
             };
 
-            if src.is_empty() || src.starts_with(';') { continue; }
+            if src.is_empty() || src.starts_with(';') {
+                continue;
+            }
             let _ = rl.add_history_entry(&src);
 
             // ── Special commands ────────────────────────────────────────────
@@ -201,7 +234,10 @@ fn run_tcp(me: usize, mpc_addrs: Vec<String>, dist_addrs: Vec<String>) {
                         println!("{}", "Signalled all parties to quit.".bright_yellow());
                         break;
                     }
-                    ":help" => { print_help(true); continue; }
+                    ":help" => {
+                        print_help(true);
+                        continue;
+                    }
                     ":examples" => {
                         match parts.next() {
                             None => print_examples_list(),
@@ -214,33 +250,58 @@ fn run_tcp(me: usize, mpc_addrs: Vec<String>, dist_addrs: Vec<String>) {
                             Some(n) if n >= 1 && n <= EXAMPLES.len() => {
                                 let ex = &EXAMPLES[n - 1];
                                 println!();
-                                println!("{} [{}] {} ({})",
+                                println!(
+                                    "{} [{}] {} ({})",
                                     "Running example".bright_yellow(),
                                     n.to_string().bright_white(),
                                     ex.name.bright_cyan(),
-                                    ex.category);
-                                println!("{} {}", "Code:    ".bright_yellow(), ex.code.bright_green());
-                                println!("{} {}", "Expected:".bright_yellow(), ex.expected.bright_magenta());
+                                    ex.category
+                                );
+                                println!(
+                                    "{} {}",
+                                    "Code:    ".bright_yellow(),
+                                    ex.code.bright_green()
+                                );
+                                println!(
+                                    "{} {}",
+                                    "Expected:".bright_yellow(),
+                                    ex.expected.bright_magenta()
+                                );
                                 println!();
                                 // broadcast and fall through to normal eval below
                                 participant.reset_per_expression();
                                 broadcast_expr(ex.code, &dist_transport);
                                 match parse(ex.code) {
                                     Ok(expr) => {
-                                        let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
-                                            if verbose {
-                                                participant.eval_quiet_verbose(&expr)
-                                            } else {
-                                                participant.eval_quiet(&expr)
-                                            }
-                                        }));
+                                        let result =
+                                            panic::catch_unwind(panic::AssertUnwindSafe(|| {
+                                                if verbose {
+                                                    participant.eval_quiet_verbose(&expr)
+                                                } else {
+                                                    participant.eval_quiet(&expr)
+                                                }
+                                            }));
                                         match result {
-                                            Ok(val) => println!("{} {}", "=>".bright_yellow(), display_result(&val, &participant)),
+                                            Ok(val) => println!(
+                                                "{} {}",
+                                                "=>".bright_yellow(),
+                                                display_result(&val, &participant)
+                                            ),
                                             Err(e) => {
-                                                let msg = if let Some(s) = e.downcast_ref::<String>() { s.clone() }
-                                                          else if let Some(s) = e.downcast_ref::<&str>() { s.to_string() }
-                                                          else { "unknown runtime error".to_string() };
-                                                println!("{} {}", "runtime error:".bright_red(), msg);
+                                                let msg = if let Some(s) =
+                                                    e.downcast_ref::<String>()
+                                                {
+                                                    s.clone()
+                                                } else if let Some(s) = e.downcast_ref::<&str>() {
+                                                    s.to_string()
+                                                } else {
+                                                    "unknown runtime error".to_string()
+                                                };
+                                                println!(
+                                                    "{} {}",
+                                                    "runtime error:".bright_red(),
+                                                    msg
+                                                );
                                                 broadcast_expr(":abort", &dist_transport);
                                             }
                                         }
@@ -251,25 +312,44 @@ fn run_tcp(me: usize, mpc_addrs: Vec<String>, dist_addrs: Vec<String>) {
                                     }
                                 }
                             }
-                            _ => println!("usage: :example <n>  (use ':examples' to list, 1–{})", EXAMPLES.len()),
+                            _ => println!(
+                                "usage: :example <n>  (use ':examples' to list, 1–{})",
+                                EXAMPLES.len()
+                            ),
                         }
                         continue;
                     }
                     ":verbose" => {
                         match parts.next() {
-                            Some("on")  => { verbose = true;  println!("{}", "verbose: on".bright_green()); }
-                            Some("off") => { verbose = false; println!("{}", "verbose: off".bright_yellow()); }
+                            Some("on") => {
+                                verbose = true;
+                                println!("{}", "verbose: on".bright_green());
+                            }
+                            Some("off") => {
+                                verbose = false;
+                                println!("{}", "verbose: off".bright_yellow());
+                            }
                             _ => {
                                 verbose = !verbose;
-                                println!("verbose: {}", if verbose { "on".bright_green() } else { "off".bright_yellow() });
+                                println!(
+                                    "verbose: {}",
+                                    if verbose {
+                                        "on".bright_green()
+                                    } else {
+                                        "off".bright_yellow()
+                                    }
+                                );
                             }
                         }
                         continue;
                     }
                     _ => {
-                        println!("{} {}  (type '{}' for reference)",
-                            "unknown command:".bright_red(), cmd,
-                            ":help".bright_cyan());
+                        println!(
+                            "{} {}  (type '{}' for reference)",
+                            "unknown command:".bright_red(),
+                            cmd,
+                            ":help".bright_cyan()
+                        );
                         continue;
                     }
                 }
@@ -299,12 +379,20 @@ fn run_tcp(me: usize, mpc_addrs: Vec<String>, dist_addrs: Vec<String>) {
                     }));
                     match result {
                         Ok(val) => {
-                            println!("{} {}", "=>".bright_yellow(), display_result(&val, &participant));
+                            println!(
+                                "{} {}",
+                                "=>".bright_yellow(),
+                                display_result(&val, &participant)
+                            );
                         }
                         Err(e) => {
-                            let msg = if let Some(s) = e.downcast_ref::<String>() { s.clone() }
-                                      else if let Some(s) = e.downcast_ref::<&str>() { s.to_string() }
-                                      else { "unknown runtime error".to_string() };
+                            let msg = if let Some(s) = e.downcast_ref::<String>() {
+                                s.clone()
+                            } else if let Some(s) = e.downcast_ref::<&str>() {
+                                s.to_string()
+                            } else {
+                                "unknown runtime error".to_string()
+                            };
                             println!("{} {}", "runtime error:".bright_red(), msg);
                             // Broadcast :abort so workers re-sync to the wait loop.
                             broadcast_expr(":abort", &dist_transport);
@@ -314,24 +402,41 @@ fn run_tcp(me: usize, mpc_addrs: Vec<String>, dist_addrs: Vec<String>) {
             }
         }
 
-        if let Some(p) = history_path() { let _ = rl.save_history(&p); }
-
+        if let Some(p) = history_path() {
+            let _ = rl.save_history(&p);
+        }
     } else {
         // ── Parties 1/2: silent workers ──────────────────────────────────────
-        eprintln!("{}", format!("[party {}] ready, waiting for expressions from party 0...", me).bright_yellow());
+        eprintln!(
+            "{}",
+            format!(
+                "[party {}] ready, waiting for expressions from party 0...",
+                me
+            )
+            .bright_yellow()
+        );
         loop {
             let src = receive_expr(&dist_transport);
             let src = src.trim().to_string();
             if src == ":quit" {
-                eprintln!("{}", format!("[party {}] received :quit, exiting.", me).bright_yellow());
+                eprintln!(
+                    "{}",
+                    format!("[party {}] received :quit, exiting.", me).bright_yellow()
+                );
                 break;
             }
             if src == ":abort" {
                 // Party 0 had a parse or runtime error; skip this round.
-                eprintln!("{}", format!("[party {}] received :abort, skipping expression.", me).bright_yellow());
+                eprintln!(
+                    "{}",
+                    format!("[party {}] received :abort, skipping expression.", me).bright_yellow()
+                );
                 continue;
             }
-            eprintln!("{}", format!("[party {}] evaluating: {}", me, src).bright_black());
+            eprintln!(
+                "{}",
+                format!("[party {}] evaluating: {}", me, src).bright_black()
+            );
             match parse(&src) {
                 Ok(expr) => {
                     // Wrap in catch_unwind so a protocol panic doesn't crash the worker.
@@ -350,25 +455,51 @@ fn run_tcp(me: usize, mpc_addrs: Vec<String>, dist_addrs: Vec<String>) {
                                 Types::Num(n) => ((*n as u32) as i32 as i64).to_string(),
                                 other => format!("{:?}", other),
                             };
-                            eprintln!("{}", format!("[party {}] => {}  (waiting for next expression)", me, display).bright_black());
+                            eprintln!(
+                                "{}",
+                                format!(
+                                    "[party {}] => {}  (waiting for next expression)",
+                                    me, display
+                                )
+                                .bright_black()
+                            );
                         }
                         Err(e) => {
-                            let msg = if let Some(s) = e.downcast_ref::<String>() { s.clone() }
-                                      else if let Some(s) = e.downcast_ref::<&str>() { s.to_string() }
-                                      else { "unknown runtime error".to_string() };
-                            eprintln!("{}", format!("[party {}] runtime error: {}  (recovered, waiting for next)", me, msg).bright_red());
+                            let msg = if let Some(s) = e.downcast_ref::<String>() {
+                                s.clone()
+                            } else if let Some(s) = e.downcast_ref::<&str>() {
+                                s.to_string()
+                            } else {
+                                "unknown runtime error".to_string()
+                            };
+                            eprintln!(
+                                "{}",
+                                format!(
+                                    "[party {}] runtime error: {}  (recovered, waiting for next)",
+                                    me, msg
+                                )
+                                .bright_red()
+                            );
                             // Wait for the :abort that party 0 will broadcast.
                             let abort = receive_expr(&dist_transport);
-                            if abort.trim() == ":quit" { break; }
+                            if abort.trim() == ":quit" {
+                                break;
+                            }
                             // any other message (including :abort) — continue the loop
                         }
                     }
                 }
                 Err(e) => {
-                    eprintln!("{}", format!("[party {}] parse error: {}  (waiting for :abort)", me, e).bright_red());
+                    eprintln!(
+                        "{}",
+                        format!("[party {}] parse error: {}  (waiting for :abort)", me, e)
+                            .bright_red()
+                    );
                     // Wait for :abort from party 0 before re-entering the wait loop.
                     let abort = receive_expr(&dist_transport);
-                    if abort.trim() == ":quit" { break; }
+                    if abort.trim() == ":quit" {
+                        break;
+                    }
                 }
             }
         }
@@ -396,13 +527,20 @@ fn run_d_sum(me: usize, addrs: Vec<String>, d_val: u128) {
     while pending > 0 && start.elapsed() < Duration::from_secs(8) {
         if let Some((from, msg)) = transport.recv() {
             if let MpcMsg::D(v) = deserialize_msg(&msg) {
-                if !got[from] { got[from] = true; d_shares[from] = v; pending -= 1; }
+                if !got[from] {
+                    got[from] = true;
+                    d_shares[from] = v;
+                    pending -= 1;
+                }
             }
         } else {
             thread::sleep(Duration::from_millis(10));
         }
     }
-    if pending > 0 { eprintln!("[party {}] timed out", me); std::process::exit(1); }
+    if pending > 0 {
+        eprintln!("[party {}] timed out", me);
+        std::process::exit(1);
+    }
     let sum: u128 = d_shares.iter().fold(0, |a, &v| a.wrapping_add(v));
     println!("SUM: {}", sum);
 }
@@ -416,9 +554,14 @@ fn main() {
         return;
     }
 
-    let me: usize = args[1].parse().expect("first argument must be party id (0/1/2)");
+    let me: usize = args[1]
+        .parse()
+        .expect("first argument must be party id (0/1/2)");
     let addrs: Vec<String> = args[2].split(',').map(|s| s.to_string()).collect();
-    if addrs.len() != 3 { eprintln!("expected 3 addresses"); std::process::exit(1); }
+    if addrs.len() != 3 {
+        eprintln!("expected 3 addresses");
+        std::process::exit(1);
+    }
 
     // legacy integration-test mode: <id> <addrs> <d_value>
     if args.len() >= 4 {
@@ -434,12 +577,17 @@ fn main() {
     }
 
     // two args: derive dist_addrs by bumping port by 100
-    let dist_addrs: Vec<String> = addrs.iter().map(|addr| {
-        if let Some(colon) = addr.rfind(':') {
-            let port: u16 = addr[colon+1..].parse().unwrap_or(7000);
-            format!("{}:{}", &addr[..colon], port + 100)
-        } else { format!("{}:7100", addr) }
-    }).collect();
+    let dist_addrs: Vec<String> = addrs
+        .iter()
+        .map(|addr| {
+            if let Some(colon) = addr.rfind(':') {
+                let port: u16 = addr[colon + 1..].parse().unwrap_or(7000);
+                format!("{}:{}", &addr[..colon], port + 100)
+            } else {
+                format!("{}:7100", addr)
+            }
+        })
+        .collect();
     thread::sleep(Duration::from_millis(300 + me as u64 * 150));
     run_tcp(me, addrs, dist_addrs);
 }

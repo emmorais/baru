@@ -1,12 +1,12 @@
-use std::path::PathBuf;
 use std::env;
 use std::error::Error;
+use std::path::PathBuf;
 
 use rustyline::error::ReadlineError;
-use rustyline::{Editor};
+use rustyline::Editor;
 
 use baru::interpreter::{parse, Participant, Types};
-use baru::repl::{EXAMPLES, print_help, print_examples_list, print_examples_for, ReplHelper};
+use baru::repl::{print_examples_for, print_examples_list, print_help, ReplHelper, EXAMPLES};
 use colored::*;
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -21,11 +21,14 @@ fn history_path() -> Option<PathBuf> {
     }
 }
 
-
 fn main() -> Result<(), Box<dyn Error>> {
     let participants: Vec<Participant> = (0..3).map(Participant::new).collect();
 
-    println!("{}", "ABY3 REPL — Secure Multi-Party Computation (replicated 3-party evaluation).".bright_green());
+    println!(
+        "{}",
+        "ABY3 REPL — Secure Multi-Party Computation (replicated 3-party evaluation)."
+            .bright_green()
+    );
     println!("{}", "Type ':help' for language reference, ':examples' to browse built-in examples, or 'quit' to exit.".bright_yellow());
 
     let mut verbose = false;
@@ -62,12 +65,10 @@ fn main() -> Result<(), Box<dyn Error>> {
                         ":help" => {
                             print_help(false);
                         }
-                        ":examples" => {
-                            match parts.next() {
-                                None => print_examples_list(),
-                                Some(cat) => print_examples_for(cat),
-                            }
-                        }
+                        ":examples" => match parts.next() {
+                            None => print_examples_list(),
+                            Some(cat) => print_examples_for(cat),
+                        },
                         ":example" => {
                             match parts.next() {
                                 None => println!("usage: :example <n>  (use ':examples' to list)"),
@@ -75,13 +76,23 @@ fn main() -> Result<(), Box<dyn Error>> {
                                     Ok(n) if n >= 1 && n <= EXAMPLES.len() => {
                                         let ex = &EXAMPLES[n - 1];
                                         println!();
-                                        println!("{} [{}] {} ({})",
+                                        println!(
+                                            "{} [{}] {} ({})",
                                             "Running example".bright_yellow(),
                                             n.to_string().bright_white(),
                                             ex.name.bright_cyan(),
-                                            ex.category);
-                                        println!("{} {}", "Code:".bright_yellow(), ex.code.bright_green());
-                                        println!("{} {}", "Expected:".bright_yellow(), ex.expected.bright_magenta());
+                                            ex.category
+                                        );
+                                        println!(
+                                            "{} {}",
+                                            "Code:".bright_yellow(),
+                                            ex.code.bright_green()
+                                        );
+                                        println!(
+                                            "{} {}",
+                                            "Expected:".bright_yellow(),
+                                            ex.expected.bright_magenta()
+                                        );
                                         println!();
                                         match parse(ex.code) {
                                             Ok(expr) => {
@@ -95,14 +106,26 @@ fn main() -> Result<(), Box<dyn Error>> {
                                                     Types::Share(sr) => {
                                                         let raw = participants[0].reveal(sr);
                                                         let val = (raw as u32) as i32 as i64;
-                                                        println!("{} {} (revealed, signed)", "result:".bright_cyan(), val.to_string().bright_green());
+                                                        println!(
+                                                            "{} {} (revealed, signed)",
+                                                            "result:".bright_cyan(),
+                                                            val.to_string().bright_green()
+                                                        );
                                                     }
                                                     Types::Num(n) => {
                                                         // sign-extend through 32 bits so MPC field values display correctly
                                                         let val = (*n as u32) as i32 as i64;
-                                                        println!("{} {}", "result:".bright_cyan(), val.to_string().bright_green());
+                                                        println!(
+                                                            "{} {}",
+                                                            "result:".bright_cyan(),
+                                                            val.to_string().bright_green()
+                                                        );
                                                     }
-                                                    other => println!("{} {:?}", "result:".bright_cyan(), other),
+                                                    other => println!(
+                                                        "{} {:?}",
+                                                        "result:".bright_cyan(),
+                                                        other
+                                                    ),
                                                 }
                                                 println!("all participants: {:?}\n", results);
                                             }
@@ -113,46 +136,47 @@ fn main() -> Result<(), Box<dyn Error>> {
                                 },
                             }
                         }
-                        ":verbose" => {
-                            match parts.next() {
-                                Some(arg) => match arg {
-                                    "on" => {
-                                        verbose = true;
-                                        println!("{}", "verbose: on".bright_green());
-                                    }
-                                    "off" => {
-                                        verbose = false;
-                                        println!("{}", "verbose: off".bright_yellow());
-                                    }
-                                    _ => println!("usage: :verbose [on|off]"),
+                        ":verbose" => match parts.next() {
+                            Some(arg) => match arg {
+                                "on" => {
+                                    verbose = true;
+                                    println!("{}", "verbose: on".bright_green());
+                                }
+                                "off" => {
+                                    verbose = false;
+                                    println!("{}", "verbose: off".bright_yellow());
+                                }
+                                _ => println!("usage: :verbose [on|off]"),
+                            },
+                            None => {
+                                verbose = !verbose;
+                                println!("verbose: {}", if verbose { "on" } else { "off" });
+                            }
+                        },
+                        ":last" => match parts.next() {
+                            Some(pid_s) => match pid_s.parse::<usize>() {
+                                Ok(pid) if pid < participants.len() => match &last_results[pid] {
+                                    Some(v) => println!(
+                                        "{} {}",
+                                        format!("last[{}] =", pid).bright_magenta(),
+                                        format!("{:?}", v)
+                                    ),
+                                    None => println!(
+                                        "{}",
+                                        format!("last[{}] = <none>", pid).bright_red()
+                                    ),
                                 },
-                                None => {
-                                    verbose = !verbose;
-                                    println!("verbose: {}", if verbose { "on" } else { "off" });
+                                _ => println!("invalid participant id"),
+                            },
+                            None => {
+                                for (i, r) in last_results.iter().enumerate() {
+                                    match r {
+                                        Some(v) => println!("last[{}] = {:?}", i, v),
+                                        None => println!("last[{}] = <none>", i),
+                                    }
                                 }
                             }
-                        }
-                        ":last" => {
-                            match parts.next() {
-                                Some(pid_s) => match pid_s.parse::<usize>() {
-                                    Ok(pid) if pid < participants.len() => {
-                                        match &last_results[pid] {
-                                            Some(v) => println!("{} {}", format!("last[{}] =", pid).bright_magenta(), format!("{:?}", v)),
-                                            None => println!("{}", format!("last[{}] = <none>", pid).bright_red()),
-                                        }
-                                    }
-                                    _ => println!("invalid participant id"),
-                                },
-                                None => {
-                                    for (i, r) in last_results.iter().enumerate() {
-                                        match r {
-                                            Some(v) => println!("last[{}] = {:?}", i, v),
-                                            None => println!("last[{}] = <none>", i),
-                                        }
-                                    }
-                                }
-                            }
-                        }
+                        },
                         ":results" => {
                             for (i, r) in last_results.iter().enumerate() {
                                 match r {
@@ -169,7 +193,12 @@ fn main() -> Result<(), Box<dyn Error>> {
                                             Some(v) => match v {
                                                 Types::Share(sr) => {
                                                     let val = participants[pid].reveal(sr);
-                                                    println!("{} {}", format!("reveal[{}] ->", pid).bright_magenta(), format!("{}", val).bright_green());
+                                                    println!(
+                                                        "{} {}",
+                                                        format!("reveal[{}] ->", pid)
+                                                            .bright_magenta(),
+                                                        format!("{}", val).bright_green()
+                                                    );
                                                 }
                                                 Types::List(list) => {
                                                     // try to reveal each share in the list
@@ -177,19 +206,27 @@ fn main() -> Result<(), Box<dyn Error>> {
                                                     for item in list {
                                                         match item {
                                                             Types::Share(sr) => {
-                                                                let val = participants[pid].reveal(sr);
+                                                                let val =
+                                                                    participants[pid].reveal(sr);
                                                                 revealed.push(format!("{}", val));
                                                             }
-                                                            Types::Num(n) => revealed.push(format!("Num({})", n)),
-                                                            other => revealed.push(format!("{:?}", other)),
+                                                            Types::Num(n) => {
+                                                                revealed.push(format!("Num({})", n))
+                                                            }
+                                                            other => revealed
+                                                                .push(format!("{:?}", other)),
                                                         }
                                                     }
                                                     println!("reveal[{}] -> {:?}", pid, revealed);
                                                 }
-                                                Types::Num(n) => println!("reveal[{}] -> Num({})", pid, n),
+                                                Types::Num(n) => {
+                                                    println!("reveal[{}] -> Num({})", pid, n)
+                                                }
                                                 other => println!("reveal[{}] -> {:?}", pid, other),
                                             },
-                                            None => println!("no last result for participant {}", pid),
+                                            None => {
+                                                println!("no last result for participant {}", pid)
+                                            }
                                         }
                                     }
                                     _ => println!("invalid participant id"),
@@ -197,29 +234,31 @@ fn main() -> Result<(), Box<dyn Error>> {
                                 None => println!("usage: :reveal <participant-id>"),
                             }
                         }
-                        ":evalfor" => {
-                            match parts.next() {
-                                Some(pid_s) => match pid_s.parse::<usize>() {
-                                    Ok(pid) if pid < participants.len() => {
-                                        let rest = parts.collect::<Vec<&str>>().join(" ");
-                                        if rest.is_empty() {
-                                            println!("usage: :evalfor <pid> EXPR");
-                                        } else {
-                                            match parse(&rest) {
-                                                Ok(expr) => {
-                                                    let r = if verbose { participants[pid].eval_verbose(&expr, verbose) } else { participants[pid].eval(&expr) };
-                                                    last_results[pid] = Some(r.clone());
-                                                    println!("evalfor[{}] -> {:?}", pid, r);
-                                                }
-                                                Err(e) => println!("parse error: {}", e),
+                        ":evalfor" => match parts.next() {
+                            Some(pid_s) => match pid_s.parse::<usize>() {
+                                Ok(pid) if pid < participants.len() => {
+                                    let rest = parts.collect::<Vec<&str>>().join(" ");
+                                    if rest.is_empty() {
+                                        println!("usage: :evalfor <pid> EXPR");
+                                    } else {
+                                        match parse(&rest) {
+                                            Ok(expr) => {
+                                                let r = if verbose {
+                                                    participants[pid].eval_verbose(&expr, verbose)
+                                                } else {
+                                                    participants[pid].eval(&expr)
+                                                };
+                                                last_results[pid] = Some(r.clone());
+                                                println!("evalfor[{}] -> {:?}", pid, r);
                                             }
+                                            Err(e) => println!("parse error: {}", e),
                                         }
                                     }
-                                    _ => println!("invalid participant id"),
-                                },
-                                None => println!("usage: :evalfor <pid> EXPR"),
-                            }
-                        }
+                                }
+                                _ => println!("invalid participant id"),
+                            },
+                            None => println!("usage: :evalfor <pid> EXPR"),
+                        },
                         ":inspect" => {
                             match parts.next() {
                                 Some(pid_s) => match pid_s.parse::<usize>() {
@@ -227,11 +266,20 @@ fn main() -> Result<(), Box<dyn Error>> {
                                         match parts.next() {
                                             Some(varname) => {
                                                 // construct (reconstruct varname)
-                                                let expr_src = format!("(reconstruct {} )", varname);
+                                                let expr_src =
+                                                    format!("(reconstruct {} )", varname);
                                                 match parse(&expr_src) {
                                                     Ok(expr) => {
-                                                        let r = if verbose { participants[pid].eval_verbose(&expr, verbose) } else { participants[pid].eval(&expr) };
-                                                        println!(":inspect[{}] {} -> {:?}", pid, varname, r);
+                                                        let r = if verbose {
+                                                            participants[pid]
+                                                                .eval_verbose(&expr, verbose)
+                                                        } else {
+                                                            participants[pid].eval(&expr)
+                                                        };
+                                                        println!(
+                                                            ":inspect[{}] {} -> {:?}",
+                                                            pid, varname, r
+                                                        );
                                                     }
                                                     Err(e) => println!("parse error: {}", e),
                                                 }
@@ -244,67 +292,74 @@ fn main() -> Result<(), Box<dyn Error>> {
                                 None => println!("usage: :inspect <pid> <varname>"),
                             }
                         }
-                        ":save" => {
-                            match parts.next() {
-                                Some(pid_s) => match pid_s.parse::<usize>() {
-                                    Ok(pid) if pid < participants.len() => {
-                                        let filename = parts.next().map(|s| s.to_string()).unwrap_or_else(|| format!("store_{}.json", pid));
-                                        let path = std::path::PathBuf::from(filename);
-                                        match participants[pid].save_store(&path) {
-                                            Ok(_) => println!("saved store for participant {} -> {:?}", pid, path),
-                                            Err(e) => println!("error saving store: {}", e),
-                                        }
+                        ":save" => match parts.next() {
+                            Some(pid_s) => match pid_s.parse::<usize>() {
+                                Ok(pid) if pid < participants.len() => {
+                                    let filename = parts
+                                        .next()
+                                        .map(|s| s.to_string())
+                                        .unwrap_or_else(|| format!("store_{}.json", pid));
+                                    let path = std::path::PathBuf::from(filename);
+                                    match participants[pid].save_store(&path) {
+                                        Ok(_) => println!(
+                                            "saved store for participant {} -> {:?}",
+                                            pid, path
+                                        ),
+                                        Err(e) => println!("error saving store: {}", e),
                                     }
-                                    _ => println!("invalid participant id"),
-                                },
-                                None => println!("usage: :save <pid> [filename]"),
-                            }
-                        }
-                        ":load" => {
-                            match parts.next() {
-                                Some(pid_s) => match pid_s.parse::<usize>() {
-                                    Ok(pid) if pid < participants.len() => {
-                                        let filename = parts.next().map(|s| s.to_string()).unwrap_or_else(|| format!("store_{}.json", pid));
-                                        let path = std::path::PathBuf::from(filename);
-                                        match participants[pid].load_store(&path) {
-                                            Ok(_) => println!("loaded store for participant {} <- {:?}", pid, path),
-                                            Err(e) => println!("error loading store: {}", e),
-                                        }
-                                    }
-                                    _ => println!("invalid participant id"),
-                                },
-                                None => println!("usage: :load <pid> [filename]"),
-                            }
-                        }
-                        ":reset" => {
-                            match parts.next() {
-                                Some(pid_s) => match pid_s.parse::<usize>() {
-                                    Ok(pid) if pid < participants.len() => {
-                                        participants[pid].reset_store();
-                                        println!("reset store for participant {}", pid);
-                                    }
-                                    _ => println!("invalid participant id"),
-                                },
-                                None => {
-                                    for pid in 0..participants.len() {
-                                        participants[pid].reset_store();
-                                    }
-                                    println!("reset stores for all participants");
                                 }
-                            }
-                        }
-                        ":env" => {
-                            match parts.next() {
-                                Some(pid_s) => match pid_s.parse::<usize>() {
-                                    Ok(pid) if pid < participants.len() => {
-                                        participants[pid].print_env();
+                                _ => println!("invalid participant id"),
+                            },
+                            None => println!("usage: :save <pid> [filename]"),
+                        },
+                        ":load" => match parts.next() {
+                            Some(pid_s) => match pid_s.parse::<usize>() {
+                                Ok(pid) if pid < participants.len() => {
+                                    let filename = parts
+                                        .next()
+                                        .map(|s| s.to_string())
+                                        .unwrap_or_else(|| format!("store_{}.json", pid));
+                                    let path = std::path::PathBuf::from(filename);
+                                    match participants[pid].load_store(&path) {
+                                        Ok(_) => println!(
+                                            "loaded store for participant {} <- {:?}",
+                                            pid, path
+                                        ),
+                                        Err(e) => println!("error loading store: {}", e),
                                     }
-                                    _ => println!("invalid participant id"),
-                                },
-                                None => println!("usage: :env <participant-id>"),
+                                }
+                                _ => println!("invalid participant id"),
+                            },
+                            None => println!("usage: :load <pid> [filename]"),
+                        },
+                        ":reset" => match parts.next() {
+                            Some(pid_s) => match pid_s.parse::<usize>() {
+                                Ok(pid) if pid < participants.len() => {
+                                    participants[pid].reset_store();
+                                    println!("reset store for participant {}", pid);
+                                }
+                                _ => println!("invalid participant id"),
+                            },
+                            None => {
+                                for pid in 0..participants.len() {
+                                    participants[pid].reset_store();
+                                }
+                                println!("reset stores for all participants");
                             }
-                        }
-                        _ => println!("unknown command: {}  (type ':help' for command reference)", cmd),
+                        },
+                        ":env" => match parts.next() {
+                            Some(pid_s) => match pid_s.parse::<usize>() {
+                                Ok(pid) if pid < participants.len() => {
+                                    participants[pid].print_env();
+                                }
+                                _ => println!("invalid participant id"),
+                            },
+                            None => println!("usage: :env <participant-id>"),
+                        },
+                        _ => println!(
+                            "unknown command: {}  (type ':help' for command reference)",
+                            cmd
+                        ),
                     }
                     continue;
                 }
@@ -314,7 +369,11 @@ fn main() -> Result<(), Box<dyn Error>> {
                         println!("parsed: {:?}", expr);
                         let mut results: Vec<Types> = Vec::new();
                         for (i, p) in participants.iter().enumerate() {
-                            let r = if verbose { p.eval_verbose(&expr, verbose) } else { p.eval(&expr) };
+                            let r = if verbose {
+                                p.eval_verbose(&expr, verbose)
+                            } else {
+                                p.eval(&expr)
+                            };
                             last_results[i] = Some(r.clone());
                             results.push(r);
                         }

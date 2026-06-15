@@ -4,17 +4,17 @@
 
 use colored::*;
 use rustyline::completion::{Completer, Pair};
-use rustyline::Helper;
-use rustyline::hint::Hinter;
 use rustyline::highlight::Highlighter;
+use rustyline::hint::Hinter;
 use rustyline::validate::Validator;
+use rustyline::Helper;
 
 // ── Examples catalog ─────────────────────────────────────────────────────────
 
 pub struct Example {
     pub category: &'static str,
-    pub name:     &'static str,
-    pub code:     &'static str,
+    pub name: &'static str,
+    pub code: &'static str,
     pub expected: &'static str,
 }
 
@@ -224,84 +224,177 @@ pub fn distinct_categories() -> Vec<&'static str> {
 /// `tcp_mode = true` shows TCP-party-0 commands instead of single-REPL commands.
 pub fn print_help(tcp_mode: bool) {
     println!();
-    println!("{}", "╔══════════════════════════════════════════════════════════════╗".bright_cyan());
-    println!("{}", "║      Baru — a Lisp-like Secure Multi-Party Computation REPL  ║".bright_cyan());
-    println!("{}", "╚══════════════════════════════════════════════════════════════╝".bright_cyan());
+    println!(
+        "{}",
+        "╔══════════════════════════════════════════════════════════════╗".bright_cyan()
+    );
+    println!(
+        "{}",
+        "║      Baru — a Lisp-like Secure Multi-Party Computation REPL  ║".bright_cyan()
+    );
+    println!(
+        "{}",
+        "╚══════════════════════════════════════════════════════════════╝".bright_cyan()
+    );
     println!();
 
     println!("{}", "LITERALS".bright_yellow());
-    println!("  {}   integers (positive and negative)", "42   -7   0".bright_green());
+    println!(
+        "  {}   integers (positive and negative)",
+        "42   -7   0".bright_green()
+    );
     println!("  {}      boolean true / false", "#t   #f".bright_green());
     println!("  {}  empty list / nil", "()".bright_green());
     println!();
 
     println!("{}", "ARITHMETIC".bright_yellow());
-    println!("  {}   addition / subtraction", "(+ a b)  (- a b)".bright_green());
-    println!("  {}   multiplication / integer division", "(* a b)  (/ a b)".bright_green());
-    println!("  {}           remainder (modulo)", "(mod a b)".bright_green());
+    println!(
+        "  {}   addition / subtraction",
+        "(+ a b)  (- a b)".bright_green()
+    );
+    println!(
+        "  {}   multiplication / integer division",
+        "(* a b)  (/ a b)".bright_green()
+    );
+    println!(
+        "  {}           remainder (modulo)",
+        "(mod a b)".bright_green()
+    );
     println!();
 
-    println!("{}", "COMPARISONS  — return 1 (true) or 0 (false)".bright_yellow());
-    println!("  {}", "(== a b)  (< a b)  (<= a b)  (> a b)  (>= a b)".bright_green());
+    println!(
+        "{}",
+        "COMPARISONS  — return 1 (true) or 0 (false)".bright_yellow()
+    );
+    println!(
+        "  {}",
+        "(== a b)  (< a b)  (<= a b)  (> a b)  (>= a b)".bright_green()
+    );
     println!();
 
     println!("{}", "BOOLEAN / BITWISE".bright_yellow());
-    println!("  {}              logical / bitwise not", "(not x)".bright_green());
-    println!("  {}        logical / bitwise and, or", "(and a b)  (or a b)".bright_green());
+    println!(
+        "  {}              logical / bitwise not",
+        "(not x)".bright_green()
+    );
+    println!(
+        "  {}        logical / bitwise and, or",
+        "(and a b)  (or a b)".bright_green()
+    );
     println!();
 
     println!("{}", "CONDITIONALS".bright_yellow());
-    println!("  {}  evaluates then or else branch", "(if cond then else)".bright_green());
+    println!(
+        "  {}  evaluates then or else branch",
+        "(if cond then else)".bright_green()
+    );
     println!();
 
     println!("{}", "LET BINDINGS".bright_yellow());
-    println!("  {}  parallel bindings, then body", "(let ((x 1) (y 2)) body)".bright_green());
-    println!("  {}  auto-shares as N-bit signed integer", "(let ((z :sint32 -5)) body)".bright_green());
+    println!(
+        "  {}  parallel bindings, then body",
+        "(let ((x 1) (y 2)) body)".bright_green()
+    );
+    println!(
+        "  {}  auto-shares as N-bit signed integer",
+        "(let ((z :sint32 -5)) body)".bright_green()
+    );
     println!();
 
     println!("{}", "LAMBDAS — first-class functions".bright_yellow());
-    println!("  {}      single parameter", "(lambda (x) body)".bright_green());
-    println!("  {}   multiple parameters", "(lambda (x y) body)".bright_green());
-    println!("  {}    direct application", "((lambda (x) (* x x)) 5)  =>  25".bright_green());
+    println!(
+        "  {}      single parameter",
+        "(lambda (x) body)".bright_green()
+    );
+    println!(
+        "  {}   multiple parameters",
+        "(lambda (x y) body)".bright_green()
+    );
+    println!(
+        "  {}    direct application",
+        "((lambda (x) (* x x)) 5)  =>  25".bright_green()
+    );
     println!();
 
     println!("{}", "RECURSIVE BINDINGS".bright_yellow());
     println!("  {}", "(letrec ((fact (lambda (n)".bright_green());
-    println!("  {}", "           (if (== n 0) 1 (* n (fact (- n 1))))))".bright_green());
+    println!(
+        "  {}",
+        "           (if (== n 0) 1 (* n (fact (- n 1))))))".bright_green()
+    );
     println!("  {}", "  (fact 10))".bright_green());
     println!("  Mutually recursive bindings are supported.");
     println!();
 
     println!("{}", "LISTS".bright_yellow());
-    println!("  {}   build a pair / list", "(cons head tail)".bright_green());
+    println!(
+        "  {}   build a pair / list",
+        "(cons head tail)".bright_green()
+    );
     println!("  {}         first element", "(car lst)".bright_green());
     println!("  {}          rest of list", "(cdr lst)".bright_green());
     println!();
 
     println!("{}", "SECURE MPC OPERATIONS".bright_yellow());
-    println!("  {}  secret-share value v in an nbits-wide field (party 0 is owner)", "(share v nbits)".bright_green());
-    println!("  {}  secret-share v with explicit owner party id", "(share-from owner v nbits)".bright_green());
-    println!("  {}   reconstruct / reveal a shared value", "(reconstruct x)".bright_green());
-    println!("  {}    auto-share as N-bit signed integer (party 0 owner)", ":sintN".bright_green());
-    println!("  {}  auto-share with explicit owner (e.g. :sint32-from-1)", ":sintN-from-M".bright_green());
+    println!(
+        "  {}  secret-share value v in an nbits-wide field (party 0 is owner)",
+        "(share v nbits)".bright_green()
+    );
+    println!(
+        "  {}  secret-share v with explicit owner party id",
+        "(share-from owner v nbits)".bright_green()
+    );
+    println!(
+        "  {}   reconstruct / reveal a shared value",
+        "(reconstruct x)".bright_green()
+    );
+    println!(
+        "  {}    auto-share as N-bit signed integer (party 0 owner)",
+        ":sintN".bright_green()
+    );
+    println!(
+        "  {}  auto-share with explicit owner (e.g. :sint32-from-1)",
+        ":sintN-from-M".bright_green()
+    );
     println!();
     println!("  Shared arithmetic:");
-    println!("    {}   local — zero communication rounds", "(+ s1 s2)  (- s1 s2)".bright_green());
-    println!("    {}          Beaver triple — 1 round", "(* s1 s2)".bright_green());
-    println!("    {}  comparison via a2b — ~1 round", "(< s1 s2)  (> s1 s2)".bright_green());
-    println!("    {}        equality test via zero-check", "(== s1 s2)".bright_green());
-    println!("    {}     branching on shared bool (leaks 1 bit!)", "(if s ...)".bright_green());
+    println!(
+        "    {}   local — zero communication rounds",
+        "(+ s1 s2)  (- s1 s2)".bright_green()
+    );
+    println!(
+        "    {}          Beaver triple — 1 round",
+        "(* s1 s2)".bright_green()
+    );
+    println!(
+        "    {}  comparison via a2b — ~1 round",
+        "(< s1 s2)  (> s1 s2)".bright_green()
+    );
+    println!(
+        "    {}        equality test via zero-check",
+        "(== s1 s2)".bright_green()
+    );
+    println!(
+        "    {}     branching on shared bool (leaks 1 bit!)",
+        "(if s ...)".bright_green()
+    );
     println!();
 
     if tcp_mode {
-        println!("{}", "REPL COMMANDS (party 0 — distributed mode)".bright_yellow());
+        println!(
+            "{}",
+            "REPL COMMANDS (party 0 — distributed mode)".bright_yellow()
+        );
         let cmds: &[(&str, &str)] = &[
-            (":help",                "show this help message"),
-            (":examples",            "list all example categories"),
+            (":help", "show this help message"),
+            (":examples", "list all example categories"),
             (":examples <category>", "show examples for a category"),
-            (":example <n>",         "broadcast and run example jointly with all parties"),
-            (":verbose [on|off]",    "toggle eval traces"),
-            (":quit",                "signal all parties to quit and exit"),
+            (
+                ":example <n>",
+                "broadcast and run example jointly with all parties",
+            ),
+            (":verbose [on|off]", "toggle eval traces"),
+            (":quit", "signal all parties to quit and exit"),
         ];
         for (cmd, desc) in cmds {
             println!("  {:<32} {}", cmd.bright_cyan(), desc);
@@ -309,20 +402,32 @@ pub fn print_help(tcp_mode: bool) {
     } else {
         println!("{}", "REPL COMMANDS".bright_yellow());
         let cmds: &[(&str, &str)] = &[
-            (":help",                       "show this help message"),
-            (":examples",                   "list all example categories"),
-            (":examples <category>",        "show examples for a category"),
-            (":example <n>",                "run example number n"),
-            (":verbose [on|off]",           "toggle per-participant eval traces"),
-            (":last [pid]",                 "print last result for participant pid"),
-            (":results",                    "print all participants' last results"),
-            (":reveal <pid>",               "reveal last shared result for participant pid"),
-            (":evalfor <pid> EXPR",         "evaluate EXPR for a specific participant"),
-            (":inspect <pid> <var>",        "reveal a variable for a participant"),
-            (":save <pid> [file]",          "save participant store to JSON file"),
-            (":load <pid> [file]",          "load participant store from JSON file"),
-            (":reset [pid]",                "clear participant store(s)"),
-            ("quit / exit",                 "exit the REPL"),
+            (":help", "show this help message"),
+            (":examples", "list all example categories"),
+            (":examples <category>", "show examples for a category"),
+            (":example <n>", "run example number n"),
+            (":verbose [on|off]", "toggle per-participant eval traces"),
+            (":last [pid]", "print last result for participant pid"),
+            (":results", "print all participants' last results"),
+            (
+                ":reveal <pid>",
+                "reveal last shared result for participant pid",
+            ),
+            (
+                ":evalfor <pid> EXPR",
+                "evaluate EXPR for a specific participant",
+            ),
+            (
+                ":inspect <pid> <var>",
+                "reveal a variable for a participant",
+            ),
+            (":save <pid> [file]", "save participant store to JSON file"),
+            (
+                ":load <pid> [file]",
+                "load participant store from JSON file",
+            ),
+            (":reset [pid]", "clear participant store(s)"),
+            ("quit / exit", "exit the REPL"),
         ];
         for (cmd, desc) in cmds {
             println!("  {:<32} {}", cmd.bright_cyan(), desc);
@@ -336,8 +441,11 @@ pub fn print_help(tcp_mode: bool) {
 pub fn print_examples_list() {
     println!();
     println!("{}", "=== Example Categories ===".bright_yellow());
-    println!("  Use '{}' to see examples  |  '{}' to run one",
-        ":examples <category>".bright_cyan(), ":example <n>".bright_cyan());
+    println!(
+        "  Use '{}' to see examples  |  '{}' to run one",
+        ":examples <category>".bright_cyan(),
+        ":example <n>".bright_cyan()
+    );
     println!();
 
     let cats = distinct_categories();
@@ -345,11 +453,13 @@ pub fn print_examples_list() {
     for cat in &cats {
         let count = EXAMPLES.iter().filter(|e| e.category == *cat).count();
         let end = start + count - 1;
-        println!("  {:<20} [{:>2}-{:>2}]  {} examples",
+        println!(
+            "  {:<20} [{:>2}-{:>2}]  {} examples",
             cat.bright_cyan(),
             start.to_string().bright_white(),
             end.to_string().bright_white(),
-            count);
+            count
+        );
         start += count;
     }
     println!();
@@ -357,7 +467,8 @@ pub fn print_examples_list() {
 
 pub fn print_examples_for(filter: &str) {
     let filter_lc = filter.to_lowercase();
-    let matched: Vec<(usize, &Example)> = EXAMPLES.iter()
+    let matched: Vec<(usize, &Example)> = EXAMPLES
+        .iter()
         .enumerate()
         .filter(|(_, e)| e.category.to_lowercase().contains(&filter_lc))
         .map(|(i, e)| (i + 1, e))
@@ -372,15 +483,24 @@ pub fn print_examples_for(filter: &str) {
     let cat_name = matched[0].1.category;
     println!();
     println!("{}", format!("=== {} ===", cat_name).bright_yellow());
-    println!("  Run with '{}' e.g. ':example {}'",
-        ":example <n>".bright_cyan(), matched[0].0);
+    println!(
+        "  Run with '{}' e.g. ':example {}'",
+        ":example <n>".bright_cyan(),
+        matched[0].0
+    );
     println!();
     for (global_idx, ex) in &matched {
-        println!("  [{}] {}",
+        println!(
+            "  [{}] {}",
             global_idx.to_string().bright_white(),
-            ex.name.bright_cyan());
+            ex.name.bright_cyan()
+        );
         println!("      {}", ex.code.bright_green());
-        println!("      {} {}", "=>".bright_yellow(), ex.expected.bright_magenta());
+        println!(
+            "      {} {}",
+            "=>".bright_yellow(),
+            ex.expected.bright_magenta()
+        );
         println!();
     }
 }
@@ -388,17 +508,34 @@ pub fn print_examples_for(filter: &str) {
 // ── Tab-completion helper ─────────────────────────────────────────────────────
 
 const BASE_WORDS: &[&str] = &[
-    ":help", ":examples", ":example", ":verbose",
-    "share", "share-from", "reconstruct", "a2b", "b2a",
-    "arithmetic", "comparisons", "booleans", "let-lambda",
-    "higher-order", "lists", "recursion", "church",
-    "mpc-basics", "mpc-signed", "mpc-compare", "relu-network", "mpc-oblivious",
+    ":help",
+    ":examples",
+    ":example",
+    ":verbose",
+    "share",
+    "share-from",
+    "reconstruct",
+    "a2b",
+    "b2a",
+    "arithmetic",
+    "comparisons",
+    "booleans",
+    "let-lambda",
+    "higher-order",
+    "lists",
+    "recursion",
+    "church",
+    "mpc-basics",
+    "mpc-signed",
+    "mpc-compare",
+    "relu-network",
+    "mpc-oblivious",
     "mpc-private-inputs",
 ];
 
 const REPL_ONLY_WORDS: &[&str] = &[
-    ":last", ":results", ":reveal", ":evalfor", ":inspect",
-    ":save", ":load", ":reset", "quit", "exit",
+    ":last", ":results", ":reveal", ":evalfor", ":inspect", ":save", ":load", ":reset", "quit",
+    "exit",
 ];
 
 const TCP_ONLY_WORDS: &[&str] = &[":quit"];
@@ -410,7 +547,9 @@ pub struct ReplHelper {
 impl ReplHelper {
     /// Tab-completion helper for the single-process REPL.
     pub fn new() -> Self {
-        let mut words: Vec<String> = BASE_WORDS.iter().chain(REPL_ONLY_WORDS.iter())
+        let mut words: Vec<String> = BASE_WORDS
+            .iter()
+            .chain(REPL_ONLY_WORDS.iter())
             .map(|&s| s.to_string())
             .collect();
         words.sort();
@@ -419,7 +558,9 @@ impl ReplHelper {
 
     /// Tab-completion helper for the TCP party-0 REPL.
     pub fn new_tcp() -> Self {
-        let mut words: Vec<String> = BASE_WORDS.iter().chain(TCP_ONLY_WORDS.iter())
+        let mut words: Vec<String> = BASE_WORDS
+            .iter()
+            .chain(TCP_ONLY_WORDS.iter())
             .map(|&s| s.to_string())
             .collect();
         words.sort();
@@ -428,7 +569,9 @@ impl ReplHelper {
 }
 
 impl Default for ReplHelper {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Helper for ReplHelper {}
@@ -456,9 +599,14 @@ impl Completer for ReplHelper {
             None => 0,
         };
         let word = &line[start..pos];
-        let matches: Vec<Pair> = self.words.iter()
+        let matches: Vec<Pair> = self
+            .words
+            .iter()
             .filter(|w| word.is_empty() || w.starts_with(word))
-            .map(|w| Pair { display: w.clone(), replacement: w.clone() })
+            .map(|w| Pair {
+                display: w.clone(),
+                replacement: w.clone(),
+            })
             .collect();
         Ok((start, matches))
     }

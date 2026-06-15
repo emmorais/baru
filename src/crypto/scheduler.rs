@@ -1,5 +1,5 @@
-use crate::crypto::types::{Share3, Fr};
-use crate::crypto::arith::{gen_beaver_triple, share_secret, scalar_mul, add_shares};
+use crate::crypto::arith::{add_shares, gen_beaver_triple, scalar_mul, share_secret};
+use crate::crypto::types::{Fr, Share3};
 
 /// Simple broadcast message used by the scheduler.
 #[derive(Debug, Clone)]
@@ -20,7 +20,11 @@ pub struct Scheduler {
 
 impl Scheduler {
     pub fn new(corrupted: Option<usize>) -> Self {
-        Scheduler { messages: Vec::new(), corrupted, rounds: 0 }
+        Scheduler {
+            messages: Vec::new(),
+            corrupted,
+            rounds: 0,
+        }
     }
 
     /// Simulate a broadcast from `from` with tag and value. If `from` matches
@@ -37,7 +41,11 @@ impl Scheduler {
         for _to in 0..3 {
             // In a real network each recipient would receive a copy; we store
             // the (from,tag,value) triple once per recipient for clarity.
-            self.messages.push(Message { from, tag, value: v });
+            self.messages.push(Message {
+                from,
+                tag,
+                value: v,
+            });
         }
         self.rounds += 1;
     }
@@ -47,7 +55,9 @@ impl Scheduler {
     pub fn collect_sum(&self, tag: &'static str) -> Fr {
         let mut sums: [Option<Fr>; 3] = [None, None, None];
         for m in &self.messages {
-            if m.tag != tag { continue; }
+            if m.tag != tag {
+                continue;
+            }
             let idx = m.from as usize;
             if sums[idx].is_none() {
                 sums[idx] = Some(m.value);
@@ -64,7 +74,9 @@ impl Scheduler {
         total
     }
 
-    pub fn rounds(&self) -> usize { self.rounds }
+    pub fn rounds(&self) -> usize {
+        self.rounds
+    }
 }
 
 /// Run the Beaver triple online phase using the scheduler to simulate broadcasts.

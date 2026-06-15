@@ -1,10 +1,10 @@
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 
+use crate::crypto::net::{PartyId, Transport};
+use crate::crypto::protocol::{self, PartyShare};
 use crate::crypto::types::Fr;
 use crate::crypto::{arith, bits, sim};
-use crate::crypto::net::{Transport, PartyId};
-use crate::crypto::protocol::{self, PartyShare};
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -21,7 +21,12 @@ pub struct ShareRef {
 impl ShareRef {
     pub fn new_local(share: crate::crypto::types::Share3, nbits: usize, owner: usize) -> Self {
         let id = NEXT_ID.fetch_add(1, Ordering::SeqCst);
-        ShareRef { id, nbits, local: Some(share), owner }
+        ShareRef {
+            id,
+            nbits,
+            local: Some(share),
+            owner,
+        }
     }
 }
 
@@ -50,7 +55,9 @@ pub struct SimBackend {
 }
 
 impl SimBackend {
-    pub fn new() -> Self { SimBackend {} }
+    pub fn new() -> Self {
+        SimBackend {}
+    }
 }
 
 impl Backend for SimBackend {
@@ -101,7 +108,9 @@ impl Backend for SimBackend {
     fn a2b(&mut self, a: &ShareRef, nbits: usize) -> Vec<ShareRef> {
         let sa = a.local.clone().expect("expected local share");
         let bits = sim::a2b_with_inproc(&sa, nbits);
-        bits.into_iter().map(|b| ShareRef::new_local(b, 1, a.owner)).collect()
+        bits.into_iter()
+            .map(|b| ShareRef::new_local(b, 1, a.owner))
+            .collect()
     }
     fn b2a(&mut self, bits: &[ShareRef]) -> ShareRef {
         // reconstruct bit values and assemble a shared number by scalar-multiplying
@@ -112,7 +121,11 @@ impl Backend for SimBackend {
             let term = crate::crypto::arith::scalar_mul(&b, 1u128 << i);
             out = crate::crypto::arith::add_shares(&out, &term);
         }
-        ShareRef::new_local(out, bits.get(0).map(|s| s.nbits).unwrap_or(0), bits.get(0).map(|s| s.owner).unwrap_or(0))
+        ShareRef::new_local(
+            out,
+            bits.get(0).map(|s| s.nbits).unwrap_or(0),
+            bits.get(0).map(|s| s.owner).unwrap_or(0),
+        )
     }
 }
 
@@ -121,7 +134,9 @@ impl Backend for SimBackend {
 pub struct Aby3Backend {}
 
 impl Aby3Backend {
-    pub fn new() -> Self { Aby3Backend {} }
+    pub fn new() -> Self {
+        Aby3Backend {}
+    }
 }
 
 impl Backend for Aby3Backend {
@@ -180,7 +195,9 @@ impl Backend for Aby3Backend {
     fn a2b(&mut self, a: &ShareRef, nbits: usize) -> Vec<ShareRef> {
         let sa = a.local.clone().expect("expected local share");
         let bits = sim::a2b_concurrent(&sa, nbits);
-        bits.into_iter().map(|b| ShareRef::new_local(b, 1, a.owner)).collect()
+        bits.into_iter()
+            .map(|b| ShareRef::new_local(b, 1, a.owner))
+            .collect()
     }
 
     fn b2a(&mut self, bits: &[ShareRef]) -> ShareRef {
@@ -190,7 +207,11 @@ impl Backend for Aby3Backend {
             let term = crate::crypto::arith::scalar_mul(&b, 1u128 << i);
             out = crate::crypto::arith::add_shares(&out, &term);
         }
-        ShareRef::new_local(out, bits.get(0).map(|s| s.nbits).unwrap_or(0), bits.get(0).map(|s| s.owner).unwrap_or(0))
+        ShareRef::new_local(
+            out,
+            bits.get(0).map(|s| s.nbits).unwrap_or(0),
+            bits.get(0).map(|s| s.owner).unwrap_or(0),
+        )
     }
 }
 
@@ -217,7 +238,12 @@ pub struct TransportBackend<T: Transport> {
 
 impl<T: Transport> TransportBackend<T> {
     pub fn new(me: PartyId, transport: T) -> Self {
-        TransportBackend { me, transport, shares: HashMap::new(), next_id: 1 }
+        TransportBackend {
+            me,
+            transport,
+            shares: HashMap::new(),
+            next_id: 1,
+        }
     }
 
     fn alloc_id(&mut self) -> u64 {
@@ -228,11 +254,18 @@ impl<T: Transport> TransportBackend<T> {
 
     fn store(&mut self, id: u64, ps: PartyShare, nbits: usize, owner: usize) -> ShareRef {
         self.shares.insert(id, ps);
-        ShareRef { id, nbits, local: None, owner }
+        ShareRef {
+            id,
+            nbits,
+            local: None,
+            owner,
+        }
     }
 
     fn get(&self, sr: &ShareRef) -> &PartyShare {
-        self.shares.get(&sr.id).unwrap_or_else(|| panic!("TransportBackend: unknown share id {}", sr.id))
+        self.shares
+            .get(&sr.id)
+            .unwrap_or_else(|| panic!("TransportBackend: unknown share id {}", sr.id))
     }
 
     fn get_cloned(&self, sr: &ShareRef) -> PartyShare {
@@ -281,7 +314,12 @@ impl<T: Transport + 'static> Backend for TransportBackend<T> {
         let mut acc_id = self.alloc_id();
         self.shares.insert(acc_id, zero);
         for br in &bit_refs {
-            let pa = self.get_cloned(&ShareRef { id: acc_id, nbits: 1, local: None, owner: a.owner });
+            let pa = self.get_cloned(&ShareRef {
+                id: acc_id,
+                nbits: 1,
+                local: None,
+                owner: a.owner,
+            });
             let pb = self.get_cloned(br);
             let sum = protocol::add_party(&pa, &pb);
             let mul_id = self.alloc_id();
@@ -295,8 +333,18 @@ impl<T: Transport + 'static> Backend for TransportBackend<T> {
         let one = protocol::share_public(1, self.me);
         let one_id = self.alloc_id();
         self.shares.insert(one_id, one);
-        let acc_ps = self.get_cloned(&ShareRef { id: acc_id, nbits: 1, local: None, owner: a.owner });
-        let one_ps = self.get_cloned(&ShareRef { id: one_id, nbits: 1, local: None, owner: a.owner });
+        let acc_ps = self.get_cloned(&ShareRef {
+            id: acc_id,
+            nbits: 1,
+            local: None,
+            owner: a.owner,
+        });
+        let one_ps = self.get_cloned(&ShareRef {
+            id: one_id,
+            nbits: 1,
+            local: None,
+            owner: a.owner,
+        });
         let not_ps = protocol::sub_party(&one_ps, &acc_ps);
         let id = self.alloc_id();
         self.store(id, not_ps, 1, a.owner)
@@ -333,11 +381,19 @@ impl<T: Transport + 'static> Backend for TransportBackend<T> {
         let pa = self.get_cloned(a);
         let op_id = self.alloc_id();
         let bit_shares = protocol::a2b_party(&pa, nbits, op_id, self.me, &self.transport);
-        bit_shares.into_iter().map(|ps| {
-            let id = self.alloc_id();
-            self.shares.insert(id, ps);
-            ShareRef { id, nbits: 1, local: None, owner: a.owner }
-        }).collect()
+        bit_shares
+            .into_iter()
+            .map(|ps| {
+                let id = self.alloc_id();
+                self.shares.insert(id, ps);
+                ShareRef {
+                    id,
+                    nbits: 1,
+                    local: None,
+                    owner: a.owner,
+                }
+            })
+            .collect()
     }
 
     fn b2a(&mut self, bits: &[ShareRef]) -> ShareRef {
@@ -350,7 +406,12 @@ impl<T: Transport + 'static> Backend for TransportBackend<T> {
             let term = protocol::scalar_mul_party(&bp, 1u128 << i);
             acc = protocol::add_party(&acc, &term);
         }
-        self.store(id, acc, bits.get(0).map(|s| s.nbits).unwrap_or(0), bits.get(0).map(|s| s.owner).unwrap_or(0))
+        self.store(
+            id,
+            acc,
+            bits.get(0).map(|s| s.nbits).unwrap_or(0),
+            bits.get(0).map(|s| s.owner).unwrap_or(0),
+        )
     }
 
     fn reset_per_expression(&mut self) {

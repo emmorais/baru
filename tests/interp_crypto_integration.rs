@@ -1,5 +1,5 @@
-use baru::interpreter::backend::{SimBackend, Backend};
 use baru::crypto::types::Fr;
+use baru::interpreter::backend::{Backend, SimBackend};
 
 #[test]
 fn test_backend_share_add_mul_roundtrip() {
@@ -25,13 +25,18 @@ fn test_backend_a2b_and_b2a() {
     let mut rec: u128 = 0;
     for (i, b) in bits.iter().enumerate() {
         let bv = be.reveal(b, None) & 1u128;
-        if bv == 1 { rec |= 1u128 << i; }
+        if bv == 1 {
+            rec |= 1u128 << i;
+        }
     }
     assert_eq!(rec & ((1u128 << 8) - 1), a & ((1u128 << 8) - 1));
 
     // test b2a roundtrip
     let sa2 = be.b2a(&bits);
-    assert_eq!(be.reveal(&sa2, None) & ((1u128<<8)-1), a & ((1u128<<8)-1));
+    assert_eq!(
+        be.reveal(&sa2, None) & ((1u128 << 8) - 1),
+        a & ((1u128 << 8) - 1)
+    );
 }
 
 #[test]

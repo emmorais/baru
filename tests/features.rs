@@ -36,25 +36,39 @@ fn eval_shared(src: &str) -> i64 {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn test_add() { assert_eq!(eval("(+ 10 32)"), 42); }
+fn test_add() {
+    assert_eq!(eval("(+ 10 32)"), 42);
+}
 
 #[test]
-fn test_mul() { assert_eq!(eval("(* 6 7)"), 42); }
+fn test_mul() {
+    assert_eq!(eval("(* 6 7)"), 42);
+}
 
 #[test]
-fn test_sub() { assert_eq!(eval("(- 100 58)"), 42); }
+fn test_sub() {
+    assert_eq!(eval("(- 100 58)"), 42);
+}
 
 #[test]
-fn test_div_exact() { assert_eq!(eval("(/ 84 7)"), 12); }
+fn test_div_exact() {
+    assert_eq!(eval("(/ 84 7)"), 12);
+}
 
 #[test]
-fn test_add_mul_nested() { assert_eq!(eval("(+ (* 6 7) (* 3 14))"), 84); }
+fn test_add_mul_nested() {
+    assert_eq!(eval("(+ (* 6 7) (* 3 14))"), 84);
+}
 
 #[test]
-fn test_mod_basic() { assert_eq!(eval("(mod 10 3)"), 1); }
+fn test_mod_basic() {
+    assert_eq!(eval("(mod 10 3)"), 1);
+}
 
 #[test]
-fn test_neg_unary() { assert_eq!(eval("(- 0 5)"), -5); }
+fn test_neg_unary() {
+    assert_eq!(eval("(- 0 5)"), -5);
+}
 
 #[test]
 fn test_wrapping_arithmetic() {
@@ -170,7 +184,10 @@ fn test_lambda_let_bind_and_call() {
 
 #[test]
 fn test_lambda_closure_capture() {
-    assert_eq!(eval("(let ((a 10)) (let ((f (lambda (x) (+ x a)))) (f 5)))"), 15);
+    assert_eq!(
+        eval("(let ((a 10)) (let ((f (lambda (x) (+ x a)))) (f 5)))"),
+        15
+    );
 }
 
 #[test]
@@ -261,18 +278,21 @@ fn test_mutual_recursion_even_odd_odd_number() {
 // ---------------------------------------------------------------------------
 
 fn fib_src(n: i64) -> String {
-    format!("(letrec ((fib (lambda (n)
+    format!(
+        "(letrec ((fib (lambda (n)
                               (if (== n 0) 0
                                 (if (== n 1) 1
                                   (+ (fib (- n 1)) (fib (- n 2))))))))
-               (fib {}))", n)
+               (fib {}))",
+        n
+    )
 }
 
 #[test]
 fn test_fibonacci() {
-    assert_eq!(eval(&fib_src(0)),  0);
-    assert_eq!(eval(&fib_src(1)),  1);
-    assert_eq!(eval(&fib_src(6)),  8);
+    assert_eq!(eval(&fib_src(0)), 0);
+    assert_eq!(eval(&fib_src(1)), 1);
+    assert_eq!(eval(&fib_src(6)), 8);
     assert_eq!(eval(&fib_src(10)), 55);
     assert_eq!(eval(&fib_src(20)), 6765);
 }
@@ -426,17 +446,26 @@ fn test_nested_if() {
 
 #[test]
 fn test_shared_add_reveal() {
-    assert_eq!(eval_shared("(reconstruct (+ (share 10 32) (share 32 32)))"), 42);
+    assert_eq!(
+        eval_shared("(reconstruct (+ (share 10 32) (share 32 32)))"),
+        42
+    );
 }
 
 #[test]
 fn test_shared_mul_reveal() {
-    assert_eq!(eval_shared("(reconstruct (* (share 6 32) (share 7 32)))"), 42);
+    assert_eq!(
+        eval_shared("(reconstruct (* (share 6 32) (share 7 32)))"),
+        42
+    );
 }
 
 #[test]
 fn test_shared_sub_reveal() {
-    assert_eq!(eval_shared("(reconstruct (- (share 100 32) (share 58 32)))"), 42);
+    assert_eq!(
+        eval_shared("(reconstruct (- (share 100 32) (share 58 32)))"),
+        42
+    );
 }
 
 #[test]
@@ -461,17 +490,26 @@ fn test_shared_negative_input() {
 
 #[test]
 fn test_shared_signed_add() {
-    assert_eq!(eval_shared("(reconstruct (+ (share -10 32) (share 52 32)))"), 42);
+    assert_eq!(
+        eval_shared("(reconstruct (+ (share -10 32) (share 52 32)))"),
+        42
+    );
 }
 
 #[test]
 fn test_shared_signed_mul() {
-    assert_eq!(eval_shared("(reconstruct (* (share -6 32) (share -7 32)))"), 42);
+    assert_eq!(
+        eval_shared("(reconstruct (* (share -6 32) (share -7 32)))"),
+        42
+    );
 }
 
 #[test]
 fn test_shared_signed_sub_negative_result() {
-    assert_eq!(eval_shared("(reconstruct (- (share 3 32) (share 10 32)))"), -7);
+    assert_eq!(
+        eval_shared("(reconstruct (- (share 3 32) (share 10 32)))"),
+        -7
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -512,8 +550,13 @@ fn test_shared_equality() {
                  (+ (* a mask) (* b (- one mask)))))",
             a_val, b_val
         );
-        assert_eq!(eval_shared(&src), *expected,
-            "equality select failed for a={} b={}", a_val, b_val);
+        assert_eq!(
+            eval_shared(&src),
+            *expected,
+            "equality select failed for a={} b={}",
+            a_val,
+            b_val
+        );
     }
 }
 
@@ -629,7 +672,7 @@ fn test_shared_clamp() {
         eval_shared(&src)
     };
     assert_eq!(clamp(-5, 0, 10), 0);
-    assert_eq!(clamp( 5, 0, 10), 5);
+    assert_eq!(clamp(5, 0, 10), 5);
     assert_eq!(clamp(15, 0, 10), 10);
 }
 
@@ -782,7 +825,8 @@ fn test_share_from_mul() {
 #[test]
 fn test_share_from_three_parties() {
     // All three parties contribute → sum = 10 + 20 + 30 = 60
-    let src = "(reconstruct (+ (share-from 0 10 32) (+ (share-from 1 20 32) (share-from 2 30 32))))";
+    let src =
+        "(reconstruct (+ (share-from 0 10 32) (+ (share-from 1 20 32) (share-from 2 30 32))))";
     assert_eq!(eval_shared(src), 60);
 }
 

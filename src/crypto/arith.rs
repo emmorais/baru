@@ -1,5 +1,5 @@
+use crate::crypto::types::{Fr, Share3};
 use rand::Rng;
-use crate::crypto::types::{Share3, Fr};
 
 /// Arithmetic helpers for Share3 values.
 ///
@@ -46,7 +46,11 @@ pub fn mul_insecure(a: &Share3, b: &Share3) -> Share3 {
 /// Multiply a share by a public scalar (local).
 pub fn scalar_mul(a: &Share3, k: Fr) -> Share3 {
     // multiply each local share by the scalar
-    Share3(a.0.wrapping_mul(k), a.1.wrapping_mul(k), a.2.wrapping_mul(k))
+    Share3(
+        a.0.wrapping_mul(k),
+        a.1.wrapping_mul(k),
+        a.2.wrapping_mul(k),
+    )
 }
 
 /// Generate a Beaver triple (x, y, z) with z = x * y, all returned as Share3 shares.
