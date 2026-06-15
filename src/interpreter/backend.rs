@@ -137,8 +137,8 @@ impl Backend for SimBackend {
     }
 
     fn and(&mut self, a: &ShareRef, b: &ShareRef) -> ShareRef {
-        let bit_refs_a = self.a2b(&a, a.nbits);
-        let bit_refs_b = self.a2b(&b, b.nbits);
+        let bit_refs_a = self.a2b(a, a.nbits);
+        let bit_refs_b = self.a2b(b, b.nbits);
         let mut and_bits = Vec::new();
         for (bit_a, bit_b) in bit_refs_a.iter().zip(bit_refs_b.iter()) {
             let and_bit = self.mul(bit_a, bit_b);
@@ -241,8 +241,8 @@ impl Backend for Aby3Backend {
     }
 
     fn and(&mut self, a: &ShareRef, b: &ShareRef) -> ShareRef {
-        let bit_refs_a = self.a2b(&a, a.nbits);
-        let bit_refs_b = self.a2b(&b, b.nbits);
+        let bit_refs_a = self.a2b(a, a.nbits);
+        let bit_refs_b = self.a2b(b, b.nbits);
         let mut and_bits = Vec::new();
         for (bit_a, bit_b) in bit_refs_a.iter().zip(bit_refs_b.iter()) {
             let and_bit = self.mul(bit_a, bit_b);
@@ -467,8 +467,8 @@ impl<T: Transport + 'static> Backend for TransportBackend<T> {
     }
 
     fn and(&mut self, a: &ShareRef, b: &ShareRef) -> ShareRef {
-        let bit_refs_a = self.a2b(&a, a.nbits);
-        let bit_refs_b = self.a2b(&b, b.nbits);
+        let bit_refs_a = self.a2b(a, a.nbits);
+        let bit_refs_b = self.a2b(b, b.nbits);
         let mut and_bits = Vec::new();
         for (bit_a, bit_b) in bit_refs_a.iter().zip(bit_refs_b.iter()) {
             let and_bit = self.mul(bit_a, bit_b);
