@@ -192,8 +192,6 @@ fn prop_a2b_and_comparisons_randomized() {
                 diff_plain,
                 proto_diff & ((1u128 << 32) - 1)
             );
-            // Dump the sim trace as well (may use different randomness)
-            eprintln!("a2b debug:\n{}", baru::crypto::sim::a2b_debug(&diff, 32));
         }
         assert_eq!(lt_res, lt_ref_val);
         let eq_sh = bits::eq_ab3(&sa, &sb, 32);

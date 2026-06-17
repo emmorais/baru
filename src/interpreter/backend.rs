@@ -36,6 +36,8 @@ pub trait Backend: Send + Sync {
     fn add(&mut self, a: &ShareRef, b: &ShareRef) -> ShareRef;
     fn sub(&mut self, a: &ShareRef, b: &ShareRef) -> ShareRef;
     fn mul(&mut self, a: &ShareRef, b: &ShareRef) -> ShareRef;
+    fn div(&mut self, a: &ShareRef, b: &ShareRef) -> ShareRef;
+    fn modulo(&mut self, a: &ShareRef, b: &ShareRef) -> ShareRef;
     fn eq(&mut self, a: &ShareRef, b: &ShareRef) -> ShareRef;
     fn lt(&mut self, a: &ShareRef, b: &ShareRef) -> ShareRef;
     fn le(&mut self, a: &ShareRef, b: &ShareRef) -> ShareRef;
@@ -49,6 +51,9 @@ pub trait Backend: Send + Sync {
     fn reset_per_expression(&mut self) {}
     fn and(&mut self, a: &ShareRef, b: &ShareRef) -> ShareRef;
     fn or(&mut self, a: &ShareRef, b: &ShareRef) -> ShareRef;
+    fn bitlen(&mut self, a: &ShareRef) -> ShareRef;
+    fn shift_right(&mut self, a: &ShareRef, n: usize) -> ShareRef;
+    fn shift_left(&mut self, a: &ShareRef, n: usize) -> ShareRef;
 }
 
 /// Single-process simulation backend backed by current sim/inproc wrappers.
@@ -91,6 +96,12 @@ impl Backend for SimBackend {
         let sb = b.local.clone().expect("expected local share");
         let prod = sim::mul_ab3_with_inproc(&sa, &sb);
         ShareRef::new_local(prod, a.nbits.max(b.nbits), a.owner)
+    }
+    fn div(&mut self, _a: &ShareRef, _b: &ShareRef) -> ShareRef {
+        unimplemented!("division not implemented yet")
+    }
+    fn modulo(&mut self, _a: &ShareRef, _b: &ShareRef) -> ShareRef {
+        unimplemented!("modulo not implemented yet")
     }
     fn eq(&mut self, a: &ShareRef, b: &ShareRef) -> ShareRef {
         let sa = a.local.clone().expect("expected local share");
@@ -158,6 +169,18 @@ impl Backend for SimBackend {
         }
         self.b2a(&or_bits)
     }
+
+    fn bitlen(&mut self, _a: &ShareRef) -> ShareRef {
+        unimplemented!("bitlen not implemented yet")
+    }
+
+    fn shift_left(&mut self, _a: &ShareRef, _n: usize) -> ShareRef {
+        unimplemented!("shift_left not implemented yet")
+    }
+
+    fn shift_right(&mut self, _a: &ShareRef, _n: usize) -> ShareRef {
+        unimplemented!("shift_right not implemented yet")
+    }
 }
 
 /// ABY3 backend that runs the online protocol via explicit in-process message
@@ -202,6 +225,14 @@ impl Backend for Aby3Backend {
         let sb = b.local.clone().expect("expected local share");
         let prod = sim::mul_ab3_concurrent(&sa, &sb);
         ShareRef::new_local(prod, a.nbits.max(b.nbits), a.owner)
+    }
+
+    fn div(&mut self, _a: &ShareRef, _b: &ShareRef) -> ShareRef {
+        unimplemented!("division not implemented yet")
+    }
+
+    fn modulo(&mut self, _a: &ShareRef, _b: &ShareRef) -> ShareRef {
+        unimplemented!("modulo not implemented yet")
     }
 
     fn eq(&mut self, a: &ShareRef, b: &ShareRef) -> ShareRef {
@@ -272,6 +303,18 @@ impl Backend for Aby3Backend {
             or_bits.push(or_bit);
         }
         self.b2a(&or_bits)
+    }
+
+    fn bitlen(&mut self, _a: &ShareRef) -> ShareRef {
+        unimplemented!("bitlen not implemented yet")
+    }
+
+    fn shift_left(&mut self, _a: &ShareRef, _n: usize) -> ShareRef {
+        unimplemented!("shift_left not implemented yet")
+    }
+
+    fn shift_right(&mut self, _a: &ShareRef, _n: usize) -> ShareRef {
+        unimplemented!("shift_right not implemented yet")
     }
 }
 
@@ -362,6 +405,14 @@ impl<T: Transport + 'static> Backend for TransportBackend<T> {
         let pb = self.get_cloned(b);
         let ps = protocol::mul_party(&pa, &pb, id, self.me, &self.transport);
         self.store(id, ps, a.nbits.max(b.nbits), a.owner)
+    }
+
+    fn div(&mut self, _a: &ShareRef, _b: &ShareRef) -> ShareRef {
+        unimplemented!("division not implemented yet")
+    }
+
+    fn modulo(&mut self, _a: &ShareRef, _b: &ShareRef) -> ShareRef {
+        unimplemented!("modulo not implemented yet")
     }
 
     fn eq(&mut self, a: &ShareRef, b: &ShareRef) -> ShareRef {
@@ -511,5 +562,17 @@ impl<T: Transport + 'static> Backend for TransportBackend<T> {
             or_bits.push(ps);
         }
         self.b2a(&or_bits)
+    }
+
+    fn bitlen(&mut self, _a: &ShareRef) -> ShareRef {
+        unimplemented!("bitlen not implemented yet")
+    }
+
+    fn shift_left(&mut self, _a: &ShareRef, _n: usize) -> ShareRef {
+        unimplemented!("shift_left not implemented yet")
+    }
+
+    fn shift_right(&mut self, _a: &ShareRef, _n: usize) -> ShareRef {
+        unimplemented!("shift_right not implemented yet")
     }
 }
