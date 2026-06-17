@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use crate::crypto::net::{PartyId, Transport};
 use crate::crypto::protocol::{self, PartyShare};
 use crate::crypto::types::Fr;
-use crate::crypto::{arith, bits, sim};
+use crate::crypto::{arith, bits, sim, Share3};
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -174,12 +174,24 @@ impl Backend for SimBackend {
         unimplemented!("bitlen not implemented yet")
     }
 
-    fn shift_left(&mut self, _a: &ShareRef, _n: usize) -> ShareRef {
-        unimplemented!("shift_left not implemented yet")
+    fn shift_left(&mut self, a: &ShareRef, n: usize) -> ShareRef {
+        let mut result = a.clone();
+        // shift is easier, since we just need to add the element to itself n times
+        for _ in 0..n {
+            result = self.add(&result, &result);
+        }
+        result
     }
 
-    fn shift_right(&mut self, _a: &ShareRef, _n: usize) -> ShareRef {
-        unimplemented!("shift_right not implemented yet")
+    fn shift_right(&mut self, a: &ShareRef, n: usize) -> ShareRef {
+        // Initialize with zeros
+        let mut result = vec![ShareRef::new_local(Share3::zero(), 1, a.owner); a.nbits];
+        let bit_refs_a = self.a2b(a, a.nbits);
+        if bit_refs_a.len() > n {
+            // copy the bits shifted to the right
+            result[..(bit_refs_a.len() - n)].clone_from_slice(&bit_refs_a[n..]);
+        }
+        self.b2a(&result)
     }
 }
 
@@ -309,12 +321,24 @@ impl Backend for Aby3Backend {
         unimplemented!("bitlen not implemented yet")
     }
 
-    fn shift_left(&mut self, _a: &ShareRef, _n: usize) -> ShareRef {
-        unimplemented!("shift_left not implemented yet")
+    fn shift_left(&mut self, a: &ShareRef, n: usize) -> ShareRef {
+        let mut result = a.clone();
+        // shift is easier, since we just need to add the element to itself n times
+        for _ in 0..n {
+            result = self.add(&result, &result);
+        }
+        result
     }
 
-    fn shift_right(&mut self, _a: &ShareRef, _n: usize) -> ShareRef {
-        unimplemented!("shift_right not implemented yet")
+    fn shift_right(&mut self, a: &ShareRef, n: usize) -> ShareRef {
+        // Initialize with zeros
+        let mut result = vec![ShareRef::new_local(Share3::zero(), 1, a.owner); n];
+        let bit_refs_a = self.a2b(a, a.nbits);
+        // copy the bits shifted to the right
+        for item in bit_refs_a.iter().take(bit_refs_a.len().saturating_sub(n)) {
+            result.push(item.clone());
+        }
+        self.b2a(&result)
     }
 }
 
@@ -568,11 +592,23 @@ impl<T: Transport + 'static> Backend for TransportBackend<T> {
         unimplemented!("bitlen not implemented yet")
     }
 
-    fn shift_left(&mut self, _a: &ShareRef, _n: usize) -> ShareRef {
-        unimplemented!("shift_left not implemented yet")
+    fn shift_left(&mut self, a: &ShareRef, n: usize) -> ShareRef {
+        let mut result = a.clone();
+        // shift is easier, since we just need to add the element to itself n times
+        for _ in 0..n {
+            result = self.add(&result, &result);
+        }
+        result
     }
 
-    fn shift_right(&mut self, _a: &ShareRef, _n: usize) -> ShareRef {
-        unimplemented!("shift_right not implemented yet")
+    fn shift_right(&mut self, a: &ShareRef, n: usize) -> ShareRef {
+        // Initialize with zeros
+        let mut result = vec![ShareRef::new_local(Share3::zero(), 1, a.owner); n];
+        let bit_refs_a = self.a2b(a, a.nbits);
+        // copy the bits shifted to the right
+        for item in bit_refs_a.iter().take(bit_refs_a.len().saturating_sub(n)) {
+            result.push(item.clone());
+        }
+        self.b2a(&result)
     }
 }

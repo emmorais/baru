@@ -115,6 +115,21 @@ fn test_booleans_not_and_or() {
 }
 
 #[test]
+fn test_ash_left() {
+    assert_eq!(eval("(ash-left 1 2)"), 4);
+    assert_eq!(eval("(reconstruct (ash-left (share 1 32) 2))"), 4);
+}
+
+#[test]
+fn test_ash_right() {
+    assert_eq!(eval("(ash-right 4 2)"), 1);
+    assert_eq!(eval("(reconstruct (ash-right (share 4 32) 2))"), 1);
+
+    assert_eq!(eval("(ash-right 512 3)"), 64);
+    assert_eq!(eval("(reconstruct (ash-right (share 512 32) 3))"), 64);
+}
+
+#[test]
 fn test_not_numeric() {
     assert_eq!(eval("(not 0)"), 1);
     assert_eq!(eval("(not 42)"), 0);

@@ -12,6 +12,8 @@ pub enum BinOp {
     Mod,
     And,
     Or,
+    AshLeft,
+    AshRight,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -182,6 +184,8 @@ pub fn parse_tokens(tokens: &[String], pos: &mut usize) -> Result<Expr, String> 
             || next_tok == "mod"
             || next_tok == "and"
             || next_tok == "or"
+            || next_tok == "ash-left"
+            || next_tok == "ash-right"
             || next_tok == "<="
             || next_tok == ">="
         {
@@ -200,6 +204,8 @@ pub fn parse_tokens(tokens: &[String], pos: &mut usize) -> Result<Expr, String> 
                 "mod" => BinOp::Mod,
                 "and" => BinOp::And,
                 "or" => BinOp::Or,
+                "ash-left" => BinOp::AshLeft,
+                "ash-right" => BinOp::AshRight,
                 _ => unreachable!(),
             };
             let left = parse_tokens(tokens, pos)?;

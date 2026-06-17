@@ -683,6 +683,32 @@ pub fn reduce_expression(
                                     Types::Num(if a != 0 || b != 0 { 1 } else { 0 })
                                 }
                             },
+                            super::parser::BinOp::AshRight => match (&left_val, &val) {
+                                (Types::Share(sa), Types::Num(bn)) => {
+                                    let mut be = backend.lock().unwrap_or_else(|e| e.into_inner());
+                                    // convert bn to usize
+                                    let b = usize::try_from(*bn).unwrap_or(0);
+                                    Types::Share(be.shift_right(sa, b))
+                                }
+                                (Types::Num(an), Types::Num(bn)) => {
+                                    let r = an.wrapping_shr(*bn as u32);
+                                    Types::Num(r)
+                                }
+                                _ => panic!("ash-right expects (SHARE, NUM) or (NUM, NUM)"),
+                            },
+                            super::parser::BinOp::AshLeft => match (&left_val, &val) {
+                                (Types::Share(sa), Types::Num(bn)) => {
+                                    let mut be = backend.lock().unwrap_or_else(|e| e.into_inner());
+                                    // convert bn to usize
+                                    let b = usize::try_from(*bn).unwrap_or(0);
+                                    Types::Share(be.shift_left(sa, b))
+                                }
+                                (Types::Num(an), Types::Num(bn)) => {
+                                    let r = an.wrapping_shl(*bn as u32);
+                                    Types::Num(r)
+                                }
+                                _ => panic!("ash-left expects (SHARE, NUM) or (NUM, NUM)"),
+                            },
                         };
                         stack.push(Apply(*cont, out, env.clone()));
                     }
