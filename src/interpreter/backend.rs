@@ -170,8 +170,44 @@ impl Backend for SimBackend {
         self.b2a(&or_bits)
     }
 
-    fn bitlen(&mut self, _a: &ShareRef) -> ShareRef {
-        unimplemented!("bitlen not implemented yet")
+    fn bitlen(&mut self, a: &ShareRef) -> ShareRef {
+        let zero: ShareRef = ShareRef {
+            id: 0,
+            nbits: 0,
+            local: Some(Share3::zero()),
+            owner: 0,
+        };
+        let one: ShareRef = ShareRef {
+            id: 0,
+            nbits: 0,
+            local: Some(Share3::one()),
+            owner: 0,
+        };
+        let bit_refs_a = self.a2b(a, a.nbits);
+        // Compute bit_refs_b such that bit_refs_b[i] = OR of bit_refs_a[i..]
+        let mut bit_refs_b = Vec::new();
+        for i in 0..bit_refs_a.len() {
+            let or = bit_refs_a[i..]
+                .iter()
+                .cloned()
+                .reduce(|a, b| self.or(&a, &b))
+                .unwrap_or(zero.clone());
+            bit_refs_b.push(or);
+        }
+        // Compute bitlen as count of 1s in (not(a_i) and not(b_i)) = 1 - OR(a_i, b_i), from MSB to LSB
+        let mut bitlen: ShareRef = ShareRef {
+            id: 0,
+            nbits: 0,
+            local: None,
+            owner: 0,
+        };
+        for (a, b) in bit_refs_a.iter().zip(bit_refs_b.iter()) {
+            let not_a = self.sub(&one, a);
+            let not_b = self.sub(&one, b);
+            let and = self.and(&not_a, &not_b);
+            bitlen = self.add(&bitlen, &and);
+        }
+        self.b2a(&bit_refs_b)
     }
 
     fn shift_left(&mut self, a: &ShareRef, n: usize) -> ShareRef {
@@ -317,8 +353,44 @@ impl Backend for Aby3Backend {
         self.b2a(&or_bits)
     }
 
-    fn bitlen(&mut self, _a: &ShareRef) -> ShareRef {
-        unimplemented!("bitlen not implemented yet")
+    fn bitlen(&mut self, a: &ShareRef) -> ShareRef {
+        let zero: ShareRef = ShareRef {
+            id: 0,
+            nbits: 0,
+            local: Some(Share3::zero()),
+            owner: 0,
+        };
+        let one: ShareRef = ShareRef {
+            id: 0,
+            nbits: 0,
+            local: Some(Share3::one()),
+            owner: 0,
+        };
+        let bit_refs_a = self.a2b(a, a.nbits);
+        // Compute bit_refs_b such that bit_refs_b[i] = OR of bit_refs_a[i..]
+        let mut bit_refs_b = Vec::new();
+        for i in 0..bit_refs_a.len() {
+            let or = bit_refs_a[i..]
+                .iter()
+                .cloned()
+                .reduce(|a, b| self.or(&a, &b))
+                .unwrap_or(zero.clone());
+            bit_refs_b.push(or);
+        }
+        // Compute bitlen as count of 1s in (not(a_i) and not(b_i)) = 1 - OR(a_i, b_i), from MSB to LSB
+        let mut bitlen: ShareRef = ShareRef {
+            id: 0,
+            nbits: 0,
+            local: None,
+            owner: 0,
+        };
+        for (a, b) in bit_refs_a.iter().zip(bit_refs_b.iter()) {
+            let not_a = self.sub(&one, a);
+            let not_b = self.sub(&one, b);
+            let and = self.and(&not_a, &not_b);
+            bitlen = self.add(&bitlen, &and);
+        }
+        self.b2a(&bit_refs_b)
     }
 
     fn shift_left(&mut self, a: &ShareRef, n: usize) -> ShareRef {
