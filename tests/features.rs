@@ -139,6 +139,9 @@ fn test_bitlen() {
     assert_eq!(eval("(bitlen 9)"), 4);
     assert_eq!(eval("(bitlen 42)"), 6);
     assert_eq!(eval("(bitlen 1042)"), 11);
+    // shared values should also work
+    assert_eq!(eval("(reconstruct (bitlen (share 42 32)))"), 6);
+    assert_eq!(eval("(reconstruct (bitlen (share 1042 32)))"), 11);
 }
 
 #[test]

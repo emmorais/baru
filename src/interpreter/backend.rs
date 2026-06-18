@@ -28,6 +28,15 @@ impl ShareRef {
             owner,
         }
     }
+    // zero
+    pub fn zero() -> Self {
+        ShareRef {
+            id: 0,
+            nbits: 0,
+            local: Some(Share3::zero()),
+            owner: 0,
+        }
+    }
 }
 
 /// Minimal synchronous backend trait for now.
@@ -171,43 +180,29 @@ impl Backend for SimBackend {
     }
 
     fn bitlen(&mut self, a: &ShareRef) -> ShareRef {
-        let zero: ShareRef = ShareRef {
+        let bit_refs_a = self.a2b(a, a.nbits);
+        // Compute bit_refs_b such that bit_refs_b[i] = OR of bit_refs_a[i..]
+        let mut bit_refs_b = Vec::new();
+        let mut init_false = ShareRef::zero();
+        for i in (0..bit_refs_a.len()).rev() {
+            let and = self.mul(&init_false, &bit_refs_a[i]);
+            init_false = self.add(&init_false, &bit_refs_a[i]);
+            init_false = self.sub(&init_false, &and);
+            bit_refs_b.push(init_false.clone());
+        }
+        bit_refs_b.reverse();
+        // Compute bitlen as count of 1s in (not(a_i) and not(b_i)) = 1 - OR(a_i, b_i), from MSB to LSB
+        let mut bitlen: ShareRef = ShareRef {
             id: 0,
             nbits: 0,
             local: Some(Share3::zero()),
             owner: 0,
         };
-        let one: ShareRef = ShareRef {
-            id: 0,
-            nbits: 0,
-            local: Some(Share3::one()),
-            owner: 0,
-        };
-        let bit_refs_a = self.a2b(a, a.nbits);
-        // Compute bit_refs_b such that bit_refs_b[i] = OR of bit_refs_a[i..]
-        let mut bit_refs_b = Vec::new();
-        for i in 0..bit_refs_a.len() {
-            let or = bit_refs_a[i..]
-                .iter()
-                .cloned()
-                .reduce(|a, b| self.or(&a, &b))
-                .unwrap_or(zero.clone());
-            bit_refs_b.push(or);
+        // compute popcount of bit_refs_b
+        for b in bit_refs_b.iter() {
+            bitlen = self.add(&bitlen, b);
         }
-        // Compute bitlen as count of 1s in (not(a_i) and not(b_i)) = 1 - OR(a_i, b_i), from MSB to LSB
-        let mut bitlen: ShareRef = ShareRef {
-            id: 0,
-            nbits: 0,
-            local: None,
-            owner: 0,
-        };
-        for (a, b) in bit_refs_a.iter().zip(bit_refs_b.iter()) {
-            let not_a = self.sub(&one, a);
-            let not_b = self.sub(&one, b);
-            let and = self.and(&not_a, &not_b);
-            bitlen = self.add(&bitlen, &and);
-        }
-        self.b2a(&bit_refs_b)
+        bitlen
     }
 
     fn shift_left(&mut self, a: &ShareRef, n: usize) -> ShareRef {
