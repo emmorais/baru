@@ -20,6 +20,7 @@ pub enum BinOp {
 pub enum UnOp {
     Not,
     Neg,
+    BitLen,
 }
 
 // Very small tokenizer + parser extracted from main.rs (keeps same behavior)
@@ -173,6 +174,15 @@ pub fn parse_tokens(tokens: &[String], pos: &mut usize) -> Result<Expr, String> 
             }
             *pos += 1;
             return Ok(Expr::UnOp(super::parser::UnOp::Not, Box::new(inner)));
+        }
+        if next_tok == "bitlen" {
+            *pos += 1;
+            let inner = parse_tokens(tokens, pos)?;
+            if *pos >= tokens.len() || tokens[*pos] != ")" {
+                return Err("expected ')' after bitlen".to_string());
+            }
+            *pos += 1;
+            return Ok(Expr::UnOp(super::parser::UnOp::BitLen, Box::new(inner)));
         }
         if next_tok == "+"
             || next_tok == "-"

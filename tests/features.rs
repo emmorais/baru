@@ -130,6 +130,18 @@ fn test_ash_right() {
 }
 
 #[test]
+fn test_bitlen() {
+    assert_eq!(eval("(bitlen 0)"), 0);
+    assert_eq!(eval("(bitlen 1)"), 1);
+    assert_eq!(eval("(bitlen 2)"), 2);
+    assert_eq!(eval("(bitlen 3)"), 2);
+    assert_eq!(eval("(bitlen 4)"), 3);
+    assert_eq!(eval("(bitlen 9)"), 4);
+    assert_eq!(eval("(bitlen 42)"), 6);
+    assert_eq!(eval("(bitlen 1042)"), 11);
+}
+
+#[test]
 fn test_not_numeric() {
     assert_eq!(eval("(not 0)"), 1);
     assert_eq!(eval("(not 42)"), 0);

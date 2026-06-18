@@ -14,6 +14,9 @@ impl Share3 {
     pub fn zero() -> Self {
         Share3(0, 0, 0)
     }
+    pub fn one() -> Self {
+        Share3(1, 0, 0)
+    }
     pub fn random<R: Rng + ?Sized>(rng: &mut R) -> Self {
         let a: u128 = rng.gen();
         let b: u128 = rng.gen();

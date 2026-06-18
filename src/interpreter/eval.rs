@@ -709,6 +709,23 @@ pub fn reduce_expression(
                                 }
                                 _ => panic!("ash-left expects (SHARE, NUM) or (NUM, NUM)"),
                             },
+                            /*super::parser::Binop::BinLen => match (&left_val, &val) {
+                                // Only accept Num or Shared as argument
+                                (Types::Num(n), _) => {
+                                    let bit_length = |n: u32| {
+                                        // ilog2(0) is undefined, so checked_ilog2 returns None for 0
+                                        n.checked_ilog2().map_or(0, |log| log + 1)
+                                    };
+                                    Types::Num(bit_length(*n) as i64)
+                                },
+                                Types::Share(s) => {
+                                    let mut be = backend.lock().unwrap_or_else(|e| e.into_inner());
+                                    let bit_length = |n: u32| {
+                                        n.checked_ilog2().map_or(0, |log| log + 1)
+                                    };
+                                    Types::Num(bit_length(s.nbits) as i64)
+                                }
+                            },*/
                         };
                         stack.push(Apply(*cont, out, env.clone()));
                     }
@@ -722,6 +739,21 @@ pub fn reduce_expression(
                             super::parser::UnOp::Neg => match val {
                                 Types::Num(n) => Types::Num(n.wrapping_neg()),
                                 _ => panic!("negation expects numeric value"),
+                            },
+                            super::parser::UnOp::BitLen => match val {
+                                Types::Num(n) => {
+                                    let bit_length = |n: u32| {
+                                        // ilog2(0) is undefined, so checked_ilog2 returns None for 0
+                                        n.checked_ilog2().map_or(0, |log| log + 1)
+                                    };
+                                    Types::Num(bit_length(n as u32) as i64)
+                                }
+                                Types::Share(s) => {
+                                    let mut be = backend.lock().unwrap_or_else(|e| e.into_inner());
+                                    let result = be.bitlen(&s);
+                                    Types::Share(result)
+                                }
+                                _ => panic!("bitlen expects numeric or shared value"),
                             },
                         };
                         stack.push(Apply(*cont, out, env.clone()));
