@@ -8,7 +8,7 @@ use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
 use crate::interpreter::ast::{Env, Expr, Types};
-use crate::interpreter::backend::{Aby3Backend, Backend, SimBackend};
+use crate::interpreter::backend::{Aby3Backend, Backend};
 use colored::*;
 
 #[derive(Debug, Clone)]
@@ -1134,20 +1134,6 @@ impl Participant {
     pub fn new(id: usize) -> Self {
         let backend: Arc<Mutex<Box<dyn Backend>>> =
             Arc::new(Mutex::new(Box::new(Aby3Backend::new())));
-        let store: Env = Rc::new(RefCell::new(HashMap::new()));
-        let participant = Participant {
-            id,
-            backend: backend.clone(),
-            store: store.clone(),
-        };
-        // register builtins once into the persistent store
-        participant.register_builtins();
-        participant
-    }
-
-    pub fn new_sim(id: usize) -> Self {
-        let backend: Arc<Mutex<Box<dyn Backend>>> =
-            Arc::new(Mutex::new(Box::new(SimBackend::new())));
         let store: Env = Rc::new(RefCell::new(HashMap::new()));
         let participant = Participant {
             id,
