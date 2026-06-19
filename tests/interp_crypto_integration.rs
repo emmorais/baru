@@ -1,9 +1,9 @@
 use baru::crypto::types::Fr;
-use baru::interpreter::backend::{Backend, SimBackend};
+use baru::interpreter::backend::{Aby3Backend, Backend};
 
 #[test]
 fn test_backend_share_add_mul_roundtrip() {
-    let mut be = SimBackend::new();
+    let mut be = Aby3Backend::new();
     let a: Fr = 42u128;
     let b: Fr = 7u128;
     let sa = be.share_secret(a, 128, 0);
@@ -16,7 +16,7 @@ fn test_backend_share_add_mul_roundtrip() {
 
 #[test]
 fn test_backend_a2b_and_b2a() {
-    let mut be = SimBackend::new();
+    let mut be = Aby3Backend::new();
     let a: Fr = 37u128; // 0b00100101
     let sa = be.share_secret(a, 8, 0);
     let bits = be.a2b(&sa, 8);
@@ -41,7 +41,7 @@ fn test_backend_a2b_and_b2a() {
 
 #[test]
 fn test_mixed_local_and_shared() {
-    let mut be = SimBackend::new();
+    let mut be = Aby3Backend::new();
     let local: Fr = 5u128;
     let shared_val: Fr = 11u128;
     let s_local = be.share_secret(local, 64, 0);

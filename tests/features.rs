@@ -7,7 +7,7 @@ use baru::interpreter::{parse, Participant, Types};
 /// Evaluate a plain (non-shared) expression and return the numeric result.
 fn eval(src: &str) -> i64 {
     let expr = parse(src).expect("parse failed");
-    let p = Participant::new_sim(0);
+    let p = Participant::new(0);
     match p.eval(&expr) {
         Types::Num(n) => n,
         other => panic!("expected Num, got: {:?}", other),
@@ -18,7 +18,7 @@ fn eval(src: &str) -> i64 {
 /// reconstructed value interpreted as a signed 32-bit integer.
 fn eval_shared(src: &str) -> i64 {
     let expr = parse(src).expect("parse failed");
-    let p = Participant::new_sim(0);
+    let p = Participant::new(0);
     match p.eval(&expr) {
         // Plain Num may carry a raw u128 field value stored as i64 bits; reinterpret as signed 32.
         Types::Num(n) => (n as u32) as i32 as i64,

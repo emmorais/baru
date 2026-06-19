@@ -65,167 +65,6 @@ pub trait Backend: Send + Sync {
     fn shift_left(&mut self, a: &ShareRef, n: usize) -> ShareRef;
 }
 
-/// Single-process simulation backend backed by current sim/inproc wrappers.
-pub struct SimBackend {
-    // no state for now; RNG could be added later
-}
-
-impl SimBackend {
-    pub fn new() -> Self {
-        SimBackend {}
-    }
-}
-
-// Default implementation for SimBackend
-impl Default for SimBackend {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl Backend for SimBackend {
-    fn share_secret(&mut self, value: Fr, nbits: usize, owner: usize) -> ShareRef {
-        let s = arith::share_secret(value);
-        ShareRef::new_local(s, nbits, owner)
-    }
-    fn add(&mut self, a: &ShareRef, b: &ShareRef) -> ShareRef {
-        let sa = a.local.clone().expect("expected local share");
-        let sb = b.local.clone().expect("expected local share");
-        let sum = arith::add_shares(&sa, &sb);
-        ShareRef::new_local(sum, a.nbits.max(b.nbits), a.owner)
-    }
-    fn sub(&mut self, a: &ShareRef, b: &ShareRef) -> ShareRef {
-        let sa = a.local.clone().expect("expected local share");
-        let sb = b.local.clone().expect("expected local share");
-        let out = arith::sub_shares(&sa, &sb);
-        ShareRef::new_local(out, a.nbits.max(b.nbits), a.owner)
-    }
-    fn mul(&mut self, a: &ShareRef, b: &ShareRef) -> ShareRef {
-        let sa = a.local.clone().expect("expected local share");
-        let sb = b.local.clone().expect("expected local share");
-        let prod = sim::mul_ab3_with_inproc(&sa, &sb);
-        ShareRef::new_local(prod, a.nbits.max(b.nbits), a.owner)
-    }
-    fn div(&mut self, _a: &ShareRef, _b: &ShareRef) -> ShareRef {
-        unimplemented!("division not implemented yet")
-    }
-    fn modulo(&mut self, _a: &ShareRef, _b: &ShareRef) -> ShareRef {
-        unimplemented!("modulo not implemented yet")
-    }
-    fn eq(&mut self, a: &ShareRef, b: &ShareRef) -> ShareRef {
-        let sa = a.local.clone().expect("expected local share");
-        let sb = b.local.clone().expect("expected local share");
-        let out = bits::eq_ab3(&sa, &sb, a.nbits.max(b.nbits));
-        ShareRef::new_local(out, 1, a.owner)
-    }
-    fn lt(&mut self, a: &ShareRef, b: &ShareRef) -> ShareRef {
-        let sa = a.local.clone().expect("expected local share");
-        let sb = b.local.clone().expect("expected local share");
-        let out = bits::lt_ab3_signed(&sa, &sb, a.nbits.max(b.nbits));
-        ShareRef::new_local(out, 1, a.owner)
-    }
-    fn le(&mut self, a: &ShareRef, b: &ShareRef) -> ShareRef {
-        let sa = a.local.clone().expect("expected local share");
-        let sb = b.local.clone().expect("expected local share");
-        let out = bits::le_ab3_signed(&sa, &sb, a.nbits.max(b.nbits));
-        ShareRef::new_local(out, 1, a.owner)
-    }
-    fn reveal(&mut self, a: &ShareRef, _reveal_to: Option<usize>) -> Fr {
-        let s = a.local.clone().expect("expected local share");
-        arith::reconstruct(&s)
-    }
-    fn a2b(&mut self, a: &ShareRef, nbits: usize) -> Vec<ShareRef> {
-        let sa = a.local.clone().expect("expected local share");
-        let bits = sim::a2b_with_inproc(&sa, nbits);
-        bits.into_iter()
-            .map(|b| ShareRef::new_local(b, 1, a.owner))
-            .collect()
-    }
-    fn b2a(&mut self, bits: &[ShareRef]) -> ShareRef {
-        // reconstruct bit values and assemble a shared number by scalar-multiplying
-        // each bit share by 1<<i and summing
-        let mut out = arith::share_secret(0);
-        for (i, bit_ref) in bits.iter().enumerate() {
-            let b = bit_ref.local.clone().expect("expected local bit share");
-            let term = crate::crypto::arith::scalar_mul(&b, 1u128 << i);
-            out = crate::crypto::arith::add_shares(&out, &term);
-        }
-        ShareRef::new_local(
-            out,
-            bits.first().map(|s| s.nbits).unwrap_or(0),
-            bits.first().map(|s| s.owner).unwrap_or(0),
-        )
-    }
-
-    fn and(&mut self, a: &ShareRef, b: &ShareRef) -> ShareRef {
-        let bit_refs_a = self.a2b(a, a.nbits);
-        let bit_refs_b = self.a2b(b, b.nbits);
-        let mut and_bits = Vec::new();
-        for (bit_a, bit_b) in bit_refs_a.iter().zip(bit_refs_b.iter()) {
-            let and_bit = self.mul(bit_a, bit_b);
-            and_bits.push(and_bit);
-        }
-        self.b2a(&and_bits)
-    }
-
-    fn or(&mut self, a: &ShareRef, b: &ShareRef) -> ShareRef {
-        let bit_refs_a = self.a2b(a, a.nbits);
-        let bit_refs_b = self.a2b(b, b.nbits);
-        let mut or_bits = Vec::new();
-        for (bit_a, bit_b) in bit_refs_a.iter().zip(bit_refs_b.iter()) {
-            let or_bit = self.add(bit_a, bit_b);
-            or_bits.push(or_bit);
-        }
-        self.b2a(&or_bits)
-    }
-
-    fn bitlen(&mut self, a: &ShareRef) -> ShareRef {
-        let bit_refs_a = self.a2b(a, a.nbits);
-        // Compute bit_refs_b such that bit_refs_b[i] = OR of bit_refs_a[i..]
-        let mut bit_refs_b = Vec::new();
-        let mut init_false = ShareRef::zero();
-        for i in (0..bit_refs_a.len()).rev() {
-            let and = self.mul(&init_false, &bit_refs_a[i]);
-            init_false = self.add(&init_false, &bit_refs_a[i]);
-            init_false = self.sub(&init_false, &and);
-            bit_refs_b.push(init_false.clone());
-        }
-        bit_refs_b.reverse();
-        // Compute bitlen as count of 1s in (not(a_i) and not(b_i)) = 1 - OR(a_i, b_i), from MSB to LSB
-        let mut bitlen: ShareRef = ShareRef {
-            id: 0,
-            nbits: 0,
-            local: Some(Share3::zero()),
-            owner: 0,
-        };
-        // compute popcount of bit_refs_b
-        for b in bit_refs_b.iter() {
-            bitlen = self.add(&bitlen, b);
-        }
-        bitlen
-    }
-
-    fn shift_left(&mut self, a: &ShareRef, n: usize) -> ShareRef {
-        let mut result = a.clone();
-        // shift is easier, since we just need to add the element to itself n times
-        for _ in 0..n {
-            result = self.add(&result, &result);
-        }
-        result
-    }
-
-    fn shift_right(&mut self, a: &ShareRef, n: usize) -> ShareRef {
-        // Initialize with zeros
-        let mut result = vec![ShareRef::new_local(Share3::zero(), 1, a.owner); a.nbits];
-        let bit_refs_a = self.a2b(a, a.nbits);
-        if bit_refs_a.len() > n {
-            // copy the bits shifted to the right
-            result[..(bit_refs_a.len() - n)].clone_from_slice(&bit_refs_a[n..]);
-        }
-        self.b2a(&result)
-    }
-}
-
 /// ABY3 backend that runs the online protocol via explicit in-process message
 /// exchanges between three simulated parties.
 pub struct Aby3Backend {}
@@ -349,43 +188,29 @@ impl Backend for Aby3Backend {
     }
 
     fn bitlen(&mut self, a: &ShareRef) -> ShareRef {
-        let zero: ShareRef = ShareRef {
+        let bit_refs_a = self.a2b(a, a.nbits);
+        // Compute bit_refs_b such that bit_refs_b[i] = OR of bit_refs_a[i..]
+        let mut bit_refs_b = Vec::new();
+        let mut init_false = ShareRef::zero();
+        for i in (0..bit_refs_a.len()).rev() {
+            let and = self.mul(&init_false, &bit_refs_a[i]);
+            init_false = self.add(&init_false, &bit_refs_a[i]);
+            init_false = self.sub(&init_false, &and);
+            bit_refs_b.push(init_false.clone());
+        }
+        bit_refs_b.reverse();
+        // Compute bitlen as count of 1s in (not(a_i) and not(b_i)) = 1 - OR(a_i, b_i), from MSB to LSB
+        let mut bitlen: ShareRef = ShareRef {
             id: 0,
             nbits: 0,
             local: Some(Share3::zero()),
             owner: 0,
         };
-        let one: ShareRef = ShareRef {
-            id: 0,
-            nbits: 0,
-            local: Some(Share3::one()),
-            owner: 0,
-        };
-        let bit_refs_a = self.a2b(a, a.nbits);
-        // Compute bit_refs_b such that bit_refs_b[i] = OR of bit_refs_a[i..]
-        let mut bit_refs_b = Vec::new();
-        for i in 0..bit_refs_a.len() {
-            let or = bit_refs_a[i..]
-                .iter()
-                .cloned()
-                .reduce(|a, b| self.or(&a, &b))
-                .unwrap_or(zero.clone());
-            bit_refs_b.push(or);
+        // compute popcount of bit_refs_b
+        for b in bit_refs_b.iter() {
+            bitlen = self.add(&bitlen, b);
         }
-        // Compute bitlen as count of 1s in (not(a_i) and not(b_i)) = 1 - OR(a_i, b_i), from MSB to LSB
-        let mut bitlen: ShareRef = ShareRef {
-            id: 0,
-            nbits: 0,
-            local: None,
-            owner: 0,
-        };
-        for (a, b) in bit_refs_a.iter().zip(bit_refs_b.iter()) {
-            let not_a = self.sub(&one, a);
-            let not_b = self.sub(&one, b);
-            let and = self.and(&not_a, &not_b);
-            bitlen = self.add(&bitlen, &and);
-        }
-        self.b2a(&bit_refs_b)
+        bitlen
     }
 
     fn shift_left(&mut self, a: &ShareRef, n: usize) -> ShareRef {
@@ -399,11 +224,11 @@ impl Backend for Aby3Backend {
 
     fn shift_right(&mut self, a: &ShareRef, n: usize) -> ShareRef {
         // Initialize with zeros
-        let mut result = vec![ShareRef::new_local(Share3::zero(), 1, a.owner); n];
+        let mut result = vec![ShareRef::new_local(Share3::zero(), 1, a.owner); a.nbits];
         let bit_refs_a = self.a2b(a, a.nbits);
-        // copy the bits shifted to the right
-        for item in bit_refs_a.iter().take(bit_refs_a.len().saturating_sub(n)) {
-            result.push(item.clone());
+        if bit_refs_a.len() > n {
+            // copy the bits shifted to the right
+            result[..(bit_refs_a.len() - n)].clone_from_slice(&bit_refs_a[n..]);
         }
         self.b2a(&result)
     }
