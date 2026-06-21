@@ -1,0 +1,14 @@
+% The table of contents is useful when writing the paper, but
+% we must remove it for submission
+\makeatletter
+\renewcommand*\l@author[2]{}
+\renewcommand*\l@title[2]{}
+\makeatletter
+\begingroup
+\let\clearpage\relax
+% \tableofcontents*
+\setcounter{tocdepth}{2}
+% \thales{Table of contents will be removed for submission}
+\tableofcontents
+\endgroup
+% End - table of contents

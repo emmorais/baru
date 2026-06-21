@@ -1,0 +1,379 @@
+@inproceedings{Persiano2022,
+author="Persiano, Giuseppe
+and Phan, Duong Hieu
+and Yung, Moti",
+editor="Dunkelman, Orr
+and Dziembowski, Stefan",
+title="Anamorphic Encryption: Private Communication Against a Dictator",
+booktitle="Advances in Cryptology -- EUROCRYPT 2022",
+year="2022",
+publisher="Springer International Publishing",
+address="Cham",
+pages="34--63",
+abstract="Cryptosystems have been developed over the years under the typical prevalent setting which assumes that the receiver's key is kept secure from the adversary, and that the choice of the message to be sent is freely performed by the sender and is kept secure from the adversary as well. Under these fundamental and basic operational assumptions, modern Cryptography has flourished over the last half a century or so, with amazing achievements: New systems (including public-key Cryptography), beautiful and useful models (including security definitions such as semantic security), and new primitives (such as zero-knowledge proofs) have been developed. Furthermore, these fundamental achievements have been translated into actual working systems, and span many of the daily human activities over the Internet.",
+isbn="978-3-031-07085-3"
+}
+
+@inproceedings{Kutylowski2023,
+   author = {Miroslaw Kutylowski and Giuseppe Persiano and Duong Hieu Phan and Moti Yung and Marcin Zawada and Mirek Kutylowski},
+   doi = {10.56553/popets-2023-0104},
+   issue = {4},
+   pages = {170-183},
+   title = {The Self-Anti-Censorship Nature of Encryption: On the Prevalence of Anamorphic Cryptography},
+   volume = {2023},
+   year = {2023},
+   booktitle= {Proceedings on Privacy Enhancing Technologies Symposium}
+}
+
+@InProceedings{Banfi2024,
+author="Banfi, Fabio
+and Gegier, Konstantin
+and Hirt, Martin
+and Maurer, Ueli
+and Rito, Guilherme",
+editor="Joye, Marc
+and Leander, Gregor",
+title="Anamorphic Encryption, Revisited",
+booktitle="Advances in Cryptology -- EUROCRYPT 2024",
+year="2024",
+publisher="Springer Nature Switzerland",
+address="Cham",
+pages="3--32",
+abstract="An anamorphic encryption scheme allows two parties who share a so-called double key to embed covert messages in ciphertexts of an established PKE scheme. This protects against a dictator that can force the receiver to reveal the secret keys for the PKE scheme, but who is oblivious about the existence of the double key. We identify two limitations of the original model by Persiano, Phan, and Yung (EUROCRYPT 2022). First, in their definition a double key can only be generated once, together with a key-pair. This has the drawback that a receiver who wants to use the anamorphic mode after a dictator comes to power, needs to deploy a new key-pair, a potentially suspicious act. Second, a receiver cannot distinguish whether or not a ciphertext contains a covert message.",
+isbn="978-3-031-58723-8"
+}
+
+
+
+@inproceedings{Kuty2023,
+author="Kuty{\l}owski, Miros{\l}aw
+and Persiano, Giuseppe
+and Phan, Duong Hieu
+and Yung, Moti
+and Zawada, Marcin",
+editor="Handschuh, Helena
+and Lysyanskaya, Anna",
+title="Anamorphic Signatures: Secrecy from a Dictator Who Only Permits Authentication!",
+booktitle="Advances in Cryptology -- CRYPTO 2023",
+year="2023",
+publisher="Springer Nature Switzerland",
+address="Cham",
+pages="759--790",
+isbn="978-3-031-38545-2"
+}
+
+@inproceedings{Persiano2024,
+author="Persiano, Giuseppe
+and Phan, Duong Hieu
+and Yung, Moti",
+editor="Reyzin, Leonid
+and Stebila, Douglas",
+title="Public-Key Anamorphism in (CCA-Secure) Public-Key Encryption and Beyond",
+booktitle="Advances in Cryptology -- CRYPTO 2024",
+year="2024",
+publisher="Springer Nature Switzerland",
+address="Cham",
+pages="422--455",
+abstract="The notion of (Receiver-) Anamorphic Encryption was put forth recently to show that a dictator (i.e., an overreaching government), which demands to get the receiver's private key and even dictates messages to the sender, cannot prevent the receiver from getting an additional covert anamorphic message from a sender. The model required an initial private collaboration to share some secret. There may be settings though where an initial collaboration may be impossible or performance-wise prohibitive, or cases when we need an immediate message to be sent without private key generation (e.g., by any casual sender in need). This situation, to date, somewhat limits the applicability of anamorphic encryption. To overcome this, in this work, we put forth the new notion of ``public-key anamorphic encryption,'' where, without any initialization, any sender that has not coordinated in any shape or form with the receiver, can nevertheless, under the dictator control of the receiver's private key, send the receiver an additional anamorphic secret message hidden from the dictator. We define the new notion with its unique new properties, and then prove that, quite interestingly, the known CCA-secure Koppula-Waters (KW) system is, in fact, public-key anamorphic.",
+isbn="978-3-031-68379-4"
+}
+
+
+@InProceedings{Jaeger2025,
+author="Jaeger, Joseph
+and Stracovsky, Roy",
+editor="Chung, Kai-Min
+and Sasaki, Yu",
+title="Dictators? Friends? Forgers.",
+booktitle="Advances in Cryptology -- ASIACRYPT 2024",
+year="2025",
+publisher="Springer Nature Singapore",
+address="Singapore",
+pages="105--137",
+abstract="Anamorphic signature schemes (KPPYZ, Crypto 2023) allow users to hide encrypted messages in signatures to allow covert communication in a hypothesized scenario where encryption is outlawed by a ``dictator'' but authentication is permitted. We enhance the security of anamorphic signatures by proposing two parallel notions of unforgeability which close gaps in existing security definitions. The first notion considers a dictator who wishes to forge anamorphic signatures. This notion patches a divide between the definition and a stated security goal of robustness (BGHMR, Eurocrypt 2024). We port two related BGHMR constructions to the signature scheme setting and show that one is secure when built from unpredictable signature schemes while the other is broken. The second notion considers a recipient who wishes to forge signatures. To motivate this notion, we identify a gap in an existing security definition from KPPYZ and present attacks that allow parties to be impersonated when using schemes erroneously deemed secure. We then formalize our new unforgeability definition to close this gap. Interestingly, while the new definition is only modestly different from the old one, the change introduces subtle technical challenges that arise when proving security. We overcome these challenges in our reanalysis of existing anamorphic signature schemes by showing they achieve our new notion when built from chosen-randomness secure signatures or with encryption that satisfies a novel ideal-model simulatability property.",
+isbn="978-981-96-0888-1"
+}
+
+
+@inproceedings{Catalano2025,
+author="Catalano, Dario
+and Giunta, Emanuele
+and Migliaro, Francesco",
+editor="Joye, Marc
+and Leander, Gregor",
+title="Anamorphic Encryption: New Constructions and Homomorphic Realizations",
+booktitle="Advances in Cryptology -- EUROCRYPT 2024",
+year="2024",
+publisher="Springer Nature Switzerland",
+address="Cham",
+pages="33--62",
+abstract="The elegant paradigm of Anamorphic Encryption (Persiano et al., Eurocrypt 2022) considers the question of establishing a private communication in a world controlled by a dictator. The challenge is to allow two users, sharing some secret anamorphic key, to exchange covert messages without the dictator noticing, even when the latter has full access to the regular secret keys. Over the last year several works considered this question and proposed constructions, novel extensions and strengthened definitions.",
+isbn="978-3-031-58723-8"
+}
+
+
+@inproceedings{Catalano2025:2,
+author="Catalano, Dario
+and Giunta, Emanuele
+and Migliaro, Francesco",
+editor="Fehr, Serge
+and Fouque, Pierre-Alain",
+title="Generic Anamorphic Encryption, Revisited: New Limitations and Constructions",
+booktitle="Advances in Cryptology -- EUROCRYPT 2025",
+year="2025",
+publisher="Springer Nature Switzerland",
+address="Cham",
+pages="275--303",
+abstract="The notion of Anamorphic Encryption (Persiano et al. Eurocrypt 2022) aims at establishing private communication against an adversary who can access secret decryption keys and influence the chosen messages. Persiano et al. gave a simple, black-box, rejection sampling-based technique to send anamorphic bits using any {\$}{\$} {\backslash}textrm{\{}IND{\}}{\backslash}text {\{}-{\}}{\backslash}textrm{\{}CPA{\}}{\$}{\$}IND-CPAsecure scheme as underlying PKE.",
+isbn="978-3-031-91124-8"
+}
+
+
+@InProceedings{Catalano2025:3,
+author="Catalano, Dario
+and Giunta, Emanuele
+and Migliaro, Francesco",
+editor="Reyzin, Leonid
+and Stebila, Douglas",
+title="Limits of Black-Box Anamorphic Encryption",
+booktitle="Advances in Cryptology -- CRYPTO 2024",
+year="2024",
+publisher="Springer Nature Switzerland",
+address="Cham",
+pages="352--383",
+abstract="(Receiver) Anamorphic encryption, introduced by Persiano et al. at Eurocrypt 2022, considers the question of achieving private communication in a world where secret decryption keys are under the control of a dictator. The challenge here is to be able to establish a secret communication channel to exchange covert (i.e. anamorphic) messages on top of some already deployed public key encryption scheme.",
+isbn="978-3-031-68379-4"
+}
+
+@misc{Choi2025,
+  author = {Choi, Wonseok and Collins, Daniel and Li, Xiangyu and Zikas, Vassilis},
+  title = {A Unified Treatment of Anamorphic Encryption},
+  howpublished = {Cryptology {ePrint} Archive, Paper 2025/309},
+  year = {2025},
+  url = {https://eprint.iacr.org/2025/309}
+}
+
+@inproceedings{Dodis2025,
+author = {Dodis, Yevgeniy and Goldin, Eli},
+title = {Anamorphic-Resistant Encryption: Or Why the Encryption Debate is Still Alive},
+year = {2025},
+isbn = {978-3-032-01880-9},
+publisher = {Springer-Verlag},
+address = {Berlin, Heidelberg},
+url = {https://doi.org/10.1007/978-3-032-01881-6_14},
+doi = {10.1007/978-3-032-01881-6_14},
+abstract = {Ever since the introduction of encryption, society has been divided over whether the government (or law enforcement agencies) should have the capability to decrypt private messages (with or without a warrant) of its citizens. From a technical viewpoint, the folklore belief is that semantic security always enables some form of steganography. Thus, adding backdoors to semantically secure schemes is pointless: it only weakens the security of the “good guys”, while “bad guys” can easily circumvent censorship, even if forced to hand over their decryption keys.In this paper, we put a dent in this folklore. We formalize three worlds: Dictatoria (“dictator wins”: no convenient steganography, no user cooperation needed), Warrantland (“checks-and-balances”: no convenient steganography, but need user’s cooperation), and Privatopia (“privacy wins”: built-in, high-rate steganography, even if giving away the decryption key). We give strong evidence that all these worlds are possible, thus reopening the encryption debate on a technical level.Our main novelty is the definition and design of special encryption schemes we call anamorphic-resistant (AR). In contrast to so-called “anamorphic schemes”,—which were studied in the literature and form the basis of Privatopia,—any attempt to steganographically communicate over an AR-encryption scheme will be either impossible or hugely slow (depending on the definitional details).},
+booktitle = {Advances in Cryptology – CRYPTO 2025: 45th Annual International Cryptology Conference, Santa Barbara, CA, USA, August 17–21, 2025, Proceedings, Part III},
+pages = {440–471},
+numpages = {32},
+location = {Santa Barbara, CA, USA}
+}
+
+@InProceedings{Giustolisi2026,
+author="Giustolisi, Rosario
+and Rakeei, Mohammadamin
+and Lenzini, Gabriele",
+editor="Haslhofer, Bernhard
+and Xu, Java
+and Victor, Friedhelm
+and Bartoletti, Massimo
+and Bracciali, Andrea
+and Matsuura, Kanta
+and Nabrzyski, Jarek
+and Estrada-Gali{\~{n}}anes, Vero
+and Tessone, Claudio
+and Budurushi, Jurlind
+and Marky, Karola",
+title="Anamorphic Voting: Ballot Freedom Against Dishonest Authorities",
+booktitle="Financial Cryptography and Data Security. FC 2025 International Workshops",
+year="2026",
+publisher="Springer Nature Switzerland",
+address="Cham",
+pages="266--280",
+abstract="Electronic voting schemes typically ensure ballot privacy by assuming that the decryption key is distributed among tallying authorities, preventing any single authority from decrypting a voter's ballot. However, this assumption may fail in a fully dishonest environment where all tallying authorities collude to break ballot privacy.",
+isbn="978-3-032-00495-6"
+}
+
+@InProceedings{Deo2025,
+author="Deo, Amit
+and Libert, Beno{\^i}t",
+editor="Hanaoka, Goichiro
+and Yang, Bo-Yin",
+title="Anamorphic Signatures With Dictator and Recipient Unforgeability for Long Messages",
+booktitle="Advances in Cryptology -- ASIACRYPT 2025",
+year="2026",
+publisher="Springer Nature Singapore",
+address="Singapore",
+pages="370--401",
+abstract="Anamorphic signatures (Kutylowski et al., Crypto'23) provide a way to covertly use encryption by hiding ciphertexts inside digital signatures without a dictator noticing. Recently (Asiacrypt'24), Jaeger and Stracovsky advocated stronger security notions for the primitive. Their notion of dictator unforgeability requires a dictator's inability to produce fresh signatures that decrypt to a meaningful covert message. The notion of recipient unforgeability requires that anamorphic receivers cannot forge signatures even after having observed anamorphic signatures on messages of their choice. To date, the known schemes satisfying all these properties simultaneously rely on the ``randomness replacement'' technique. As a result, they are restricted to short anamorphic messages either because their anamorphic decryption mechanism involves an exhaustive search step, or because they embed the anamorphic plaintext in a public random salt (which is typically short in compatible signature schemes like RSA-PSS). In this paper, we present anamorphic signatures that depart from the randomness replacement paradigm and make it possible to encrypt longer anamorphic plaintexts. We show that (generalized) Okamoto-Schnorr signatures, as well as GQ and {\$}{\$}2^t{\$}{\$}2t-root signatures all have anamorphic modes satisfying the three desired security properties. The ratio between the lengths of anamorphic plaintexts and signatures can even be very close to 1 for appropriate parameters. We also discuss an extension to Lyubashevsky's lattice-based signatures.",
+isbn="978-981-95-5119-4"
+}
+
+
+@misc{Avitabile2025,
+      author = {Gennaro Avitabile and Vincenzo Botta and Emanuele Giunta and Marcin Mielniczuk and Francesco Migliaro},
+      title = {The Malice of {ELFs}: Practical Anamorphic-Resistant Encryption without Random Oracles},
+      howpublished = {Cryptology {ePrint} Archive, Paper 2025/305},
+      year = {2025},
+      url = {https://eprint.iacr.org/2025/305}
+}
+
+@inproceedings{Carnemolla2026,
+author="Carnemolla, Davide
+and Catalano, Dario
+and Giunta, Emanuele
+and Migliaro, Francesco",
+editor="Tauman Kalai, Yael
+and Kamara, Seny F.",
+title="Anamorphic Resistant Encryption: the Good, the Bad and the Ugly",
+booktitle="Advances in Cryptology -- CRYPTO 2025",
+year="2025",
+publisher="Springer Nature Switzerland",
+address="Cham",
+pages="472--503",
+abstract="Anamorphic encryption (AE), introduced by Persiano, Phan and Yung at Eurocrypt `22, allows to establish secure communication in scenarios where users might be forced to hand over their decryption keys to some hostile authority. Over the last few years, several works have improved our understanding of the primitive by proposing novel realizations, new security notions and studying inherent limitations.",
+isbn="978-3-032-01881-6"
+}
+
+
+@misc{Chu2025,
+      author = {Hien Chu and Khue Do and Lucjan Hanzlik and Sri AravindaKrishnan Thyagarajan},
+      title = {When Threshold Meets Anamorphic Signatures: What is Possible and What is Not!},
+      howpublished = {Cryptology {ePrint} Archive, Paper 2025/1044},
+      year = {2025},
+      url = {https://eprint.iacr.org/2025/1044}
+}
+
+
+@misc{Michalas2026,
+      author = {Antonis Michalas},
+      title = {Anamorphic E-Voting: Coercion-Resistant Through Fake and Real Votes},
+      howpublished = {Cryptology {ePrint} Archive, Paper 2026/308},
+      year = {2026},
+      url = {https://eprint.iacr.org/2026/308}
+}
+
+@techreport{nist-hqc,
+author = {
+Alagic, Gorjan and
+Bros, Maxime and
+Ciadoux, Piere and
+Cooper, David and
+Dang, Quynh and
+Dang, Thinh and
+Kelsey, John and
+Lichtinger, Jacob and
+Liu, Yi-Kai and
+Miller, Carl and
+Moody, Dustin and
+Peralta, Rene and
+Perlner, Ray and
+Robinson, Angela and
+Silberg, Hamilton and
+Smith-Tone, Daniel and
+Waller, Noah and
+},
+title = {Status Report on the Fourth Round of the NIST Post-Quantum Cryptography Standardization Process.},
+institution = {National Institute of Standards and Technology},
+address= {Gaithersburg, MD},
+number = {NIST Internal Report (IR) NIST IR 8545},
+doi = {10.6028/NIST.IR.8545},
+year = {2025},
+}
+
+@misc{HQC,
+author = {
+Gaborit, Phillipe and
+Aguillar-Melchor, Carlos and
+Aragon, Nicolas and
+Bidoux, Lo{\"i}c and
+Blazy, Olivier and
+Deneuville, Jean-Christophe and
+Persichetti, Edoardo and 
+Zémor, Gilles and
+Bos, Jurjen and
+Dion, Aranaud and
+Lacan, Jérôme and
+Robert, Jean-Marc and
+Véron, Pascal and
+Barreto, Paulo and
+Ghosh, Santosh and
+Gueron, Shay and
+G{\"u}neysu, Tim and
+Misoczki, Rafael and
+Richter-Brockmann, Jan and
+Sendrier, Nicolas and 
+Tillich, Jean-Pierre and 
+Vasseur, Valentin and 
+},
+title = {{Hamming Quasi-Cyclic (HQC) Specification}},
+year = {2025},
+url = {https://pqc-hqc.org/doc/hqc_specifications_2025_08_22.pdf}
+}
+
+@misc{BIKE,
+author = {
+Aragon, Nicolas and
+Barreto, Paulo and
+Bettaieb, Slim and
+Bididoux, Lo{\"i}c and
+Blazy, Olivier and
+Deneuville, Jean-Christophe and
+Gaborit, Phillipe and 
+Ghosh, Santosh and 
+Gueron, Shay and 
+Tim, G{\"u}neysu and
+Aguillar-Melchor, Carlos and 
+Misoczki, Rafael and 
+Persichetti, Edoardo and 
+Richter-Brockmann, Jan and
+Sendrier, Nicolas and 
+Tillich, Jean-Pierre and 
+Vasseur, Valentin and 
+Zémor, Gilles
+},
+title = {{BIKE: Bit Flipping Key Encapsulation - Round 4 submission}},
+year = {2025},
+url = {https://bikesuite.org/files/v5.0/BIKE_Spec.2022.10.04.1.pdf},
+}
+
+@InProceedings{Wang2023,
+author="Wang, Yi
+and Chen, Rongmao
+and Huang, Xinyi
+and Yung, Moti",
+editor="Guo, Jian
+and Steinfeld, Ron",
+title="Sender-Anamorphic Encryption Reformulated: Achieving Robust and Generic Constructions",
+booktitle="Advances in Cryptology -- ASIACRYPT 2023",
+year="2023",
+publisher="Springer Nature Singapore",
+address="Singapore",
+pages="135--167",
+abstract="Motivated by the violation of two fundamental assumptions in secure communication - receiver-privacy and sender-freedom - by a certain entity referred to as ``the dictator'', Persiano et al. introduced the concept of Anamorphic Encryption (AME) for public key cryptosystems (EUROCRYPT 2022). Specifically, they presented receiver/sender-AME, directly tailored to scenarios where receiver privacy and sender freedom assumptions are compromised, respectively. In receiver-AME, entities share a double key to communicate in anamorphic fashion, raising concerns about the online distribution of the double key without detection by the dictator. The sender-AME with no shared secret is a potential candidate for key distribution. However, the only such known schemes (i.e., LWE and Dual LWE encryptions) suffer from an intrinsic limitation and cannot achieve reliable distribution.",
+isbn="978-981-99-8736-8"
+}
+
+@InProceedings{Wang2024,
+author="Wang, Weihao
+and Han, Shuai
+and Liu, Shengli",
+editor="Chung, Kai-Min
+and Sasaki, Yu",
+title="Anamorphic Authenticated Key Exchange: Double Key Distribution Under Surveillance",
+booktitle="Advances in Cryptology -- ASIACRYPT 2024",
+year="2025",
+publisher="Springer Nature Singapore",
+address="Singapore",
+pages="168--200",
+abstract="Anamorphic encryptions and anamorphic signatures assume a double key pre-shared between two parties so as to enable the transmission of covert messages. How to securely and efficiently distribute a double key under the dictator's surveillance is a central problem for anamorphic cryptography, especially when the users are forced to surrender their long-term secret keys or even the randomness used in the algorithms to the dictator.",
+isbn="978-981-96-0935-2"
+}
+
+@misc{Banerjee2025,
+      author = {Shalini Banerjee and Tapas Pal and Andy Rupp and Daniel Slamanig},
+      title = {Simple Public Key Anamorphic Encryption and Signature using Multi-Message Extensions},
+      howpublished = {Cryptology {ePrint} Archive, Paper 2025/370},
+      year = {2025},
+      url = {https://eprint.iacr.org/2025/370}
+}
