@@ -45,8 +45,7 @@ pub trait Backend: Send + Sync {
     fn add(&mut self, a: &ShareRef, b: &ShareRef) -> ShareRef;
     fn sub(&mut self, a: &ShareRef, b: &ShareRef) -> ShareRef;
     fn mul(&mut self, a: &ShareRef, b: &ShareRef) -> ShareRef;
-    fn div(&mut self, a: &ShareRef, b: &ShareRef) -> ShareRef;
-    fn modulo(&mut self, a: &ShareRef, b: &ShareRef) -> ShareRef;
+    fn divmod(&mut self, a: &ShareRef, b: &ShareRef) -> (ShareRef, ShareRef);
     fn eq(&mut self, a: &ShareRef, b: &ShareRef) -> ShareRef;
     fn lt(&mut self, a: &ShareRef, b: &ShareRef) -> ShareRef;
     fn le(&mut self, a: &ShareRef, b: &ShareRef) -> ShareRef;
@@ -109,12 +108,8 @@ impl Backend for Aby3Backend {
         ShareRef::new_local(prod, a.nbits.max(b.nbits), a.owner)
     }
 
-    fn div(&mut self, _a: &ShareRef, _b: &ShareRef) -> ShareRef {
+    fn divmod(&mut self, _a: &ShareRef, _b: &ShareRef) -> (ShareRef, ShareRef) {
         unimplemented!("division not implemented yet")
-    }
-
-    fn modulo(&mut self, _a: &ShareRef, _b: &ShareRef) -> ShareRef {
-        unimplemented!("modulo not implemented yet")
     }
 
     fn eq(&mut self, a: &ShareRef, b: &ShareRef) -> ShareRef {
@@ -323,12 +318,29 @@ impl<T: Transport + 'static> Backend for TransportBackend<T> {
         self.store(id, ps, a.nbits.max(b.nbits), a.owner)
     }
 
-    fn div(&mut self, _a: &ShareRef, _b: &ShareRef) -> ShareRef {
-        unimplemented!("division not implemented yet")
-    }
+    // assume a > b
+    fn divmod(&mut self, _a: &ShareRef, _b: &ShareRef) -> (ShareRef, ShareRef) {
+        // Compute the bitlen of a and b, multiply b by 2^(bitlen(a)-bitlen(b)),
+        // then if the result is positive,
+        // subtract b until the remainder is less than b, otherwise add b until the remainder is non-negative
+        /*let bitlen_a = &self.bitlen(a);
+        let bitlen_b = &self.bitlen(b);
+        let mut diff = self.sub(bitlen_a, bitlen_b);
+        // multiply b by 2^diff
+        let mut rem = self.shift_left(&b, diff);
 
-    fn modulo(&mut self, _a: &ShareRef, _b: &ShareRef) -> ShareRef {
-        unimplemented!("modulo not implemented yet")
+        if rem.nbits > 0 {
+            // result is positive
+            while rem.nbits > 0 {
+                rem = self.sub(&rem, b);
+            }
+        } else {
+            while rem.nbits < 0 {
+                rem = self.add(&rem, b);
+            }
+        }
+        (rem, b)*/
+        unimplemented!("division not implemented yet")
     }
 
     fn eq(&mut self, a: &ShareRef, b: &ShareRef) -> ShareRef {

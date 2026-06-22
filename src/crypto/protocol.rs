@@ -356,13 +356,13 @@ pub fn mul_party<T: Transport>(
     transport: &T,
 ) -> PartyShare {
     println!("mul_party: op_id={}, me={}", op_id, me);
-    //let triple_id = op_id + 3; // reserve 3 ids for x/y/z
     let triple_id = op_id + 1; // get a fresh triple_id for this multiplication instance
 
     // obtain triple
     let (x, y, z) = if me == 0 {
         deal_triple(triple_id, me, transport)
     } else {
+        // TODO: find a better solution
         sleep(std::time::Duration::from_millis(500)); // give the dealer a chance to send before we start recv'ing
         receive_triple(triple_id, transport)
     };
