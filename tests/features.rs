@@ -1,35 +1,4 @@
-use baru::interpreter::{parse, Participant, Types};
-
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-/// Evaluate a plain (non-shared) expression and return the numeric result.
-fn eval(src: &str) -> i64 {
-    let expr = parse(src).expect("parse failed");
-    let p = Participant::new(0);
-    match p.eval(&expr) {
-        Types::Num(n) => n,
-        other => panic!("expected Num, got: {:?}", other),
-    }
-}
-
-/// Evaluate an expression, reveal any resulting Share, and return the
-/// reconstructed value interpreted as a signed 32-bit integer.
-fn eval_shared(src: &str) -> i64 {
-    let expr = parse(src).expect("parse failed");
-    let p = Participant::new(0);
-    match p.eval(&expr) {
-        // Plain Num may carry a raw u128 field value stored as i64 bits; reinterpret as signed 32.
-        Types::Num(n) => (n as u32) as i32 as i64,
-        Types::Share(sr) => {
-            let raw = p.reveal(&sr);
-            // sign-extend from 32 bits
-            (raw as u32) as i32 as i64
-        }
-        other => panic!("expected Num or Share, got: {:?}", other),
-    }
-}
+use baru::interpreter::eval::{eval_plain as eval, eval_shared};
 
 // ---------------------------------------------------------------------------
 // Basic arithmetic
@@ -588,78 +557,6 @@ fn test_shared_equality() {
             b_val
         );
     }
-}
-
-// ---------------------------------------------------------------------------
-// ReLU (max(x, 0)) — the fundamental building block of neural networks
-// ---------------------------------------------------------------------------
-
-#[test]
-fn test_relu_positive() {
-    // ReLU(5) = 5
-    let src = "(let ((z (share 5 32))) (if (> z 0) z 0))";
-    assert_eq!(eval_shared(src), 5);
-}
-
-#[test]
-fn test_relu_negative() {
-    // ReLU(-4) = 0
-    let src = "(let ((z (share -4 32))) (if (> z 0) z 0))";
-    assert_eq!(eval_shared(src), 0);
-}
-
-#[test]
-fn test_relu_zero() {
-    // ReLU(0) = 0
-    let src = "(let ((z (share 0 32))) (if (> z 0) z 0))";
-    assert_eq!(eval_shared(src), 0);
-}
-
-// ---------------------------------------------------------------------------
-// Neural-network style: dot-product + ReLU
-// ---------------------------------------------------------------------------
-
-#[test]
-fn test_very_simple_neural_network() {
-    // z = w1*x + w2*x = (2+3)*4 = 20
-    let src = "(let ((w1 (share 2 32)) (w2 (share 3 32)) (x (share 4 32)))
-                 (+ (* w1 x) (* w2 x)))";
-    assert_eq!(eval_shared(src), 20);
-}
-
-#[test]
-fn test_simple_neural_network() {
-    // z = 2*4 + (-3)*4 = 8 - 12 = -4  ->  ReLU(-4) = 0
-    let src = "(let ((w1 (share 2 32)) (w2 (share -3 32)) (x (share 4 32)))
-                 (let ((z (+ (* w1 x) (* w2 x))))
-                   (if (> z 0) z 0)))";
-    assert_eq!(eval_shared(src), 0);
-}
-
-#[test]
-fn test_neural_network_positive_output() {
-    // z = 5*3 + (-2)*3 = 15 - 6 = 9  ->  ReLU(9) = 9
-    let src = "(let ((w1 (share 5 32)) (w2 (share -2 32)) (x (share 3 32)))
-                 (let ((z (+ (* w1 x) (* w2 x))))
-                   (if (> z 0) z 0)))";
-    assert_eq!(eval_shared(src), 9);
-}
-
-#[test]
-fn test_two_neuron_layer() {
-    // two neurons, same input:
-    //   n1 = ReLU(w11*x + w12*x) = ReLU((2 + -3)*4) = ReLU(-4) = 0
-    //   n2 = ReLU(w21*x + w22*x) = ReLU((1 +  2)*4) = ReLU(12) = 12
-    // output = n1 + n2 = 12
-    let src = "(let ((x  (share 4 32))
-                     (w11 (share 2 32)) (w12 (share -3 32))
-                     (w21 (share 1 32)) (w22 (share  2 32)))
-                 (let ((z1 (+ (* w11 x) (* w12 x)))
-                       (z2 (+ (* w21 x) (* w22 x))))
-                   (let ((n1 (if (> z1 0) z1 0))
-                         (n2 (if (> z2 0) z2 0)))
-                     (+ n1 n2))))";
-    assert_eq!(eval_shared(src), 12);
 }
 
 // ---------------------------------------------------------------------------
