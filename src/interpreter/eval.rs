@@ -9,6 +9,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::interpreter::ast::{Env, Expr, Types};
 use crate::interpreter::backend::{Aby3Backend, Backend};
+use crate::interpreter::parse;
 use colored::*;
 
 #[derive(Debug, Clone)]
@@ -1533,4 +1534,31 @@ fn int_to_fr_signed(n: i64, nbits: usize) -> u128 {
     }
     let v = (n as i128).rem_euclid(modulus);
     v as u128
+}
+
+/// Evaluate a plain (non-shared) expression and return the numeric result.
+pub fn eval_plain(src: &str) -> i64 {
+    let expr = parse(src).expect("parse failed");
+    let p = Participant::new(0);
+    match p.eval(&expr) {
+        Types::Num(n) => n,
+        other => panic!("expected Num, got: {:?}", other),
+    }
+}
+
+/// Evaluate an expression, reveal any resulting Share, and return the
+/// reconstructed value interpreted as a signed 32-bit integer.
+pub fn eval_shared(src: &str) -> i64 {
+    let expr = parse(src).expect("parse failed");
+    let p = Participant::new(0);
+    match p.eval(&expr) {
+        // Plain Num may carry a raw u128 field value stored as i64 bits; reinterpret as signed 32.
+        Types::Num(n) => (n as u32) as i32 as i64,
+        Types::Share(sr) => {
+            let raw = p.reveal(&sr);
+            // sign-extend from 32 bits
+            (raw as u32) as i32 as i64
+        }
+        other => panic!("expected Num or Share, got: {:?}", other),
+    }
 }
