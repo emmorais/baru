@@ -96,7 +96,7 @@ fn test_int_recognition_neural_network() {
     // neural network that can recognize handwritten digits, using the MNIST dataset.
     // The input is a 28x28 pixel image (flattened into a 784-length vector), and the
     // output is a single number representing the predicted digit (0-9), tested with
-    // 0 and 1. The network will have one hidden layer with ReLU activations.
+    // 0 and 1 only. The network will have one hidden layer with ReLU activations.
 
     // Bias Integer: 80
     //let bias = 80;

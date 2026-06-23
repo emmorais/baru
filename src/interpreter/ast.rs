@@ -6,6 +6,7 @@ use std::rc::Rc;
 pub enum Expr {
     Num(i64),
     Var(String),
+    Quote(Box<Expr>),
     BinOp(super::parser::BinOp, Box<Expr>, Box<Expr>),
     UnOp(super::parser::UnOp, Box<Expr>),
     Let(Vec<(String, Expr)>, Vec<Expr>),
