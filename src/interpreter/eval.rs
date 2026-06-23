@@ -719,6 +719,12 @@ pub fn reduce_expression(
                     }
                     Continuation::UnOp { op, cont, env } => {
                         let out = match op {
+                            super::parser::UnOp::Atom => match val {
+                                Types::Num(_) | Types::Bool(_) | Types::Str(_) | Types::Char(_) => {
+                                    Types::Num(1)
+                                }
+                                _ => Types::Num(0),
+                            },
                             super::parser::UnOp::Not => match val {
                                 Types::Num(n) => Types::Num(if n == 0 { 1 } else { 0 }),
                                 Types::Bool(b) => Types::Num(if !b { 1 } else { 0 }),

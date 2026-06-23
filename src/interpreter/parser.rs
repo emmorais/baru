@@ -18,6 +18,7 @@ pub enum BinOp {
 
 #[derive(Debug, Clone, Copy)]
 pub enum UnOp {
+    Atom,
     Not,
     Neg,
     BitLen,
@@ -185,7 +186,16 @@ pub fn parse_tokens(tokens: &[String], pos: &mut usize) -> Result<Expr, String> 
             *pos += 1;
             return Ok(Expr::Quote(Box::new(quoted)));
         }
-        // unary operators: not, bitlen
+        // unary operators: atom, not, bitlen
+        if next_tok == "atom" {
+            *pos += 1;
+            let inner = parse_tokens(tokens, pos)?;
+            if *pos >= tokens.len() || tokens[*pos] != ")" {
+                return Err("expected ')' after atom".to_string());
+            }
+            *pos += 1;
+            return Ok(Expr::UnOp(super::parser::UnOp::Atom, Box::new(inner)));
+        }
         if next_tok == "not" {
             *pos += 1;
             let inner = parse_tokens(tokens, pos)?;
