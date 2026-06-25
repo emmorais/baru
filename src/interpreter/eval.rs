@@ -199,6 +199,7 @@ pub fn reduce_expression(
                     Types::Str(s) => format!("{}", format!("Str(\"{}\")", s).magenta()),
                     Types::Char(c) => format!("{}", format!("Char({})", c).magenta()),
                     Types::List(l) => format!("{}", format!("List(len={})", l.len()).blue()),
+                    Types::Quoted(e) => format!("{}", format!("Quoted({:?})", e).blue()),
                     Types::Closure(_, _, _) => "Closure".magenta().to_string(),
                     Types::Share(sr) => format!(
                         "{}",
@@ -241,7 +242,8 @@ pub fn reduce_expression(
                     stack.push(Apply(k, Types::Bool(b), eenv.clone()));
                 }
                 Expr::Quote(inner) => {
-                    stack.push(Eval(*inner, k, eenv.clone()));
+                    //stack.push(Eval(*inner, k, eenv.clone()));
+                    stack.push(Apply(k, Types::Quoted(Box::new(*inner)), eenv.clone()));
                 }
                 Expr::UnOp(op, inner) => {
                     let new_cont = Continuation::UnOp {
@@ -1553,6 +1555,24 @@ pub fn eval_plain(src: &str) -> i64 {
     let p = Participant::new(0);
     match p.eval(&expr) {
         Types::Num(n) => n,
+        other => panic!("expected Num, got: {:?}", other),
+    }
+}
+
+/// Evaluate a plain (non-shared) expression and return the numeric result.
+pub fn eval_plain_string(src: &str) -> String {
+    let expr = parse(src).expect("parse failed");
+    let p = Participant::new(0);
+    match p.eval(&expr) {
+        Types::Num(n) => {
+            println!("eval_plain: numeric value: {}", n);
+            n.to_string()
+        }
+        Types::Quoted(v) => {
+            println!("eval_plain: quoted value: {:?}", v);
+            // Return the string representation of the quoted value as string
+            v.to_string()
+        }
         other => panic!("expected Num, got: {:?}", other),
     }
 }

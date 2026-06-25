@@ -1,4 +1,7 @@
-use baru::interpreter::eval::{eval_plain as eval, eval_shared};
+use baru::interpreter::{
+    eval::{eval_plain as eval, eval_shared},
+    eval_plain_string,
+};
 
 // ---------------------------------------------------------------------------
 // Basic arithmetic
@@ -47,17 +50,6 @@ fn test_wrapping_arithmetic() {
 }
 
 // ---------------------------------------------------------------------------
-// Quoting
-// ---------------------------------------------------------------------------
-
-#[test]
-fn test_quote() {
-    assert_eq!(eval("(quote 42)"), 42);
-    assert_eq!(eval("(quote (+ 2 3))"), 5);
-    assert_eq!(eval("(let ((x 10)) (quote (+ x 5)))"), 15);
-}
-
-// ---------------------------------------------------------------------------
 // Atom
 // ---------------------------------------------------------------------------
 
@@ -66,6 +58,60 @@ fn test_atom() {
     assert_eq!(eval("(atom 42)"), 1);
     assert_eq!(eval("(atom (+ 2 3))"), 1);
     assert_eq!(eval("(let ((x 10)) (atom (+ x 5)))"), 1);
+}
+
+// ---------------------------------------------------------------------------
+// Quoting
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_quote() {
+    assert_eq!(eval_plain_string("(quote 42)"), "42");
+    assert_eq!(eval_plain_string("(quote (+ 2 3))"), "(+ 2 3)");
+    assert_eq!(
+        eval_plain_string("(let ((x 10)) (quote (+ x 5)))"),
+        "(+ x 5)"
+    );
+}
+
+#[test]
+#[ignore] // This test is ignored because it requires a more complex evaluation of quoted expressions
+fn test_quote_atom() {
+    assert_eq!(eval_plain_string("(car (+ 1 (+ 2 3)))"), "+");
+    /*assert_eq!(eval("(letrec ((count-additions
+              (lambda (expr)
+                  (if (atom expr)
+                      0
+                      (+ (if (= (car expr) '+) 1 0)
+                          (+
+                              (count-additions (car expr))
+                              (count-additions (cdr expr))
+                          )
+                      )
+                  )
+              )
+          ))
+          (count-additions (quote (+ 1 (+ 2 3))))
+    )"), 2);*/
+}
+
+#[test]
+#[ignore] // This test is ignored because it requires a more complex evaluation of quoted expressions
+fn test_quote_atom2() {
+    assert_eq!(
+        eval(
+            "((letrec ((count-additions
+                                    (lambda (expr)
+                                        (if (atom expr)
+                                            0
+                                            (+ (if (= (car expr) '+) 1 0)
+                                                (count-additions (car expr))
+                                                (count-additions (cdr expr)))))))
+                                        count-additions
+                            (quote (+ 1 (+ 2 3)))))"
+        ),
+        2
+    );
 }
 
 // ---------------------------------------------------------------------------
