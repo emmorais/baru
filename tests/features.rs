@@ -75,6 +75,12 @@ fn test_quote() {
 }
 
 #[test]
+fn test_eval() {
+    assert_eq!(eval_plain_string("(eval (quote (+ 2 3)))"), "5");
+    assert_eq!(eval_plain_string("(eval (quote (if #t 1 0)))"), "1");
+}
+
+#[test]
 #[ignore] // This test is ignored because it requires a more complex evaluation of quoted expressions
 fn test_quote_atom() {
     assert_eq!(eval_plain_string("(car (+ 1 (+ 2 3)))"), "+");

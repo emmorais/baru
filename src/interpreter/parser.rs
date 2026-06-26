@@ -186,6 +186,15 @@ pub fn parse_tokens(tokens: &[String], pos: &mut usize) -> Result<Expr, String> 
             *pos += 1;
             return Ok(Expr::Quote(Box::new(quoted)));
         }
+        if next_tok == "eval" {
+            *pos += 1;
+            let inner = parse_tokens(tokens, pos)?;
+            if *pos >= tokens.len() || tokens[*pos] != ")" {
+                return Err("expected ')' after eval".to_string());
+            }
+            *pos += 1;
+            return Ok(Expr::Eval(Box::new(inner)));
+        }
         // unary operators: atom, not, bitlen
         if next_tok == "atom" {
             *pos += 1;

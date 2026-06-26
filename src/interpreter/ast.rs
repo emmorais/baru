@@ -7,6 +7,7 @@ pub enum Expr {
     Num(i64),
     Var(String),
     Quote(Box<Expr>),
+    Eval(Box<Expr>),
     BinOp(super::parser::BinOp, Box<Expr>, Box<Expr>),
     UnOp(super::parser::UnOp, Box<Expr>),
     Let(Vec<(String, Expr)>, Vec<Expr>),
@@ -30,6 +31,7 @@ impl std::fmt::Display for Expr {
             Expr::Num(n) => write!(f, "{}", n),
             Expr::Var(v) => write!(f, "{}", v),
             Expr::Quote(e) => write!(f, "'{}", e),
+            Expr::Eval(e) => write!(f, "(eval {})", e),
             Expr::BinOp(op, lhs, rhs) => match op {
                 super::parser::BinOp::Add => write!(f, "(+ {} {})", lhs, rhs),
                 super::parser::BinOp::Sub => write!(f, "(- {} {})", lhs, rhs),

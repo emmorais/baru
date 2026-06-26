@@ -173,6 +173,7 @@ pub fn reduce_expression(
                     Expr::Bool(b) => format!("{}", format!("Bool({})", b).yellow()),
                     Expr::BinOp(_, _, _) => format!("{}", expr_short(e).blue()),
                     Expr::Quote(_) => format!("{}", expr_short(e).blue()),
+                    Expr::Eval(_) => format!("{}", expr_short(e).blue()),
                     Expr::UnOp(_, _) => format!("{}", expr_short(e).blue()),
                     Expr::Let(bs, _) => format!("{}", format!("Let(len={})", bs.len()).blue()),
                     Expr::LetRec(bs, _) => {
@@ -242,8 +243,15 @@ pub fn reduce_expression(
                     stack.push(Apply(k, Types::Bool(b), eenv.clone()));
                 }
                 Expr::Quote(inner) => {
-                    //stack.push(Eval(*inner, k, eenv.clone()));
                     stack.push(Apply(k, Types::Quoted(Box::new(*inner)), eenv.clone()));
+                }
+                Expr::Eval(inner) => {
+                    // if inner is quoted, we can evaluate it directly without going through the Eval continuation
+                    if let Expr::Quote(inner_inner) = *inner {
+                        stack.push(Eval(*inner_inner, k, eenv.clone()));
+                    } else {
+                        stack.push(Eval(*inner, k, eenv.clone()));
+                    }
                 }
                 Expr::UnOp(op, inner) => {
                     let new_cont = Continuation::UnOp {
@@ -1496,6 +1504,7 @@ fn from_persist_value(p: PersistValue) -> Option<Types> {
 fn expr_short(e: &Expr) -> String {
     match e {
         Expr::Quote(_) => "Quote".to_string(),
+        Expr::Eval(_) => "Eval".to_string(),
         Expr::UnOp(_, _) => "UnOp".to_string(),
         Expr::Str(s) => format!("Str(len={})", s.len()),
         Expr::Char(_) => "Char".to_string(),
