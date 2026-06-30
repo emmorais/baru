@@ -18,6 +18,7 @@ pub enum BinOp {
 
 #[derive(Debug, Clone, Copy)]
 pub enum UnOp {
+    Atom,
     Not,
     Neg,
     BitLen,
@@ -123,6 +124,16 @@ pub fn tokenize(src: &str) -> Vec<String> {
                     tokens.push(String::from("-"));
                 }
             }
+            ';' => {
+                // comment until end of line
+                chars.next();
+                while let Some(&c) = chars.peek() {
+                    chars.next();
+                    if c == '\n' {
+                        break;
+                    }
+                }
+            }
             d if d.is_ascii_digit() => {
                 let mut num = String::new();
                 while let Some(&d2) = chars.peek() {
@@ -165,7 +176,35 @@ pub fn parse_tokens(tokens: &[String], pos: &mut usize) -> Result<Expr, String> 
             return Err("expected content after '('".to_string());
         }
         let next_tok = &tokens[*pos];
-        // unary operator `not`
+        // quoting
+        if next_tok == "quote" {
+            *pos += 1;
+            let quoted = parse_tokens(tokens, pos)?;
+            if *pos >= tokens.len() || tokens[*pos] != ")" {
+                return Err("expected ')' after quote".to_string());
+            }
+            *pos += 1;
+            return Ok(Expr::Quote(Box::new(quoted)));
+        }
+        if next_tok == "eval" {
+            *pos += 1;
+            let inner = parse_tokens(tokens, pos)?;
+            if *pos >= tokens.len() || tokens[*pos] != ")" {
+                return Err("expected ')' after eval".to_string());
+            }
+            *pos += 1;
+            return Ok(Expr::Eval(Box::new(inner)));
+        }
+        // unary operators: atom, not, bitlen
+        if next_tok == "atom" {
+            *pos += 1;
+            let inner = parse_tokens(tokens, pos)?;
+            if *pos >= tokens.len() || tokens[*pos] != ")" {
+                return Err("expected ')' after atom".to_string());
+            }
+            *pos += 1;
+            return Ok(Expr::UnOp(super::parser::UnOp::Atom, Box::new(inner)));
+        }
         if next_tok == "not" {
             *pos += 1;
             let inner = parse_tokens(tokens, pos)?;

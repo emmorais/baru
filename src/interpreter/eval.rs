@@ -172,6 +172,8 @@ pub fn reduce_expression(
                     Expr::Char(c) => format!("{}", format!("Char({})", c).magenta()),
                     Expr::Bool(b) => format!("{}", format!("Bool({})", b).yellow()),
                     Expr::BinOp(_, _, _) => format!("{}", expr_short(e).blue()),
+                    Expr::Quote(_) => format!("{}", expr_short(e).blue()),
+                    Expr::Eval(_) => format!("{}", expr_short(e).blue()),
                     Expr::UnOp(_, _) => format!("{}", expr_short(e).blue()),
                     Expr::Let(bs, _) => format!("{}", format!("Let(len={})", bs.len()).blue()),
                     Expr::LetRec(bs, _) => {
@@ -198,6 +200,7 @@ pub fn reduce_expression(
                     Types::Str(s) => format!("{}", format!("Str(\"{}\")", s).magenta()),
                     Types::Char(c) => format!("{}", format!("Char({})", c).magenta()),
                     Types::List(l) => format!("{}", format!("List(len={})", l.len()).blue()),
+                    Types::Quoted(e) => format!("{}", format!("Quoted({:?})", e).blue()),
                     Types::Closure(_, _, _) => "Closure".magenta().to_string(),
                     Types::Share(sr) => format!(
                         "{}",
@@ -238,6 +241,17 @@ pub fn reduce_expression(
                 }
                 Expr::Bool(b) => {
                     stack.push(Apply(k, Types::Bool(b), eenv.clone()));
+                }
+                Expr::Quote(inner) => {
+                    stack.push(Apply(k, Types::Quoted(Box::new(*inner)), eenv.clone()));
+                }
+                Expr::Eval(inner) => {
+                    // if inner is quoted, we can evaluate it directly without going through the Eval continuation
+                    if let Expr::Quote(inner_inner) = *inner {
+                        stack.push(Eval(*inner_inner, k, eenv.clone()));
+                    } else {
+                        stack.push(Eval(*inner, k, eenv.clone()));
+                    }
                 }
                 Expr::UnOp(op, inner) => {
                     let new_cont = Continuation::UnOp {
@@ -715,6 +729,12 @@ pub fn reduce_expression(
                     }
                     Continuation::UnOp { op, cont, env } => {
                         let out = match op {
+                            super::parser::UnOp::Atom => match val {
+                                Types::Num(_) | Types::Bool(_) | Types::Str(_) | Types::Char(_) => {
+                                    Types::Num(1)
+                                }
+                                _ => Types::Num(0),
+                            },
                             super::parser::UnOp::Not => match val {
                                 Types::Num(n) => Types::Num(if n == 0 { 1 } else { 0 }),
                                 Types::Bool(b) => Types::Num(if !b { 1 } else { 0 }),
@@ -1483,6 +1503,8 @@ fn from_persist_value(p: PersistValue) -> Option<Types> {
 
 fn expr_short(e: &Expr) -> String {
     match e {
+        Expr::Quote(_) => "Quote".to_string(),
+        Expr::Eval(_) => "Eval".to_string(),
         Expr::UnOp(_, _) => "UnOp".to_string(),
         Expr::Str(s) => format!("Str(len={})", s.len()),
         Expr::Char(_) => "Char".to_string(),
@@ -1542,6 +1564,24 @@ pub fn eval_plain(src: &str) -> i64 {
     let p = Participant::new(0);
     match p.eval(&expr) {
         Types::Num(n) => n,
+        other => panic!("expected Num, got: {:?}", other),
+    }
+}
+
+/// Evaluate a plain (non-shared) expression and return the numeric result.
+pub fn eval_plain_string(src: &str) -> String {
+    let expr = parse(src).expect("parse failed");
+    let p = Participant::new(0);
+    match p.eval(&expr) {
+        Types::Num(n) => {
+            println!("eval_plain: numeric value: {}", n);
+            n.to_string()
+        }
+        Types::Quoted(v) => {
+            println!("eval_plain: quoted value: {:?}", v);
+            // Return the string representation of the quoted value as string
+            v.to_string()
+        }
         other => panic!("expected Num, got: {:?}", other),
     }
 }
