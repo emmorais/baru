@@ -2,6 +2,7 @@
 pub mod ast;
 pub mod backend;
 pub mod aby3_backend;
+pub mod transport_backend;
 pub mod eval;
 pub mod parser;
 

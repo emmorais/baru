@@ -1156,7 +1156,7 @@ impl Participant {
         id: usize,
         transport: T,
     ) -> Self {
-        use crate::interpreter::backend::TransportBackend;
+        use crate::interpreter::transport_backend::TransportBackend;
         let backend: Arc<Mutex<Box<dyn Backend>>> =
             Arc::new(Mutex::new(Box::new(TransportBackend::new(id, transport))));
         let store: Env = Rc::new(RefCell::new(HashMap::new()));
