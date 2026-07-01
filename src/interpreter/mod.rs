@@ -1,6 +1,7 @@
 // Interpreter module moved from main.rs. This file will re-export submodules.
 pub mod ast;
 pub mod backend;
+pub mod aby3_backend;
 pub mod eval;
 pub mod parser;
 

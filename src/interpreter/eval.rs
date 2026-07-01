@@ -8,7 +8,8 @@ use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
 use crate::interpreter::ast::{Env, Expr, Types};
-use crate::interpreter::backend::{Aby3Backend, Backend};
+use crate::interpreter::backend::Backend;
+use crate::interpreter::aby3_backend::Aby3Backend;
 use crate::interpreter::parse;
 use colored::*;
 
