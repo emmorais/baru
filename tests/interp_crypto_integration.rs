@@ -1,5 +1,6 @@
 use baru::crypto::types::Fr;
-use baru::interpreter::backend::{Aby3Backend, Backend};
+use baru::interpreter::backend::Backend;
+use baru::interpreter::aby3_backend::Aby3Backend;
 
 #[test]
 fn test_backend_share_add_mul_roundtrip() {
