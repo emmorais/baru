@@ -3,4 +3,6 @@ pub mod interpreter;
 
 pub mod crypto;
 
+pub mod zkp;
+
 pub mod repl;

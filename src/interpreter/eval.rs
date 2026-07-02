@@ -191,6 +191,7 @@ pub fn reduce_expression(
                         format!("{}", format!("Call(arity={})", args.len()).magenta())
                     }
                     Expr::If(_, _, _) => "If".blue().to_string(),
+                    Expr::Private(_) => format!("{}", expr_short(e).blue()),
                 }
             }
 
@@ -245,6 +246,11 @@ pub fn reduce_expression(
                 }
                 Expr::Quote(inner) => {
                     stack.push(Apply(k, Types::Quoted(Box::new(*inner)), eenv.clone()));
+                }
+                Expr::Private(inner) => {
+                    // Private annotation is metadata for ZKP witness marking.
+                    // At runtime, we evaluate the inner expression directly.
+                    stack.push(Eval(*inner, k, eenv.clone()));
                 }
                 Expr::Eval(inner) => {
                     // if inner is quoted, we can evaluate it directly without going through the Eval continuation
@@ -1303,6 +1309,49 @@ impl Participant {
             "b2a".to_string(),
             Rc::new(RefCell::new(Types::NativeFunc(b2a_fn))),
         );
+
+        // zkp-compile builtin: (zkp-compile expr private-vars)
+        // Compiles an expression to a ZKP circuit
+        let zkp_compile_fn = Arc::new(move |args: Vec<Types>| -> Types {
+            if args.len() != 2 {
+                panic!("zkp-compile expects 2 args: (zkp-compile expr private-vars)");
+            }
+            // For now, return a placeholder (would need AST integration)
+            // This is a placeholder that shows intent
+            Types::Str("zkp-circuit".to_string())
+        });
+        self.store.borrow_mut().insert(
+            "zkp-compile".to_string(),
+            Rc::new(RefCell::new(Types::NativeFunc(zkp_compile_fn))),
+        );
+
+        // zkp-prove builtin: (zkp-prove circuit private-vals public-vals)
+        // Generates a ZKP proof
+        let zkp_prove_fn = Arc::new(move |args: Vec<Types>| -> Types {
+            if args.len() != 3 {
+                panic!("zkp-prove expects 3 args");
+            }
+            // For now, return a placeholder
+            Types::Str("zkp-proof".to_string())
+        });
+        self.store.borrow_mut().insert(
+            "zkp-prove".to_string(),
+            Rc::new(RefCell::new(Types::NativeFunc(zkp_prove_fn))),
+        );
+
+        // zkp-verify builtin: (zkp-verify circuit proof public-vals)
+        // Verifies a ZKP proof
+        let zkp_verify_fn = Arc::new(move |args: Vec<Types>| -> Types {
+            if args.len() != 3 {
+                panic!("zkp-verify expects 3 args");
+            }
+            // For now, return true (placeholder)
+            Types::Bool(true)
+        });
+        self.store.borrow_mut().insert(
+            "zkp-verify".to_string(),
+            Rc::new(RefCell::new(Types::NativeFunc(zkp_verify_fn))),
+        );
     }
 
     /// Reveal a shared value to the caller (simulated reveal via backend).
@@ -1522,6 +1571,7 @@ fn expr_short(e: &Expr) -> String {
         Expr::Lambda(ps, _) => format!("Lambda(arity={})", ps.len()),
         Expr::Call(_, args) => format!("Call(arity={})", args.len()),
         Expr::If(_, _, _) => "If".to_string(),
+        Expr::Private(_) => "Private".to_string(),
     }
 }
 

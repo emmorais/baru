@@ -22,6 +22,7 @@ pub enum Expr {
     Str(String),
     Char(char),
     Bool(bool),
+    Private(Box<Expr>),  // NEW: (private expr) for ZKP witness marking
 }
 
 // Implement to_string for Expr
@@ -122,6 +123,7 @@ impl std::fmt::Display for Expr {
             Expr::Str(s) => write!(f, "\"{}\"", s),
             Expr::Char(c) => write!(f, "'{}'", c),
             Expr::Bool(b) => write!(f, "{}", b),
+            Expr::Private(expr) => write!(f, "(private {})", expr),
         }
     }
 }

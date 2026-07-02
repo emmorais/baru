@@ -186,6 +186,16 @@ pub fn parse_tokens(tokens: &[String], pos: &mut usize) -> Result<Expr, String> 
             *pos += 1;
             return Ok(Expr::Quote(Box::new(quoted)));
         }
+        // private annotation for ZKP witness marking
+        if next_tok == "private" {
+            *pos += 1;
+            let inner = parse_tokens(tokens, pos)?;
+            if *pos >= tokens.len() || tokens[*pos] != ")" {
+                return Err("expected ')' after private".to_string());
+            }
+            *pos += 1;
+            return Ok(Expr::Private(Box::new(inner)));
+        }
         if next_tok == "eval" {
             *pos += 1;
             let inner = parse_tokens(tokens, pos)?;
