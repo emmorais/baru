@@ -7,6 +7,7 @@ use std::collections::HashMap;
 
 pub mod binius64_backend;
 pub mod circuit_compiler;
+pub mod serialization;
 
 /// Public input/output values for a circuit
 /// Maps variable names to field element values

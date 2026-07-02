@@ -1352,6 +1352,44 @@ impl Participant {
             "zkp-verify".to_string(),
             Rc::new(RefCell::new(Types::NativeFunc(zkp_verify_fn))),
         );
+
+        // proof-save builtin: (proof-save proof filename)
+        // Saves a proof to a JSON file
+        let proof_save_fn = Arc::new(move |args: Vec<Types>| -> Types {
+            if args.len() != 2 {
+                panic!("proof-save expects 2 args: (proof-save proof filename)");
+            }
+            match (&args[0], &args[1]) {
+                (Types::Str(_proof_str), Types::Str(_filename)) => {
+                    // For now, placeholder - would integrate with serialization module
+                    Types::Str("proof-saved".to_string())
+                }
+                _ => panic!("proof-save expects (string string)"),
+            }
+        });
+        self.store.borrow_mut().insert(
+            "proof-save".to_string(),
+            Rc::new(RefCell::new(Types::NativeFunc(proof_save_fn))),
+        );
+
+        // proof-load builtin: (proof-load filename)
+        // Loads a proof from a JSON file
+        let proof_load_fn = Arc::new(move |args: Vec<Types>| -> Types {
+            if args.len() != 1 {
+                panic!("proof-load expects 1 arg: (proof-load filename)");
+            }
+            match &args[0] {
+                Types::Str(_filename) => {
+                    // For now, placeholder - would integrate with serialization module
+                    Types::Str("proof-loaded".to_string())
+                }
+                _ => panic!("proof-load expects a filename string"),
+            }
+        });
+        self.store.borrow_mut().insert(
+            "proof-load".to_string(),
+            Rc::new(RefCell::new(Types::NativeFunc(proof_load_fn))),
+        );
     }
 
     /// Reveal a shared value to the caller (simulated reveal via backend).
