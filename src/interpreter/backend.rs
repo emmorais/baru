@@ -1,6 +1,5 @@
 use crate::crypto::types::Fr;
 
-
 #[derive(Debug, Clone)]
 pub struct ShareRef {
     pub id: u64,
@@ -38,5 +37,3 @@ pub trait Backend: Send + Sync {
     fn shift_right(&mut self, a: &ShareRef, n: usize) -> ShareRef;
     fn shift_left(&mut self, a: &ShareRef, n: usize) -> ShareRef;
 }
-
-

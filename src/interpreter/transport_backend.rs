@@ -7,8 +7,8 @@
 
 use std::collections::HashMap;
 
-use crate::crypto::net::{PartyId, Transport};
 use crate::crypto::aby3_protocol::PartyShare;
+use crate::crypto::net::{PartyId, Transport};
 use crate::crypto::types::Fr;
 
 use super::backend::{Backend, ShareRef};
@@ -48,11 +48,7 @@ impl<T: Transport> TransportBackend<T> {
 
     fn store(&mut self, id: u64, ps: PartyShare, nbits: usize, owner: usize) -> ShareRef {
         self.shares.insert(id, ps);
-        ShareRef {
-            id,
-            nbits,
-            owner,
-        }
+        ShareRef { id, nbits, owner }
     }
 
     fn get(&self, sr: &ShareRef) -> &PartyShare {
@@ -69,7 +65,8 @@ impl<T: Transport> TransportBackend<T> {
 impl<T: Transport + 'static> Backend for TransportBackend<T> {
     fn share_secret(&mut self, value: Fr, nbits: usize, owner: usize) -> ShareRef {
         let id = self.alloc_id();
-        let ps = crate::crypto::aby3_protocol::share_input(value, id, owner, self.me, &self.transport);
+        let ps =
+            crate::crypto::aby3_protocol::share_input(value, id, owner, self.me, &self.transport);
         self.store(id, ps, nbits, owner)
     }
 
@@ -149,7 +146,8 @@ impl<T: Transport + 'static> Backend for TransportBackend<T> {
             let _mul_id_triple2 = self.alloc_id();
             let _mul_id_triple3 = self.alloc_id();
             println!("TransportBackend: computing mul for OR, mul_id={}", mul_id);
-            let prod = crate::crypto::aby3_protocol::mul_party(&pa, &pb, mul_id, self.me, &self.transport);
+            let prod =
+                crate::crypto::aby3_protocol::mul_party(&pa, &pb, mul_id, self.me, &self.transport);
             let or_ps = crate::crypto::aby3_protocol::sub_party(&sum, &prod);
             let new_id = self.alloc_id();
             println!("TransportBackend: inserting OR share id {}", new_id);
@@ -191,7 +189,8 @@ impl<T: Transport + 'static> Backend for TransportBackend<T> {
         let pb = self.get_cloned(&eq);
         let sum = crate::crypto::aby3_protocol::add_party(&pa, &pb);
         let mul_id = self.alloc_id();
-        let prod = crate::crypto::aby3_protocol::mul_party(&pa, &pb, mul_id, self.me, &self.transport);
+        let prod =
+            crate::crypto::aby3_protocol::mul_party(&pa, &pb, mul_id, self.me, &self.transport);
         let ps = crate::crypto::aby3_protocol::sub_party(&sum, &prod);
         let id = self.alloc_id();
         self.store(id, ps, 1, a.owner)
@@ -205,7 +204,8 @@ impl<T: Transport + 'static> Backend for TransportBackend<T> {
     fn a2b(&mut self, a: &ShareRef, nbits: usize) -> Vec<ShareRef> {
         let pa = self.get_cloned(a);
         let op_id = self.alloc_id();
-        let bit_shares = crate::crypto::aby3_protocol::a2b_party(&pa, nbits, op_id, self.me, &self.transport);
+        let bit_shares =
+            crate::crypto::aby3_protocol::a2b_party(&pa, nbits, op_id, self.me, &self.transport);
         bit_shares
             .into_iter()
             .map(|ps| {

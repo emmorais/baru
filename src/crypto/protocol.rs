@@ -6,6 +6,6 @@
 
 // Re-export ABY3-specific protocol from its module for backward compatibility
 pub use crate::crypto::aby3_protocol::{
-    PartyShare, share_input, share_public, add_party, sub_party, scalar_mul_party,
-    reveal, deal_triple, receive_triple, mul_party, a2b_party, reveal_bit_to_all,
+    a2b_party, add_party, deal_triple, mul_party, receive_triple, reveal, reveal_bit_to_all,
+    scalar_mul_party, share_input, share_public, sub_party, PartyShare,
 };

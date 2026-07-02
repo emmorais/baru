@@ -26,10 +26,7 @@ impl GCBit {
     pub fn new(value: bool) -> Self {
         // In real GC, mask would be a cryptographic commitment
         // For this demo, we use a simple boolean mask
-        GCBit {
-            value,
-            mask: false,
-        }
+        GCBit { value, mask: false }
     }
 
     pub fn zero() -> Self {
@@ -85,7 +82,7 @@ impl GarbledShare {
 }
 
 /// 2-party Garbled Circuits backend.
-/// 
+///
 /// This backend implements boolean circuit evaluation with garbling.
 /// Party 0 garbles circuits; Party 1 evaluates them.
 pub struct GCBackend {
@@ -227,11 +224,8 @@ impl Backend for GCBackend {
                     let product_bit = Self::and_gate(a_bit, b_bit);
                     if product_bit {
                         // Add the product bit to result at position i+j
-                        let (sum, mut carry) = Self::full_adder(
-                            result_bits[i + j].value,
-                            product_bit,
-                            false,
-                        );
+                        let (sum, mut carry) =
+                            Self::full_adder(result_bits[i + j].value, product_bit, false);
                         result_bits[i + j] = GCBit::new(sum);
 
                         // Propagate carry
@@ -290,7 +284,7 @@ impl Backend for GCBackend {
                 let a_bit = ga.bits.get(i).map(|b| b.value).unwrap_or(false);
                 let b_bit = gb.bits.get(i).map(|b| b.value).unwrap_or(false);
                 if a_bit != b_bit {
-                    less = a_bit < b_bit;
+                    less = !a_bit & b_bit;
                     equal = false;
                 }
             }
@@ -303,9 +297,7 @@ impl Backend for GCBackend {
     fn le(&mut self, a: &ShareRef, b: &ShareRef) -> ShareRef {
         let lt = self.lt(a, b);
         let eq = self.eq(a, b);
-
-        let result = self.or(&lt, &eq);
-        result
+        self.or(&lt, &eq)
     }
 
     fn reveal(&mut self, a: &ShareRef, _reveal_to: Option<usize>) -> Fr {
@@ -334,7 +326,11 @@ impl Backend for GCBackend {
                 result |= 1u128 << i;
             }
         }
-        self.share_secret(result, bits.len(), bits.first().map(|s| s.owner).unwrap_or(0))
+        self.share_secret(
+            result,
+            bits.len(),
+            bits.first().map(|s| s.owner).unwrap_or(0),
+        )
     }
 
     fn and(&mut self, a: &ShareRef, b: &ShareRef) -> ShareRef {

@@ -441,11 +441,11 @@ pub fn a2b_party<T: Transport>(
     let mut out: Vec<PartyShare> = Vec::with_capacity(nbits);
     let mut carry = share_public(0, me);
 
-    for i in 0..nbits {
+    for (i, r_bit) in r_bits.iter().enumerate().take(nbits) {
         let d_bit: Fr = (d >> i) & 1;
         let r_bit_val: Fr = (r >> i) & 1;
 
-        let s1 = xor_public_party(&r_bits[i], &share_public(d_bit, me), me);
+        let s1 = xor_public_party(r_bit, &share_public(d_bit, me), me);
         let sum = xor_public_party(&s1, &carry, me);
         out.push(sum);
 
