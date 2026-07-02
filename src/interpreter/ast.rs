@@ -22,7 +22,7 @@ pub enum Expr {
     Str(String),
     Char(char),
     Bool(bool),
-    Private(Box<Expr>),  // NEW: (private expr) for ZKP witness marking
+    Private(Box<Expr>), // NEW: (private expr) for ZKP witness marking
 }
 
 // Implement to_string for Expr

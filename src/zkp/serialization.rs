@@ -18,14 +18,13 @@ pub fn save_proof<P: AsRef<Path>>(proof: &ZKProof, path: P) -> Result<(), String
     let json_string = serde_json::to_string_pretty(&json)
         .map_err(|e| format!("Failed to serialize proof: {}", e))?;
 
-    fs::write(&path, json_string)
-        .map_err(|e| format!("Failed to write proof file: {}", e))
+    fs::write(&path, json_string).map_err(|e| format!("Failed to write proof file: {}", e))
 }
 
 /// Load a proof from a JSON file
 pub fn load_proof<P: AsRef<Path>>(path: P) -> Result<ZKProof, String> {
-    let json_string = fs::read_to_string(&path)
-        .map_err(|e| format!("Failed to read proof file: {}", e))?;
+    let json_string =
+        fs::read_to_string(&path).map_err(|e| format!("Failed to read proof file: {}", e))?;
 
     let json: Value = serde_json::from_str(&json_string)
         .map_err(|e| format!("Failed to parse proof JSON: {}", e))?;
@@ -39,8 +38,8 @@ pub fn load_proof<P: AsRef<Path>>(path: P) -> Result<ZKProof, String> {
         .as_str()
         .ok_or("Missing 'proof_data' field in proof")?;
 
-    let proof_data = hex::decode(proof_data_hex)
-        .map_err(|e| format!("Failed to decode proof data: {}", e))?;
+    let proof_data =
+        hex::decode(proof_data_hex).map_err(|e| format!("Failed to decode proof data: {}", e))?;
 
     let public_values = json["public_values"]
         .as_object()
@@ -52,9 +51,7 @@ pub fn load_proof<P: AsRef<Path>>(path: P) -> Result<ZKProof, String> {
         })
         .collect::<Result<PublicValues, String>>()?;
 
-    let timestamp = json["timestamp"]
-        .as_u64()
-        .unwrap_or(0);
+    let timestamp = json["timestamp"].as_u64().unwrap_or(0);
 
     Ok(ZKProof {
         proof_data,
@@ -81,14 +78,13 @@ pub fn save_circuit<P: AsRef<Path>>(circuit: &Circuit, path: P) -> Result<(), St
     let json_string = serde_json::to_string_pretty(&json)
         .map_err(|e| format!("Failed to serialize circuit: {}", e))?;
 
-    fs::write(&path, json_string)
-        .map_err(|e| format!("Failed to write circuit file: {}", e))
+    fs::write(&path, json_string).map_err(|e| format!("Failed to write circuit file: {}", e))
 }
 
 /// Load a circuit from a JSON file
 pub fn load_circuit<P: AsRef<Path>>(path: P) -> Result<Circuit, String> {
-    let json_string = fs::read_to_string(&path)
-        .map_err(|e| format!("Failed to read circuit file: {}", e))?;
+    let json_string =
+        fs::read_to_string(&path).map_err(|e| format!("Failed to read circuit file: {}", e))?;
 
     let json: Value = serde_json::from_str(&json_string)
         .map_err(|e| format!("Failed to parse circuit JSON: {}", e))?;
@@ -123,19 +119,13 @@ pub fn load_circuit<P: AsRef<Path>>(path: P) -> Result<Circuit, String> {
         .collect::<Result<Vec<_>, _>>()?;
 
     let metadata = CircuitMetadata {
-        num_gates: json["metadata"]["num_gates"]
-            .as_u64()
-            .unwrap_or(0) as usize,
-        num_constraints: json["metadata"]["num_constraints"]
-            .as_u64()
-            .unwrap_or(0) as usize,
+        num_gates: json["metadata"]["num_gates"].as_u64().unwrap_or(0) as usize,
+        num_constraints: json["metadata"]["num_constraints"].as_u64().unwrap_or(0) as usize,
         backend_name: json["metadata"]["backend_name"]
             .as_str()
             .ok_or("Missing backend_name in metadata")?
             .to_string(),
-        timestamp: json["metadata"]["timestamp"]
-            .as_u64()
-            .unwrap_or(0),
+        timestamp: json["metadata"]["timestamp"].as_u64().unwrap_or(0),
     };
 
     Ok(Circuit {

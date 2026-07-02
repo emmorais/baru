@@ -51,18 +51,14 @@ pub struct ZKProof {
 /// ZKP Backend trait - abstraction over different ZKP systems
 pub trait ZKPBackend: Send + Sync {
     /// Compile an expression into a circuit
-    /// 
+    ///
     /// # Arguments
     /// * `expr` - The expression to compile
     /// * `private_vars` - Variable names that should be treated as witnesses
-    /// 
+    ///
     /// # Returns
     /// A compiled circuit ready for proving, or an error message
-    fn compile_circuit(
-        &self,
-        expr: &Expr,
-        private_vars: &[String],
-    ) -> Result<Circuit, String>;
+    fn compile_circuit(&self, expr: &Expr, private_vars: &[String]) -> Result<Circuit, String>;
 
     /// Generate a proof for a circuit given witness and public values
     ///
@@ -107,11 +103,7 @@ pub trait ZKPBackend: Send + Sync {
 pub struct MockZKPBackend;
 
 impl ZKPBackend for MockZKPBackend {
-    fn compile_circuit(
-        &self,
-        _expr: &Expr,
-        private_vars: &[String],
-    ) -> Result<Circuit, String> {
+    fn compile_circuit(&self, _expr: &Expr, private_vars: &[String]) -> Result<Circuit, String> {
         Ok(Circuit {
             circuit_data: vec![],
             witness_vars: private_vars.to_vec(),
@@ -179,9 +171,7 @@ mod tests {
     fn test_mock_backend_prove() {
         let backend = MockZKPBackend;
         let expr = Expr::Num(42);
-        let circuit = backend
-            .compile_circuit(&expr, &["x".to_string()])
-            .unwrap();
+        let circuit = backend.compile_circuit(&expr, &["x".to_string()]).unwrap();
 
         let private_values = HashMap::new();
         let public_values = HashMap::new();
@@ -194,9 +184,7 @@ mod tests {
     fn test_mock_backend_verify() {
         let backend = MockZKPBackend;
         let expr = Expr::Num(42);
-        let circuit = backend
-            .compile_circuit(&expr, &["x".to_string()])
-            .unwrap();
+        let circuit = backend.compile_circuit(&expr, &["x".to_string()]).unwrap();
 
         let proof = backend
             .prove(&circuit, &HashMap::new(), &HashMap::new())

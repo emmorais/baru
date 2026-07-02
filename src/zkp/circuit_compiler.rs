@@ -47,6 +47,12 @@ pub struct CircuitCompiler {
     public_inputs: Vec<String>,
 }
 
+impl Default for CircuitCompiler {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl CircuitCompiler {
     pub fn new() -> Self {
         CircuitCompiler {

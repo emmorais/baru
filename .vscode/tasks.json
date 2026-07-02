@@ -1,0 +1,21 @@
+{
+	"version": "2.0.0",
+	"tasks": [
+		{
+			"label": "Clippy Check",
+			"type": "shell",
+			"command": "cargo",
+			"args": [
+				"clippy",
+				"--all-targets",
+				"--all-features",
+				"--",
+				"-D",
+				"warnings"
+			],
+			"problemMatcher": [
+				"$rustc"
+			]
+		}
+	]
+}
