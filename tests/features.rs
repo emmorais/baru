@@ -887,3 +887,14 @@ fn test_panics() {
                  (if (> a b) a b))";
     assert_eq!(eval_shared(src), 42);
 }
+
+// Test ZKP
+// Addition of private variables with zero-knowledge proof, using "private" builtin
+// All variables fro the same participant are private, and the result is public.
+// The result is revealed to all participants, but the inputs are not revealed.
+/*#[test]
+fn test_zkp() {
+    let src = "(let ((a (private 30)) (b (private 42)) (c 72))
+                        (== (verify (prove (== (+ a b) c))) 1))";
+    assert_eq!(eval_shared(src), 72);
+}*/
