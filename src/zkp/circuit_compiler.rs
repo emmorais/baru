@@ -37,9 +37,9 @@
 // the circuit as small as possible because the prover "guesses"
 // the answer and the verifier only checks the algebraic relation.
 
-use std::collections::HashMap;
 use crate::interpreter::ast::Expr;
 use crate::interpreter::parser::{BinOp, UnOp};
+use std::collections::HashMap;
 
 // ─── Flat IR ─────────────────────────────────────────────────
 
@@ -67,8 +67,8 @@ pub enum FlatOp {
     /// Witness: quotient q and remainder r such that lhs = q*rhs + r, 0 ≤ r < rhs.
     /// Emits: q (witness), r (witness), check constraint q*rhs + r == lhs.
     IDiv {
-        dst_q: Wire,   // quotient
-        dst_r: Wire,   // remainder
+        dst_q: Wire, // quotient
+        dst_r: Wire, // remainder
         lhs: Wire,
         rhs: Wire,
     },
@@ -168,7 +168,12 @@ pub enum Constraint {
     Shr { dst: Wire, src: Wire, amount: u32 },
 
     /// Mux gadget: dst = band(cond,t) bor band(bnot(cond),e)
-    Mux { dst: Wire, cond: Wire, t_val: Wire, e_val: Wire },
+    Mux {
+        dst: Wire,
+        cond: Wire,
+        t_val: Wire,
+        e_val: Wire,
+    },
 
     /// popcount gadget
     PopCount { dst: Wire, src: Wire },
@@ -204,7 +209,9 @@ pub struct CircuitCompiler {
 }
 
 impl Default for CircuitCompiler {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl CircuitCompiler {
@@ -287,28 +294,37 @@ impl CircuitCompiler {
         flat: &mut Vec<FlatOp>,
     ) -> Result<Wire, String> {
         match expr {
-
             // ── Literals ─────────────────────────────────────
             Expr::Num(n) => {
                 let dst = self.fresh("c");
-                flat.push(FlatOp::Const { dst: dst.clone(), value: *n });
+                flat.push(FlatOp::Const {
+                    dst: dst.clone(),
+                    value: *n,
+                });
                 Ok(dst)
             }
             Expr::Bool(b) => {
                 let dst = self.fresh("c");
-                flat.push(FlatOp::Const { dst: dst.clone(), value: if *b { 1 } else { 0 } });
+                flat.push(FlatOp::Const {
+                    dst: dst.clone(),
+                    value: if *b { 1 } else { 0 },
+                });
                 Ok(dst)
             }
             Expr::Char(c) => {
                 let dst = self.fresh("c");
-                flat.push(FlatOp::Const { dst: dst.clone(), value: *c as i64 });
+                flat.push(FlatOp::Const {
+                    dst: dst.clone(),
+                    value: *c as i64,
+                });
                 Ok(dst)
             }
 
             // ── Variable reference ────────────────────────────
-            Expr::Var(name) => {
-                env.get(name).cloned().ok_or_else(|| format!("unbound variable: {}", name))
-            }
+            Expr::Var(name) => env
+                .get(name)
+                .cloned()
+                .ok_or_else(|| format!("unbound variable: {}", name)),
 
             // ── Private annotation (metadata only) ───────────
             Expr::Private(inner) => self.flatten(inner, env, flat),
@@ -316,7 +332,10 @@ impl CircuitCompiler {
             // ── Quote (treat as constant 0 — not evaluatable) ─
             Expr::Quote(_) => {
                 let dst = self.fresh("c");
-                flat.push(FlatOp::Const { dst: dst.clone(), value: 0 });
+                flat.push(FlatOp::Const {
+                    dst: dst.clone(),
+                    value: 0,
+                });
                 Ok(dst)
             }
 
@@ -330,7 +349,10 @@ impl CircuitCompiler {
                     child_env.insert(name.clone(), wire);
                 }
                 let mut result = self.fresh("c");
-                flat.push(FlatOp::Const { dst: result.clone(), value: 0 }); // default
+                flat.push(FlatOp::Const {
+                    dst: result.clone(),
+                    value: 0,
+                }); // default
                 for e in body {
                     result = self.flatten(e, &mut child_env, flat)?;
                 }
@@ -347,7 +369,10 @@ impl CircuitCompiler {
                     child_env.insert(name.clone(), wire);
                 }
                 let mut result = self.fresh("c");
-                flat.push(FlatOp::Const { dst: result.clone(), value: 0 });
+                flat.push(FlatOp::Const {
+                    dst: result.clone(),
+                    value: 0,
+                });
                 for e in body {
                     result = self.flatten(e, &mut child_env, flat)?;
                 }
@@ -357,7 +382,10 @@ impl CircuitCompiler {
             // ── Seq ───────────────────────────────────────────
             Expr::Seq(exprs) => {
                 let mut result = self.fresh("c");
-                flat.push(FlatOp::Const { dst: result.clone(), value: 0 });
+                flat.push(FlatOp::Const {
+                    dst: result.clone(),
+                    value: 0,
+                });
                 for e in exprs {
                     result = self.flatten(e, env, flat)?;
                 }
@@ -382,9 +410,9 @@ impl CircuitCompiler {
             // then a Mux gate selects the result based on the condition bit.
             // This is the standard ZK technique: no control flow, only data flow.
             Expr::If(cond, then_e, else_e) => {
-                let cond_wire  = self.flatten(cond,   env, flat)?;
-                let then_wire  = self.flatten(then_e, env, flat)?;
-                let else_wire  = self.flatten(else_e, env, flat)?;
+                let cond_wire = self.flatten(cond, env, flat)?;
+                let then_wire = self.flatten(then_e, env, flat)?;
+                let else_wire = self.flatten(else_e, env, flat)?;
                 let dst = self.fresh("mux");
                 flat.push(FlatOp::Mux {
                     dst: dst.clone(),
@@ -403,20 +431,21 @@ impl CircuitCompiler {
                 // A bare lambda not applied to arguments yields a sentinel.
                 // In practice lambdas are only meaningful inside a Call.
                 let dst = self.fresh("lam");
-                flat.push(FlatOp::Const { dst: dst.clone(), value: 0 });
+                flat.push(FlatOp::Const {
+                    dst: dst.clone(),
+                    value: 0,
+                });
                 let _ = (params, body);
                 Ok(dst)
             }
-            Expr::Call(func, args) => {
-                self.flatten_call(func, args, env, flat)
-            }
+            Expr::Call(func, args) => self.flatten_call(func, args, env, flat),
 
             // ── List operations — structural, encode as pairs ─
             Expr::Cons(left, right) => {
                 // Pairs: in a circuit we keep both components; return the left
                 // wire as a proxy (the right is emitted as a side-effect).
-                let _l = self.flatten(left,  env, flat)?;
-                let  r = self.flatten(right, env, flat)?;
+                let _l = self.flatten(left, env, flat)?;
+                let r = self.flatten(right, env, flat)?;
                 Ok(r) // conservative: return last meaningful wire
             }
             Expr::Car(inner) => self.flatten(inner, env, flat),
@@ -426,7 +455,10 @@ impl CircuitCompiler {
             Expr::Str(_) => {
                 // Strings are not arithmetic; emit a sentinel 0.
                 let dst = self.fresh("str");
-                flat.push(FlatOp::Const { dst: dst.clone(), value: 0 });
+                flat.push(FlatOp::Const {
+                    dst: dst.clone(),
+                    value: 0,
+                });
                 Ok(dst)
             }
         }
@@ -443,9 +475,21 @@ impl CircuitCompiler {
     ) -> Result<Wire, String> {
         let dst = self.fresh("t");
         match op {
-            BinOp::Add => flat.push(FlatOp::IAdd32 { dst: dst.clone(), lhs: l, rhs: r }),
-            BinOp::Sub => flat.push(FlatOp::ISub32 { dst: dst.clone(), lhs: l, rhs: r }),
-            BinOp::Mul => flat.push(FlatOp::IMul   { dst: dst.clone(), lhs: l, rhs: r }),
+            BinOp::Add => flat.push(FlatOp::IAdd32 {
+                dst: dst.clone(),
+                lhs: l,
+                rhs: r,
+            }),
+            BinOp::Sub => flat.push(FlatOp::ISub32 {
+                dst: dst.clone(),
+                lhs: l,
+                rhs: r,
+            }),
+            BinOp::Mul => flat.push(FlatOp::IMul {
+                dst: dst.clone(),
+                lhs: l,
+                rhs: r,
+            }),
 
             // Non-deterministic division: witness q and rem, then check.
             BinOp::DivExact => {
@@ -469,34 +513,76 @@ impl CircuitCompiler {
             }
 
             // Comparisons
-            BinOp::Eq => flat.push(FlatOp::ICmpEq  { dst: dst.clone(), lhs: l, rhs: r }),
-            BinOp::Lt => flat.push(FlatOp::ICmpSlt { dst: dst.clone(), lhs: l, rhs: r }),
+            BinOp::Eq => flat.push(FlatOp::ICmpEq {
+                dst: dst.clone(),
+                lhs: l,
+                rhs: r,
+            }),
+            BinOp::Lt => flat.push(FlatOp::ICmpSlt {
+                dst: dst.clone(),
+                lhs: l,
+                rhs: r,
+            }),
             BinOp::Gt => {
                 // a > b  ⟺  b < a
-                flat.push(FlatOp::ICmpSlt { dst: dst.clone(), lhs: r, rhs: l });
+                flat.push(FlatOp::ICmpSlt {
+                    dst: dst.clone(),
+                    lhs: r,
+                    rhs: l,
+                });
             }
             BinOp::Le => {
                 // a ≤ b  ⟺  NOT (a > b)  ⟺  NOT (b < a)
                 let lt = self.fresh("lt");
-                flat.push(FlatOp::ICmpSlt { dst: lt.clone(), lhs: r, rhs: l.clone() });
-                flat.push(FlatOp::BNot { dst: dst.clone(), src: lt });
+                flat.push(FlatOp::ICmpSlt {
+                    dst: lt.clone(),
+                    lhs: r,
+                    rhs: l.clone(),
+                });
+                flat.push(FlatOp::BNot {
+                    dst: dst.clone(),
+                    src: lt,
+                });
             }
             BinOp::Ge => {
                 // a ≥ b  ⟺  NOT (a < b)
                 let lt = self.fresh("lt");
-                flat.push(FlatOp::ICmpSlt { dst: lt.clone(), lhs: l.clone(), rhs: r });
-                flat.push(FlatOp::BNot { dst: dst.clone(), src: lt });
+                flat.push(FlatOp::ICmpSlt {
+                    dst: lt.clone(),
+                    lhs: l.clone(),
+                    rhs: r,
+                });
+                flat.push(FlatOp::BNot {
+                    dst: dst.clone(),
+                    src: lt,
+                });
             }
 
             // Logical (bitwise)
-            BinOp::And => flat.push(FlatOp::BAnd { dst: dst.clone(), lhs: l, rhs: r }),
-            BinOp::Or  => flat.push(FlatOp::BOr  { dst: dst.clone(), lhs: l, rhs: r }),
+            BinOp::And => flat.push(FlatOp::BAnd {
+                dst: dst.clone(),
+                lhs: l,
+                rhs: r,
+            }),
+            BinOp::Or => flat.push(FlatOp::BOr {
+                dst: dst.clone(),
+                lhs: l,
+                rhs: r,
+            }),
 
             // Shifts — rhs must be a compile-time constant for circuits.
             // We accept it as a wire and encode amount = 0 as a fallback;
             // a fully static amount is enforced when the rhs is Expr::Num.
-            BinOp::AshLeft  => flat.push(FlatOp::Shl { dst: dst.clone(), src: l, amount: 0 }),
-            BinOp::AshRight => flat.push(FlatOp::Shr { dst: dst.clone(), src: l, amount: 0 }),
+            BinOp::AshLeft => flat.push(FlatOp::Shl {
+                dst: dst.clone(),
+                src: l,
+                amount: 0,
+            }),
+            BinOp::AshRight => flat.push(FlatOp::Shr {
+                dst: dst.clone(),
+                src: l,
+                amount: 0,
+            }),
         }
         Ok(dst)
     }
@@ -511,20 +597,36 @@ impl CircuitCompiler {
     ) -> Result<Wire, String> {
         let dst = self.fresh("t");
         match op {
-            UnOp::Not => flat.push(FlatOp::BNot { dst: dst.clone(), src }),
+            UnOp::Not => flat.push(FlatOp::BNot {
+                dst: dst.clone(),
+                src,
+            }),
             UnOp::Neg => {
                 // -x  =  0 - x  =  isub_32(0, x)
                 let zero = self.fresh("c");
-                flat.push(FlatOp::Const { dst: zero.clone(), value: 0 });
-                flat.push(FlatOp::ISub32 { dst: dst.clone(), lhs: zero, rhs: src });
+                flat.push(FlatOp::Const {
+                    dst: zero.clone(),
+                    value: 0,
+                });
+                flat.push(FlatOp::ISub32 {
+                    dst: dst.clone(),
+                    lhs: zero,
+                    rhs: src,
+                });
             }
             UnOp::Atom => {
                 // atom(x) returns 1 for non-list types; in a numeric circuit always 1.
-                flat.push(FlatOp::Const { dst: dst.clone(), value: 1 });
+                flat.push(FlatOp::Const {
+                    dst: dst.clone(),
+                    value: 1,
+                });
             }
             UnOp::BitLen => {
                 // bitlen(x) = ceil(log2(x+1)); approximate via popcount on the wire.
-                flat.push(FlatOp::PopCount { dst: dst.clone(), src });
+                flat.push(FlatOp::PopCount {
+                    dst: dst.clone(),
+                    src,
+                });
             }
         }
         Ok(dst)
@@ -544,7 +646,8 @@ impl CircuitCompiler {
                 if params.len() != args.len() {
                     return Err(format!(
                         "arity mismatch: lambda expects {}, got {}",
-                        params.len(), args.len()
+                        params.len(),
+                        args.len()
                     ));
                 }
                 // Beta-reduce: evaluate each argument, bind to param names.
@@ -563,7 +666,10 @@ impl CircuitCompiler {
                         // We can only inline if we still have the lambda body.
                         // At this point the wire is already collapsed; emit sentinel.
                         let dst = self.fresh("call");
-                        flat.push(FlatOp::Const { dst: dst.clone(), value: 0 });
+                        flat.push(FlatOp::Const {
+                            dst: dst.clone(),
+                            value: 0,
+                        });
                         Ok(dst)
                     }
                     None => Err(format!("unbound function: {}", name)),
@@ -581,63 +687,110 @@ impl CircuitCompiler {
         let mut out = Vec::with_capacity(flat.len());
         for op in flat {
             match op {
-                FlatOp::Const { dst, value } =>
-                    out.push(Constraint::Constant { dst: dst.clone(), value: *value }),
+                FlatOp::Const { dst, value } => out.push(Constraint::Constant {
+                    dst: dst.clone(),
+                    value: *value,
+                }),
 
-                FlatOp::IAdd32 { dst, lhs, rhs } =>
-                    out.push(Constraint::IAdd32 { dst: dst.clone(), lhs: lhs.clone(), rhs: rhs.clone() }),
+                FlatOp::IAdd32 { dst, lhs, rhs } => out.push(Constraint::IAdd32 {
+                    dst: dst.clone(),
+                    lhs: lhs.clone(),
+                    rhs: rhs.clone(),
+                }),
 
-                FlatOp::ISub32 { dst, lhs, rhs } =>
-                    out.push(Constraint::ISub32 { dst: dst.clone(), lhs: lhs.clone(), rhs: rhs.clone() }),
+                FlatOp::ISub32 { dst, lhs, rhs } => out.push(Constraint::ISub32 {
+                    dst: dst.clone(),
+                    lhs: lhs.clone(),
+                    rhs: rhs.clone(),
+                }),
 
-                FlatOp::IMul { dst, lhs, rhs } =>
-                    out.push(Constraint::IMul { dst: dst.clone(), lhs: lhs.clone(), rhs: rhs.clone() }),
+                FlatOp::IMul { dst, lhs, rhs } => out.push(Constraint::IMul {
+                    dst: dst.clone(),
+                    lhs: lhs.clone(),
+                    rhs: rhs.clone(),
+                }),
 
-                FlatOp::IDiv { dst_q, dst_r, lhs, rhs } =>
-                    out.push(Constraint::NDivCheck {
-                        dst_q: dst_q.clone(),
-                        dst_r: dst_r.clone(),
-                        lhs: lhs.clone(),
-                        rhs: rhs.clone(),
-                    }),
+                FlatOp::IDiv {
+                    dst_q,
+                    dst_r,
+                    lhs,
+                    rhs,
+                } => out.push(Constraint::NDivCheck {
+                    dst_q: dst_q.clone(),
+                    dst_r: dst_r.clone(),
+                    lhs: lhs.clone(),
+                    rhs: rhs.clone(),
+                }),
 
-                FlatOp::ICmpEq  { dst, lhs, rhs } =>
-                    out.push(Constraint::ICmpEq  { dst: dst.clone(), lhs: lhs.clone(), rhs: rhs.clone() }),
+                FlatOp::ICmpEq { dst, lhs, rhs } => out.push(Constraint::ICmpEq {
+                    dst: dst.clone(),
+                    lhs: lhs.clone(),
+                    rhs: rhs.clone(),
+                }),
 
-                FlatOp::ICmpUlt { dst, lhs, rhs } =>
-                    out.push(Constraint::ICmpUlt { dst: dst.clone(), lhs: lhs.clone(), rhs: rhs.clone() }),
+                FlatOp::ICmpUlt { dst, lhs, rhs } => out.push(Constraint::ICmpUlt {
+                    dst: dst.clone(),
+                    lhs: lhs.clone(),
+                    rhs: rhs.clone(),
+                }),
 
-                FlatOp::ICmpSlt { dst, lhs, rhs } =>
-                    out.push(Constraint::ICmpSlt { dst: dst.clone(), lhs: lhs.clone(), rhs: rhs.clone() }),
+                FlatOp::ICmpSlt { dst, lhs, rhs } => out.push(Constraint::ICmpSlt {
+                    dst: dst.clone(),
+                    lhs: lhs.clone(),
+                    rhs: rhs.clone(),
+                }),
 
-                FlatOp::BAnd { dst, lhs, rhs } =>
-                    out.push(Constraint::BAnd { dst: dst.clone(), lhs: lhs.clone(), rhs: rhs.clone() }),
+                FlatOp::BAnd { dst, lhs, rhs } => out.push(Constraint::BAnd {
+                    dst: dst.clone(),
+                    lhs: lhs.clone(),
+                    rhs: rhs.clone(),
+                }),
 
-                FlatOp::BOr { dst, lhs, rhs } =>
-                    out.push(Constraint::BOr  { dst: dst.clone(), lhs: lhs.clone(), rhs: rhs.clone() }),
+                FlatOp::BOr { dst, lhs, rhs } => out.push(Constraint::BOr {
+                    dst: dst.clone(),
+                    lhs: lhs.clone(),
+                    rhs: rhs.clone(),
+                }),
 
-                FlatOp::BXor { dst, lhs, rhs } =>
-                    out.push(Constraint::BXor { dst: dst.clone(), lhs: lhs.clone(), rhs: rhs.clone() }),
+                FlatOp::BXor { dst, lhs, rhs } => out.push(Constraint::BXor {
+                    dst: dst.clone(),
+                    lhs: lhs.clone(),
+                    rhs: rhs.clone(),
+                }),
 
-                FlatOp::BNot { dst, src } =>
-                    out.push(Constraint::BNot { dst: dst.clone(), src: src.clone() }),
+                FlatOp::BNot { dst, src } => out.push(Constraint::BNot {
+                    dst: dst.clone(),
+                    src: src.clone(),
+                }),
 
-                FlatOp::Shl { dst, src, amount } =>
-                    out.push(Constraint::Shl { dst: dst.clone(), src: src.clone(), amount: *amount }),
+                FlatOp::Shl { dst, src, amount } => out.push(Constraint::Shl {
+                    dst: dst.clone(),
+                    src: src.clone(),
+                    amount: *amount,
+                }),
 
-                FlatOp::Shr { dst, src, amount } =>
-                    out.push(Constraint::Shr { dst: dst.clone(), src: src.clone(), amount: *amount }),
+                FlatOp::Shr { dst, src, amount } => out.push(Constraint::Shr {
+                    dst: dst.clone(),
+                    src: src.clone(),
+                    amount: *amount,
+                }),
 
-                FlatOp::Mux { dst, cond, t_val, e_val } =>
-                    out.push(Constraint::Mux {
-                        dst: dst.clone(),
-                        cond: cond.clone(),
-                        t_val: t_val.clone(),
-                        e_val: e_val.clone(),
-                    }),
+                FlatOp::Mux {
+                    dst,
+                    cond,
+                    t_val,
+                    e_val,
+                } => out.push(Constraint::Mux {
+                    dst: dst.clone(),
+                    cond: cond.clone(),
+                    t_val: t_val.clone(),
+                    e_val: e_val.clone(),
+                }),
 
-                FlatOp::PopCount { dst, src } =>
-                    out.push(Constraint::PopCount { dst: dst.clone(), src: src.clone() }),
+                FlatOp::PopCount { dst, src } => out.push(Constraint::PopCount {
+                    dst: dst.clone(),
+                    src: src.clone(),
+                }),
             }
         }
         out
@@ -661,7 +814,9 @@ impl CircuitCompiler {
                     vars.push(name.clone());
                     self.extract_vars_helper(e, vars);
                 }
-                for e in body { self.extract_vars_helper(e, vars); }
+                for e in body {
+                    self.extract_vars_helper(e, vars);
+                }
             }
             Expr::BinOp(_, l, r) => {
                 self.extract_vars_helper(l, vars);
@@ -670,7 +825,9 @@ impl CircuitCompiler {
             Expr::UnOp(_, e) => self.extract_vars_helper(e, vars),
             Expr::Call(f, args) => {
                 self.extract_vars_helper(f, vars);
-                for a in args { self.extract_vars_helper(a, vars); }
+                for a in args {
+                    self.extract_vars_helper(a, vars);
+                }
             }
             Expr::If(c, t, e) => {
                 self.extract_vars_helper(c, vars);
@@ -683,7 +840,11 @@ impl CircuitCompiler {
             }
             Expr::Car(e) | Expr::Cdr(e) => self.extract_vars_helper(e, vars),
             Expr::Quote(e) | Expr::Eval(e) | Expr::Private(e) => self.extract_vars_helper(e, vars),
-            Expr::Seq(exprs) => { for e in exprs { self.extract_vars_helper(e, vars); } }
+            Expr::Seq(exprs) => {
+                for e in exprs {
+                    self.extract_vars_helper(e, vars);
+                }
+            }
             Expr::Num(_) | Expr::Str(_) | Expr::Char(_) | Expr::Bool(_) | Expr::Lambda(_, _) => {}
         }
     }
@@ -716,7 +877,10 @@ mod tests {
         let mut c = CircuitCompiler::new();
         let circuit = c.compile(&Expr::Num(42), &[]).unwrap();
         assert_eq!(circuit.flat_ops.len(), 1);
-        assert!(matches!(circuit.flat_ops[0], FlatOp::Const { value: 42, .. }));
+        assert!(matches!(
+            circuit.flat_ops[0],
+            FlatOp::Const { value: 42, .. }
+        ));
     }
 
     #[test]
@@ -724,12 +888,18 @@ mod tests {
         let mut c = CircuitCompiler::new();
         let expr = add_expr(Expr::Var("x".into()), Expr::Var("y".into()));
         let circuit = c.compile(&expr, &["x".to_string()]).unwrap();
-        assert_eq!(circuit.witnesses,     vec!["x"]);
+        assert_eq!(circuit.witnesses, vec!["x"]);
         assert_eq!(circuit.public_inputs, vec!["y"]);
         // One IAdd32 FlatOp
-        assert!(circuit.flat_ops.iter().any(|op| matches!(op, FlatOp::IAdd32 { .. })));
+        assert!(circuit
+            .flat_ops
+            .iter()
+            .any(|op| matches!(op, FlatOp::IAdd32 { .. })));
         // One IAdd32 Constraint
-        assert!(circuit.constraints.iter().any(|c| matches!(c, Constraint::IAdd32 { .. })));
+        assert!(circuit
+            .constraints
+            .iter()
+            .any(|c| matches!(c, Constraint::IAdd32 { .. })));
     }
 
     #[test]
@@ -737,18 +907,35 @@ mod tests {
         let mut c = CircuitCompiler::new();
         let expr = mul_expr(Expr::Var("x".into()), Expr::Var("y".into()));
         let circuit = c.compile(&expr, &[]).unwrap();
-        assert!(circuit.flat_ops.iter().any(|op| matches!(op, FlatOp::IMul { .. })));
+        assert!(circuit
+            .flat_ops
+            .iter()
+            .any(|op| matches!(op, FlatOp::IMul { .. })));
     }
 
     #[test]
     fn test_compile_if_becomes_mux() {
         let mut c = CircuitCompiler::new();
         // (if (< x y) x y)
-        let cond = Expr::BinOp(BinOp::Lt, Box::new(Expr::Var("x".into())), Box::new(Expr::Var("y".into())));
-        let expr = Expr::If(Box::new(cond), Box::new(Expr::Var("x".into())), Box::new(Expr::Var("y".into())));
+        let cond = Expr::BinOp(
+            BinOp::Lt,
+            Box::new(Expr::Var("x".into())),
+            Box::new(Expr::Var("y".into())),
+        );
+        let expr = Expr::If(
+            Box::new(cond),
+            Box::new(Expr::Var("x".into())),
+            Box::new(Expr::Var("y".into())),
+        );
         let circuit = c.compile(&expr, &[]).unwrap();
-        assert!(circuit.flat_ops.iter().any(|op| matches!(op, FlatOp::Mux { .. })));
-        assert!(circuit.constraints.iter().any(|co| matches!(co, Constraint::Mux { .. })));
+        assert!(circuit
+            .flat_ops
+            .iter()
+            .any(|op| matches!(op, FlatOp::Mux { .. })));
+        assert!(circuit
+            .constraints
+            .iter()
+            .any(|co| matches!(co, Constraint::Mux { .. })));
     }
 
     #[test]
@@ -756,25 +943,33 @@ mod tests {
         let mut c = CircuitCompiler::new();
         // (let ((z (+ x 1))) (* z z))
         let inner = add_expr(Expr::Var("x".into()), Expr::Num(1));
-        let body   = mul_expr(Expr::Var("z".into()), Expr::Var("z".into()));
-        let expr = Expr::Let(
-            vec![("z".to_string(), inner)],
-            vec![body],
-        );
+        let body = mul_expr(Expr::Var("z".into()), Expr::Var("z".into()));
+        let expr = Expr::Let(vec![("z".to_string(), inner)], vec![body]);
         let circuit = c.compile(&expr, &["x".to_string()]).unwrap();
-        assert!(circuit.flat_ops.iter().any(|op| matches!(op, FlatOp::IMul { .. })));
+        assert!(circuit
+            .flat_ops
+            .iter()
+            .any(|op| matches!(op, FlatOp::IMul { .. })));
     }
 
     #[test]
     fn test_compile_div_introduces_witness() {
         let mut c = CircuitCompiler::new();
-        let expr = Expr::BinOp(BinOp::DivExact,
+        let expr = Expr::BinOp(
+            BinOp::DivExact,
             Box::new(Expr::Var("n".into())),
-            Box::new(Expr::Var("d".into())));
+            Box::new(Expr::Var("d".into())),
+        );
         let circuit = c.compile(&expr, &[]).unwrap();
         // Non-det witnesses for quotient/remainder
-        assert!(circuit.flat_ops.iter().any(|op| matches!(op, FlatOp::IDiv { .. })));
-        assert!(circuit.constraints.iter().any(|co| matches!(co, Constraint::NDivCheck { .. })));
+        assert!(circuit
+            .flat_ops
+            .iter()
+            .any(|op| matches!(op, FlatOp::IDiv { .. })));
+        assert!(circuit
+            .constraints
+            .iter()
+            .any(|co| matches!(co, Constraint::NDivCheck { .. })));
         // Remainder wire must be in witnesses
         assert!(!circuit.witnesses.is_empty());
     }
@@ -789,6 +984,9 @@ mod tests {
         );
         let expr = Expr::Call(Box::new(lam), vec![Expr::Num(5)]);
         let circuit = c.compile(&expr, &[]).unwrap();
-        assert!(circuit.flat_ops.iter().any(|op| matches!(op, FlatOp::IMul { .. })));
+        assert!(circuit
+            .flat_ops
+            .iter()
+            .any(|op| matches!(op, FlatOp::IMul { .. })));
     }
 }

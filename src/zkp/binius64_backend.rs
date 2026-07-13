@@ -33,18 +33,18 @@ impl Binius64Backend {
             Constraint::Constant { value, .. } => *value as u128,
             Constraint::IAdd32 { .. } => 0x02,
             Constraint::ISub32 { .. } => 0x03,
-            Constraint::IMul   { .. } => 0x04,
+            Constraint::IMul { .. } => 0x04,
             Constraint::NDivCheck { .. } => 0x05,
-            Constraint::ICmpEq  { .. } => 0x06,
+            Constraint::ICmpEq { .. } => 0x06,
             Constraint::ICmpUlt { .. } => 0x07,
             Constraint::ICmpSlt { .. } => 0x08,
             Constraint::BAnd { .. } => 0x09,
-            Constraint::BOr  { .. } => 0x0A,
+            Constraint::BOr { .. } => 0x0A,
             Constraint::BXor { .. } => 0x0B,
             Constraint::BNot { .. } => 0x0C,
-            Constraint::Shl  { .. } => 0x0D,
-            Constraint::Shr  { .. } => 0x0E,
-            Constraint::Mux  { .. } => 0x0F,
+            Constraint::Shl { .. } => 0x0D,
+            Constraint::Shr { .. } => 0x0E,
+            Constraint::Mux { .. } => 0x0F,
             Constraint::PopCount { .. } => 0x10,
         }
     }
@@ -91,7 +91,12 @@ impl Binius64Backend {
                     push_wire(&mut data, rhs);
                 }
                 // 0x05  non-deterministic div: witness q,r  check q*rhs+r==lhs
-                Constraint::NDivCheck { dst_q, dst_r, lhs, rhs } => {
+                Constraint::NDivCheck {
+                    dst_q,
+                    dst_r,
+                    lhs,
+                    rhs,
+                } => {
                     data.push(0x05);
                     push_wire(&mut data, dst_q);
                     push_wire(&mut data, dst_r);
@@ -161,7 +166,12 @@ impl Binius64Backend {
                     data.push(*amount as u8);
                 }
                 // 0x0F  mux gadget: dst = band(cond,t) bor band(bnot(cond),e)
-                Constraint::Mux { dst, cond, t_val, e_val } => {
+                Constraint::Mux {
+                    dst,
+                    cond,
+                    t_val,
+                    e_val,
+                } => {
                     data.push(0x0F);
                     push_wire(&mut data, dst);
                     push_wire(&mut data, cond);
