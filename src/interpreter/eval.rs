@@ -1323,6 +1323,8 @@ impl Participant {
                 _ => panic!("zkp-compile: first arg must be a quoted expression (use ')"),
             };
             // Second arg: list of private variable names
+            // Accepts either Types::List (from evaluated list) or Types::Quoted
+            // (from quote shorthand '("x" "y")), or an empty quoted seq.
             let private_vars: Vec<String> = match &args[1] {
                 Types::List(items) => items
                     .iter()
@@ -1331,7 +1333,32 @@ impl Participant {
                         _ => panic!("zkp-compile: private-vars must be a list of strings"),
                     })
                     .collect(),
-                _ => panic!("zkp-compile: second arg must be a list of strings"),
+                Types::Quoted(inner) => {
+                    // '("x" "y") parses as Quote(Call(Str("x"), [Str("y"), ...]))
+                    // or Quote(Seq([...])) for zero/multiple items
+                    match inner.as_ref() {
+                        Expr::Call(head, rest) => {
+                            let mut vars = Vec::new();
+                            if let Expr::Str(s) = head.as_ref() {
+                                vars.push(s.clone());
+                            } else {
+                                panic!("zkp-compile: private-vars must be a list of strings");
+                            }
+                            for e in rest {
+                                if let Expr::Str(s) = e {
+                                    vars.push(s.clone());
+                                } else {
+                                    panic!("zkp-compile: private-vars must be a list of strings");
+                                }
+                            }
+                            vars
+                        }
+                        Expr::Str(s) => vec![s.clone()],
+                        Expr::Seq(items) if items.is_empty() => vec![],
+                        _ => panic!("zkp-compile: private-vars must be a quoted list of strings like '(\"x\" \"y\")"),
+                    }
+                }
+                _ => panic!("zkp-compile: second arg must be a list of strings or a quoted list like '(\"x\")"),
             };
             let backend = crate::zkp::binius64_backend::Binius64Backend::new();
             use crate::zkp::ZKPBackend;
@@ -1347,48 +1374,42 @@ impl Participant {
             Rc::new(RefCell::new(Types::NativeFunc(zkp_compile_fn))),
         );
 
-        // zkp-prove builtin: (zkp-prove circuit-json '(("x" 5)) '(("y" 6)))
-        // circuit-json: string returned by zkp-compile
-        // private-vals: list of (name value) pairs for witness variables
-        // public-vals:  list of (name value) pairs for public outputs
+        // zkp-prove builtin: (zkp-prove circuit-str '("x") '(5) '("y") '(6))
+        // circuit-str: string returned by zkp-compile (store with let)
+        // private-keys: quoted list of witness variable names  e.g. '("x" "z")
+        // private-vals: quoted list of witness values          e.g. '(5 10)
+        // public-keys:  quoted list of public output names     e.g. '("y")
+        // public-vals:  quoted list of public output values    e.g. '(6)
         // Returns a JSON string representing the ZKProof.
         let zkp_prove_fn = Arc::new(move |args: Vec<Types>| -> Types {
-            if args.len() != 3 {
-                panic!("zkp-prove expects 3 args: (zkp-prove circuit-json private-vals public-vals)");
+            if args.len() != 5 {
+                panic!("zkp-prove expects 5 args: (zkp-prove circuit-str '(priv-keys) '(priv-vals) '(pub-keys) '(pub-vals))");
             }
             let circuit_json = match &args[0] {
                 Types::Str(s) => s.clone(),
-                _ => panic!("zkp-prove: first arg must be a circuit JSON string"),
+                _ => {
+                    panic!("zkp-prove: first arg must be a circuit JSON string (from zkp-compile)")
+                }
             };
             let circuit: crate::zkp::Circuit = serde_json::from_str(&circuit_json)
                 .unwrap_or_else(|e| panic!("zkp-prove: invalid circuit JSON: {}", e));
 
-            // Parse list of (name val) pairs into HashMap
-            let parse_pairs = |v: &Types, label: &str| -> std::collections::HashMap<String, i64> {
-                match v {
-                    Types::List(pairs) => pairs
-                        .iter()
-                        .map(|pair| match pair {
-                            Types::List(kv) if kv.len() == 2 => {
-                                let key = match &kv[0] {
-                                    Types::Str(s) => s.clone(),
-                                    _ => panic!("{}: key must be a string", label),
-                                };
-                                let val = match &kv[1] {
-                                    Types::Num(n) => *n,
-                                    _ => panic!("{}: value must be a number", label),
-                                };
-                                (key, val)
-                            }
-                            _ => panic!("{}: each entry must be a (name value) pair", label),
-                        })
-                        .collect(),
-                    _ => panic!("{}: must be a list of (name value) pairs", label),
-                }
-            };
+            let private_keys = decode_quoted_str_list(&args[1], "zkp-prove private-keys");
+            let private_nums = decode_quoted_num_list(&args[2], "zkp-prove private-vals");
+            let public_keys = decode_quoted_str_list(&args[3], "zkp-prove public-keys");
+            let public_nums = decode_quoted_num_list(&args[4], "zkp-prove public-vals");
 
-            let private_vals = parse_pairs(&args[1], "zkp-prove private-vals");
-            let public_vals = parse_pairs(&args[2], "zkp-prove public-vals");
+            if private_keys.len() != private_nums.len() {
+                panic!("zkp-prove: private-keys and private-vals must have the same length");
+            }
+            if public_keys.len() != public_nums.len() {
+                panic!("zkp-prove: public-keys and public-vals must have the same length");
+            }
+
+            let private_vals: std::collections::HashMap<String, i64> =
+                private_keys.into_iter().zip(private_nums).collect();
+            let public_vals: std::collections::HashMap<String, i64> =
+                public_keys.into_iter().zip(public_nums).collect();
 
             let backend = crate::zkp::binius64_backend::Binius64Backend::new();
             use crate::zkp::ZKPBackend;
@@ -1404,11 +1425,11 @@ impl Participant {
             Rc::new(RefCell::new(Types::NativeFunc(zkp_prove_fn))),
         );
 
-        // zkp-verify builtin: (zkp-verify circuit-json proof-json '(("y" 6)))
-        // Returns 1 if valid, panics with error message if invalid.
+        // zkp-verify builtin: (zkp-verify circuit-str proof-str '("y") '(6))
+        // Returns 1 if valid, 0 if invalid, panics on structural errors.
         let zkp_verify_fn = Arc::new(move |args: Vec<Types>| -> Types {
-            if args.len() != 3 {
-                panic!("zkp-verify expects 3 args: (zkp-verify circuit-json proof-json public-vals)");
+            if args.len() != 4 {
+                panic!("zkp-verify expects 4 args: (zkp-verify circuit-str proof-str '(pub-keys) '(pub-vals))");
             }
             let circuit_json = match &args[0] {
                 Types::Str(s) => s.clone(),
@@ -1423,26 +1444,14 @@ impl Participant {
             let proof: crate::zkp::ZKProof = serde_json::from_str(&proof_json)
                 .unwrap_or_else(|e| panic!("zkp-verify: invalid proof JSON: {}", e));
 
-            let public_vals: std::collections::HashMap<String, i64> = match &args[2] {
-                Types::List(pairs) => pairs
-                    .iter()
-                    .map(|pair| match pair {
-                        Types::List(kv) if kv.len() == 2 => {
-                            let key = match &kv[0] {
-                                Types::Str(s) => s.clone(),
-                                _ => panic!("zkp-verify: public key must be a string"),
-                            };
-                            let val = match &kv[1] {
-                                Types::Num(n) => *n,
-                                _ => panic!("zkp-verify: public value must be a number"),
-                            };
-                            (key, val)
-                        }
-                        _ => panic!("zkp-verify: each entry must be a (name value) pair"),
-                    })
-                    .collect(),
-                _ => panic!("zkp-verify: third arg must be a list of (name value) pairs"),
-            };
+            let public_keys = decode_quoted_str_list(&args[2], "zkp-verify public-keys");
+            let public_nums = decode_quoted_num_list(&args[3], "zkp-verify public-vals");
+
+            if public_keys.len() != public_nums.len() {
+                panic!("zkp-verify: public-keys and public-vals must have the same length");
+            }
+            let public_vals: std::collections::HashMap<String, i64> =
+                public_keys.into_iter().zip(public_nums).collect();
 
             let backend = crate::zkp::binius64_backend::Binius64Backend::new();
             use crate::zkp::ZKPBackend;
@@ -1741,6 +1750,83 @@ fn cont_short(c: &Continuation) -> String {
         Continuation::CallEvalArgs { .. } => "CallEvalArgs".to_string(),
         Continuation::If { .. } => "IfCont".to_string(),
         Continuation::IfResultNormalize { .. } => "IfResultNormalize".to_string(),
+    }
+}
+
+/// Decode a quoted list of strings from a Types value.
+/// Accepts '("a" "b") → Quote(Call(Str("a"), [Str("b")])) or Quote(Str("a")) or Quote(Seq([])).
+fn decode_quoted_str_list(v: &Types, label: &str) -> Vec<String> {
+    use crate::interpreter::ast::Expr;
+    match v {
+        Types::List(items) => items
+            .iter()
+            .map(|x| match x {
+                Types::Str(s) => s.clone(),
+                _ => panic!("{}: expected string item", label),
+            })
+            .collect(),
+        Types::Quoted(inner) => match inner.as_ref() {
+            Expr::Call(head, rest) => {
+                let mut out = Vec::new();
+                if let Expr::Str(s) = head.as_ref() {
+                    out.push(s.clone());
+                } else {
+                    panic!("{}: expected string in quoted list, got {:?}", label, head);
+                }
+                for e in rest {
+                    if let Expr::Str(s) = e {
+                        out.push(s.clone());
+                    } else {
+                        panic!("{}: expected string in quoted list", label);
+                    }
+                }
+                out
+            }
+            Expr::Str(s) => vec![s.clone()],
+            Expr::Seq(items) if items.is_empty() => vec![],
+            _ => panic!(
+                "{}: expected a quoted list of strings like '(\"x\" \"y\")",
+                label
+            ),
+        },
+        _ => panic!("{}: expected a quoted list of strings like '(\"x\")", label),
+    }
+}
+
+/// Decode a quoted list of numbers from a Types value.
+/// Accepts '(5 10) → Quote(Call(Num(5), [Num(10)])) or Quote(Num(5)) or Quote(Seq([])).
+fn decode_quoted_num_list(v: &Types, label: &str) -> Vec<i64> {
+    use crate::interpreter::ast::Expr;
+    match v {
+        Types::List(items) => items
+            .iter()
+            .map(|x| match x {
+                Types::Num(n) => *n,
+                _ => panic!("{}: expected number item", label),
+            })
+            .collect(),
+        Types::Quoted(inner) => match inner.as_ref() {
+            Expr::Call(head, rest) => {
+                let mut out = Vec::new();
+                if let Expr::Num(n) = head.as_ref() {
+                    out.push(*n);
+                } else {
+                    panic!("{}: expected number in quoted list, got {:?}", label, head);
+                }
+                for e in rest {
+                    if let Expr::Num(n) = e {
+                        out.push(*n);
+                    } else {
+                        panic!("{}: expected number in quoted list", label);
+                    }
+                }
+                out
+            }
+            Expr::Num(n) => vec![*n],
+            Expr::Seq(items) if items.is_empty() => vec![],
+            _ => panic!("{}: expected a quoted list of numbers like '(5 10)", label),
+        },
+        _ => panic!("{}: expected a quoted list of numbers like '(5)", label),
     }
 }
 
