@@ -1310,61 +1310,168 @@ impl Participant {
             Rc::new(RefCell::new(Types::NativeFunc(b2a_fn))),
         );
 
-        // zkp-compile builtin: (zkp-compile expr private-vars)
-        // Compiles an expression to a ZKP circuit
+        // zkp-compile builtin: (zkp-compile 'expr '("x" "y"))
+        // Compiles a quoted expression to a Binius64 circuit.
+        // Returns a JSON string representing the compiled Circuit.
         let zkp_compile_fn = Arc::new(move |args: Vec<Types>| -> Types {
             if args.len() != 2 {
-                panic!("zkp-compile expects 2 args: (zkp-compile expr private-vars)");
+                panic!("zkp-compile expects 2 args: (zkp-compile 'expr '(\"x\" \"y\"))");
             }
-            // For now, return a placeholder (would need AST integration)
-            // This is a placeholder that shows intent
-            Types::Str("zkp-circuit".to_string())
+            // First arg: quoted expression
+            let expr = match &args[0] {
+                Types::Quoted(e) => *e.clone(),
+                _ => panic!("zkp-compile: first arg must be a quoted expression (use ')"),
+            };
+            // Second arg: list of private variable names
+            let private_vars: Vec<String> = match &args[1] {
+                Types::List(items) => items
+                    .iter()
+                    .map(|v| match v {
+                        Types::Str(s) => s.clone(),
+                        _ => panic!("zkp-compile: private-vars must be a list of strings"),
+                    })
+                    .collect(),
+                _ => panic!("zkp-compile: second arg must be a list of strings"),
+            };
+            let backend = crate::zkp::binius64_backend::Binius64Backend::new();
+            use crate::zkp::ZKPBackend;
+            let circuit = backend
+                .compile_circuit(&expr, &private_vars)
+                .unwrap_or_else(|e| panic!("zkp-compile failed: {}", e));
+            let json = serde_json::to_string(&circuit)
+                .unwrap_or_else(|e| panic!("zkp-compile: failed to serialize circuit: {}", e));
+            Types::Str(json)
         });
         self.store.borrow_mut().insert(
             "zkp-compile".to_string(),
             Rc::new(RefCell::new(Types::NativeFunc(zkp_compile_fn))),
         );
 
-        // zkp-prove builtin: (zkp-prove circuit private-vals public-vals)
-        // Generates a ZKP proof
+        // zkp-prove builtin: (zkp-prove circuit-json '(("x" 5)) '(("y" 6)))
+        // circuit-json: string returned by zkp-compile
+        // private-vals: list of (name value) pairs for witness variables
+        // public-vals:  list of (name value) pairs for public outputs
+        // Returns a JSON string representing the ZKProof.
         let zkp_prove_fn = Arc::new(move |args: Vec<Types>| -> Types {
             if args.len() != 3 {
-                panic!("zkp-prove expects 3 args");
+                panic!("zkp-prove expects 3 args: (zkp-prove circuit-json private-vals public-vals)");
             }
-            // For now, return a placeholder
-            Types::Str("zkp-proof".to_string())
+            let circuit_json = match &args[0] {
+                Types::Str(s) => s.clone(),
+                _ => panic!("zkp-prove: first arg must be a circuit JSON string"),
+            };
+            let circuit: crate::zkp::Circuit = serde_json::from_str(&circuit_json)
+                .unwrap_or_else(|e| panic!("zkp-prove: invalid circuit JSON: {}", e));
+
+            // Parse list of (name val) pairs into HashMap
+            let parse_pairs = |v: &Types, label: &str| -> std::collections::HashMap<String, i64> {
+                match v {
+                    Types::List(pairs) => pairs
+                        .iter()
+                        .map(|pair| match pair {
+                            Types::List(kv) if kv.len() == 2 => {
+                                let key = match &kv[0] {
+                                    Types::Str(s) => s.clone(),
+                                    _ => panic!("{}: key must be a string", label),
+                                };
+                                let val = match &kv[1] {
+                                    Types::Num(n) => *n,
+                                    _ => panic!("{}: value must be a number", label),
+                                };
+                                (key, val)
+                            }
+                            _ => panic!("{}: each entry must be a (name value) pair", label),
+                        })
+                        .collect(),
+                    _ => panic!("{}: must be a list of (name value) pairs", label),
+                }
+            };
+
+            let private_vals = parse_pairs(&args[1], "zkp-prove private-vals");
+            let public_vals = parse_pairs(&args[2], "zkp-prove public-vals");
+
+            let backend = crate::zkp::binius64_backend::Binius64Backend::new();
+            use crate::zkp::ZKPBackend;
+            let proof = backend
+                .prove(&circuit, &private_vals, &public_vals)
+                .unwrap_or_else(|e| panic!("zkp-prove failed: {}", e));
+            let json = serde_json::to_string(&proof)
+                .unwrap_or_else(|e| panic!("zkp-prove: failed to serialize proof: {}", e));
+            Types::Str(json)
         });
         self.store.borrow_mut().insert(
             "zkp-prove".to_string(),
             Rc::new(RefCell::new(Types::NativeFunc(zkp_prove_fn))),
         );
 
-        // zkp-verify builtin: (zkp-verify circuit proof public-vals)
-        // Verifies a ZKP proof
+        // zkp-verify builtin: (zkp-verify circuit-json proof-json '(("y" 6)))
+        // Returns 1 if valid, panics with error message if invalid.
         let zkp_verify_fn = Arc::new(move |args: Vec<Types>| -> Types {
             if args.len() != 3 {
-                panic!("zkp-verify expects 3 args");
+                panic!("zkp-verify expects 3 args: (zkp-verify circuit-json proof-json public-vals)");
             }
-            // For now, return true (placeholder)
-            Types::Bool(true)
+            let circuit_json = match &args[0] {
+                Types::Str(s) => s.clone(),
+                _ => panic!("zkp-verify: first arg must be a circuit JSON string"),
+            };
+            let proof_json = match &args[1] {
+                Types::Str(s) => s.clone(),
+                _ => panic!("zkp-verify: second arg must be a proof JSON string"),
+            };
+            let circuit: crate::zkp::Circuit = serde_json::from_str(&circuit_json)
+                .unwrap_or_else(|e| panic!("zkp-verify: invalid circuit JSON: {}", e));
+            let proof: crate::zkp::ZKProof = serde_json::from_str(&proof_json)
+                .unwrap_or_else(|e| panic!("zkp-verify: invalid proof JSON: {}", e));
+
+            let public_vals: std::collections::HashMap<String, i64> = match &args[2] {
+                Types::List(pairs) => pairs
+                    .iter()
+                    .map(|pair| match pair {
+                        Types::List(kv) if kv.len() == 2 => {
+                            let key = match &kv[0] {
+                                Types::Str(s) => s.clone(),
+                                _ => panic!("zkp-verify: public key must be a string"),
+                            };
+                            let val = match &kv[1] {
+                                Types::Num(n) => *n,
+                                _ => panic!("zkp-verify: public value must be a number"),
+                            };
+                            (key, val)
+                        }
+                        _ => panic!("zkp-verify: each entry must be a (name value) pair"),
+                    })
+                    .collect(),
+                _ => panic!("zkp-verify: third arg must be a list of (name value) pairs"),
+            };
+
+            let backend = crate::zkp::binius64_backend::Binius64Backend::new();
+            use crate::zkp::ZKPBackend;
+            match backend.verify(&circuit, &proof, &public_vals) {
+                Ok(true) => Types::Num(1),
+                Ok(false) => Types::Num(0),
+                Err(e) => panic!("zkp-verify failed: {}", e),
+            }
         });
         self.store.borrow_mut().insert(
             "zkp-verify".to_string(),
             Rc::new(RefCell::new(Types::NativeFunc(zkp_verify_fn))),
         );
 
-        // proof-save builtin: (proof-save proof filename)
-        // Saves a proof to a JSON file
+        // proof-save builtin: (proof-save proof-json filename)
+        // Saves a proof JSON string to a file using the serialization module.
         let proof_save_fn = Arc::new(move |args: Vec<Types>| -> Types {
             if args.len() != 2 {
-                panic!("proof-save expects 2 args: (proof-save proof filename)");
+                panic!("proof-save expects 2 args: (proof-save proof-json filename)");
             }
             match (&args[0], &args[1]) {
-                (Types::Str(_proof_str), Types::Str(_filename)) => {
-                    // For now, placeholder - would integrate with serialization module
-                    Types::Str("proof-saved".to_string())
+                (Types::Str(proof_json), Types::Str(filename)) => {
+                    let proof: crate::zkp::ZKProof = serde_json::from_str(proof_json)
+                        .unwrap_or_else(|e| panic!("proof-save: invalid proof JSON: {}", e));
+                    crate::zkp::serialization::save_proof(&proof, filename)
+                        .unwrap_or_else(|e| panic!("proof-save failed: {}", e));
+                    Types::Str(format!("proof saved to {}", filename))
                 }
-                _ => panic!("proof-save expects (string string)"),
+                _ => panic!("proof-save expects (proof-json-string filename-string)"),
             }
         });
         self.store.borrow_mut().insert(
@@ -1373,15 +1480,18 @@ impl Participant {
         );
 
         // proof-load builtin: (proof-load filename)
-        // Loads a proof from a JSON file
+        // Loads a proof from a JSON file, returns proof JSON string.
         let proof_load_fn = Arc::new(move |args: Vec<Types>| -> Types {
             if args.len() != 1 {
                 panic!("proof-load expects 1 arg: (proof-load filename)");
             }
             match &args[0] {
-                Types::Str(_filename) => {
-                    // For now, placeholder - would integrate with serialization module
-                    Types::Str("proof-loaded".to_string())
+                Types::Str(filename) => {
+                    let proof = crate::zkp::serialization::load_proof(filename)
+                        .unwrap_or_else(|e| panic!("proof-load failed: {}", e));
+                    let json = serde_json::to_string(&proof)
+                        .unwrap_or_else(|e| panic!("proof-load: failed to serialize: {}", e));
+                    Types::Str(json)
                 }
                 _ => panic!("proof-load expects a filename string"),
             }
