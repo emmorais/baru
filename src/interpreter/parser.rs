@@ -96,76 +96,76 @@ pub fn tokenize(src: &str) -> Vec<String> {
                         let mut saw_first = false;
                         let mut inner_tokens: Vec<String> = Vec::new();
                         while let Some(&c) = chars.peek() {
-                                if c.is_whitespace() && !saw_first {
+                            if c.is_whitespace() && !saw_first {
+                                chars.next();
+                                continue;
+                            }
+                            match c {
+                                '(' => {
+                                    depth += 1;
+                                    saw_first = true;
+                                    inner_tokens.push("(".to_string());
                                     chars.next();
-                                    continue;
                                 }
-                                match c {
-                                    '(' => {
-                                        depth += 1;
-                                        saw_first = true;
-                                        inner_tokens.push("(".to_string());
-                                        chars.next();
+                                ')' => {
+                                    depth -= 1;
+                                    inner_tokens.push(")".to_string());
+                                    chars.next();
+                                    if depth <= 0 {
+                                        break;
                                     }
-                                    ')' => {
-                                        depth -= 1;
-                                        inner_tokens.push(")".to_string());
+                                }
+                                '"' => {
+                                    chars.next();
+                                    let mut s = String::new();
+                                    while let Some(&sc) = chars.peek() {
                                         chars.next();
-                                        if depth <= 0 {
+                                        if sc == '"' {
                                             break;
                                         }
-                                    }
-                                    '"' => {
-                                        chars.next();
-                                        let mut s = String::new();
-                                        while let Some(&sc) = chars.peek() {
-                                            chars.next();
-                                            if sc == '"' {
-                                                break;
-                                            }
-                                            if sc == '\\' {
-                                                if let Some(&esc) = chars.peek() {
-                                                    chars.next();
-                                                    match esc {
-                                                        'n' => s.push('\n'),
-                                                        't' => s.push('\t'),
-                                                        '\\' => s.push('\\'),
-                                                        '"' => s.push('"'),
-                                                        _ => s.push(esc),
-                                                    }
+                                        if sc == '\\' {
+                                            if let Some(&esc) = chars.peek() {
+                                                chars.next();
+                                                match esc {
+                                                    'n' => s.push('\n'),
+                                                    't' => s.push('\t'),
+                                                    '\\' => s.push('\\'),
+                                                    '"' => s.push('"'),
+                                                    _ => s.push(esc),
                                                 }
-                                            } else {
-                                                s.push(sc);
                                             }
-                                        }
-                                        inner_tokens.push(format!("\"{}\"", s));
-                                        saw_first = true;
-                                        if depth == 0 {
-                                            break;
+                                        } else {
+                                            s.push(sc);
                                         }
                                     }
-                                    c if c.is_whitespace() => {
-                                        chars.next();
-                                        if saw_first && depth == 0 {
-                                            break;
-                                        }
-                                    }
-                                    _ => {
-                                        let mut sym = String::new();
-                                        while let Some(&sc) = chars.peek() {
-                                            if sc.is_whitespace() || sc == '(' || sc == ')' {
-                                                break;
-                                            }
-                                            sym.push(sc);
-                                            chars.next();
-                                        }
-                                        inner_tokens.push(sym);
-                                        saw_first = true;
-                                        if depth == 0 {
-                                            break;
-                                        }
+                                    inner_tokens.push(format!("\"{}\"", s));
+                                    saw_first = true;
+                                    if depth == 0 {
+                                        break;
                                     }
                                 }
+                                c if c.is_whitespace() => {
+                                    chars.next();
+                                    if saw_first && depth == 0 {
+                                        break;
+                                    }
+                                }
+                                _ => {
+                                    let mut sym = String::new();
+                                    while let Some(&sc) = chars.peek() {
+                                        if sc.is_whitespace() || sc == '(' || sc == ')' {
+                                            break;
+                                        }
+                                        sym.push(sc);
+                                        chars.next();
+                                    }
+                                    inner_tokens.push(sym);
+                                    saw_first = true;
+                                    if depth == 0 {
+                                        break;
+                                    }
+                                }
+                            }
                         }
                         tokens.extend(inner_tokens);
                         tokens.push(")".to_string());
