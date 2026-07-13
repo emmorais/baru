@@ -170,6 +170,86 @@ When the condition is a shared boolean, the evaluator:
 
 ---
 
+## Zero-knowledge proofs (ZKP)
+
+Baru includes built-in support for **zero-knowledge proof compilation and verification** using the **Binius Reed-Solomon SNARK** backend. This allows proving and verifying statements about private computations without revealing the inputs.
+
+### ZKP builtins
+
+The interpreter provides five core ZKP operations:
+
+```lisp
+(zkp-compile <quoted-expr> <quoted-private-vars>)
+```
+
+Compiles an arithmetic expression to a circuit representation. The circuit encodes constraints for the given expression, with designated private variables.
+
+```
+Example:
+(zkp-compile '(* x (+ x 1)) '("x"))
+```
+
+---
+
+```lisp
+(zkp-prove <circuit> <private-keys> <private-values> <public-keys> <public-values>)
+```
+
+Generates a zero-knowledge proof for the circuit, given private inputs and public outputs. All arguments except the circuit are quoted lists.
+
+```
+Example:
+(let ((c (zkp-compile '(+ x y) '("x" "y"))))
+  (zkp-prove c '("x" "y") '(3 5) '() '()))
+```
+
+The proof demonstrates knowledge of private values `x=3, y=5` without revealing them.
+
+---
+
+```lisp
+(zkp-verify <circuit> <proof> <public-keys> <public-values>)
+```
+
+Verifies a zero-knowledge proof against a circuit. Returns `1` if valid, `0` if invalid.
+
+```
+Example:
+(zkp-verify c proof-obj '() '())
+```
+
+---
+
+```lisp
+(proof-save <proof> <filename>)
+```
+
+Serializes a proof to a JSON file for persistence or transmission.
+
+---
+
+```lisp
+(proof-load <filename>)
+```
+
+Deserializes a proof from a JSON file.
+
+### Quote shorthand
+
+To simplify REPL usage, Baru supports **quote shorthand syntax**: `'expr` is equivalent to `(quote expr)`. This makes ZKP calls more ergonomic:
+
+```lisp
+; Old syntax:
+(zkp-compile (quote (+ x 1)) (quote ("x")))
+
+; New syntax with quote shorthand:
+(zkp-compile '(+ x 1) '("x"))
+```
+
+The parser distinguishes char literals (`'a'`) from quote shorthand using lookahead: a quote followed by a closing quote indicates a char literal; otherwise, it begins a quoted form.
+
+---
+
 ## Transport layer
 
 All inter-party communication goes through the `Transport` trait (`src/crypto/net.rs`):
