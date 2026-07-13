@@ -7,39 +7,32 @@
 //     ▼  Phase 1 – flatten()
 //   FlatIR  (SSA block of FlatOps, one per Binius64 gate/opcode)
 //     │
+//     ▼  Phase 1b – fold_constants() + eliminate_dead_wires()
+//   Optimised FlatIR
+//     │
 //     ▼  Phase 2 – emit_constraints()
 //   Vec<Constraint>  (ready for Binius64 CircuitBuilder)
 //
-// Phase 1 inlines let/letrec bindings, beta-reduces lambda calls,
-// eliminates if-branches via non-deterministic selection (mux), and
-// unrolls bounded recursion.  The result is a straight-line SSA
-// program with no control flow.
+// Optimisations applied between phases:
+//   Constant folding   — Const op Const → single Const, shrinks circuit
+//   Dead-wire elim.    — removes Const nodes whose dst is never read
 //
-// Phase 2 maps each FlatOp to the closest Binius64 gate:
-//   Add      → iadd_32   (wrapping 32-bit addition)
-//   Sub      → iadd_32 + neg  (negate right, then add)
-//   Mul      → imul       (64-bit multiply, low word)
-//   Div      → non-deterministic witness quotient q, check q*d + r = n
-//   Mod      → non-deterministic witness remainder r, same check
-//   Eq       → icmp_eq
-//   Lt       → icmp_ult (unsigned) / icmp_slt (signed)
-//   Gt/Le/Ge → derived from Lt / Eq
-//   And      → band
-//   Or       → bor
-//   Not      → bnot (bitwise) / icmp_eq(x, 0) (logical)
-//   Neg      → iadd_32(0, x) with negation encoding
-//   Shl/Shr  → shl / shr
-//   Mux      → band + bor  (c*t + (1-c)*e)
-//   Assign   → constant wire
+// Non-determinism:
+//   Div / Mod  — witness quotient + remainder, check q*d+r==n
+//   If         — both branches evaluated; Mux selects result (no branching)
 //
-// Non-determinism note: Div, Mod and If all introduce witnesses
-// (advice wires) that are constrained after the fact.  This keeps
-// the circuit as small as possible because the prover "guesses"
-// the answer and the verifier only checks the algebraic relation.
+// Binius64 gate mapping:
+//   Add      → iadd_32        Sub  → isub_32
+//   Mul      → imul           Div  → NDivCheck (non-det witness)
+//   Eq       → icmp_eq        Lt   → icmp_slt
+//   Gt/Le/Ge → derived        And  → band      Or → bor
+//   Not      → bnot           Neg  → isub_32(0, x)
+//   Shl/Shr  → shl/shr (static amount extracted from AST)
+//   Mux      → band+bor gadget
 
 use crate::interpreter::ast::Expr;
 use crate::interpreter::parser::{BinOp, UnOp};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 // ─── Flat IR ─────────────────────────────────────────────────
 
@@ -53,152 +46,204 @@ pub type Wire = String;
 pub enum FlatOp {
     /// dst = constant
     Const { dst: Wire, value: i64 },
-
-    /// dst = iadd_32(lhs, rhs)   — wrapping 32-bit add
+    /// dst = iadd_32(lhs, rhs)
     IAdd32 { dst: Wire, lhs: Wire, rhs: Wire },
-
-    /// dst = isub_32(lhs, rhs)   — wrapping 32-bit sub (lhs - rhs)
+    /// dst = isub_32(lhs, rhs)
     ISub32 { dst: Wire, lhs: Wire, rhs: Wire },
-
-    /// dst = imul(lhs, rhs)      — 64-bit multiply (lower 64 bits)
+    /// dst = imul(lhs, rhs)
     IMul { dst: Wire, lhs: Wire, rhs: Wire },
-
-    /// Non-deterministic integer division.
-    /// Witness: quotient q and remainder r such that lhs = q*rhs + r, 0 ≤ r < rhs.
-    /// Emits: q (witness), r (witness), check constraint q*rhs + r == lhs.
+    /// Non-deterministic division: lhs = dst_q * rhs + dst_r, 0 ≤ dst_r < rhs
     IDiv {
-        dst_q: Wire, // quotient
-        dst_r: Wire, // remainder
+        dst_q: Wire,
+        dst_r: Wire,
         lhs: Wire,
         rhs: Wire,
     },
-
-    /// dst = icmp_eq(lhs, rhs)   — 1 if equal, 0 otherwise
+    /// dst = icmp_eq(lhs, rhs)  — 1 if equal, else 0
     ICmpEq { dst: Wire, lhs: Wire, rhs: Wire },
-
-    /// dst = icmp_ult(lhs, rhs)  — unsigned less-than
+    /// dst = icmp_ult(lhs, rhs) — unsigned less-than
     ICmpUlt { dst: Wire, lhs: Wire, rhs: Wire },
-
-    /// dst = icmp_slt(lhs, rhs)  — signed less-than
+    /// dst = icmp_slt(lhs, rhs) — signed less-than
     ICmpSlt { dst: Wire, lhs: Wire, rhs: Wire },
-
-    /// dst = band(lhs, rhs)      — bitwise AND
+    /// dst = band(lhs, rhs)
     BAnd { dst: Wire, lhs: Wire, rhs: Wire },
-
-    /// dst = bor(lhs, rhs)       — bitwise OR
+    /// dst = bor(lhs, rhs)
     BOr { dst: Wire, lhs: Wire, rhs: Wire },
-
-    /// dst = bxor(lhs, rhs)      — bitwise XOR
+    /// dst = bxor(lhs, rhs)
     BXor { dst: Wire, lhs: Wire, rhs: Wire },
-
-    /// dst = bnot(src)           — bitwise NOT
+    /// dst = bnot(src)
     BNot { dst: Wire, src: Wire },
-
-    /// dst = shl(src, amount)    — logical shift left (amount is literal)
+    /// dst = shl(src, amount)  — amount is a compile-time literal
     Shl { dst: Wire, src: Wire, amount: u32 },
-
-    /// dst = shr(src, amount)    — logical shift right (amount is literal)
+    /// dst = shr(src, amount)
     Shr { dst: Wire, src: Wire, amount: u32 },
-
-    /// Non-deterministic multiplexer: dst = cond ? t_val : e_val
-    /// Encoded as dst = band(cond, t_val) bor band(bnot(cond), e_val).
-    /// cond must be a 1-bit wire.
+    /// dst = cond ? t_val : e_val   (Mux gadget: band+bor)
     Mux {
         dst: Wire,
         cond: Wire,
         t_val: Wire,
         e_val: Wire,
     },
-
-    /// dst = popcount(src)       — number of 1-bits
+    /// dst = popcount(src)
     PopCount { dst: Wire, src: Wire },
+}
+
+impl FlatOp {
+    /// The single wire this op writes to.
+    pub fn dst(&self) -> &str {
+        match self {
+            FlatOp::Const { dst, .. }
+            | FlatOp::IAdd32 { dst, .. }
+            | FlatOp::ISub32 { dst, .. }
+            | FlatOp::IMul { dst, .. }
+            | FlatOp::ICmpEq { dst, .. }
+            | FlatOp::ICmpUlt { dst, .. }
+            | FlatOp::ICmpSlt { dst, .. }
+            | FlatOp::BAnd { dst, .. }
+            | FlatOp::BOr { dst, .. }
+            | FlatOp::BXor { dst, .. }
+            | FlatOp::BNot { dst, .. }
+            | FlatOp::Shl { dst, .. }
+            | FlatOp::Shr { dst, .. }
+            | FlatOp::Mux { dst, .. }
+            | FlatOp::PopCount { dst, .. } => dst.as_str(),
+            // IDiv has two destinations — return the quotient wire.
+            FlatOp::IDiv { dst_q, .. } => dst_q.as_str(),
+        }
+    }
+
+    /// All wires this op reads (inputs).
+    pub fn inputs(&self) -> Vec<&str> {
+        match self {
+            FlatOp::Const { .. } => vec![],
+            FlatOp::IAdd32 { lhs, rhs, .. }
+            | FlatOp::ISub32 { lhs, rhs, .. }
+            | FlatOp::IMul { lhs, rhs, .. }
+            | FlatOp::ICmpEq { lhs, rhs, .. }
+            | FlatOp::ICmpUlt { lhs, rhs, .. }
+            | FlatOp::ICmpSlt { lhs, rhs, .. }
+            | FlatOp::BAnd { lhs, rhs, .. }
+            | FlatOp::BOr { lhs, rhs, .. }
+            | FlatOp::BXor { lhs, rhs, .. } => vec![lhs, rhs],
+            FlatOp::BNot { src, .. }
+            | FlatOp::Shl { src, .. }
+            | FlatOp::Shr { src, .. }
+            | FlatOp::PopCount { src, .. } => vec![src],
+            FlatOp::IDiv { lhs, rhs, .. } => vec![lhs, rhs],
+            FlatOp::Mux {
+                cond, t_val, e_val, ..
+            } => vec![cond, t_val, e_val],
+        }
+    }
 }
 
 // ─── Constraint (Binius64 gate encoding) ─────────────────────
 
-/// High-level constraint emitted for the Binius64 CircuitBuilder.
-/// Each variant names the exact Binius64 gate / opcode.
 #[derive(Debug, Clone)]
 pub enum Constraint {
-    /// builder.add_constant_64(value) → dst
-    Constant { dst: Wire, value: i64 },
-
-    /// builder.iadd_32(lhs, rhs) → dst
-    IAdd32 { dst: Wire, lhs: Wire, rhs: Wire },
-
-    /// builder.isub_32(lhs, rhs) → dst  (negation + iadd_32 internally)
-    ISub32 { dst: Wire, lhs: Wire, rhs: Wire },
-
-    /// builder.imul(lhs, rhs) → dst
-    IMul { dst: Wire, lhs: Wire, rhs: Wire },
-
-    /// Non-det quotient witness + check: q*rhs + r == lhs
+    Constant {
+        dst: Wire,
+        value: i64,
+    },
+    IAdd32 {
+        dst: Wire,
+        lhs: Wire,
+        rhs: Wire,
+    },
+    ISub32 {
+        dst: Wire,
+        lhs: Wire,
+        rhs: Wire,
+    },
+    IMul {
+        dst: Wire,
+        lhs: Wire,
+        rhs: Wire,
+    },
+    /// Non-det: witness q,r  s.t.  lhs == q*rhs + r
     NDivCheck {
         dst_q: Wire,
         dst_r: Wire,
         lhs: Wire,
         rhs: Wire,
     },
-
-    /// builder.icmp_eq(lhs, rhs) → dst
-    ICmpEq { dst: Wire, lhs: Wire, rhs: Wire },
-
-    /// builder.icmp_ult(lhs, rhs) → dst
-    ICmpUlt { dst: Wire, lhs: Wire, rhs: Wire },
-
-    /// builder.icmp_slt(lhs, rhs) → dst
-    ICmpSlt { dst: Wire, lhs: Wire, rhs: Wire },
-
-    /// builder.band(lhs, rhs) → dst
-    BAnd { dst: Wire, lhs: Wire, rhs: Wire },
-
-    /// builder.bor(lhs, rhs) → dst
-    BOr { dst: Wire, lhs: Wire, rhs: Wire },
-
-    /// builder.bxor(lhs, rhs) → dst
-    BXor { dst: Wire, lhs: Wire, rhs: Wire },
-
-    /// builder.bnot(src) → dst
-    BNot { dst: Wire, src: Wire },
-
-    /// builder.shl(src, amount) → dst
-    Shl { dst: Wire, src: Wire, amount: u32 },
-
-    /// builder.shr(src, amount) → dst
-    Shr { dst: Wire, src: Wire, amount: u32 },
-
-    /// Mux gadget: dst = band(cond,t) bor band(bnot(cond),e)
+    ICmpEq {
+        dst: Wire,
+        lhs: Wire,
+        rhs: Wire,
+    },
+    ICmpUlt {
+        dst: Wire,
+        lhs: Wire,
+        rhs: Wire,
+    },
+    ICmpSlt {
+        dst: Wire,
+        lhs: Wire,
+        rhs: Wire,
+    },
+    BAnd {
+        dst: Wire,
+        lhs: Wire,
+        rhs: Wire,
+    },
+    BOr {
+        dst: Wire,
+        lhs: Wire,
+        rhs: Wire,
+    },
+    BXor {
+        dst: Wire,
+        lhs: Wire,
+        rhs: Wire,
+    },
+    BNot {
+        dst: Wire,
+        src: Wire,
+    },
+    Shl {
+        dst: Wire,
+        src: Wire,
+        amount: u32,
+    },
+    Shr {
+        dst: Wire,
+        src: Wire,
+        amount: u32,
+    },
     Mux {
         dst: Wire,
         cond: Wire,
         t_val: Wire,
         e_val: Wire,
     },
-
-    /// popcount gadget
-    PopCount { dst: Wire, src: Wire },
+    PopCount {
+        dst: Wire,
+        src: Wire,
+    },
 }
 
 // ─── Compiled circuit ────────────────────────────────────────
 
 #[derive(Debug)]
 pub struct CompiledCircuit {
-    /// Flat SSA intermediate representation (for inspection / debugging)
+    /// Optimised flat SSA IR (after constant folding + dead-wire elimination)
     pub flat_ops: Vec<FlatOp>,
-    /// Gate-level constraints for Binius64 (derived from flat_ops)
+    /// Gate-level constraints (one per FlatOp)
     pub constraints: Vec<Constraint>,
-    /// Witness (private) wire names
     pub witnesses: Vec<Wire>,
-    /// Public input wire names
     pub public_inputs: Vec<Wire>,
-    /// Total gate count
     pub num_gates: usize,
 }
 
 // ─── Flattening environment ───────────────────────────────────
 
-/// Substitution map: variable name → SSA wire that holds its value.
+/// Maps variable names to SSA wires.
 type Env = HashMap<String, Wire>;
+
+/// Maps lambda names to their parameter lists and body, for inlining
+/// named functions bound in let/letrec.
+type LambdaStore = HashMap<String, (Vec<String>, Expr)>;
 
 // ─── CircuitCompiler ─────────────────────────────────────────
 
@@ -239,14 +284,12 @@ impl CircuitCompiler {
 
     // ── Public entry point ───────────────────────────────────
 
-    /// Compile `expr` to a `CompiledCircuit`.
-    /// `private_vars` names user-declared private inputs (witnesses).
     pub fn compile(
         &mut self,
         expr: &Expr,
         private_vars: &[String],
     ) -> Result<CompiledCircuit, String> {
-        // Classify user-named variables
+        // Classify user-named variables as witnesses or public inputs.
         let all_vars = self.extract_variables(expr);
         for var in &all_vars {
             if private_vars.contains(var) {
@@ -258,17 +301,22 @@ impl CircuitCompiler {
             }
         }
 
-        // ── Phase 1: flatten ─────────────────────────────────
+        // ── Phase 1: flatten to SSA ───────────────────────────
         let mut flat: Vec<FlatOp> = Vec::new();
         let mut env: Env = Env::new();
+        let mut lambdas: LambdaStore = LambdaStore::new();
 
-        // Seed env with user variables (they map to themselves)
+        // User variables map to themselves (they are input wires).
         for var in self.witnesses.iter().chain(self.public_inputs.iter()) {
             env.insert(var.clone(), var.clone());
         }
 
-        let result_wire = self.flatten(expr, &mut env, &mut flat)?;
-        let _ = result_wire; // top-level output wire
+        let result_wire = self.flatten(expr, &mut env, &mut lambdas, &mut flat)?;
+
+        // ── Phase 1b: optimise flat IR ────────────────────────
+        let flat = Self::fold_constants(flat);
+        let flat =
+            Self::eliminate_dead_wires(flat, &result_wire, &self.witnesses, &self.public_inputs);
 
         // ── Phase 2: emit constraints ─────────────────────────
         let constraints = Self::emit_constraints(&flat);
@@ -285,12 +333,11 @@ impl CircuitCompiler {
 
     // ── Phase 1 – flatten ────────────────────────────────────
 
-    /// Recursively flatten `expr` into `flat`, returning the wire
-    /// that holds the expression's value in the SSA block.
     fn flatten(
         &mut self,
         expr: &Expr,
         env: &mut Env,
+        lambdas: &mut LambdaStore,
         flat: &mut Vec<FlatOp>,
     ) -> Result<Wire, String> {
         match expr {
@@ -326,10 +373,10 @@ impl CircuitCompiler {
                 .cloned()
                 .ok_or_else(|| format!("unbound variable: {}", name)),
 
-            // ── Private annotation (metadata only) ───────────
-            Expr::Private(inner) => self.flatten(inner, env, flat),
+            // ── Private annotation (witness metadata) ─────────
+            Expr::Private(inner) => self.flatten(inner, env, lambdas, flat),
 
-            // ── Quote (treat as constant 0 — not evaluatable) ─
+            // ── Quote → constant 0 (non-evaluatable in circuit)
             Expr::Quote(_) => {
                 let dst = self.fresh("c");
                 flat.push(FlatOp::Const {
@@ -339,34 +386,19 @@ impl CircuitCompiler {
                 Ok(dst)
             }
 
-            // ── Let bindings ──────────────────────────────────
-            // Inlined: each binding compiles its RHS and maps the
-            // name to the resulting SSA wire in a child environment.
+            // ── Let: inline bindings, then compile body ───────
             Expr::Let(bindings, body) => {
                 let mut child_env = env.clone();
+                let mut child_lam = lambdas.clone();
                 for (name, rhs) in bindings {
-                    let wire = self.flatten(rhs, &mut child_env, flat)?;
-                    child_env.insert(name.clone(), wire);
-                }
-                let mut result = self.fresh("c");
-                flat.push(FlatOp::Const {
-                    dst: result.clone(),
-                    value: 0,
-                }); // default
-                for e in body {
-                    result = self.flatten(e, &mut child_env, flat)?;
-                }
-                Ok(result)
-            }
-
-            // ── Letrec ───────────────────────────────────────
-            // For circuits, letrec without recursion is identical
-            // to let.  Mutual recursion is rejected (circuits are acyclic).
-            Expr::LetRec(bindings, body) => {
-                let mut child_env = env.clone();
-                for (name, rhs) in bindings {
-                    let wire = self.flatten(rhs, &mut child_env, flat)?;
-                    child_env.insert(name.clone(), wire);
+                    // If the RHS is a lambda, store it for later inlining
+                    // instead of collapsing it to a sentinel wire.
+                    if let Expr::Lambda(params, lam_body) = rhs {
+                        child_lam.insert(name.clone(), (params.clone(), *lam_body.clone()));
+                    } else {
+                        let wire = self.flatten(rhs, &mut child_env, &mut child_lam, flat)?;
+                        child_env.insert(name.clone(), wire);
+                    }
                 }
                 let mut result = self.fresh("c");
                 flat.push(FlatOp::Const {
@@ -374,7 +406,30 @@ impl CircuitCompiler {
                     value: 0,
                 });
                 for e in body {
-                    result = self.flatten(e, &mut child_env, flat)?;
+                    result = self.flatten(e, &mut child_env, &mut child_lam, flat)?;
+                }
+                Ok(result)
+            }
+
+            // ── Letrec: same as Let for acyclic circuits ──────
+            Expr::LetRec(bindings, body) => {
+                let mut child_env = env.clone();
+                let mut child_lam = lambdas.clone();
+                for (name, rhs) in bindings {
+                    if let Expr::Lambda(params, lam_body) = rhs {
+                        child_lam.insert(name.clone(), (params.clone(), *lam_body.clone()));
+                    } else {
+                        let wire = self.flatten(rhs, &mut child_env, &mut child_lam, flat)?;
+                        child_env.insert(name.clone(), wire);
+                    }
+                }
+                let mut result = self.fresh("c");
+                flat.push(FlatOp::Const {
+                    dst: result.clone(),
+                    value: 0,
+                });
+                for e in body {
+                    result = self.flatten(e, &mut child_env, &mut child_lam, flat)?;
                 }
                 Ok(result)
             }
@@ -387,49 +442,67 @@ impl CircuitCompiler {
                     value: 0,
                 });
                 for e in exprs {
-                    result = self.flatten(e, env, flat)?;
+                    result = self.flatten(e, env, lambdas, flat)?;
                 }
                 Ok(result)
             }
 
             // ── Binary operations ─────────────────────────────
             Expr::BinOp(op, left, right) => {
-                let l = self.flatten(left, env, flat)?;
-                let r = self.flatten(right, env, flat)?;
+                // Special case: extract static shift amounts directly from AST
+                // so the Shl/Shr opcodes carry the correct literal amount.
+                if matches!(op, BinOp::AshLeft | BinOp::AshRight) {
+                    let src = self.flatten(left, env, lambdas, flat)?;
+                    let amount = if let Expr::Num(n) = right.as_ref() {
+                        *n as u32
+                    } else {
+                        0
+                    };
+                    let dst = self.fresh("t");
+                    if matches!(op, BinOp::AshLeft) {
+                        flat.push(FlatOp::Shl {
+                            dst: dst.clone(),
+                            src,
+                            amount,
+                        });
+                    } else {
+                        flat.push(FlatOp::Shr {
+                            dst: dst.clone(),
+                            src,
+                            amount,
+                        });
+                    }
+                    return Ok(dst);
+                }
+                let l = self.flatten(left, env, lambdas, flat)?;
+                let r = self.flatten(right, env, lambdas, flat)?;
                 self.flatten_binop(*op, l, r, flat)
             }
 
             // ── Unary operations ──────────────────────────────
             Expr::UnOp(op, inner) => {
-                let src = self.flatten(inner, env, flat)?;
+                let src = self.flatten(inner, env, lambdas, flat)?;
                 self.flatten_unop(*op, src, flat)
             }
 
-            // ── If — non-deterministic multiplexer ───────────
-            // Both branches are always evaluated (circuit is acyclic),
-            // then a Mux gate selects the result based on the condition bit.
-            // This is the standard ZK technique: no control flow, only data flow.
+            // ── If → Mux (both branches evaluated; non-det select)
             Expr::If(cond, then_e, else_e) => {
-                let cond_wire = self.flatten(cond, env, flat)?;
-                let then_wire = self.flatten(then_e, env, flat)?;
-                let else_wire = self.flatten(else_e, env, flat)?;
+                let cond_w = self.flatten(cond, env, lambdas, flat)?;
+                let then_w = self.flatten(then_e, env, lambdas, flat)?;
+                let else_w = self.flatten(else_e, env, lambdas, flat)?;
                 let dst = self.fresh("mux");
                 flat.push(FlatOp::Mux {
                     dst: dst.clone(),
-                    cond: cond_wire,
-                    t_val: then_wire,
-                    e_val: else_wire,
+                    cond: cond_w,
+                    t_val: then_w,
+                    e_val: else_w,
                 });
                 Ok(dst)
             }
 
-            // ── Lambda / Call — beta reduction ────────────────
-            // Lambdas are inlined at every call site (monomorphisation).
-            // This terminates only for non-recursive calls; recursive
-            // lambdas require a bounded unroll depth (see below).
+            // ── Lambda / Call ─────────────────────────────────
             Expr::Lambda(params, body) => {
-                // A bare lambda not applied to arguments yields a sentinel.
-                // In practice lambdas are only meaningful inside a Call.
+                // Bare lambda — emit sentinel; meaningful only inside Call.
                 let dst = self.fresh("lam");
                 flat.push(FlatOp::Const {
                     dst: dst.clone(),
@@ -438,22 +511,18 @@ impl CircuitCompiler {
                 let _ = (params, body);
                 Ok(dst)
             }
-            Expr::Call(func, args) => self.flatten_call(func, args, env, flat),
+            Expr::Call(func, args) => self.flatten_call(func, args, env, lambdas, flat),
 
-            // ── List operations — structural, encode as pairs ─
+            // ── List operations ───────────────────────────────
             Expr::Cons(left, right) => {
-                // Pairs: in a circuit we keep both components; return the left
-                // wire as a proxy (the right is emitted as a side-effect).
-                let _l = self.flatten(left, env, flat)?;
-                let r = self.flatten(right, env, flat)?;
-                Ok(r) // conservative: return last meaningful wire
+                let _l = self.flatten(left, env, lambdas, flat)?;
+                let r = self.flatten(right, env, lambdas, flat)?;
+                Ok(r)
             }
-            Expr::Car(inner) => self.flatten(inner, env, flat),
-            Expr::Cdr(inner) => self.flatten(inner, env, flat),
-
-            Expr::Eval(inner) => self.flatten(inner, env, flat),
+            Expr::Car(inner) => self.flatten(inner, env, lambdas, flat),
+            Expr::Cdr(inner) => self.flatten(inner, env, lambdas, flat),
+            Expr::Eval(inner) => self.flatten(inner, env, lambdas, flat),
             Expr::Str(_) => {
-                // Strings are not arithmetic; emit a sentinel 0.
                 let dst = self.fresh("str");
                 flat.push(FlatOp::Const {
                     dst: dst.clone(),
@@ -491,7 +560,7 @@ impl CircuitCompiler {
                 rhs: r,
             }),
 
-            // Non-deterministic division: witness q and rem, then check.
+            // Non-deterministic: witness q and rem, check q*rhs + rem == lhs.
             BinOp::DivExact => {
                 let dst_r = self.fresh_witness("rem");
                 flat.push(FlatOp::IDiv {
@@ -502,7 +571,6 @@ impl CircuitCompiler {
                 });
             }
             BinOp::Mod => {
-                // For (mod l r): witness both q and r_wire; dst holds the remainder.
                 let dst_q = self.fresh_witness("quot");
                 flat.push(FlatOp::IDiv {
                     dst_q,
@@ -512,7 +580,6 @@ impl CircuitCompiler {
                 });
             }
 
-            // Comparisons
             BinOp::Eq => flat.push(FlatOp::ICmpEq {
                 dst: dst.clone(),
                 lhs: l,
@@ -523,21 +590,18 @@ impl CircuitCompiler {
                 lhs: l,
                 rhs: r,
             }),
-            BinOp::Gt => {
-                // a > b  ⟺  b < a
-                flat.push(FlatOp::ICmpSlt {
-                    dst: dst.clone(),
-                    lhs: r,
-                    rhs: l,
-                });
-            }
+            BinOp::Gt => flat.push(FlatOp::ICmpSlt {
+                dst: dst.clone(),
+                lhs: r,
+                rhs: l,
+            }),
             BinOp::Le => {
-                // a ≤ b  ⟺  NOT (a > b)  ⟺  NOT (b < a)
+                // a ≤ b  ⟺  NOT (b < a)
                 let lt = self.fresh("lt");
                 flat.push(FlatOp::ICmpSlt {
                     dst: lt.clone(),
                     lhs: r,
-                    rhs: l.clone(),
+                    rhs: l,
                 });
                 flat.push(FlatOp::BNot {
                     dst: dst.clone(),
@@ -549,7 +613,7 @@ impl CircuitCompiler {
                 let lt = self.fresh("lt");
                 flat.push(FlatOp::ICmpSlt {
                     dst: lt.clone(),
-                    lhs: l.clone(),
+                    lhs: l,
                     rhs: r,
                 });
                 flat.push(FlatOp::BNot {
@@ -557,8 +621,6 @@ impl CircuitCompiler {
                     src: lt,
                 });
             }
-
-            // Logical (bitwise)
             BinOp::And => flat.push(FlatOp::BAnd {
                 dst: dst.clone(),
                 lhs: l,
@@ -570,9 +632,8 @@ impl CircuitCompiler {
                 rhs: r,
             }),
 
-            // Shifts — rhs must be a compile-time constant for circuits.
-            // We accept it as a wire and encode amount = 0 as a fallback;
-            // a fully static amount is enforced when the rhs is Expr::Num.
+            // Static shifts are handled before this call-site (in BinOp arm above).
+            // If reached here the amount is unknown; default to 0.
             BinOp::AshLeft => flat.push(FlatOp::Shl {
                 dst: dst.clone(),
                 src: l,
@@ -602,7 +663,6 @@ impl CircuitCompiler {
                 src,
             }),
             UnOp::Neg => {
-                // -x  =  0 - x  =  isub_32(0, x)
                 let zero = self.fresh("c");
                 flat.push(FlatOp::Const {
                     dst: zero.clone(),
@@ -615,14 +675,12 @@ impl CircuitCompiler {
                 });
             }
             UnOp::Atom => {
-                // atom(x) returns 1 for non-list types; in a numeric circuit always 1.
                 flat.push(FlatOp::Const {
                     dst: dst.clone(),
                     value: 1,
                 });
             }
             UnOp::BitLen => {
-                // bitlen(x) = ceil(log2(x+1)); approximate via popcount on the wire.
                 flat.push(FlatOp::PopCount {
                     dst: dst.clone(),
                     src,
@@ -639,9 +697,11 @@ impl CircuitCompiler {
         func: &Expr,
         args: &[Expr],
         env: &mut Env,
+        lambdas: &mut LambdaStore,
         flat: &mut Vec<FlatOp>,
     ) -> Result<Wire, String> {
         match func {
+            // Direct lambda application — beta-reduce immediately.
             Expr::Lambda(params, body) => {
                 if params.len() != args.len() {
                     return Err(format!(
@@ -650,153 +710,283 @@ impl CircuitCompiler {
                         args.len()
                     ));
                 }
-                // Beta-reduce: evaluate each argument, bind to param names.
                 let mut child_env = env.clone();
+                let mut child_lam = lambdas.clone();
                 for (param, arg) in params.iter().zip(args.iter()) {
-                    let wire = self.flatten(arg, env, flat)?;
+                    let wire = self.flatten(arg, env, lambdas, flat)?;
                     child_env.insert(param.clone(), wire);
                 }
-                self.flatten(body, &mut child_env, flat)
+                self.flatten(body, &mut child_env, &mut child_lam, flat)
             }
+
+            // Named call — look up lambda store and inline if available.
             Expr::Var(name) => {
-                // Look up the lambda wire in the environment.
-                // Named functions must be bound via let/letrec before the call.
-                match env.get(name).cloned() {
-                    Some(_) => {
-                        // We can only inline if we still have the lambda body.
-                        // At this point the wire is already collapsed; emit sentinel.
-                        let dst = self.fresh("call");
-                        flat.push(FlatOp::Const {
-                            dst: dst.clone(),
-                            value: 0,
-                        });
-                        Ok(dst)
+                if let Some((params, body)) = lambdas.get(name).cloned() {
+                    if params.len() != args.len() {
+                        return Err(format!(
+                            "arity mismatch for `{}`: expects {}, got {}",
+                            name,
+                            params.len(),
+                            args.len()
+                        ));
                     }
-                    None => Err(format!("unbound function: {}", name)),
+                    let mut child_env = env.clone();
+                    let mut child_lam = lambdas.clone();
+                    for (param, arg) in params.iter().zip(args.iter()) {
+                        let wire = self.flatten(arg, env, lambdas, flat)?;
+                        child_env.insert(param.clone(), wire);
+                    }
+                    self.flatten(&body, &mut child_env, &mut child_lam, flat)
+                } else if env.contains_key(name.as_str()) {
+                    // Variable exists but isn't a lambda — emit sentinel.
+                    let dst = self.fresh("call");
+                    flat.push(FlatOp::Const {
+                        dst: dst.clone(),
+                        value: 0,
+                    });
+                    Ok(dst)
+                } else {
+                    Err(format!("unbound function: {}", name))
                 }
             }
-            _ => Err("complex call target not yet supported in circuit compilation".to_string()),
+
+            _ => Err("complex call target not supported in circuit compilation".to_string()),
         }
     }
 
-    // ── Phase 2 – emit_constraints ───────────────────────────
+    // ── Phase 1b – constant folding ──────────────────────────
 
-    /// Map each `FlatOp` to the corresponding `Constraint`(s).
-    /// Preserves the SSA ordering so constraints are topologically sorted.
-    fn emit_constraints(flat: &[FlatOp]) -> Vec<Constraint> {
-        let mut out = Vec::with_capacity(flat.len());
+    /// Evaluate any binary / unary op whose operands are both known
+    /// constants at compile time, replacing the op with a single Const.
+    /// Runs in a single forward pass (SSA ensures defs precede uses).
+    fn fold_constants(flat: Vec<FlatOp>) -> Vec<FlatOp> {
+        // known[wire] = Some(value) if the wire holds a compile-time constant.
+        let mut known: HashMap<Wire, i64> = HashMap::new();
+        let mut out: Vec<FlatOp> = Vec::with_capacity(flat.len());
+
         for op in flat {
-            match op {
-                FlatOp::Const { dst, value } => out.push(Constraint::Constant {
-                    dst: dst.clone(),
-                    value: *value,
-                }),
+            let folded: Option<(Wire, i64)> = match &op {
+                FlatOp::Const { dst, value } => {
+                    known.insert(dst.clone(), *value);
+                    None // keep as-is; will push below
+                }
+                FlatOp::IAdd32 { dst, lhs, rhs } => {
+                    Self::fold2(&known, lhs, rhs, |a, b| a.wrapping_add(b))
+                        .map(|v| (dst.clone(), v))
+                }
+                FlatOp::ISub32 { dst, lhs, rhs } => {
+                    Self::fold2(&known, lhs, rhs, |a, b| a.wrapping_sub(b))
+                        .map(|v| (dst.clone(), v))
+                }
+                FlatOp::IMul { dst, lhs, rhs } => {
+                    Self::fold2(&known, lhs, rhs, |a, b| a.wrapping_mul(b))
+                        .map(|v| (dst.clone(), v))
+                }
+                FlatOp::ICmpEq { dst, lhs, rhs } => {
+                    Self::fold2(&known, lhs, rhs, |a, b| if a == b { 1 } else { 0 })
+                        .map(|v| (dst.clone(), v))
+                }
+                FlatOp::ICmpSlt { dst, lhs, rhs } => {
+                    Self::fold2(&known, lhs, rhs, |a, b| if a < b { 1 } else { 0 })
+                        .map(|v| (dst.clone(), v))
+                }
+                FlatOp::ICmpUlt { dst, lhs, rhs } => Self::fold2(&known, lhs, rhs, |a, b| {
+                    if (a as u64) < (b as u64) {
+                        1
+                    } else {
+                        0
+                    }
+                })
+                .map(|v| (dst.clone(), v)),
+                FlatOp::BAnd { dst, lhs, rhs } => {
+                    Self::fold2(&known, lhs, rhs, |a, b| a & b).map(|v| (dst.clone(), v))
+                }
+                FlatOp::BOr { dst, lhs, rhs } => {
+                    Self::fold2(&known, lhs, rhs, |a, b| a | b).map(|v| (dst.clone(), v))
+                }
+                FlatOp::BXor { dst, lhs, rhs } => {
+                    Self::fold2(&known, lhs, rhs, |a, b| a ^ b).map(|v| (dst.clone(), v))
+                }
+                FlatOp::BNot { dst, src } => known.get(src.as_str()).map(|&v| (dst.clone(), !v)),
+                FlatOp::Shl { dst, src, amount } => {
+                    known.get(src.as_str()).map(|&v| (dst.clone(), v << amount))
+                }
+                FlatOp::Shr { dst, src, amount } => {
+                    known.get(src.as_str()).map(|&v| (dst.clone(), v >> amount))
+                }
+                _ => None,
+            };
 
-                FlatOp::IAdd32 { dst, lhs, rhs } => out.push(Constraint::IAdd32 {
-                    dst: dst.clone(),
-                    lhs: lhs.clone(),
-                    rhs: rhs.clone(),
-                }),
-
-                FlatOp::ISub32 { dst, lhs, rhs } => out.push(Constraint::ISub32 {
-                    dst: dst.clone(),
-                    lhs: lhs.clone(),
-                    rhs: rhs.clone(),
-                }),
-
-                FlatOp::IMul { dst, lhs, rhs } => out.push(Constraint::IMul {
-                    dst: dst.clone(),
-                    lhs: lhs.clone(),
-                    rhs: rhs.clone(),
-                }),
-
-                FlatOp::IDiv {
-                    dst_q,
-                    dst_r,
-                    lhs,
-                    rhs,
-                } => out.push(Constraint::NDivCheck {
-                    dst_q: dst_q.clone(),
-                    dst_r: dst_r.clone(),
-                    lhs: lhs.clone(),
-                    rhs: rhs.clone(),
-                }),
-
-                FlatOp::ICmpEq { dst, lhs, rhs } => out.push(Constraint::ICmpEq {
-                    dst: dst.clone(),
-                    lhs: lhs.clone(),
-                    rhs: rhs.clone(),
-                }),
-
-                FlatOp::ICmpUlt { dst, lhs, rhs } => out.push(Constraint::ICmpUlt {
-                    dst: dst.clone(),
-                    lhs: lhs.clone(),
-                    rhs: rhs.clone(),
-                }),
-
-                FlatOp::ICmpSlt { dst, lhs, rhs } => out.push(Constraint::ICmpSlt {
-                    dst: dst.clone(),
-                    lhs: lhs.clone(),
-                    rhs: rhs.clone(),
-                }),
-
-                FlatOp::BAnd { dst, lhs, rhs } => out.push(Constraint::BAnd {
-                    dst: dst.clone(),
-                    lhs: lhs.clone(),
-                    rhs: rhs.clone(),
-                }),
-
-                FlatOp::BOr { dst, lhs, rhs } => out.push(Constraint::BOr {
-                    dst: dst.clone(),
-                    lhs: lhs.clone(),
-                    rhs: rhs.clone(),
-                }),
-
-                FlatOp::BXor { dst, lhs, rhs } => out.push(Constraint::BXor {
-                    dst: dst.clone(),
-                    lhs: lhs.clone(),
-                    rhs: rhs.clone(),
-                }),
-
-                FlatOp::BNot { dst, src } => out.push(Constraint::BNot {
-                    dst: dst.clone(),
-                    src: src.clone(),
-                }),
-
-                FlatOp::Shl { dst, src, amount } => out.push(Constraint::Shl {
-                    dst: dst.clone(),
-                    src: src.clone(),
-                    amount: *amount,
-                }),
-
-                FlatOp::Shr { dst, src, amount } => out.push(Constraint::Shr {
-                    dst: dst.clone(),
-                    src: src.clone(),
-                    amount: *amount,
-                }),
-
-                FlatOp::Mux {
-                    dst,
-                    cond,
-                    t_val,
-                    e_val,
-                } => out.push(Constraint::Mux {
-                    dst: dst.clone(),
-                    cond: cond.clone(),
-                    t_val: t_val.clone(),
-                    e_val: e_val.clone(),
-                }),
-
-                FlatOp::PopCount { dst, src } => out.push(Constraint::PopCount {
-                    dst: dst.clone(),
-                    src: src.clone(),
-                }),
+            if let Some((dst, value)) = folded {
+                known.insert(dst.clone(), value);
+                out.push(FlatOp::Const { dst, value });
+            } else {
+                out.push(op);
             }
         }
         out
     }
 
-    // ── Variable extraction (unchanged) ──────────────────────
+    fn fold2(
+        known: &HashMap<Wire, i64>,
+        lhs: &str,
+        rhs: &str,
+        f: impl Fn(i64, i64) -> i64,
+    ) -> Option<i64> {
+        known
+            .get(lhs)
+            .and_then(|&a| known.get(rhs).map(|&b| f(a, b)))
+    }
+
+    // ── Phase 1b – dead-wire elimination ─────────────────────
+
+    /// Remove Const nodes whose destination wire is never used by any
+    /// downstream op, by the result wire, or by witness/public-input wires.
+    fn eliminate_dead_wires(
+        flat: Vec<FlatOp>,
+        result_wire: &str,
+        witnesses: &[Wire],
+        public_inputs: &[Wire],
+    ) -> Vec<FlatOp> {
+        // Collect every wire that is actually consumed.
+        let mut live: HashSet<String> = HashSet::new();
+        live.insert(result_wire.to_string());
+        for w in witnesses {
+            live.insert(w.clone());
+        }
+        for w in public_inputs {
+            live.insert(w.clone());
+        }
+
+        // Pre-compute (dst, inputs) pairs so we can do a borrow-free reverse pass.
+        let op_data: Vec<(String, Vec<String>)> = flat
+            .iter()
+            .map(|op| {
+                let dst = op.dst().to_string();
+                let inputs: Vec<String> = op.inputs().iter().map(|s| s.to_string()).collect();
+                (dst, inputs)
+            })
+            .collect();
+
+        // Single backward pass over SSA: if a dst is live, all its inputs become live.
+        for (dst, inputs) in op_data.iter().rev() {
+            if live.contains(dst.as_str()) {
+                for inp in inputs {
+                    live.insert(inp.clone());
+                }
+            }
+        }
+
+        flat.into_iter()
+            .filter(|op| {
+                // Only prune Const nodes; all other gate ops are kept unconditionally.
+                !matches!(op, FlatOp::Const { .. }) || live.contains(op.dst())
+            })
+            .collect()
+    }
+
+    // ── Phase 2 – emit_constraints ───────────────────────────
+
+    fn emit_constraints(flat: &[FlatOp]) -> Vec<Constraint> {
+        let mut out = Vec::with_capacity(flat.len());
+        for op in flat {
+            let c = match op {
+                FlatOp::Const { dst, value } => Constraint::Constant {
+                    dst: dst.clone(),
+                    value: *value,
+                },
+                FlatOp::IAdd32 { dst, lhs, rhs } => Constraint::IAdd32 {
+                    dst: dst.clone(),
+                    lhs: lhs.clone(),
+                    rhs: rhs.clone(),
+                },
+                FlatOp::ISub32 { dst, lhs, rhs } => Constraint::ISub32 {
+                    dst: dst.clone(),
+                    lhs: lhs.clone(),
+                    rhs: rhs.clone(),
+                },
+                FlatOp::IMul { dst, lhs, rhs } => Constraint::IMul {
+                    dst: dst.clone(),
+                    lhs: lhs.clone(),
+                    rhs: rhs.clone(),
+                },
+                FlatOp::IDiv {
+                    dst_q,
+                    dst_r,
+                    lhs,
+                    rhs,
+                } => Constraint::NDivCheck {
+                    dst_q: dst_q.clone(),
+                    dst_r: dst_r.clone(),
+                    lhs: lhs.clone(),
+                    rhs: rhs.clone(),
+                },
+                FlatOp::ICmpEq { dst, lhs, rhs } => Constraint::ICmpEq {
+                    dst: dst.clone(),
+                    lhs: lhs.clone(),
+                    rhs: rhs.clone(),
+                },
+                FlatOp::ICmpUlt { dst, lhs, rhs } => Constraint::ICmpUlt {
+                    dst: dst.clone(),
+                    lhs: lhs.clone(),
+                    rhs: rhs.clone(),
+                },
+                FlatOp::ICmpSlt { dst, lhs, rhs } => Constraint::ICmpSlt {
+                    dst: dst.clone(),
+                    lhs: lhs.clone(),
+                    rhs: rhs.clone(),
+                },
+                FlatOp::BAnd { dst, lhs, rhs } => Constraint::BAnd {
+                    dst: dst.clone(),
+                    lhs: lhs.clone(),
+                    rhs: rhs.clone(),
+                },
+                FlatOp::BOr { dst, lhs, rhs } => Constraint::BOr {
+                    dst: dst.clone(),
+                    lhs: lhs.clone(),
+                    rhs: rhs.clone(),
+                },
+                FlatOp::BXor { dst, lhs, rhs } => Constraint::BXor {
+                    dst: dst.clone(),
+                    lhs: lhs.clone(),
+                    rhs: rhs.clone(),
+                },
+                FlatOp::BNot { dst, src } => Constraint::BNot {
+                    dst: dst.clone(),
+                    src: src.clone(),
+                },
+                FlatOp::Shl { dst, src, amount } => Constraint::Shl {
+                    dst: dst.clone(),
+                    src: src.clone(),
+                    amount: *amount,
+                },
+                FlatOp::Shr { dst, src, amount } => Constraint::Shr {
+                    dst: dst.clone(),
+                    src: src.clone(),
+                    amount: *amount,
+                },
+                FlatOp::Mux {
+                    dst,
+                    cond,
+                    t_val,
+                    e_val,
+                } => Constraint::Mux {
+                    dst: dst.clone(),
+                    cond: cond.clone(),
+                    t_val: t_val.clone(),
+                    e_val: e_val.clone(),
+                },
+                FlatOp::PopCount { dst, src } => Constraint::PopCount {
+                    dst: dst.clone(),
+                    src: src.clone(),
+                },
+            };
+            out.push(c);
+        }
+        out
+    }
+
+    // ── Variable extraction ───────────────────────────────────
 
     fn extract_variables(&self, expr: &Expr) -> Vec<String> {
         let mut vars = Vec::new();
@@ -859,17 +1049,18 @@ mod tests {
     fn add_expr(l: Expr, r: Expr) -> Expr {
         Expr::BinOp(BinOp::Add, Box::new(l), Box::new(r))
     }
-
+    fn sub_expr(l: Expr, r: Expr) -> Expr {
+        Expr::BinOp(BinOp::Sub, Box::new(l), Box::new(r))
+    }
     fn mul_expr(l: Expr, r: Expr) -> Expr {
         Expr::BinOp(BinOp::Mul, Box::new(l), Box::new(r))
     }
 
     #[test]
     fn test_extract_variables() {
-        let compiler = CircuitCompiler::new();
+        let c = CircuitCompiler::new();
         let expr = add_expr(Expr::Var("x".into()), Expr::Var("y".into()));
-        let vars = compiler.extract_variables(&expr);
-        assert_eq!(vars, vec!["x", "y"]);
+        assert_eq!(c.extract_variables(&expr), vec!["x", "y"]);
     }
 
     #[test]
@@ -890,16 +1081,14 @@ mod tests {
         let circuit = c.compile(&expr, &["x".to_string()]).unwrap();
         assert_eq!(circuit.witnesses, vec!["x"]);
         assert_eq!(circuit.public_inputs, vec!["y"]);
-        // One IAdd32 FlatOp
         assert!(circuit
             .flat_ops
             .iter()
             .any(|op| matches!(op, FlatOp::IAdd32 { .. })));
-        // One IAdd32 Constraint
         assert!(circuit
             .constraints
             .iter()
-            .any(|c| matches!(c, Constraint::IAdd32 { .. })));
+            .any(|co| matches!(co, Constraint::IAdd32 { .. })));
     }
 
     #[test]
@@ -916,7 +1105,6 @@ mod tests {
     #[test]
     fn test_compile_if_becomes_mux() {
         let mut c = CircuitCompiler::new();
-        // (if (< x y) x y)
         let cond = Expr::BinOp(
             BinOp::Lt,
             Box::new(Expr::Var("x".into())),
@@ -961,7 +1149,6 @@ mod tests {
             Box::new(Expr::Var("d".into())),
         );
         let circuit = c.compile(&expr, &[]).unwrap();
-        // Non-det witnesses for quotient/remainder
         assert!(circuit
             .flat_ops
             .iter()
@@ -970,23 +1157,147 @@ mod tests {
             .constraints
             .iter()
             .any(|co| matches!(co, Constraint::NDivCheck { .. })));
-        // Remainder wire must be in witnesses
         assert!(!circuit.witnesses.is_empty());
     }
 
     #[test]
     fn test_lambda_beta_reduction() {
         let mut c = CircuitCompiler::new();
-        // ((lambda (x) (* x x)) 5)
+        // ((lambda (x) (* x x)) 5)  — constant folds to Const(25)
         let lam = Expr::Lambda(
             vec!["x".to_string()],
             Box::new(mul_expr(Expr::Var("x".into()), Expr::Var("x".into()))),
         );
         let expr = Expr::Call(Box::new(lam), vec![Expr::Num(5)]);
         let circuit = c.compile(&expr, &[]).unwrap();
+        // After beta-reduction and constant folding, result is Const(25).
+        let has_25 = circuit
+            .flat_ops
+            .iter()
+            .any(|op| matches!(op, FlatOp::Const { value: 25, .. }));
+        let has_mul = circuit
+            .flat_ops
+            .iter()
+            .any(|op| matches!(op, FlatOp::IMul { .. }));
+        assert!(
+            has_25 || has_mul,
+            "expected Const(25) from folded mul or IMul gate, got {:?}",
+            circuit.flat_ops
+        );
+    }
+
+    /// Named lambda stored in let, then called by name — must be inlined.
+    #[test]
+    fn test_named_lambda_inlined() {
+        let mut c = CircuitCompiler::new();
+        // (let ((double (lambda (x) (+ x x)))) (double 7))
+        // After inlining and constant folding: Const(14)
+        let lam = Expr::Lambda(
+            vec!["x".to_string()],
+            Box::new(add_expr(Expr::Var("x".into()), Expr::Var("x".into()))),
+        );
+        let call = Expr::Call(Box::new(Expr::Var("double".into())), vec![Expr::Num(7)]);
+        let expr = Expr::Let(vec![("double".to_string(), lam)], vec![call]);
+        let circuit = c.compile(&expr, &[]).unwrap();
+        let has_14 = circuit
+            .flat_ops
+            .iter()
+            .any(|op| matches!(op, FlatOp::Const { value: 14, .. }));
+        let has_add = circuit
+            .flat_ops
+            .iter()
+            .any(|op| matches!(op, FlatOp::IAdd32 { .. }));
+        assert!(
+            has_14 || has_add,
+            "expected Const(14) from folded add or IAdd32 gate, got {:?}",
+            circuit.flat_ops
+        );
+    }
+
+    /// Constant folding: (+ 3 4) should collapse to a single Const 7.
+    #[test]
+    fn test_constant_folding() {
+        let mut c = CircuitCompiler::new();
+        let expr = add_expr(Expr::Num(3), Expr::Num(4));
+        let circuit = c.compile(&expr, &[]).unwrap();
+        // After folding, only one Const node with value 7.
+        let consts: Vec<i64> = circuit
+            .flat_ops
+            .iter()
+            .filter_map(|op| {
+                if let FlatOp::Const { value, .. } = op {
+                    Some(*value)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert!(
+            consts.contains(&7),
+            "expected folded Const(7), got {:?}",
+            circuit.flat_ops
+        );
+        assert!(
+            !circuit
+                .flat_ops
+                .iter()
+                .any(|op| matches!(op, FlatOp::IAdd32 { .. })),
+            "IAdd32 should have been folded away"
+        );
+    }
+
+    /// Dead-wire elimination: `(let ((unused 99)) x)` should drop the Const(99).
+    #[test]
+    fn test_dead_wire_elimination() {
+        let mut c = CircuitCompiler::new();
+        let expr = Expr::Let(
+            vec![("unused".to_string(), Expr::Num(99))],
+            vec![Expr::Var("x".into())],
+        );
+        let circuit = c.compile(&expr, &["x".to_string()]).unwrap();
+        let const_99 = circuit
+            .flat_ops
+            .iter()
+            .any(|op| matches!(op, FlatOp::Const { value: 99, .. }));
+        assert!(!const_99, "Const(99) should have been eliminated as dead");
+    }
+
+    /// Shift with static amount: `(ash-left x 3)` → Shl { amount: 3 }.
+    #[test]
+    fn test_static_shift_amount() {
+        let mut c = CircuitCompiler::new();
+        let expr = Expr::BinOp(
+            BinOp::AshLeft,
+            Box::new(Expr::Var("x".into())),
+            Box::new(Expr::Num(3)),
+        );
+        let circuit = c.compile(&expr, &[]).unwrap();
+        let has_shl3 = circuit
+            .flat_ops
+            .iter()
+            .any(|op| matches!(op, FlatOp::Shl { amount: 3, .. }));
+        assert!(
+            has_shl3,
+            "expected Shl {{ amount: 3 }}, got {:?}",
+            circuit.flat_ops
+        );
+    }
+
+    /// Comparison chain: (- (+ x 1) y) compiled; check both Add and Sub emitted.
+    #[test]
+    fn test_complex_expr_emits_correct_ops() {
+        let mut c = CircuitCompiler::new();
+        // (- (+ x 1) y)
+        let inner = add_expr(Expr::Var("x".into()), Expr::Num(1));
+        let expr = sub_expr(inner, Expr::Var("y".into()));
+        let circuit = c.compile(&expr, &["x".to_string()]).unwrap();
         assert!(circuit
             .flat_ops
             .iter()
-            .any(|op| matches!(op, FlatOp::IMul { .. })));
+            .any(|op| matches!(op, FlatOp::IAdd32 { .. })));
+        assert!(circuit
+            .flat_ops
+            .iter()
+            .any(|op| matches!(op, FlatOp::ISub32 { .. })));
     }
 }
