@@ -1,5 +1,6 @@
 //! crypto module root for crate::crypto
 
+pub mod aby3_protocol;
 pub mod arith;
 pub mod bits;
 pub mod net;

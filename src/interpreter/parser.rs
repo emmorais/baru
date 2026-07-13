@@ -61,20 +61,115 @@ pub fn tokenize(src: &str) -> Vec<String> {
                 tokens.push(format!("\"{}\"", s));
             }
             '\'' => {
-                // char literal like 'a'
-                // consume opening '\''
                 chars.next();
-                if let Some(&c) = chars.peek() {
-                    // consume the char
-                    let ch = c;
-                    chars.next();
-                    // if there's a closing quote, consume it
-                    if let Some(&closing) = chars.peek() {
-                        if closing == '\'' {
-                            chars.next();
+                // Peek at what follows the single quote to decide: char literal or quote shorthand.
+                if let Some(&next_ch) = chars.peek() {
+                    // Char literal: 'x' — single character followed by closing quote
+                    // We need to look two chars ahead to distinguish 'a' from 'abc or '(...)
+                    let is_char_literal = {
+                        let mut it = chars.clone();
+                        let first = it.next();
+                        let second = it.next();
+                        matches!((first, second), (Some(c), Some('\'')) if !c.is_whitespace() && c != '(')
+                    };
+
+                    if is_char_literal {
+                        // Char literal: 'a' — consume the char and closing quote
+                        let ch = next_ch;
+                        chars.next();
+                        if let Some(&closing) = chars.peek() {
+                            if closing == '\'' {
+                                chars.next();
+                            }
                         }
+                        tokens.push(format!("'{}'", ch));
+                    } else if next_ch == '('
+                        || next_ch.is_alphanumeric()
+                        || next_ch == '"'
+                        || next_ch == '#'
+                        || next_ch == '\''
+                    {
+                        // Quote shorthand: 'expr  →  (quote expr)
+                        tokens.push("(".to_string());
+                        tokens.push("quote".to_string());
+                        let mut depth = 0i32;
+                        let mut saw_first = false;
+                        let mut inner_tokens: Vec<String> = Vec::new();
+                        while let Some(&c) = chars.peek() {
+                            if c.is_whitespace() && !saw_first {
+                                chars.next();
+                                continue;
+                            }
+                            match c {
+                                '(' => {
+                                    depth += 1;
+                                    saw_first = true;
+                                    inner_tokens.push("(".to_string());
+                                    chars.next();
+                                }
+                                ')' => {
+                                    depth -= 1;
+                                    inner_tokens.push(")".to_string());
+                                    chars.next();
+                                    if depth <= 0 {
+                                        break;
+                                    }
+                                }
+                                '"' => {
+                                    chars.next();
+                                    let mut s = String::new();
+                                    while let Some(&sc) = chars.peek() {
+                                        chars.next();
+                                        if sc == '"' {
+                                            break;
+                                        }
+                                        if sc == '\\' {
+                                            if let Some(&esc) = chars.peek() {
+                                                chars.next();
+                                                match esc {
+                                                    'n' => s.push('\n'),
+                                                    't' => s.push('\t'),
+                                                    '\\' => s.push('\\'),
+                                                    '"' => s.push('"'),
+                                                    _ => s.push(esc),
+                                                }
+                                            }
+                                        } else {
+                                            s.push(sc);
+                                        }
+                                    }
+                                    inner_tokens.push(format!("\"{}\"", s));
+                                    saw_first = true;
+                                    if depth == 0 {
+                                        break;
+                                    }
+                                }
+                                c if c.is_whitespace() => {
+                                    chars.next();
+                                    if saw_first && depth == 0 {
+                                        break;
+                                    }
+                                }
+                                _ => {
+                                    let mut sym = String::new();
+                                    while let Some(&sc) = chars.peek() {
+                                        if sc.is_whitespace() || sc == '(' || sc == ')' {
+                                            break;
+                                        }
+                                        sym.push(sc);
+                                        chars.next();
+                                    }
+                                    inner_tokens.push(sym);
+                                    saw_first = true;
+                                    if depth == 0 {
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        tokens.extend(inner_tokens);
+                        tokens.push(")".to_string());
                     }
-                    tokens.push(format!("'{}'", ch));
                 }
             }
             '#' => {
@@ -185,6 +280,16 @@ pub fn parse_tokens(tokens: &[String], pos: &mut usize) -> Result<Expr, String> 
             }
             *pos += 1;
             return Ok(Expr::Quote(Box::new(quoted)));
+        }
+        // private annotation for ZKP witness marking
+        if next_tok == "private" {
+            *pos += 1;
+            let inner = parse_tokens(tokens, pos)?;
+            if *pos >= tokens.len() || tokens[*pos] != ")" {
+                return Err("expected ')' after private".to_string());
+            }
+            *pos += 1;
+            return Ok(Expr::Private(Box::new(inner)));
         }
         if next_tok == "eval" {
             *pos += 1;

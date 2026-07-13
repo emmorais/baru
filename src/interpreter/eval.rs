@@ -7,8 +7,9 @@ use std::path::Path;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
+use crate::interpreter::aby3_backend::Aby3Backend;
 use crate::interpreter::ast::{Env, Expr, Types};
-use crate::interpreter::backend::{Aby3Backend, Backend};
+use crate::interpreter::backend::Backend;
 use crate::interpreter::parse;
 use colored::*;
 
@@ -190,6 +191,7 @@ pub fn reduce_expression(
                         format!("{}", format!("Call(arity={})", args.len()).magenta())
                     }
                     Expr::If(_, _, _) => "If".blue().to_string(),
+                    Expr::Private(_) => format!("{}", expr_short(e).blue()),
                 }
             }
 
@@ -244,6 +246,11 @@ pub fn reduce_expression(
                 }
                 Expr::Quote(inner) => {
                     stack.push(Apply(k, Types::Quoted(Box::new(*inner)), eenv.clone()));
+                }
+                Expr::Private(inner) => {
+                    // Private annotation is metadata for ZKP witness marking.
+                    // At runtime, we evaluate the inner expression directly.
+                    stack.push(Eval(*inner, k, eenv.clone()));
                 }
                 Expr::Eval(inner) => {
                     // if inner is quoted, we can evaluate it directly without going through the Eval continuation
@@ -1155,7 +1162,7 @@ impl Participant {
         id: usize,
         transport: T,
     ) -> Self {
-        use crate::interpreter::backend::TransportBackend;
+        use crate::interpreter::transport_backend::TransportBackend;
         let backend: Arc<Mutex<Box<dyn Backend>>> =
             Arc::new(Mutex::new(Box::new(TransportBackend::new(id, transport))));
         let store: Env = Rc::new(RefCell::new(HashMap::new()));
@@ -1301,6 +1308,206 @@ impl Participant {
         self.store.borrow_mut().insert(
             "b2a".to_string(),
             Rc::new(RefCell::new(Types::NativeFunc(b2a_fn))),
+        );
+
+        // zkp-compile builtin: (zkp-compile 'expr '("x" "y"))
+        // Compiles a quoted expression to a Binius64 circuit.
+        // Returns a JSON string representing the compiled Circuit.
+        let zkp_compile_fn = Arc::new(move |args: Vec<Types>| -> Types {
+            if args.len() != 2 {
+                panic!("zkp-compile expects 2 args: (zkp-compile 'expr '(\"x\" \"y\"))");
+            }
+            // First arg: quoted expression
+            let expr = match &args[0] {
+                Types::Quoted(e) => *e.clone(),
+                _ => panic!("zkp-compile: first arg must be a quoted expression (use ')"),
+            };
+            // Second arg: list of private variable names
+            // Accepts either Types::List (from evaluated list) or Types::Quoted
+            // (from quote shorthand '("x" "y")), or an empty quoted seq.
+            let private_vars: Vec<String> = match &args[1] {
+                Types::List(items) => items
+                    .iter()
+                    .map(|v| match v {
+                        Types::Str(s) => s.clone(),
+                        _ => panic!("zkp-compile: private-vars must be a list of strings"),
+                    })
+                    .collect(),
+                Types::Quoted(inner) => {
+                    // '("x" "y") parses as Quote(Call(Str("x"), [Str("y"), ...]))
+                    // or Quote(Seq([...])) for zero/multiple items
+                    match inner.as_ref() {
+                        Expr::Call(head, rest) => {
+                            let mut vars = Vec::new();
+                            if let Expr::Str(s) = head.as_ref() {
+                                vars.push(s.clone());
+                            } else {
+                                panic!("zkp-compile: private-vars must be a list of strings");
+                            }
+                            for e in rest {
+                                if let Expr::Str(s) = e {
+                                    vars.push(s.clone());
+                                } else {
+                                    panic!("zkp-compile: private-vars must be a list of strings");
+                                }
+                            }
+                            vars
+                        }
+                        Expr::Str(s) => vec![s.clone()],
+                        Expr::Seq(items) if items.is_empty() => vec![],
+                        _ => panic!("zkp-compile: private-vars must be a quoted list of strings like '(\"x\" \"y\")"),
+                    }
+                }
+                _ => panic!("zkp-compile: second arg must be a list of strings or a quoted list like '(\"x\")"),
+            };
+            let backend = crate::zkp::binius64_backend::Binius64Backend::new();
+            use crate::zkp::ZKPBackend;
+            let circuit = backend
+                .compile_circuit(&expr, &private_vars)
+                .unwrap_or_else(|e| panic!("zkp-compile failed: {}", e));
+            let json = serde_json::to_string(&circuit)
+                .unwrap_or_else(|e| panic!("zkp-compile: failed to serialize circuit: {}", e));
+            Types::Str(json)
+        });
+        self.store.borrow_mut().insert(
+            "zkp-compile".to_string(),
+            Rc::new(RefCell::new(Types::NativeFunc(zkp_compile_fn))),
+        );
+
+        // zkp-prove builtin: (zkp-prove circuit-str '("x") '(5) '("y") '(6))
+        // circuit-str: string returned by zkp-compile (store with let)
+        // private-keys: quoted list of witness variable names  e.g. '("x" "z")
+        // private-vals: quoted list of witness values          e.g. '(5 10)
+        // public-keys:  quoted list of public output names     e.g. '("y")
+        // public-vals:  quoted list of public output values    e.g. '(6)
+        // Returns a JSON string representing the ZKProof.
+        let zkp_prove_fn = Arc::new(move |args: Vec<Types>| -> Types {
+            if args.len() != 5 {
+                panic!("zkp-prove expects 5 args: (zkp-prove circuit-str '(priv-keys) '(priv-vals) '(pub-keys) '(pub-vals))");
+            }
+            let circuit_json = match &args[0] {
+                Types::Str(s) => s.clone(),
+                _ => {
+                    panic!("zkp-prove: first arg must be a circuit JSON string (from zkp-compile)")
+                }
+            };
+            let circuit: crate::zkp::Circuit = serde_json::from_str(&circuit_json)
+                .unwrap_or_else(|e| panic!("zkp-prove: invalid circuit JSON: {}", e));
+
+            let private_keys = decode_quoted_str_list(&args[1], "zkp-prove private-keys");
+            let private_nums = decode_quoted_num_list(&args[2], "zkp-prove private-vals");
+            let public_keys = decode_quoted_str_list(&args[3], "zkp-prove public-keys");
+            let public_nums = decode_quoted_num_list(&args[4], "zkp-prove public-vals");
+
+            if private_keys.len() != private_nums.len() {
+                panic!("zkp-prove: private-keys and private-vals must have the same length");
+            }
+            if public_keys.len() != public_nums.len() {
+                panic!("zkp-prove: public-keys and public-vals must have the same length");
+            }
+
+            let private_vals: std::collections::HashMap<String, i64> =
+                private_keys.into_iter().zip(private_nums).collect();
+            let public_vals: std::collections::HashMap<String, i64> =
+                public_keys.into_iter().zip(public_nums).collect();
+
+            let backend = crate::zkp::binius64_backend::Binius64Backend::new();
+            use crate::zkp::ZKPBackend;
+            let proof = backend
+                .prove(&circuit, &private_vals, &public_vals)
+                .unwrap_or_else(|e| panic!("zkp-prove failed: {}", e));
+            let json = serde_json::to_string(&proof)
+                .unwrap_or_else(|e| panic!("zkp-prove: failed to serialize proof: {}", e));
+            Types::Str(json)
+        });
+        self.store.borrow_mut().insert(
+            "zkp-prove".to_string(),
+            Rc::new(RefCell::new(Types::NativeFunc(zkp_prove_fn))),
+        );
+
+        // zkp-verify builtin: (zkp-verify circuit-str proof-str '("y") '(6))
+        // Returns 1 if valid, 0 if invalid, panics on structural errors.
+        let zkp_verify_fn = Arc::new(move |args: Vec<Types>| -> Types {
+            if args.len() != 4 {
+                panic!("zkp-verify expects 4 args: (zkp-verify circuit-str proof-str '(pub-keys) '(pub-vals))");
+            }
+            let circuit_json = match &args[0] {
+                Types::Str(s) => s.clone(),
+                _ => panic!("zkp-verify: first arg must be a circuit JSON string"),
+            };
+            let proof_json = match &args[1] {
+                Types::Str(s) => s.clone(),
+                _ => panic!("zkp-verify: second arg must be a proof JSON string"),
+            };
+            let circuit: crate::zkp::Circuit = serde_json::from_str(&circuit_json)
+                .unwrap_or_else(|e| panic!("zkp-verify: invalid circuit JSON: {}", e));
+            let proof: crate::zkp::ZKProof = serde_json::from_str(&proof_json)
+                .unwrap_or_else(|e| panic!("zkp-verify: invalid proof JSON: {}", e));
+
+            let public_keys = decode_quoted_str_list(&args[2], "zkp-verify public-keys");
+            let public_nums = decode_quoted_num_list(&args[3], "zkp-verify public-vals");
+
+            if public_keys.len() != public_nums.len() {
+                panic!("zkp-verify: public-keys and public-vals must have the same length");
+            }
+            let public_vals: std::collections::HashMap<String, i64> =
+                public_keys.into_iter().zip(public_nums).collect();
+
+            let backend = crate::zkp::binius64_backend::Binius64Backend::new();
+            use crate::zkp::ZKPBackend;
+            match backend.verify(&circuit, &proof, &public_vals) {
+                Ok(true) => Types::Num(1),
+                Ok(false) => Types::Num(0),
+                Err(e) => panic!("zkp-verify failed: {}", e),
+            }
+        });
+        self.store.borrow_mut().insert(
+            "zkp-verify".to_string(),
+            Rc::new(RefCell::new(Types::NativeFunc(zkp_verify_fn))),
+        );
+
+        // proof-save builtin: (proof-save proof-json filename)
+        // Saves a proof JSON string to a file using the serialization module.
+        let proof_save_fn = Arc::new(move |args: Vec<Types>| -> Types {
+            if args.len() != 2 {
+                panic!("proof-save expects 2 args: (proof-save proof-json filename)");
+            }
+            match (&args[0], &args[1]) {
+                (Types::Str(proof_json), Types::Str(filename)) => {
+                    let proof: crate::zkp::ZKProof = serde_json::from_str(proof_json)
+                        .unwrap_or_else(|e| panic!("proof-save: invalid proof JSON: {}", e));
+                    crate::zkp::serialization::save_proof(&proof, filename)
+                        .unwrap_or_else(|e| panic!("proof-save failed: {}", e));
+                    Types::Str(format!("proof saved to {}", filename))
+                }
+                _ => panic!("proof-save expects (proof-json-string filename-string)"),
+            }
+        });
+        self.store.borrow_mut().insert(
+            "proof-save".to_string(),
+            Rc::new(RefCell::new(Types::NativeFunc(proof_save_fn))),
+        );
+
+        // proof-load builtin: (proof-load filename)
+        // Loads a proof from a JSON file, returns proof JSON string.
+        let proof_load_fn = Arc::new(move |args: Vec<Types>| -> Types {
+            if args.len() != 1 {
+                panic!("proof-load expects 1 arg: (proof-load filename)");
+            }
+            match &args[0] {
+                Types::Str(filename) => {
+                    let proof = crate::zkp::serialization::load_proof(filename)
+                        .unwrap_or_else(|e| panic!("proof-load failed: {}", e));
+                    let json = serde_json::to_string(&proof)
+                        .unwrap_or_else(|e| panic!("proof-load: failed to serialize: {}", e));
+                    Types::Str(json)
+                }
+                _ => panic!("proof-load expects a filename string"),
+            }
+        });
+        self.store.borrow_mut().insert(
+            "proof-load".to_string(),
+            Rc::new(RefCell::new(Types::NativeFunc(proof_load_fn))),
         );
     }
 
@@ -1469,11 +1676,8 @@ fn to_persist_value(v: &Types) -> Option<PersistValue> {
         Types::List(lst) => {
             let mut out: Vec<PersistValue> = Vec::new();
             for item in lst.iter() {
-                if let Some(iv) = to_persist_value(item) {
-                    out.push(iv);
-                } else {
-                    return None;
-                }
+                let iv = to_persist_value(item)?;
+                out.push(iv);
             }
             Some(PersistValue::List(out))
         }
@@ -1490,11 +1694,8 @@ fn from_persist_value(p: PersistValue) -> Option<Types> {
         PersistValue::List(vs) => {
             let mut out: Vec<Types> = Vec::new();
             for iv in vs.into_iter() {
-                if let Some(sv) = from_persist_value(iv) {
-                    out.push(sv);
-                } else {
-                    return None;
-                }
+                let sv = from_persist_value(iv)?;
+                out.push(sv);
             }
             Some(Types::List(out))
         }
@@ -1521,6 +1722,7 @@ fn expr_short(e: &Expr) -> String {
         Expr::Lambda(ps, _) => format!("Lambda(arity={})", ps.len()),
         Expr::Call(_, args) => format!("Call(arity={})", args.len()),
         Expr::If(_, _, _) => "If".to_string(),
+        Expr::Private(_) => "Private".to_string(),
     }
 }
 
@@ -1542,6 +1744,83 @@ fn cont_short(c: &Continuation) -> String {
         Continuation::CallEvalArgs { .. } => "CallEvalArgs".to_string(),
         Continuation::If { .. } => "IfCont".to_string(),
         Continuation::IfResultNormalize { .. } => "IfResultNormalize".to_string(),
+    }
+}
+
+/// Decode a quoted list of strings from a Types value.
+/// Accepts '("a" "b") → Quote(Call(Str("a"), [Str("b")])) or Quote(Str("a")) or Quote(Seq([])).
+fn decode_quoted_str_list(v: &Types, label: &str) -> Vec<String> {
+    use crate::interpreter::ast::Expr;
+    match v {
+        Types::List(items) => items
+            .iter()
+            .map(|x| match x {
+                Types::Str(s) => s.clone(),
+                _ => panic!("{}: expected string item", label),
+            })
+            .collect(),
+        Types::Quoted(inner) => match inner.as_ref() {
+            Expr::Call(head, rest) => {
+                let mut out = Vec::new();
+                if let Expr::Str(s) = head.as_ref() {
+                    out.push(s.clone());
+                } else {
+                    panic!("{}: expected string in quoted list, got {:?}", label, head);
+                }
+                for e in rest {
+                    if let Expr::Str(s) = e {
+                        out.push(s.clone());
+                    } else {
+                        panic!("{}: expected string in quoted list", label);
+                    }
+                }
+                out
+            }
+            Expr::Str(s) => vec![s.clone()],
+            Expr::Seq(items) if items.is_empty() => vec![],
+            _ => panic!(
+                "{}: expected a quoted list of strings like '(\"x\" \"y\")",
+                label
+            ),
+        },
+        _ => panic!("{}: expected a quoted list of strings like '(\"x\")", label),
+    }
+}
+
+/// Decode a quoted list of numbers from a Types value.
+/// Accepts '(5 10) → Quote(Call(Num(5), [Num(10)])) or Quote(Num(5)) or Quote(Seq([])).
+fn decode_quoted_num_list(v: &Types, label: &str) -> Vec<i64> {
+    use crate::interpreter::ast::Expr;
+    match v {
+        Types::List(items) => items
+            .iter()
+            .map(|x| match x {
+                Types::Num(n) => *n,
+                _ => panic!("{}: expected number item", label),
+            })
+            .collect(),
+        Types::Quoted(inner) => match inner.as_ref() {
+            Expr::Call(head, rest) => {
+                let mut out = Vec::new();
+                if let Expr::Num(n) = head.as_ref() {
+                    out.push(*n);
+                } else {
+                    panic!("{}: expected number in quoted list, got {:?}", label, head);
+                }
+                for e in rest {
+                    if let Expr::Num(n) = e {
+                        out.push(*n);
+                    } else {
+                        panic!("{}: expected number in quoted list", label);
+                    }
+                }
+                out
+            }
+            Expr::Num(n) => vec![*n],
+            Expr::Seq(items) if items.is_empty() => vec![],
+            _ => panic!("{}: expected a quoted list of numbers like '(5 10)", label),
+        },
+        _ => panic!("{}: expected a quoted list of numbers like '(5)", label),
     }
 }
 

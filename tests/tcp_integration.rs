@@ -273,10 +273,9 @@ fn run_cases(cases: &[Case]) {
         .filter_map(|line| {
             let t = line.trim();
             // Match "=> 42" or "=> -7" etc.
-            let t = if let Some(rest) = t.strip_prefix("=>") {
+            let t = {
+                let rest = t.strip_prefix("=>")?;
                 rest.trim()
-            } else {
-                return None;
             };
             t.split_whitespace()
                 .next()
