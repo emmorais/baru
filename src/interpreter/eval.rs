@@ -1676,11 +1676,8 @@ fn to_persist_value(v: &Types) -> Option<PersistValue> {
         Types::List(lst) => {
             let mut out: Vec<PersistValue> = Vec::new();
             for item in lst.iter() {
-                if let Some(iv) = to_persist_value(item) {
-                    out.push(iv);
-                } else {
-                    return None;
-                }
+                let iv = to_persist_value(item)?;
+                out.push(iv);
             }
             Some(PersistValue::List(out))
         }
@@ -1697,11 +1694,8 @@ fn from_persist_value(p: PersistValue) -> Option<Types> {
         PersistValue::List(vs) => {
             let mut out: Vec<Types> = Vec::new();
             for iv in vs.into_iter() {
-                if let Some(sv) = from_persist_value(iv) {
-                    out.push(sv);
-                } else {
-                    return None;
-                }
+                let sv = from_persist_value(iv)?;
+                out.push(sv);
             }
             Some(Types::List(out))
         }
