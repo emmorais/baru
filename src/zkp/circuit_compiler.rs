@@ -487,15 +487,15 @@ impl CircuitCompiler {
 
             // ── If → Mux (both branches evaluated; non-det select)
             Expr::If(cond, then_e, else_e) => {
-                let cond_w = self.flatten(cond, env, lambdas, flat)?;
-                let then_w = self.flatten(then_e, env, lambdas, flat)?;
-                let else_w = self.flatten(else_e, env, lambdas, flat)?;
+                let cond_wire = self.flatten(cond, env, lambdas, flat)?;
+                let then_wire = self.flatten(then_e, env, lambdas, flat)?;
+                let else_wire = self.flatten(else_e, env, lambdas, flat)?;
                 let dst = self.fresh("mux");
                 flat.push(FlatOp::Mux {
                     dst: dst.clone(),
-                    cond: cond_w,
-                    t_val: then_w,
-                    e_val: else_w,
+                    cond: cond_wire,
+                    t_val: then_wire,
+                    e_val: else_wire,
                 });
                 Ok(dst)
             }
@@ -890,98 +890,112 @@ impl CircuitCompiler {
     fn emit_constraints(flat: &[FlatOp]) -> Vec<Constraint> {
         let mut out = Vec::with_capacity(flat.len());
         for op in flat {
-            let c = match op {
-                FlatOp::Const { dst, value } => Constraint::Constant {
+            match op {
+                FlatOp::Const { dst, value } => out.push(Constraint::Constant {
                     dst: dst.clone(),
                     value: *value,
-                },
-                FlatOp::IAdd32 { dst, lhs, rhs } => Constraint::IAdd32 {
+                }),
+
+                FlatOp::IAdd32 { dst, lhs, rhs } => out.push(Constraint::IAdd32 {
                     dst: dst.clone(),
                     lhs: lhs.clone(),
                     rhs: rhs.clone(),
-                },
-                FlatOp::ISub32 { dst, lhs, rhs } => Constraint::ISub32 {
+                }),
+
+                FlatOp::ISub32 { dst, lhs, rhs } => out.push(Constraint::ISub32 {
                     dst: dst.clone(),
                     lhs: lhs.clone(),
                     rhs: rhs.clone(),
-                },
-                FlatOp::IMul { dst, lhs, rhs } => Constraint::IMul {
+                }),
+
+                FlatOp::IMul { dst, lhs, rhs } => out.push(Constraint::IMul {
                     dst: dst.clone(),
                     lhs: lhs.clone(),
                     rhs: rhs.clone(),
-                },
+                }),
+
                 FlatOp::IDiv {
                     dst_q,
                     dst_r,
                     lhs,
                     rhs,
-                } => Constraint::NDivCheck {
+                } => out.push(Constraint::NDivCheck {
                     dst_q: dst_q.clone(),
                     dst_r: dst_r.clone(),
                     lhs: lhs.clone(),
                     rhs: rhs.clone(),
-                },
-                FlatOp::ICmpEq { dst, lhs, rhs } => Constraint::ICmpEq {
+                }),
+
+                FlatOp::ICmpEq { dst, lhs, rhs } => out.push(Constraint::ICmpEq {
                     dst: dst.clone(),
                     lhs: lhs.clone(),
                     rhs: rhs.clone(),
-                },
-                FlatOp::ICmpUlt { dst, lhs, rhs } => Constraint::ICmpUlt {
+                }),
+
+                FlatOp::ICmpUlt { dst, lhs, rhs } => out.push(Constraint::ICmpUlt {
                     dst: dst.clone(),
                     lhs: lhs.clone(),
                     rhs: rhs.clone(),
-                },
-                FlatOp::ICmpSlt { dst, lhs, rhs } => Constraint::ICmpSlt {
+                }),
+
+                FlatOp::ICmpSlt { dst, lhs, rhs } => out.push(Constraint::ICmpSlt {
                     dst: dst.clone(),
                     lhs: lhs.clone(),
                     rhs: rhs.clone(),
-                },
-                FlatOp::BAnd { dst, lhs, rhs } => Constraint::BAnd {
+                }),
+
+                FlatOp::BAnd { dst, lhs, rhs } => out.push(Constraint::BAnd {
                     dst: dst.clone(),
                     lhs: lhs.clone(),
                     rhs: rhs.clone(),
-                },
-                FlatOp::BOr { dst, lhs, rhs } => Constraint::BOr {
+                }),
+
+                FlatOp::BOr { dst, lhs, rhs } => out.push(Constraint::BOr {
                     dst: dst.clone(),
                     lhs: lhs.clone(),
                     rhs: rhs.clone(),
-                },
-                FlatOp::BXor { dst, lhs, rhs } => Constraint::BXor {
+                }),
+
+                FlatOp::BXor { dst, lhs, rhs } => out.push(Constraint::BXor {
                     dst: dst.clone(),
                     lhs: lhs.clone(),
                     rhs: rhs.clone(),
-                },
-                FlatOp::BNot { dst, src } => Constraint::BNot {
+                }),
+
+                FlatOp::BNot { dst, src } => out.push(Constraint::BNot {
                     dst: dst.clone(),
                     src: src.clone(),
-                },
-                FlatOp::Shl { dst, src, amount } => Constraint::Shl {
+                }),
+
+                FlatOp::Shl { dst, src, amount } => out.push(Constraint::Shl {
                     dst: dst.clone(),
                     src: src.clone(),
                     amount: *amount,
-                },
-                FlatOp::Shr { dst, src, amount } => Constraint::Shr {
+                }),
+
+                FlatOp::Shr { dst, src, amount } => out.push(Constraint::Shr {
                     dst: dst.clone(),
                     src: src.clone(),
                     amount: *amount,
-                },
+                }),
+
                 FlatOp::Mux {
                     dst,
                     cond,
                     t_val,
                     e_val,
-                } => Constraint::Mux {
+                } => out.push(Constraint::Mux {
                     dst: dst.clone(),
                     cond: cond.clone(),
                     t_val: t_val.clone(),
                     e_val: e_val.clone(),
-                },
-                FlatOp::PopCount { dst, src } => Constraint::PopCount {
+                }),
+
+                FlatOp::PopCount { dst, src } => out.push(Constraint::PopCount {
                     dst: dst.clone(),
                     src: src.clone(),
-                },
-            };
-            out.push(c);
+                }),
+            }
         }
         out
     }
