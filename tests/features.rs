@@ -1,5 +1,5 @@
 use baru::interpreter::{
-    eval::{eval_plain as eval, eval_shared},
+    eval::{eval_fhe, eval_plain as eval, eval_shared},
     eval_plain_string,
 };
 
@@ -898,3 +898,39 @@ fn test_zkp() {
                         (== (verify (prove (== (+ a b) c))) 1))";
     assert_eq!(eval_shared(src), 72);
 }*/
+
+// ---------------------------------------------------------------------------
+// FHE builtins — mock plaintext backend (fhe-keygen)
+// These tests run instantly since MockFheBackend does no crypto.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_fhe_mock_encrypt_decrypt() {
+    // Basic round-trip: encrypt 42, decrypt, compare.
+    let src = "(let ((keys (fhe-keygen)))
+                 (fhe-dec keys (fhe-enc keys 42)))";
+    assert_eq!(eval_fhe(src), 42);
+}
+
+#[test]
+fn test_fhe_mock_compile_eval_add() {
+    // Compile (+ x y), evaluate with x=10 (public) and y encrypted.
+    let src = r#"(let ((keys (fhe-keygen)))
+                   (let ((ct-y (fhe-enc keys 32)))
+                     (let ((circuit (fhe-compile '(+ x y) '("y"))))
+                       (fhe-dec keys
+                         (fhe-eval circuit keys '("x") '(10) '("y") (list ct-y))))))"#;
+    assert_eq!(eval_fhe(src), 42);
+}
+
+#[test]
+fn test_fhe_mock_compile_eval_mul() {
+    // Compile (* a b), both encrypted.
+    let src = r#"(let ((keys (fhe-keygen)))
+                   (let ((ct-a (fhe-enc keys 6))
+                         (ct-b (fhe-enc keys 7)))
+                     (let ((circuit (fhe-compile '(* a b) '("a" "b"))))
+                       (fhe-dec keys
+                         (fhe-eval circuit keys '() '() '("a" "b") (list ct-a ct-b))))))"#;
+    assert_eq!(eval_fhe(src), 42);
+}

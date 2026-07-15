@@ -1037,6 +1037,10 @@ pub fn reduce_expression(
                                         Rc::new(RefCell::new(closure_env.borrow().clone()));
                                     stack.push(Eval(*body, *cont, call_env));
                                 }
+                                Types::NativeFunc(f) => {
+                                    let result = f(vec![]);
+                                    stack.push(Apply(*cont, result, env.clone()));
+                                }
                                 _ => panic!("attempt to call non-function: {:?}", val),
                             }
                         } else {
@@ -1394,6 +1398,15 @@ impl Participant {
             Rc::new(RefCell::new(Types::NativeFunc(b2a_fn))),
         );
 
+        // list builtin: (list v1 v2 ...) → Types::List
+        // Collects all arguments into a list.  Useful for building ciphertext
+        // lists to pass to fhe-eval's enc-cts argument.
+        let list_fn = Arc::new(move |args: Vec<Types>| -> Types { Types::List(args) });
+        self.store.borrow_mut().insert(
+            "list".to_string(),
+            Rc::new(RefCell::new(Types::NativeFunc(list_fn))),
+        );
+
         // zkp-compile builtin: (zkp-compile 'expr '("x" "y"))
         // Compiles a quoted expression to a Binius64 circuit.
         // Returns a JSON string representing the compiled Circuit.
@@ -1677,7 +1690,7 @@ impl Participant {
         //   → enc-keys / enc-cts:        ciphertext inputs (Types::FheCiphertext)
         //   → returns Types::FheCiphertext (the encrypted result)
 
-        // fhe-keygen
+        // fhe-keygen  (mock plaintext backend — instant, no crypto)
         let fhe_keygen_fn = Arc::new(move |args: Vec<Types>| -> Types {
             if !args.is_empty() {
                 panic!("fhe-keygen takes no arguments");
@@ -1697,6 +1710,32 @@ impl Participant {
         self.store.borrow_mut().insert(
             "fhe-keygen".to_string(),
             Rc::new(RefCell::new(Types::NativeFunc(fhe_keygen_fn))),
+        );
+
+        // fhe-keygen-tfhe  (real TFHE-rs backend — slow first call ~3 s)
+        // Also installs the server key into the TFHE-rs global thread-local so
+        // subsequent fhe-enc / fhe-eval calls work without extra setup.
+        let fhe_keygen_tfhe_fn = Arc::new(move |args: Vec<Types>| -> Types {
+            if !args.is_empty() {
+                panic!("fhe-keygen-tfhe takes no arguments");
+            }
+            use crate::fhe::FheBackend;
+            let be = crate::fhe::TfheBackend::new();
+            let (ck, sk) = be.keygen();
+            // Install server key globally so all subsequent gates work.
+            crate::fhe::TfheBackend::install_server_key(&sk);
+            let kp = crate::fhe::backend::FheKeyPair {
+                backend_id: be.backend_id().to_string(),
+                client_key_bytes: ck,
+                server_key_bytes: sk,
+            };
+            let json = serde_json::to_string(&kp)
+                .unwrap_or_else(|e| panic!("fhe-keygen-tfhe: serialise error: {}", e));
+            Types::Str(json)
+        });
+        self.store.borrow_mut().insert(
+            "fhe-keygen-tfhe".to_string(),
+            Rc::new(RefCell::new(Types::NativeFunc(fhe_keygen_tfhe_fn))),
         );
 
         // fhe-enc
@@ -1722,14 +1761,27 @@ impl Participant {
                 }
                 _ => panic!("fhe-enc: second arg must be a number or boolean"),
             };
-            let be = crate::fhe::MockFheBackend;
             use crate::fhe::FheBackend;
-            let ct = be.encrypt(&kp.client_key_bytes, plaintext);
-            let handle = crate::fhe::backend::FheCiphertextHandle {
-                backend_id: be.backend_id().to_string(),
-                bytes: be.serialize_ct(&ct),
-            };
-            Types::FheCiphertext(handle)
+            match kp.backend_id.as_str() {
+                "tfhe-rs-v1.6" => {
+                    let be = crate::fhe::TfheBackend::new();
+                    let ct = be.encrypt(&kp.client_key_bytes, plaintext);
+                    let handle = crate::fhe::backend::FheCiphertextHandle {
+                        backend_id: be.backend_id().to_string(),
+                        bytes: be.serialize_ct(&ct),
+                    };
+                    Types::FheCiphertext(handle)
+                }
+                _ => {
+                    let be = crate::fhe::MockFheBackend;
+                    let ct = be.encrypt(&kp.client_key_bytes, plaintext);
+                    let handle = crate::fhe::backend::FheCiphertextHandle {
+                        backend_id: be.backend_id().to_string(),
+                        bytes: be.serialize_ct(&ct),
+                    };
+                    Types::FheCiphertext(handle)
+                }
+            }
         });
         self.store.borrow_mut().insert(
             "fhe-enc".to_string(),
@@ -1751,10 +1803,19 @@ impl Participant {
                 Types::FheCiphertext(h) => h.clone(),
                 _ => panic!("fhe-dec: second arg must be a FheCiphertext"),
             };
-            let be = crate::fhe::MockFheBackend;
             use crate::fhe::FheBackend;
-            let ct = be.deserialize_ct(&handle.bytes);
-            Types::Num(be.decrypt(&kp.client_key_bytes, &ct) as i64)
+            match kp.backend_id.as_str() {
+                "tfhe-rs-v1.6" => {
+                    let be = crate::fhe::TfheBackend::new();
+                    let ct = be.deserialize_ct(&handle.bytes);
+                    Types::Num(be.decrypt(&kp.client_key_bytes, &ct) as i64)
+                }
+                _ => {
+                    let be = crate::fhe::MockFheBackend;
+                    let ct = be.deserialize_ct(&handle.bytes);
+                    Types::Num(be.decrypt(&kp.client_key_bytes, &ct) as i64)
+                }
+            }
         });
         self.store.borrow_mut().insert(
             "fhe-dec".to_string(),
@@ -1839,6 +1900,7 @@ impl Participant {
             let pub_nums = decode_quoted_num_list(&args[3], "fhe-eval pub-vals");
             let enc_keys = decode_quoted_str_list(&args[4], "fhe-eval enc-keys");
             // enc-cts: list of FheCiphertext values
+            // Accepts Types::List (from `list` builtin) or an empty quoted seq '()
             let enc_cts: Vec<crate::fhe::backend::FheCiphertextHandle> = match &args[5] {
                 Types::List(items) => items
                     .iter()
@@ -1847,7 +1909,11 @@ impl Participant {
                         _ => panic!("fhe-eval: enc-cts must be a list of FheCiphertext values"),
                     })
                     .collect(),
-                _ => panic!("fhe-eval: enc-cts must be a list of FheCiphertext values"),
+                Types::Quoted(inner) => match inner.as_ref() {
+                    Expr::Seq(items) if items.is_empty() => vec![],
+                    _ => panic!("fhe-eval: enc-cts must be a list of FheCiphertext values (use (list ct1 ct2 ...) or '() for empty)"),
+                },
+                _ => panic!("fhe-eval: enc-cts must be a list of FheCiphertext values (use (list ct1 ct2 ...) or '() for empty)"),
             };
 
             if pub_keys.len() != pub_nums.len() {
@@ -1861,27 +1927,45 @@ impl Participant {
             circuit.public_inputs = pub_keys.clone();
             circuit.encrypted_inputs = enc_keys.clone();
 
-            let be = crate::fhe::MockFheBackend;
             use crate::fhe::FheBackend;
-
             let pub_map: std::collections::HashMap<String, i64> =
                 pub_keys.into_iter().zip(pub_nums).collect();
-            let enc_map: std::collections::HashMap<String, u64> = enc_keys
-                .into_iter()
-                .zip(enc_cts.iter().map(|h| be.deserialize_ct(&h.bytes)))
-                .collect();
 
-            let result_ct =
-                crate::fhe::circuit_emitter::evaluate_fhe(&circuit, &pub_map, &enc_map, &be);
-
-            let handle = crate::fhe::backend::FheCiphertextHandle {
-                backend_id: be.backend_id().to_string(),
-                bytes: be.serialize_ct(&result_ct),
-            };
-            // Also store the server key on the backend so evaluation can proceed.
-            // (mock backend ignores it; real backends would install it here)
-            let _ = kp.server_key_bytes;
-            Types::FheCiphertext(handle)
+            match kp.backend_id.as_str() {
+                "tfhe-rs-v1.6" => {
+                    // Ensure the server key is installed (caller may have used
+                    // fhe-keygen-tfhe which installs it, but re-install to be safe).
+                    crate::fhe::TfheBackend::install_server_key(&kp.server_key_bytes);
+                    let be = crate::fhe::TfheBackend::new();
+                    let enc_map: std::collections::HashMap<String, _> = enc_keys
+                        .into_iter()
+                        .zip(enc_cts.iter().map(|h| be.deserialize_ct(&h.bytes)))
+                        .collect();
+                    let result_ct = crate::fhe::circuit_emitter::evaluate_fhe(
+                        &circuit, &pub_map, &enc_map, &be,
+                    );
+                    let handle = crate::fhe::backend::FheCiphertextHandle {
+                        backend_id: be.backend_id().to_string(),
+                        bytes: be.serialize_ct(&result_ct),
+                    };
+                    Types::FheCiphertext(handle)
+                }
+                _ => {
+                    let be = crate::fhe::MockFheBackend;
+                    let enc_map: std::collections::HashMap<String, u64> = enc_keys
+                        .into_iter()
+                        .zip(enc_cts.iter().map(|h| be.deserialize_ct(&h.bytes)))
+                        .collect();
+                    let result_ct = crate::fhe::circuit_emitter::evaluate_fhe(
+                        &circuit, &pub_map, &enc_map, &be,
+                    );
+                    let handle = crate::fhe::backend::FheCiphertextHandle {
+                        backend_id: be.backend_id().to_string(),
+                        bytes: be.serialize_ct(&result_ct),
+                    };
+                    Types::FheCiphertext(handle)
+                }
+            }
         });
         self.store.borrow_mut().insert(
             "fhe-eval".to_string(),
@@ -2273,6 +2357,19 @@ pub fn eval_shared(src: &str) -> i64 {
             (raw as u32) as i32 as i64
         }
         other => panic!("expected Num or Share, got: {:?}", other),
+    }
+}
+
+/// Evaluate a Baru expression that uses FHE builtins (fhe-keygen, fhe-enc,
+/// fhe-dec, fhe-eval, fhe-keygen-tfhe).  Returns the numeric result.
+/// The expression must produce a `Types::Num` at the top level; use
+/// `fhe-dec` inside the expression to convert a ciphertext to a number.
+pub fn eval_fhe(src: &str) -> i64 {
+    let expr = parse(src).expect("parse failed");
+    let p = Participant::new(0);
+    match p.eval(&expr) {
+        Types::Num(n) => n,
+        other => panic!("eval_fhe: expected Num, got: {:?}", other),
     }
 }
 
