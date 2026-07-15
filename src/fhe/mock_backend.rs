@@ -77,11 +77,19 @@ impl FheBackend for MockFheBackend {
     // ── Comparisons ──────────────────────────────────────────────────────────
 
     fn cmpeq(&self, a: &Self::Ct, b: &Self::Ct) -> Self::Ct {
-        if a == b { 1 } else { 0 }
+        if a == b {
+            1
+        } else {
+            0
+        }
     }
 
     fn cmplt(&self, a: &Self::Ct, b: &Self::Ct) -> Self::Ct {
-        if (*a as i64) < (*b as i64) { 1 } else { 0 }
+        if (*a as i64) < (*b as i64) {
+            1
+        } else {
+            0
+        }
     }
 
     // ── Bitwise ──────────────────────────────────────────────────────────────
@@ -115,7 +123,11 @@ impl FheBackend for MockFheBackend {
     // ── Mux ──────────────────────────────────────────────────────────────────
 
     fn mux(&self, cond: &Self::Ct, t: &Self::Ct, e: &Self::Ct) -> Self::Ct {
-        if *cond != 0 { *t } else { *e }
+        if *cond != 0 {
+            *t
+        } else {
+            *e
+        }
     }
 
     // ── Division ─────────────────────────────────────────────────────────────

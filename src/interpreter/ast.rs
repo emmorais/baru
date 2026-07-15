@@ -203,7 +203,12 @@ impl fmt::Debug for Types {
             Types::Share(sref) => write!(f, "Share(id={}, nbits={})", sref.id, sref.nbits),
             Types::NativeFunc(_) => write!(f, "NativeFunc"),
             Types::FheCiphertext(h) => {
-                write!(f, "FheCiphertext(backend={}, bytes={})", h.backend_id, h.bytes.len())
+                write!(
+                    f,
+                    "FheCiphertext(backend={}, bytes={})",
+                    h.backend_id,
+                    h.bytes.len()
+                )
             }
         }
     }

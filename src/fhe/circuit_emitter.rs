@@ -121,7 +121,12 @@ pub fn evaluate_fhe<B: FheBackend>(
                 env.insert(dst.clone(), result);
             }
 
-            FlatOp::IDiv { dst_q, dst_r, lhs, rhs } => {
+            FlatOp::IDiv {
+                dst_q,
+                dst_r,
+                lhs,
+                rhs,
+            } => {
                 let (q, r) = backend.divmod(&ct!(lhs), &ct!(rhs));
                 env.insert(dst_q.clone(), WireVal::Cipher(q));
                 env.insert(dst_r.clone(), WireVal::Cipher(r));
@@ -173,7 +178,12 @@ pub fn evaluate_fhe<B: FheBackend>(
                 env.insert(dst.clone(), WireVal::Cipher(result));
             }
 
-            FlatOp::Mux { dst, cond, t_val, e_val } => {
+            FlatOp::Mux {
+                dst,
+                cond,
+                t_val,
+                e_val,
+            } => {
                 let result = backend.mux(&ct!(cond), &ct!(t_val), &ct!(e_val));
                 env.insert(dst.clone(), WireVal::Cipher(result));
             }

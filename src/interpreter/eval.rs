@@ -583,12 +583,16 @@ pub fn reduce_expression(
                                                     ((a as i128 * b as i128) >> 16) as i64
                                                 }
                                                 super::parser::BinOp::DivExact => {
-                                                    if b == 0 { panic!("division by zero"); }
+                                                    if b == 0 {
+                                                        panic!("division by zero");
+                                                    }
                                                     // (a << 16) / b
                                                     ((a as i128) << 16) as i64 / b
                                                 }
                                                 super::parser::BinOp::Mod => {
-                                                    if b == 0 { panic!("modulo by zero"); }
+                                                    if b == 0 {
+                                                        panic!("modulo by zero");
+                                                    }
                                                     a % b
                                                 }
                                                 _ => unreachable!(),
@@ -1709,7 +1713,13 @@ impl Participant {
             let plaintext = match &args[1] {
                 Types::Num(n) => *n as u64,
                 Types::Fixed(v) => *v as u64,
-                Types::Bool(b) => if *b { 1u64 } else { 0u64 },
+                Types::Bool(b) => {
+                    if *b {
+                        1u64
+                    } else {
+                        0u64
+                    }
+                }
                 _ => panic!("fhe-enc: second arg must be a number or boolean"),
             };
             let be = crate::fhe::MockFheBackend;
@@ -1773,9 +1783,13 @@ impl Participant {
                     Expr::Seq(items) if items.is_empty() => vec![],
                     Expr::Call(head, rest) => {
                         let mut vars = Vec::new();
-                        if let Expr::Str(s) = head.as_ref() { vars.push(s.clone()); }
+                        if let Expr::Str(s) = head.as_ref() {
+                            vars.push(s.clone());
+                        }
                         for e in rest {
-                            if let Expr::Str(s) = e { vars.push(s.clone()); }
+                            if let Expr::Str(s) = e {
+                                vars.push(s.clone());
+                            }
                         }
                         vars
                     }
@@ -1812,9 +1826,8 @@ impl Participant {
                 Types::Str(s) => s.clone(),
                 _ => panic!("fhe-eval: first arg must be a circuit JSON string (from fhe-compile)"),
             };
-            let mut circuit: crate::fhe::backend::FheCircuit =
-                serde_json::from_str(&circuit_json)
-                    .unwrap_or_else(|e| panic!("fhe-eval: invalid circuit JSON: {}", e));
+            let mut circuit: crate::fhe::backend::FheCircuit = serde_json::from_str(&circuit_json)
+                .unwrap_or_else(|e| panic!("fhe-eval: invalid circuit JSON: {}", e));
             let keys_json = match &args[1] {
                 Types::Str(s) => s.clone(),
                 _ => panic!("fhe-eval: second arg must be a key-pair JSON string"),
@@ -1822,21 +1835,20 @@ impl Participant {
             let kp: crate::fhe::backend::FheKeyPair = serde_json::from_str(&keys_json)
                 .unwrap_or_else(|e| panic!("fhe-eval: invalid key JSON: {}", e));
 
-            let pub_keys  = decode_quoted_str_list(&args[2], "fhe-eval pub-keys");
-            let pub_nums  = decode_quoted_num_list(&args[3], "fhe-eval pub-vals");
-            let enc_keys  = decode_quoted_str_list(&args[4], "fhe-eval enc-keys");
+            let pub_keys = decode_quoted_str_list(&args[2], "fhe-eval pub-keys");
+            let pub_nums = decode_quoted_num_list(&args[3], "fhe-eval pub-vals");
+            let enc_keys = decode_quoted_str_list(&args[4], "fhe-eval enc-keys");
             // enc-cts: list of FheCiphertext values
-            let enc_cts: Vec<crate::fhe::backend::FheCiphertextHandle> =
-                match &args[5] {
-                    Types::List(items) => items
-                        .iter()
-                        .map(|v| match v {
-                            Types::FheCiphertext(h) => h.clone(),
-                            _ => panic!("fhe-eval: enc-cts must be a list of FheCiphertext values"),
-                        })
-                        .collect(),
-                    _ => panic!("fhe-eval: enc-cts must be a list of FheCiphertext values"),
-                };
+            let enc_cts: Vec<crate::fhe::backend::FheCiphertextHandle> = match &args[5] {
+                Types::List(items) => items
+                    .iter()
+                    .map(|v| match v {
+                        Types::FheCiphertext(h) => h.clone(),
+                        _ => panic!("fhe-eval: enc-cts must be a list of FheCiphertext values"),
+                    })
+                    .collect(),
+                _ => panic!("fhe-eval: enc-cts must be a list of FheCiphertext values"),
+            };
 
             if pub_keys.len() != pub_nums.len() {
                 panic!("fhe-eval: pub-keys and pub-vals must have the same length");
@@ -2315,7 +2327,12 @@ mod fixed_point_tests {
             Types::Fixed(v) => {
                 let expected = (3 * FIXED_SCALE + 3 * FIXED_SCALE / 4) as f64 / FIXED_SCALE as f64;
                 let got = v as f64 / FIXED_SCALE as f64;
-                assert!((got - expected).abs() < 0.0002, "expected ~{}, got {}", expected, got);
+                assert!(
+                    (got - expected).abs() < 0.0002,
+                    "expected ~{}, got {}",
+                    expected,
+                    got
+                );
             }
             _ => panic!("expected Fixed, got {:?}", result),
         }

@@ -337,10 +337,7 @@ impl CircuitCompiler {
     /// encrypted input (caller decides at evaluation time which ones are
     /// plaintext public inputs vs. encrypted inputs).  There are no witnesses
     /// (non-determinism) — `IDiv` ops are kept as-is and evaluated via PBS.
-    pub fn compile_fhe(
-        &mut self,
-        expr: &Expr,
-    ) -> Result<crate::fhe::backend::FheCircuit, String> {
+    pub fn compile_fhe(&mut self, expr: &Expr) -> Result<crate::fhe::backend::FheCircuit, String> {
         let all_vars = self.extract_variables(expr);
         // All variables are potential inputs; classification is deferred to
         // the caller (fhe-eval supplies them as plain or cipher maps).
@@ -364,14 +361,14 @@ impl CircuitCompiler {
         let flat = Self::eliminate_dead_wires(
             flat,
             &result_wire,
-            &[],                     // no ZKP witnesses
+            &[], // no ZKP witnesses
             &self.public_inputs,
         );
 
         let num_gates = flat.len();
         Ok(crate::fhe::backend::FheCircuit {
             flat_ops: flat,
-            encrypted_inputs: vec![],       // filled in by caller / fhe-compile
+            encrypted_inputs: vec![], // filled in by caller / fhe-compile
             public_inputs: self.public_inputs.clone(),
             output_wire: result_wire,
             num_gates,
@@ -1106,7 +1103,12 @@ impl CircuitCompiler {
                     self.extract_vars_helper(e, vars);
                 }
             }
-            Expr::Num(_) | Expr::Fixed(_) | Expr::Str(_) | Expr::Char(_) | Expr::Bool(_) | Expr::Lambda(_, _) => {}
+            Expr::Num(_)
+            | Expr::Fixed(_)
+            | Expr::Str(_)
+            | Expr::Char(_)
+            | Expr::Bool(_)
+            | Expr::Lambda(_, _) => {}
         }
     }
 }
