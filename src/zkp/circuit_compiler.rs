@@ -42,7 +42,7 @@ pub type Wire = String;
 /// One instruction in the flat, straight-line SSA block.
 /// Every variant maps to exactly one or a small fixed number of
 /// Binius64 gates, making constraint emission trivial.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum FlatOp {
     /// dst = constant
     Const { dst: Wire, value: i64 },
@@ -331,6 +331,53 @@ impl CircuitCompiler {
         })
     }
 
+    /// Compile an expression to an `FheCircuit` for homomorphic evaluation.
+    ///
+    /// Unlike ZKP compilation, every input variable is treated as a potential
+    /// encrypted input (caller decides at evaluation time which ones are
+    /// plaintext public inputs vs. encrypted inputs).  There are no witnesses
+    /// (non-determinism) — `IDiv` ops are kept as-is and evaluated via PBS.
+    pub fn compile_fhe(
+        &mut self,
+        expr: &Expr,
+    ) -> Result<crate::fhe::backend::FheCircuit, String> {
+        let all_vars = self.extract_variables(expr);
+        // All variables are potential inputs; classification is deferred to
+        // the caller (fhe-eval supplies them as plain or cipher maps).
+        for v in &all_vars {
+            if !self.public_inputs.contains(v) {
+                self.public_inputs.push(v.clone());
+            }
+        }
+
+        let mut flat: Vec<FlatOp> = Vec::new();
+        let mut env: Env = Env::new();
+        let mut lambdas: LambdaStore = LambdaStore::new();
+
+        for var in &self.public_inputs {
+            env.insert(var.clone(), var.clone());
+        }
+
+        let result_wire = self.flatten(expr, &mut env, &mut lambdas, &mut flat)?;
+
+        let flat = Self::fold_constants(flat);
+        let flat = Self::eliminate_dead_wires(
+            flat,
+            &result_wire,
+            &[],                     // no ZKP witnesses
+            &self.public_inputs,
+        );
+
+        let num_gates = flat.len();
+        Ok(crate::fhe::backend::FheCircuit {
+            flat_ops: flat,
+            encrypted_inputs: vec![],       // filled in by caller / fhe-compile
+            public_inputs: self.public_inputs.clone(),
+            output_wire: result_wire,
+            num_gates,
+        })
+    }
+
     // ── Phase 1 – flatten ────────────────────────────────────
 
     fn flatten(
@@ -347,6 +394,16 @@ impl CircuitCompiler {
                 flat.push(FlatOp::Const {
                     dst: dst.clone(),
                     value: *n,
+                });
+                Ok(dst)
+            }
+            // Fixed-point literal: the circuit works on the scaled integer directly.
+            // Truncation after multiplication is handled by the FixedMul / Shr gates.
+            Expr::Fixed(v) => {
+                let dst = self.fresh("c");
+                flat.push(FlatOp::Const {
+                    dst: dst.clone(),
+                    value: *v,
                 });
                 Ok(dst)
             }
@@ -1049,7 +1106,7 @@ impl CircuitCompiler {
                     self.extract_vars_helper(e, vars);
                 }
             }
-            Expr::Num(_) | Expr::Str(_) | Expr::Char(_) | Expr::Bool(_) | Expr::Lambda(_, _) => {}
+            Expr::Num(_) | Expr::Fixed(_) | Expr::Str(_) | Expr::Char(_) | Expr::Bool(_) | Expr::Lambda(_, _) => {}
         }
     }
 }

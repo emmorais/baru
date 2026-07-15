@@ -207,6 +207,18 @@ pub fn tokenize(src: &str) -> Vec<String> {
                             if d.is_ascii_digit() {
                                 num.push(d);
                                 chars.next();
+                            } else if d == '.' {
+                                num.push(d);
+                                chars.next();
+                                while let Some(&d2) = chars.peek() {
+                                    if d2.is_ascii_digit() {
+                                        num.push(d2);
+                                        chars.next();
+                                    } else {
+                                        break;
+                                    }
+                                }
+                                break;
                             } else {
                                 break;
                             }
@@ -235,6 +247,19 @@ pub fn tokenize(src: &str) -> Vec<String> {
                     if d2.is_ascii_digit() {
                         num.push(d2);
                         chars.next();
+                    } else if d2 == '.' {
+                        // could be a decimal literal like 42.0
+                        num.push(d2);
+                        chars.next();
+                        while let Some(&d3) = chars.peek() {
+                            if d3.is_ascii_digit() {
+                                num.push(d3);
+                                chars.next();
+                            } else {
+                                break;
+                            }
+                        }
+                        break;
                     } else {
                         break;
                     }
@@ -623,6 +648,16 @@ pub fn parse_tokens(tokens: &[String], pos: &mut usize) -> Result<Expr, String> 
             Ok(Expr::Bool(true))
         } else if tok == "#f" {
             Ok(Expr::Bool(false))
+        } else if tok.contains('.') {
+            // Decimal literal: parse as f64 then scale to Q16.16
+            match tok.parse::<f64>() {
+                Ok(f) => {
+                    use crate::interpreter::ast::FIXED_SCALE;
+                    let scaled = (f * FIXED_SCALE as f64).round() as i64;
+                    Ok(Expr::Fixed(scaled))
+                }
+                Err(_) => Ok(Expr::Var(tok.clone())),
+            }
         } else if let Ok(n) = tok.parse::<i64>() {
             Ok(Expr::Num(n))
         } else {

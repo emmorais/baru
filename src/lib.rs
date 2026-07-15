@@ -5,4 +5,6 @@ pub mod crypto;
 
 pub mod zkp;
 
+pub mod fhe;
+
 pub mod repl;
