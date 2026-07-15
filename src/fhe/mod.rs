@@ -50,6 +50,8 @@
 pub mod backend;
 pub mod circuit_emitter;
 pub mod mock_backend;
+pub mod tfhe_backend;
 
 pub use backend::{FheBackend, FheCircuit};
 pub use mock_backend::MockFheBackend;
+pub use tfhe_backend::TfheBackend;

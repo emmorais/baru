@@ -16,6 +16,13 @@
 			"problemMatcher": [
 				"$rustc"
 			]
+		},
+		{
+			"label": "write-tfhe-backend",
+			"type": "shell",
+			"command": "python3",
+			"args": ["-c", "import textwrap; open('/Users/eduardo/github/baru/src/fhe/tfhe_backend.rs','w').write('// written\\n'); print('ok')"],
+			"problemMatcher": []
 		}
 	]
 }
