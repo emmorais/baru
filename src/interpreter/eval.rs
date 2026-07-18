@@ -1367,6 +1367,73 @@ impl Participant {
             Rc::new(RefCell::new(Types::NativeFunc(reconstruct_fn))),
         );
 
+        // ── Vector builtins: dot, vsum, matvec ────────────────────────────────
+        // Native replacements for the recursive car/cdr dot-product pattern.
+        // Elements may be Num, Fixed, or Share; a user lambda named `dot`
+        // shadows the builtin (letrec bindings overwrite store entries).
+        let dot_backend = backend.clone();
+        let dot_fn = Arc::new(move |args: Vec<Types>| -> Types {
+            if args.len() != 2 {
+                panic!("dot expects 2 args: (dot vec-a vec-b)");
+            }
+            match (&args[0], &args[1]) {
+                (Types::List(a), Types::List(b)) => vec_dot(&dot_backend, a, b),
+                _ => panic!("dot expects two lists"),
+            }
+        });
+        self.store.borrow_mut().insert(
+            "dot".to_string(),
+            Rc::new(RefCell::new(Types::NativeFunc(dot_fn))),
+        );
+
+        let vsum_backend = backend.clone();
+        let vsum_fn = Arc::new(move |args: Vec<Types>| -> Types {
+            if args.len() != 1 {
+                panic!("vsum expects 1 arg: (vsum vec)");
+            }
+            match &args[0] {
+                Types::List(items) => {
+                    let mut acc: Option<Types> = None;
+                    for item in items {
+                        acc = Some(match acc {
+                            None => item.clone(),
+                            Some(s) => vec_add(&vsum_backend, &s, item),
+                        });
+                    }
+                    acc.unwrap_or(Types::Num(0))
+                }
+                _ => panic!("vsum expects a list"),
+            }
+        });
+        self.store.borrow_mut().insert(
+            "vsum".to_string(),
+            Rc::new(RefCell::new(Types::NativeFunc(vsum_fn))),
+        );
+
+        let matvec_backend = backend.clone();
+        let matvec_fn = Arc::new(move |args: Vec<Types>| -> Types {
+            if args.len() != 2 {
+                panic!("matvec expects 2 args: (matvec matrix vec)");
+            }
+            match (&args[0], &args[1]) {
+                (Types::List(rows), Types::List(v)) => {
+                    let out: Vec<Types> = rows
+                        .iter()
+                        .map(|row| match row {
+                            Types::List(r) => vec_dot(&matvec_backend, r, v),
+                            _ => panic!("matvec: matrix rows must be lists"),
+                        })
+                        .collect();
+                    Types::List(out)
+                }
+                _ => panic!("matvec expects a list of lists and a list"),
+            }
+        });
+        self.store.borrow_mut().insert(
+            "matvec".to_string(),
+            Rc::new(RefCell::new(Types::NativeFunc(matvec_fn))),
+        );
+
         // a2b builtin
         let a2b_backend = backend.clone();
         let a2b_fn = Arc::new(move |args: Vec<Types>| -> Types {
@@ -1769,14 +1836,14 @@ impl Participant {
             };
             let kp: crate::fhe::backend::FheKeyPair = serde_json::from_str(&keys_json)
                 .unwrap_or_else(|e| panic!("fhe-enc: invalid key JSON: {}", e));
-            let plaintext = match &args[1] {
-                Types::Num(n) => *n as u64,
-                Types::Fixed(v) => *v as u64,
+            let (plaintext, is_fixed) = match &args[1] {
+                Types::Num(n) => (*n as u64, false),
+                Types::Fixed(v) => (*v as u64, true),
                 Types::Bool(b) => {
                     if *b {
-                        1u64
+                        (1u64, false)
                     } else {
-                        0u64
+                        (0u64, false)
                     }
                 }
                 _ => panic!("fhe-enc: second arg must be a number or boolean"),
@@ -1789,6 +1856,7 @@ impl Participant {
                     let handle = crate::fhe::backend::FheCiphertextHandle {
                         backend_id: be.backend_id().to_string(),
                         bytes: be.serialize_ct(&ct),
+                        fixed: is_fixed,
                     };
                     Types::FheCiphertext(handle)
                 }
@@ -1798,6 +1866,7 @@ impl Participant {
                     let handle = crate::fhe::backend::FheCiphertextHandle {
                         backend_id: be.backend_id().to_string(),
                         bytes: be.serialize_ct(&ct),
+                        fixed: is_fixed,
                     };
                     Types::FheCiphertext(handle)
                 }
@@ -1824,17 +1893,22 @@ impl Participant {
                 _ => panic!("fhe-dec: second arg must be a FheCiphertext"),
             };
             use crate::fhe::FheBackend;
-            match kp.backend_id.as_str() {
+            let plain = match kp.backend_id.as_str() {
                 "tfhe-rs-v1.6" => {
                     let be = crate::fhe::TfheBackend::new();
                     let ct = be.deserialize_ct(&handle.bytes);
-                    Types::Num(be.decrypt(&kp.client_key_bytes, &ct) as i64)
+                    be.decrypt(&kp.client_key_bytes, &ct) as i64
                 }
                 _ => {
                     let be = crate::fhe::MockFheBackend;
                     let ct = be.deserialize_ct(&handle.bytes);
-                    Types::Num(be.decrypt(&kp.client_key_bytes, &ct) as i64)
+                    be.decrypt(&kp.client_key_bytes, &ct) as i64
                 }
+            };
+            if handle.fixed {
+                Types::Fixed(plain)
+            } else {
+                Types::Num(plain)
             }
         });
         self.store.borrow_mut().insert(
@@ -1967,6 +2041,7 @@ impl Participant {
                     let handle = crate::fhe::backend::FheCiphertextHandle {
                         backend_id: be.backend_id().to_string(),
                         bytes: be.serialize_ct(&result_ct),
+                        fixed: circuit.output_fixed,
                     };
                     Types::FheCiphertext(handle)
                 }
@@ -1982,6 +2057,7 @@ impl Participant {
                     let handle = crate::fhe::backend::FheCiphertextHandle {
                         backend_id: be.backend_id().to_string(),
                         bytes: be.serialize_ct(&result_ct),
+                        fixed: circuit.output_fixed,
                     };
                     Types::FheCiphertext(handle)
                 }
@@ -2358,6 +2434,87 @@ fn decode_quoted_num_list(v: &Types, label: &str) -> Vec<i64> {
         },
         _ => panic!("{}: expected a quoted list of numbers like '(5)", label),
     }
+}
+
+// ─── Vector builtin helpers (dot / vsum / matvec) ────────────────────────────
+
+/// Element-wise product for the vector builtins.  Handles Num, Fixed and
+/// Share operands; Fixed follows Q16.16 semantics, shares stay in the
+/// integer domain (fixed-point shares are not supported).
+fn vec_mul(backend: &Arc<Mutex<Box<dyn Backend>>>, a: &Types, b: &Types) -> Types {
+    use crate::interpreter::ast::FIXED_SCALE;
+    let to_fixed = |v: &Types| -> i64 {
+        match v {
+            Types::Fixed(f) => *f,
+            Types::Num(n) => n * FIXED_SCALE,
+            _ => unreachable!(),
+        }
+    };
+    match (a, b) {
+        (Types::Num(x), Types::Num(y)) => Types::Num(x.wrapping_mul(*y)),
+        (Types::Fixed(_), Types::Fixed(_))
+        | (Types::Fixed(_), Types::Num(_))
+        | (Types::Num(_), Types::Fixed(_)) => {
+            let prod = (to_fixed(a) as i128 * to_fixed(b) as i128) >> 16;
+            Types::Fixed(prod as i64)
+        }
+        (Types::Share(sa), Types::Share(sb)) => {
+            let mut be = backend.lock().unwrap_or_else(|e| e.into_inner());
+            Types::Share(be.mul(sa, sb))
+        }
+        (Types::Share(sa), Types::Num(n)) | (Types::Num(n), Types::Share(sa)) => {
+            let mut be = backend.lock().unwrap_or_else(|e| e.into_inner());
+            let imm = int_to_fr_signed(*n, sa.nbits);
+            let sb = be.share_secret(imm, sa.nbits, 0);
+            Types::Share(be.mul(sa, &sb))
+        }
+        _ => panic!("vector builtins: cannot multiply {:?} and {:?}", a, b),
+    }
+}
+
+/// Element-wise sum for the vector builtins.  Same operand rules as `vec_mul`.
+fn vec_add(backend: &Arc<Mutex<Box<dyn Backend>>>, a: &Types, b: &Types) -> Types {
+    use crate::interpreter::ast::FIXED_SCALE;
+    let to_fixed = |v: &Types| -> i64 {
+        match v {
+            Types::Fixed(f) => *f,
+            Types::Num(n) => n * FIXED_SCALE,
+            _ => unreachable!(),
+        }
+    };
+    match (a, b) {
+        (Types::Num(x), Types::Num(y)) => Types::Num(x.wrapping_add(*y)),
+        (Types::Fixed(_), Types::Fixed(_))
+        | (Types::Fixed(_), Types::Num(_))
+        | (Types::Num(_), Types::Fixed(_)) => Types::Fixed(to_fixed(a).wrapping_add(to_fixed(b))),
+        (Types::Share(sa), Types::Share(sb)) => {
+            let mut be = backend.lock().unwrap_or_else(|e| e.into_inner());
+            Types::Share(be.add(sa, sb))
+        }
+        (Types::Share(sa), Types::Num(n)) | (Types::Num(n), Types::Share(sa)) => {
+            let mut be = backend.lock().unwrap_or_else(|e| e.into_inner());
+            let imm = int_to_fr_signed(*n, sa.nbits);
+            let sb = be.share_secret(imm, sa.nbits, 0);
+            Types::Share(be.add(sa, &sb))
+        }
+        _ => panic!("vector builtins: cannot add {:?} and {:?}", a, b),
+    }
+}
+
+/// Dot product of two element vectors (used by both `dot` and `matvec`).
+fn vec_dot(backend: &Arc<Mutex<Box<dyn Backend>>>, a: &[Types], b: &[Types]) -> Types {
+    if a.len() != b.len() {
+        panic!("dot: length mismatch ({} vs {})", a.len(), b.len());
+    }
+    let mut acc: Option<Types> = None;
+    for (x, y) in a.iter().zip(b.iter()) {
+        let p = vec_mul(backend, x, y);
+        acc = Some(match acc {
+            None => p,
+            Some(s) => vec_add(backend, &s, &p),
+        });
+    }
+    acc.unwrap_or(Types::Num(0))
 }
 
 // Convert a signed i64 value into an unsigned field element representing two's complement with `nbits` bits

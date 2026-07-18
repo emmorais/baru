@@ -271,6 +271,10 @@ pub struct CircuitCompiler {
     flat_known: HashMap<Wire, i64>,
     /// Current lambda-inlining depth (guarded by MAX_INLINE_DEPTH).
     inline_depth: usize,
+    /// Wires carrying Q16.16 fixed-point values.  Tracked statically so
+    /// arithmetic can insert the rescale (>>16 after multiply) and coerce
+    /// mixed int/fixed operands, mirroring the interpreter's semantics.
+    fixed_wires: HashSet<Wire>,
 }
 
 impl Default for CircuitCompiler {
@@ -287,6 +291,7 @@ impl CircuitCompiler {
             public_inputs: Vec::new(),
             flat_known: HashMap::new(),
             inline_depth: 0,
+            fixed_wires: HashSet::new(),
         }
     }
 
@@ -324,6 +329,154 @@ impl CircuitCompiler {
         let w = self.fresh(prefix);
         self.witnesses.push(w.clone());
         w
+    }
+
+    // ── Q16.16 fixed-point helpers ───────────────────────────
+
+    fn is_fixed(&self, w: &Wire) -> bool {
+        self.fixed_wires.contains(w)
+    }
+
+    /// Coerce an integer wire into the Q16.16 domain (<<16), like the
+    /// interpreter's Num→Fixed coercion.
+    fn to_fixed_wire(&mut self, w: Wire, flat: &mut Vec<FlatOp>) -> Wire {
+        let dst = self.fresh("fx");
+        flat.push(FlatOp::Shl {
+            dst: dst.clone(),
+            src: w,
+            amount: 16,
+        });
+        self.fixed_wires.insert(dst.clone());
+        dst
+    }
+
+    /// Arithmetic shift right by 16 on a two's-complement u64 wire, built
+    /// from logical gates: (x >> 16) | (sign ? 0xFFFF000000000000 : 0).
+    /// This is the rescale after a fixed×fixed multiply; `Shr` is logical
+    /// in every backend, so the sign correction is explicit.
+    fn emit_ashr16(&mut self, src: Wire, flat: &mut Vec<FlatOp>) -> Wire {
+        let lo = self.fresh("t");
+        flat.push(FlatOp::Shr {
+            dst: lo.clone(),
+            src: src.clone(),
+            amount: 16,
+        });
+        let sign = self.fresh("t");
+        flat.push(FlatOp::Shr {
+            dst: sign.clone(),
+            src,
+            amount: 63,
+        });
+        let mask = self.emit_const((u64::MAX << 48) as i64, flat);
+        let zero = self.emit_const(0, flat);
+        let corr = self.fresh("t");
+        flat.push(FlatOp::Mux {
+            dst: corr.clone(),
+            cond: sign,
+            t_val: mask,
+            e_val: zero,
+        });
+        let dst = self.fresh("t");
+        flat.push(FlatOp::BOr {
+            dst: dst.clone(),
+            lhs: lo,
+            rhs: corr,
+        });
+        dst
+    }
+
+    /// Multiply with fixed-point awareness:
+    ///   fixed×fixed → IMul then >>16 rescale (arithmetic)
+    ///   fixed×int   → IMul only ((a·2¹⁶)·b is already scaled)
+    ///   int×int     → IMul
+    fn emit_mul_typed(&mut self, l: Wire, r: Wire, flat: &mut Vec<FlatOp>) -> Wire {
+        let lf = self.is_fixed(&l);
+        let rf = self.is_fixed(&r);
+        let prod = self.fresh("t");
+        flat.push(FlatOp::IMul {
+            dst: prod.clone(),
+            lhs: l,
+            rhs: r,
+        });
+        let dst = if lf && rf {
+            self.emit_ashr16(prod, flat)
+        } else {
+            prod
+        };
+        if lf || rf {
+            self.fixed_wires.insert(dst.clone());
+        }
+        dst
+    }
+
+    /// Add with fixed-point awareness: a mixed int operand is coerced <<16.
+    fn emit_add_typed(&mut self, l: Wire, r: Wire, flat: &mut Vec<FlatOp>) -> Wire {
+        let lf = self.is_fixed(&l);
+        let rf = self.is_fixed(&r);
+        let (l, r) = if lf || rf {
+            (
+                if lf { l } else { self.to_fixed_wire(l, flat) },
+                if rf { r } else { self.to_fixed_wire(r, flat) },
+            )
+        } else {
+            (l, r)
+        };
+        let dst = self.fresh("t");
+        flat.push(FlatOp::IAdd32 {
+            dst: dst.clone(),
+            lhs: l,
+            rhs: r,
+        });
+        if lf || rf {
+            self.fixed_wires.insert(dst.clone());
+        }
+        dst
+    }
+
+    /// Truncate a Q16.16 wire toward zero (matches the interpreter's
+    /// `fixed->int`, i.e. v / 65536 with Rust division semantics):
+    ///   x >= 0 →  x >> 16
+    ///   x <  0 →  -((-x) >> 16)
+    fn emit_fixed_to_int(&mut self, x: Wire, flat: &mut Vec<FlatOp>) -> Wire {
+        let zero = self.emit_const(0, flat);
+        let neg = self.fresh("t");
+        flat.push(FlatOp::ICmpSlt {
+            dst: neg.clone(),
+            lhs: x.clone(),
+            rhs: zero.clone(),
+        });
+        let negx = self.fresh("t");
+        flat.push(FlatOp::ISub32 {
+            dst: negx.clone(),
+            lhs: zero.clone(),
+            rhs: x.clone(),
+        });
+        let qn = self.fresh("t");
+        flat.push(FlatOp::Shr {
+            dst: qn.clone(),
+            src: negx,
+            amount: 16,
+        });
+        let nqn = self.fresh("t");
+        flat.push(FlatOp::ISub32 {
+            dst: nqn.clone(),
+            lhs: zero,
+            rhs: qn,
+        });
+        let qp = self.fresh("t");
+        flat.push(FlatOp::Shr {
+            dst: qp.clone(),
+            src: x,
+            amount: 16,
+        });
+        let dst = self.fresh("t");
+        flat.push(FlatOp::Mux {
+            dst: dst.clone(),
+            cond: neg,
+            t_val: nqn,
+            e_val: qp,
+        });
+        dst
     }
 
     // ── Public entry point ───────────────────────────────────
@@ -421,13 +574,26 @@ impl CircuitCompiler {
             &self.public_inputs,
         );
 
+        // extract_variables over-collects names that never become input
+        // wires (builtin call targets like `dot` or `fixed->int`, letrec
+        // binders).  Keep only variables some gate actually reads — or the
+        // output itself for the identity circuit.
+        let used: HashSet<String> = flat
+            .iter()
+            .flat_map(|op| op.inputs().into_iter().map(String::from))
+            .collect();
+        self.public_inputs
+            .retain(|v| used.contains(v) || *v == result_wire);
+
         let num_gates = flat.len();
+        let output_fixed = self.is_fixed(&result_wire);
         Ok(crate::fhe::backend::FheCircuit {
             flat_ops: flat,
             encrypted_inputs: vec![], // filled in by caller / fhe-compile
             public_inputs: self.public_inputs.clone(),
             output_wire: result_wire,
             num_gates,
+            output_fixed,
         })
     }
 
@@ -443,9 +609,13 @@ impl CircuitCompiler {
         match expr {
             // ── Literals ─────────────────────────────────────
             Expr::Num(n) => Ok(CVal::Wire(self.emit_const(*n, flat))),
-            // Fixed-point literal: the circuit works on the scaled integer directly.
-            // Truncation after multiplication is handled by the FixedMul / Shr gates.
-            Expr::Fixed(v) => Ok(CVal::Wire(self.emit_const(*v, flat))),
+            // Fixed-point literal: the circuit works on the scaled integer
+            // directly; the wire is marked so arithmetic inserts rescales.
+            Expr::Fixed(v) => {
+                let w = self.emit_const(*v, flat);
+                self.fixed_wires.insert(w.clone());
+                Ok(CVal::Wire(w))
+            }
             Expr::Bool(b) => Ok(CVal::Wire(self.emit_const(if *b { 1 } else { 0 }, flat))),
             Expr::Char(c) => Ok(CVal::Wire(self.emit_const(*c as i64, flat))),
 
@@ -533,6 +703,46 @@ impl CircuitCompiler {
                 let l = Self::expect_wire(self.flatten(left, env, lambdas, flat)?, "left operand")?;
                 let r =
                     Self::expect_wire(self.flatten(right, env, lambdas, flat)?, "right operand")?;
+
+                // Q16.16 interception: when either operand is fixed-point,
+                // mirror the interpreter — coerce the int side (<<16), rescale
+                // after multiply, pre-shift the dividend, and mark results.
+                let lf = self.is_fixed(&l);
+                let rf = self.is_fixed(&r);
+                if lf || rf {
+                    match op {
+                        BinOp::Mul => return Ok(CVal::Wire(self.emit_mul_typed(l, r, flat))),
+                        BinOp::Add | BinOp::Sub | BinOp::Mod => {
+                            let l = if lf { l } else { self.to_fixed_wire(l, flat) };
+                            let r = if rf { r } else { self.to_fixed_wire(r, flat) };
+                            let dst = self.flatten_binop(*op, l, r, flat)?;
+                            self.fixed_wires.insert(dst.clone());
+                            return Ok(CVal::Wire(dst));
+                        }
+                        BinOp::DivExact => {
+                            // (a << 16) / b, both operands scaled.
+                            let l = if lf { l } else { self.to_fixed_wire(l, flat) };
+                            let r = if rf { r } else { self.to_fixed_wire(r, flat) };
+                            let num = self.fresh("t");
+                            flat.push(FlatOp::Shl {
+                                dst: num.clone(),
+                                src: l,
+                                amount: 16,
+                            });
+                            let dst = self.flatten_binop(BinOp::DivExact, num, r, flat)?;
+                            self.fixed_wires.insert(dst.clone());
+                            return Ok(CVal::Wire(dst));
+                        }
+                        BinOp::Eq | BinOp::Lt | BinOp::Gt | BinOp::Le | BinOp::Ge => {
+                            // Compare in the scaled domain; result is a plain bit.
+                            let l = if lf { l } else { self.to_fixed_wire(l, flat) };
+                            let r = if rf { r } else { self.to_fixed_wire(r, flat) };
+                            return Ok(CVal::Wire(self.flatten_binop(*op, l, r, flat)?));
+                        }
+                        // Bitwise / shift ops stay in the raw integer domain.
+                        _ => {}
+                    }
+                }
                 Ok(CVal::Wire(self.flatten_binop(*op, l, r, flat)?))
             }
 
@@ -574,6 +784,20 @@ impl CircuitCompiler {
                     Self::expect_wire(self.flatten(then_e, env, lambdas, flat)?, "then branch")?;
                 let else_wire =
                     Self::expect_wire(self.flatten(else_e, env, lambdas, flat)?, "else branch")?;
+                // If exactly one branch is fixed-point, coerce the other so
+                // the mux output lives in a single domain.
+                let tf = self.is_fixed(&then_wire);
+                let ef = self.is_fixed(&else_wire);
+                let then_wire = if ef && !tf {
+                    self.to_fixed_wire(then_wire, flat)
+                } else {
+                    then_wire
+                };
+                let else_wire = if tf && !ef {
+                    self.to_fixed_wire(else_wire, flat)
+                } else {
+                    else_wire
+                };
                 let dst = self.fresh("mux");
                 flat.push(FlatOp::Mux {
                     dst: dst.clone(),
@@ -581,6 +805,9 @@ impl CircuitCompiler {
                     t_val: then_wire,
                     e_val: else_wire,
                 });
+                if tf || ef {
+                    self.fixed_wires.insert(dst.clone());
+                }
                 Ok(CVal::Wire(dst))
             }
 
@@ -653,12 +880,20 @@ impl CircuitCompiler {
         fn elem(cc: &mut CircuitCompiler, e: &Expr, flat: &mut Vec<FlatOp>) -> Option<CVal> {
             match e {
                 Expr::Num(n) => Some(CVal::Wire(cc.emit_const(*n, flat))),
-                Expr::Fixed(v) => Some(CVal::Wire(cc.emit_const(*v, flat))),
+                Expr::Fixed(v) => {
+                    let w = cc.emit_const(*v, flat);
+                    cc.fixed_wires.insert(w.clone());
+                    Some(CVal::Wire(w))
+                }
                 Expr::Bool(b) => Some(CVal::Wire(cc.emit_const(if *b { 1 } else { 0 }, flat))),
                 Expr::Char(c) => Some(CVal::Wire(cc.emit_const(*c as i64, flat))),
                 Expr::UnOp(UnOp::Neg, inner) => match inner.as_ref() {
                     Expr::Num(n) => Some(CVal::Wire(cc.emit_const(-n, flat))),
-                    Expr::Fixed(v) => Some(CVal::Wire(cc.emit_const(-v, flat))),
+                    Expr::Fixed(v) => {
+                        let w = cc.emit_const(-v, flat);
+                        cc.fixed_wires.insert(w.clone());
+                        Some(CVal::Wire(w))
+                    }
                     _ => None,
                 },
                 Expr::Call(_, _) | Expr::Seq(_) => cc.quote_to_cval(e, flat),
@@ -923,6 +1158,34 @@ impl CircuitCompiler {
                         child_env.insert(param.clone(), val);
                     }
                     self.inline_guard(|cc| cc.flatten(&body, &mut child_env, &mut child_lam, flat))
+                } else if matches!(name.as_str(), "dot" | "vsum" | "matvec") {
+                    // Vector builtins — a user lambda of the same name (looked
+                    // up above) shadows these.
+                    self.flatten_vector_builtin(name, args, env, lambdas, flat)
+                } else if matches!(name.as_str(), "int->fixed" | "fixed->int") {
+                    if args.len() != 1 {
+                        return Err(format!("{} expects 1 arg, got {}", name, args.len()));
+                    }
+                    let w = Self::expect_wire(
+                        self.flatten(&args[0], env, lambdas, flat)?,
+                        name.as_str(),
+                    )?;
+                    let already_fixed = self.is_fixed(&w);
+                    if name == "int->fixed" {
+                        Ok(CVal::Wire(if already_fixed {
+                            w
+                        } else {
+                            self.to_fixed_wire(w, flat)
+                        }))
+                    } else {
+                        // fixed->int on an int wire is the identity, like the
+                        // interpreter's Num passthrough.
+                        Ok(CVal::Wire(if already_fixed {
+                            self.emit_fixed_to_int(w, flat)
+                        } else {
+                            w
+                        }))
+                    }
                 } else if env.contains_key(name.as_str()) {
                     // Variable exists but isn't a lambda — emit sentinel.
                     let dst = self.fresh("call");
@@ -938,6 +1201,88 @@ impl CircuitCompiler {
 
             _ => Err("complex call target not supported in circuit compilation".to_string()),
         }
+    }
+
+    /// Vector builtins over compile-time lists, lowered to flat multiply-add
+    /// chains (the native replacement for the recursive car/cdr dot-product):
+    ///   (dot a b)     — sum of element products; scalar wire
+    ///   (vsum v)      — sum of elements; scalar wire
+    ///   (matvec m v)  — list of (dot row v) for each row of m
+    /// Elements are integer wires; Q16.16 operands are not rescaled here.
+    fn flatten_vector_builtin(
+        &mut self,
+        name: &str,
+        args: &[Expr],
+        env: &mut Env,
+        lambdas: &mut LambdaStore,
+        flat: &mut Vec<FlatOp>,
+    ) -> Result<CVal, String> {
+        let expect_list = |val: CVal, ctx: &str| -> Result<Vec<CVal>, String> {
+            match val {
+                CVal::List(items) => Ok(items),
+                CVal::Wire(_) => Err(format!(
+                    "{}: expects a compile-time list (lists exist only at compile time in circuits)",
+                    ctx
+                )),
+            }
+        };
+        match name {
+            "dot" => {
+                if args.len() != 2 {
+                    return Err(format!("dot expects 2 args, got {}", args.len()));
+                }
+                let a = expect_list(self.flatten(&args[0], env, lambdas, flat)?, "dot")?;
+                let b = expect_list(self.flatten(&args[1], env, lambdas, flat)?, "dot")?;
+                Ok(CVal::Wire(self.emit_dot(&a, &b, flat)?))
+            }
+            "vsum" => {
+                if args.len() != 1 {
+                    return Err(format!("vsum expects 1 arg, got {}", args.len()));
+                }
+                let v = expect_list(self.flatten(&args[0], env, lambdas, flat)?, "vsum")?;
+                let mut acc: Option<Wire> = None;
+                for item in v {
+                    let w = Self::expect_wire(item, "vsum element")?;
+                    acc = Some(match acc {
+                        None => w,
+                        Some(s) => self.emit_add_typed(s, w, flat),
+                    });
+                }
+                Ok(CVal::Wire(acc.unwrap_or_else(|| self.emit_const(0, flat))))
+            }
+            "matvec" => {
+                if args.len() != 2 {
+                    return Err(format!("matvec expects 2 args, got {}", args.len()));
+                }
+                let m = expect_list(self.flatten(&args[0], env, lambdas, flat)?, "matvec")?;
+                let v = expect_list(self.flatten(&args[1], env, lambdas, flat)?, "matvec")?;
+                let mut out = Vec::with_capacity(m.len());
+                for row in m {
+                    let row = expect_list(row, "matvec row")?;
+                    out.push(CVal::Wire(self.emit_dot(&row, &v, flat)?));
+                }
+                Ok(CVal::List(out))
+            }
+            _ => unreachable!("flatten_vector_builtin called with '{}'", name),
+        }
+    }
+
+    /// Emit the multiply-add chain for a dot product of two element vectors.
+    fn emit_dot(&mut self, a: &[CVal], b: &[CVal], flat: &mut Vec<FlatOp>) -> Result<Wire, String> {
+        if a.len() != b.len() {
+            return Err(format!("dot: length mismatch ({} vs {})", a.len(), b.len()));
+        }
+        let mut acc: Option<Wire> = None;
+        for (x, y) in a.iter().zip(b.iter()) {
+            let xw = Self::expect_wire(x.clone(), "dot element")?;
+            let yw = Self::expect_wire(y.clone(), "dot element")?;
+            let prod = self.emit_mul_typed(xw, yw, flat);
+            acc = Some(match acc {
+                None => prod,
+                Some(s) => self.emit_add_typed(s, prod, flat),
+            });
+        }
+        Ok(acc.unwrap_or_else(|| self.emit_const(0, flat)))
     }
 
     /// Run a lambda-body flatten with the inlining depth guard.
@@ -1017,7 +1362,11 @@ impl CircuitCompiler {
                     known.get(src.as_str()).map(|&v| (dst.clone(), v << amount))
                 }
                 FlatOp::Shr { dst, src, amount } => {
-                    known.get(src.as_str()).map(|&v| (dst.clone(), v >> amount))
+                    // Logical shift, matching every backend (values live on
+                    // u64 wires); `i64 >>` would sign-extend and diverge.
+                    known
+                        .get(src.as_str())
+                        .map(|&v| (dst.clone(), ((v as u64) >> amount) as i64))
                 }
                 _ => None,
             };

@@ -936,6 +936,30 @@ fn test_fhe_mock_compile_eval_mul() {
 }
 
 #[test]
+fn test_fhe_mock_fixed_point_output() {
+    // (* x 1.5) marks the output wire as Q16.16; fhe-dec returns a Fixed,
+    // which fixed->int truncates to an integer.
+    let src = r#"(let ((keys (fhe-keygen)))
+                   (let ((ct-x (fhe-enc keys 4)))
+                     (let ((circuit (fhe-compile '(* x 1.5) '("x"))))
+                       (fixed->int (fhe-dec keys
+                         (fhe-eval circuit keys '() '() '("x") (list ct-x)))))))"#;
+    assert_eq!(eval_fhe(src), 6);
+}
+
+#[test]
+fn test_fhe_mock_fixed_point_negative() {
+    // Negative fixed product: -6 * 1.5 = -9.0 (the >>16 rescale must be an
+    // arithmetic shift, emulated with logical gates).
+    let src = r#"(let ((keys (fhe-keygen)))
+                   (let ((ct-x (fhe-enc keys -6)))
+                     (let ((circuit (fhe-compile '(* x 1.5) '("x"))))
+                       (fixed->int (fhe-dec keys
+                         (fhe-eval circuit keys '() '() '("x") (list ct-x)))))))"#;
+    assert_eq!(eval_fhe(src), -9);
+}
+
+#[test]
 fn test_fhe_mock_negative_roundtrip() {
     // Negative values survive encrypt/decrypt via two's complement.
     let src = "(let ((keys (fhe-keygen)))

@@ -111,6 +111,62 @@ fn test_dot_product_cons_list() {
     assert_eq!(eval(src), 50);
 }
 
+// ---------------------------------------------------------------------------
+// Vector builtins: dot / vsum / matvec
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_dot_builtin_plain() {
+    assert_eq!(eval("(dot '(1 2 3) '(4 5 6))"), 32);
+    assert_eq!(eval("(dot (list 1 2) (list 10 20))"), 50);
+    assert_eq!(eval("(dot '() '())"), 0);
+}
+
+#[test]
+fn test_vsum_builtin_plain() {
+    assert_eq!(eval("(vsum '(1 2 3 4))"), 10);
+    assert_eq!(eval("(vsum '())"), 0);
+}
+
+#[test]
+fn test_matvec_builtin_plain() {
+    // [[1 2] [3 4]] · [5 6] = [17 39]; sum to a scalar for the assertion.
+    assert_eq!(eval("(vsum (matvec (list '(1 2) '(3 4)) '(5 6)))"), 56);
+    assert_eq!(eval("(car (matvec (list '(1 0) '(0 1)) '(7 9)))"), 7);
+}
+
+#[test]
+fn test_dot_builtin_shadowed_by_user_lambda() {
+    // A letrec-bound `dot` must shadow the builtin.
+    let src = "(letrec ((dot (lambda (a b) 99))) (dot '(1 2) '(3 4)))";
+    assert_eq!(eval(src), 99);
+}
+
+#[test]
+fn test_dot_builtin_shares() {
+    // Encrypted input vector · plain weights, reconstructed.
+    let src = "(let ((x (share 4 32)) (y (share 5 32)))
+                 (reconstruct (dot (list x y) '(2 3))))";
+    assert_eq!(eval_shared(src), 23);
+}
+
+#[test]
+fn test_matvec_builtin_shares() {
+    // Two-neuron linear layer over a shared input vector.
+    // [[2 -3] [1 2]] · [4 4] = [-4 12]; vsum = 8.
+    let src = "(let ((x (share 4 32)) (y (share 4 32)))
+                 (reconstruct (vsum (matvec (list '(2 -3) '(1 2)) (list x y)))))";
+    assert_eq!(eval_shared(src), 8);
+}
+
+#[test]
+fn test_dot_builtin_fixed() {
+    // Q16.16: dot((1.5, 2.0), (2.0, 0.5)) = 3.0 + 1.0 = 4.0
+    let src = "(fixed->int (dot (list (/ (int->fixed 3) (int->fixed 2)) (int->fixed 2))
+                                (list (int->fixed 2) (/ (int->fixed 1) (int->fixed 2)))))";
+    assert_eq!(eval(src), 4);
+}
+
 #[test]
 fn test_int_recognition_neural_network() {
     // A single linear neuron over flattened 28x28 MNIST images (784 inputs),

@@ -17,7 +17,7 @@ use baru::fhe::backend::FheCircuit;
 use baru::fhe::circuit_emitter::evaluate_fhe;
 use baru::fhe::{FheBackend, MockFheBackend, TfheBackend};
 use baru::interpreter::eval::eval_plain;
-use baru::interpreter::parse;
+use baru::interpreter::{parse, Participant, Types};
 use baru::zkp::circuit_compiler::CircuitCompiler;
 
 fn compile_with_encrypted_x(expr_src: &str) -> FheCircuit {
@@ -129,6 +129,116 @@ fn diff_dot_product_recursion_mock() {
     assert_eq!(eval_dot_product_fhe(&be, &ck, -1, 7), 19); // -2 + 21
 }
 
+/// Plain evaluation returning the raw wire value: Num as-is, Fixed as its
+/// Q16.16 scaled integer (which is exactly what a fixed circuit outputs).
+fn eval_plain_raw(expr_src: &str, x: i64) -> i64 {
+    let src = format!("(let ((x {})) {})", x, expr_src);
+    let expr = parse(&src).expect("parse");
+    match Participant::new(0).eval_quiet(&expr) {
+        Types::Num(n) => n,
+        Types::Fixed(f) => f,
+        other => panic!("expected Num or Fixed, got {:?}", other),
+    }
+}
+
+#[test]
+fn diff_fixed_point_mock() {
+    // Q16.16 arithmetic compiled to circuits must match the interpreter on
+    // the raw scaled representation.  Division stays non-negative (IDiv is
+    // unsigned), everything else exercises negatives too.
+    let cases: &[(&str, &[i64])] = &[
+        ("(* x 1.5)", &[4, -6, 0, 7]),
+        ("(* 0.5 (* x 1.5))", &[4, -4]), // fixed×fixed rescale chain
+        ("(+ 1.25 (* x 0.5))", &[3, -3]),
+        ("(- (* x 0.5) 2.75)", &[9, -9]),
+        ("(dot (list x x) '(0.5 2.5))", &[4, -4]),
+        ("(if (> (* x 1.5) 0.0) (* x 1.5) 0.0)", &[5, -5]),
+        ("(fixed->int (* x 2.5))", &[3, -3, 0]),
+        ("(int->fixed x)", &[7, -7]),
+        ("(/ (int->fixed x) 4.0)", &[10, 0]),
+    ];
+    for (expr, xs) in cases {
+        let circuit = compile_with_encrypted_x(expr);
+        let be = MockFheBackend;
+        let (ck, _) = be.keygen();
+        for &x in *xs {
+            let plain = eval_plain_raw(expr, x);
+            let mut enc = HashMap::new();
+            enc.insert("x".to_string(), be.encrypt(&ck, x as u64));
+            let ct = evaluate_fhe(&circuit, &HashMap::new(), &enc, &be);
+            let fhe = be.decrypt(&ck, &ct) as i64;
+            assert_eq!(
+                plain, fhe,
+                "fixed-point divergence for `{}` at x={}: plain={} fhe={}",
+                expr, x, plain, fhe
+            );
+        }
+    }
+}
+
+#[test]
+fn diff_fixed_output_flag() {
+    // compile_fhe must mark fixed outputs (and only those).
+    let expr = parse("(* x 1.5)").expect("parse");
+    let mut cc = CircuitCompiler::new();
+    assert!(cc.compile_fhe(&expr).expect("compile").output_fixed);
+
+    let expr = parse("(fixed->int (* x 1.5))").expect("parse");
+    let mut cc = CircuitCompiler::new();
+    assert!(!cc.compile_fhe(&expr).expect("compile").output_fixed);
+
+    let expr = parse("(+ (* x 3) 7)").expect("parse");
+    let mut cc = CircuitCompiler::new();
+    assert!(!cc.compile_fhe(&expr).expect("compile").output_fixed);
+}
+
+#[test]
+fn diff_dot_builtin_mock() {
+    // The native `dot` builtin lowers to a flat multiply-add chain — no
+    // letrec unrolling involved.  dot([x, y], [2, 3]) = 2x + 3y.
+    let src = "(dot (list x y) '(2 3))";
+    let expr = parse(src).expect("parse");
+    let mut cc = CircuitCompiler::new();
+    let mut circuit = cc.compile_fhe(&expr).expect("compile_fhe");
+    circuit.encrypted_inputs = vec!["x".to_string(), "y".to_string()];
+    circuit.public_inputs = vec![];
+
+    let be = MockFheBackend;
+    let (ck, _) = be.keygen();
+    for (x, y) in [(4i64, 5i64), (-1, 7), (0, 0)] {
+        let plain = eval_plain(&format!("(let ((x {}) (y {})) {})", x, y, src));
+        let mut enc = HashMap::new();
+        enc.insert("x".to_string(), be.encrypt(&ck, x as u64));
+        enc.insert("y".to_string(), be.encrypt(&ck, y as u64));
+        let ct = evaluate_fhe(&circuit, &HashMap::new(), &enc, &be);
+        let fhe = be.decrypt(&ck, &ct) as i64;
+        assert_eq!(plain, fhe, "dot builtin divergence at x={} y={}", x, y);
+    }
+}
+
+#[test]
+fn diff_matvec_builtin_mock() {
+    // (vsum (matvec [[2 -3] [1 2]] [x y])) — a two-neuron linear layer.
+    let src = "(vsum (matvec (list '(2 -3) '(1 2)) (list x y)))";
+    let expr = parse(src).expect("parse");
+    let mut cc = CircuitCompiler::new();
+    let mut circuit = cc.compile_fhe(&expr).expect("compile_fhe");
+    circuit.encrypted_inputs = vec!["x".to_string(), "y".to_string()];
+    circuit.public_inputs = vec![];
+
+    let be = MockFheBackend;
+    let (ck, _) = be.keygen();
+    for (x, y) in [(4i64, 4i64), (-2, 3)] {
+        let plain = eval_plain(&format!("(let ((x {}) (y {})) {})", x, y, src));
+        let mut enc = HashMap::new();
+        enc.insert("x".to_string(), be.encrypt(&ck, x as u64));
+        enc.insert("y".to_string(), be.encrypt(&ck, y as u64));
+        let ct = evaluate_fhe(&circuit, &HashMap::new(), &enc, &be);
+        let fhe = be.decrypt(&ck, &ct) as i64;
+        assert_eq!(plain, fhe, "matvec builtin divergence at x={} y={}", x, y);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Real TFHE backend — small subset (keygen once, a few evaluations).
 // ---------------------------------------------------------------------------
@@ -143,6 +253,7 @@ fn diff_tfhe_subset() {
         ("(if (< x 5) (* x 2) (+ x 1))", &[3, 9]),
         ("(if (>= x 0) x (- 0 x))", &[-6]), // abs(-6) = 6
         ("(/ x 3)", &[21]),
+        ("(fixed->int (* x 2.5))", &[-3]), // Q16.16: rescale + trunc gadgets
     ];
 
     for (expr, xs) in cases {

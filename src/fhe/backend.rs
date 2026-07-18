@@ -30,6 +30,10 @@ pub struct FheCircuit {
     pub output_wire: String,
     /// Total gate count.
     pub num_gates: usize,
+    /// True when the output wire carries a Q16.16 fixed-point value
+    /// (decrypt yields the scaled integer).
+    #[serde(default)]
+    pub output_fixed: bool,
 }
 
 // ─── Key handles (serialisable for REPL round-trips) ─────────────────────────
@@ -57,6 +61,10 @@ pub struct FheCiphertextHandle {
     pub backend_id: String,
     /// Serialised ciphertext bytes.
     pub bytes: Vec<u8>,
+    /// True when the plaintext is a Q16.16 fixed-point value; `fhe-dec`
+    /// returns Types::Fixed for such handles.
+    #[serde(default)]
+    pub fixed: bool,
 }
 
 // ─── Backend trait ────────────────────────────────────────────────────────────

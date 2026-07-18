@@ -69,6 +69,12 @@ pub const SUITE: &[BenchCase] = &[
         mpc_expr: None,
         inputs: &[("x", 4), ("y", 5)],
     },
+    BenchCase {
+        name: "dot4-builtin",
+        expr: "(dot (list a b c d) '(2 3 4 5))",
+        mpc_expr: None,
+        inputs: &[("a", 1), ("b", 2), ("c", 3), ("d", -4)],
+    },
 ];
 
 // ─── Reports ──────────────────────────────────────────────────────────────────
@@ -313,7 +319,8 @@ fn run_zkp(expr: &str, inputs: &[(String, i64)]) -> BackendReport {
             .unwrap_or_else(|e| panic!("compile: {}", e))
     });
 
-    let private_values: HashMap<String, i64> = inputs.iter().map(|(k, v)| (k.clone(), *v)).collect();
+    let private_values: HashMap<String, i64> =
+        inputs.iter().map(|(k, v)| (k.clone(), *v)).collect();
     let public_values: HashMap<String, i64> = HashMap::new();
 
     let proof = t.phase("prove", || {
@@ -431,7 +438,14 @@ pub fn run_case(case: &BenchCase, backends: &[Backend], iters: u32) -> CaseRepor
             }
             Backend::FheMock => guarded("fhe-mock", || {
                 averaged(iters, || {
-                    run_fhe("fhe-mock", &MockFheBackend, case.expr, &inputs, baseline, |_| {})
+                    run_fhe(
+                        "fhe-mock",
+                        &MockFheBackend,
+                        case.expr,
+                        &inputs,
+                        baseline,
+                        |_| {},
+                    )
                 })
             }),
             Backend::FheTfhe => guarded("fhe-tfhe", || {
@@ -493,8 +507,11 @@ pub fn run_cli(args: &[String]) -> Result<(), String> {
             }
             "--list" => {
                 for c in SUITE {
-                    let ins: Vec<String> =
-                        c.inputs.iter().map(|(k, v)| format!("{}={}", k, v)).collect();
+                    let ins: Vec<String> = c
+                        .inputs
+                        .iter()
+                        .map(|(k, v)| format!("{}={}", k, v))
+                        .collect();
                     println!("{:<10} {}   [{}]", c.name, c.expr, ins.join(" "));
                 }
                 return Ok(());
@@ -620,10 +637,16 @@ fn print_table(report: &CaseReport) {
     );
     for b in &report.backends {
         if let Some(err) = &b.error {
-            println!("   {:<13} {:>10}  {:>8}  {:<4} error: {}", b.backend, "-", "-", "-", err);
+            println!(
+                "   {:<13} {:>10}  {:>8}  {:<4} error: {}",
+                b.backend, "-", "-", "-", err
+            );
             continue;
         }
-        let result = b.result.map(|r| r.to_string()).unwrap_or_else(|| "-".into());
+        let result = b
+            .result
+            .map(|r| r.to_string())
+            .unwrap_or_else(|| "-".into());
         let ok = match b.ok {
             Some(true) => "✓",
             Some(false) => "✗",
