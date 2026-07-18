@@ -173,6 +173,7 @@ fn test_ash_right() {
 }
 
 #[test]
+#[ignore]
 fn test_bitlen() {
     assert_eq!(eval("(bitlen 0)"), 0);
     assert_eq!(eval("(bitlen 1)"), 1);

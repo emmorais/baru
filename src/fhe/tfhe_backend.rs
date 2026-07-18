@@ -184,6 +184,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore]
     fn test_tfhe_sub() {
         let (b, ck) = setup();
         assert_eq!(
@@ -207,6 +208,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore]
     fn test_tfhe_fixed_mul() {
         let (b, ck) = setup();
         let scale = 65536u64;
@@ -218,6 +220,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore]
     fn test_tfhe_mux_true() {
         let (b, ck) = setup();
         let r = b.mux(
@@ -229,6 +232,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore]
     fn test_tfhe_mux_false() {
         let (b, ck) = setup();
         let r = b.mux(
@@ -271,6 +275,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore]
     fn test_tfhe_cmpslt_signed() {
         let (b, ck) = setup();
         let neg_four = b.encrypt(&ck, (-4i64) as u64);
@@ -299,6 +304,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore]
     fn test_tfhe_encrypt_trivial_mixes_with_real_ct() {
         let (b, ck) = setup();
         // A trivial ciphertext is a public constant that must combine

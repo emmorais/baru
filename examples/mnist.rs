@@ -16,6 +16,22 @@
 //! Run:  cargo run --release --example mnist [--mpc] [--tfhe]
 //!
 //! Exits non-zero if any backend misclassifies or diverges from plain.
+//!
+//! Results:
+//!
+//! ╰─ cargo run --release --example mnist -- --tfhe                                                                                                                                                               ─╯
+//!    Finished `release` profile [optimized] target(s) in 0.16s
+//!     Running `target/release/examples/mnist --tfhe`
+//! MNIST linear discriminator — 784 private pixels, Q16.16 public weights
+//!
+//! plain      score("0")=3389.7422  score("1")=2853.0156  → predicts 0   (2.8ms)
+//! fhe-mock   score("0")=3389.7422  score("1")=2853.0156  → predicts 0   (compile 2.8ms, 2365 gates, eval 842.1µs)
+//!
+//! fhe-tfhe: keygen + 784 encrypted pixels — this takes minutes...
+//! fhe-tfhe   keygen 860.9ms
+//! fhe-tfhe   score("0")=3389.7422  score("1")=2853.0156  → predicts 0   (eval 2829.1s)
+//!
+//! all backends agree — image "0" outscores image "1"
 
 use std::collections::HashMap;
 use std::fmt::Write as _;

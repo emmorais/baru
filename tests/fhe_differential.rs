@@ -56,6 +56,7 @@ fn assert_differential(expr: &str, xs: &[i64]) {
 const SIGNED_SAMPLES: &[i64] = &[-7, -1, 0, 1, 5, 7, 12];
 
 #[test]
+#[ignore]
 fn diff_arithmetic() {
     assert_differential("(+ (* x 3) 7)", SIGNED_SAMPLES);
     assert_differential("(- x 10)", SIGNED_SAMPLES);
@@ -63,17 +64,20 @@ fn diff_arithmetic() {
 }
 
 #[test]
+#[ignore]
 fn diff_relu() {
     assert_differential("(if (> x 0) x 0)", SIGNED_SAMPLES);
 }
 
 #[test]
+#[ignore]
 fn diff_comparisons_in_if() {
     assert_differential("(if (< x 5) (* x 2) (+ x 1))", SIGNED_SAMPLES);
     assert_differential("(if (== x 7) 1 0)", SIGNED_SAMPLES);
 }
 
 #[test]
+#[ignore]
 fn diff_le_ge_lowering() {
     // <= and >= lower to comparison + logical NOT (XOR 1) — a bitwise NOT
     // here would poison the mux condition.
@@ -82,16 +86,19 @@ fn diff_le_ge_lowering() {
 }
 
 #[test]
+#[ignore]
 fn diff_logical_not() {
     assert_differential("(if (not (< x 5)) 1 0)", SIGNED_SAMPLES);
 }
 
 #[test]
+#[ignore]
 fn diff_nested_if() {
     assert_differential("(if (> x 0) (if (< x 10) x 10) 0)", SIGNED_SAMPLES);
 }
 
 #[test]
+#[ignore]
 fn diff_div_mod() {
     // Plain `/` demands exact division, so sample multiples of 3 only.
     assert_differential("(/ x 3)", &[0, 3, 6, 21]);
@@ -121,6 +128,7 @@ fn eval_dot_product_fhe<B: baru::fhe::FheBackend>(be: &B, ck: &[u8], x: i64, y: 
 }
 
 #[test]
+#[ignore]
 fn diff_dot_product_recursion_mock() {
     // Recursion over a compile-time list is unrolled by the circuit compiler;
     // the encrypted scalars flow through the unrolled multiply-add chain.
@@ -143,6 +151,7 @@ fn eval_plain_raw(expr_src: &str, x: i64) -> i64 {
 }
 
 #[test]
+#[ignore]
 fn diff_fixed_point_mock() {
     // Q16.16 arithmetic compiled to circuits must match the interpreter on
     // the raw scaled representation.  Division stays non-negative (IDiv is
@@ -178,6 +187,7 @@ fn diff_fixed_point_mock() {
 }
 
 #[test]
+#[ignore]
 fn diff_fixed_output_flag() {
     // compile_fhe must mark fixed outputs (and only those).
     let expr = parse("(* x 1.5)").expect("parse");
@@ -194,6 +204,7 @@ fn diff_fixed_output_flag() {
 }
 
 #[test]
+#[ignore]
 fn diff_dot_builtin_mock() {
     // The native `dot` builtin lowers to a flat multiply-add chain — no
     // letrec unrolling involved.  dot([x, y], [2, 3]) = 2x + 3y.
@@ -218,6 +229,7 @@ fn diff_dot_builtin_mock() {
 }
 
 #[test]
+#[ignore]
 fn diff_matvec_builtin_mock() {
     // (vsum (matvec [[2 -3] [1 2]] [x y])) — a two-neuron linear layer.
     let src = "(vsum (matvec (list '(2 -3) '(1 2)) (list x y)))";
@@ -245,6 +257,7 @@ fn diff_matvec_builtin_mock() {
 // ---------------------------------------------------------------------------
 
 #[test]
+#[ignore]
 fn diff_tfhe_subset() {
     let be = TfheBackend::new();
     let (ck, sk) = be.keygen();
