@@ -159,6 +159,74 @@ fn test_matvec_builtin_shares() {
     assert_eq!(eval_shared(src), 8);
 }
 
+// ---------------------------------------------------------------------------
+// Q16.16 fixed-point shares
+// (fixed×fixed share products need headroom before the >>16 rescale — use
+//  64-bit shares; mixed fixed×int products are exact and fit 32 bits)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_fixed_share_roundtrip() {
+    // share → reconstruct returns a Fixed; ×2 makes it integral.
+    let src = "(fixed->int (* 2 (reconstruct (share 1.5 32))))";
+    assert_eq!(eval(src), 3);
+}
+
+#[test]
+fn test_fixed_share_mul_truncation() {
+    // fixed×fixed: 1.5 * 2.5 = 3.75 → rescale via a2b/b2a arithmetic shift.
+    let src = "(fixed->int (reconstruct (* (share 1.5 64) (share 2.5 64))))";
+    assert_eq!(eval(src), 3);
+}
+
+#[test]
+fn test_fixed_share_mul_negative() {
+    // -1.5 * 2.5 = -3.75 → the sign bit must survive the rescale;
+    // fixed->int truncates toward zero: -3.
+    let src = "(fixed->int (reconstruct (* (share -1.5 64) (share 2.5 64))))";
+    assert_eq!(eval(src), -3);
+}
+
+#[test]
+fn test_fixed_share_mixed_imm() {
+    // int share × fixed constant: exact, no truncation needed.
+    let src = "(fixed->int (* 2 (reconstruct (* (share 3 32) 0.5))))";
+    assert_eq!(eval(src), 3);
+}
+
+#[test]
+fn test_fixed_share_add_coercion() {
+    // fixed share + integer constant: the int side is lifted to Q16.16.
+    let src = "(fixed->int (reconstruct (+ (share 1.5 32) 2)))";
+    assert_eq!(eval(src), 3);
+}
+
+#[test]
+fn test_fixed_share_comparison() {
+    // Comparison happens in the scaled domain and yields a plain bit share.
+    assert_eq!(eval_shared("(reconstruct (> (share 1.5 32) 1))"), 1);
+    assert_eq!(eval_shared("(reconstruct (> (share 0.5 32) 1))"), 0);
+    assert_eq!(eval_shared("(reconstruct (< (share -0.5 32) 0))"), 1);
+}
+
+#[test]
+fn test_fixed_share_relu_mux() {
+    // ReLU in mux style on a fixed share: z = 1.0 - 2.5 = -1.5 → relu = 0.
+    let src = "(fixed->int (reconstruct
+                 (let ((z (- (share 1.0 32) 2.5)))
+                   (* z (> z 0)))))";
+    assert_eq!(eval(src), 0);
+}
+
+#[test]
+fn test_fixed_share_dot_weights() {
+    // The NN pattern: integer pixel shares × fixed public weights.
+    // dot([3, 4], [0.5, 2.5]) = 1.5 + 10.0 = 11.5 → ×2 = 23.
+    let src = "(fixed->int (* 2 (reconstruct
+                 (dot (list (share 3 32) (share 4 32)) '(0.5 2.5)))))";
+    assert_eq!(eval(src), 23);
+}
+
 #[test]
 fn test_dot_builtin_fixed() {
     // Q16.16: dot((1.5, 2.0), (2.0, 0.5)) = 3.0 + 1.0 = 4.0

@@ -48,7 +48,12 @@ impl<T: Transport> TransportBackend<T> {
 
     fn store(&mut self, id: u64, ps: PartyShare, nbits: usize, owner: usize) -> ShareRef {
         self.shares.insert(id, ps);
-        ShareRef { id, nbits, owner }
+        ShareRef {
+            id,
+            nbits,
+            owner,
+            fixed: false,
+        }
     }
 
     fn get(&self, sr: &ShareRef) -> &PartyShare {
@@ -138,6 +143,7 @@ impl<T: Transport + 'static> Backend for TransportBackend<T> {
                 id: acc_id,
                 nbits: 1,
                 owner: a.owner,
+                fixed: false,
             });
             let pb = self.get_cloned(br);
             let sum = crate::crypto::aby3_protocol::add_party(&pa, &pb);
@@ -162,11 +168,13 @@ impl<T: Transport + 'static> Backend for TransportBackend<T> {
             id: acc_id,
             nbits: 1,
             owner: a.owner,
+            fixed: false,
         });
         let one_ps = self.get_cloned(&ShareRef {
             id: one_id,
             nbits: 1,
             owner: a.owner,
+            fixed: false,
         });
         let not_ps = crate::crypto::aby3_protocol::sub_party(&one_ps, &acc_ps);
         let id = self.alloc_id();
@@ -215,6 +223,7 @@ impl<T: Transport + 'static> Backend for TransportBackend<T> {
                     id,
                     nbits: 1,
                     owner: a.owner,
+                    fixed: false,
                 }
             })
             .collect()
@@ -272,11 +281,13 @@ impl<T: Transport + 'static> Backend for TransportBackend<T> {
             id: 0,
             nbits: 0,
             owner: 0,
+            fixed: false,
         };
         let one: ShareRef = ShareRef {
             id: 0,
             nbits: 0,
             owner: 0,
+            fixed: false,
         };
         let bit_refs_a = self.a2b(a, a.nbits);
         // Compute bit_refs_b such that bit_refs_b[i] = OR of bit_refs_a[i..]
@@ -294,6 +305,7 @@ impl<T: Transport + 'static> Backend for TransportBackend<T> {
             id: 0,
             nbits: 0,
             owner: 0,
+            fixed: false,
         };
         for (a, b) in bit_refs_a.iter().zip(bit_refs_b.iter()) {
             let not_a = self.sub(&one, a);

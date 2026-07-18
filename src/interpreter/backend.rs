@@ -5,11 +5,20 @@ pub struct ShareRef {
     pub id: u64,
     pub nbits: usize,
     pub owner: usize,
+    /// True when the shared value is a Q16.16 fixed-point number (the share
+    /// holds the scaled integer).  Metadata only — backends ignore it; the
+    /// interpreter uses it to insert rescales and coerce mixed operands.
+    pub fixed: bool,
 }
 
 impl ShareRef {
     pub fn new(id: u64, nbits: usize, owner: usize) -> Self {
-        ShareRef { id, nbits, owner }
+        ShareRef {
+            id,
+            nbits,
+            owner,
+            fixed: false,
+        }
     }
 }
 

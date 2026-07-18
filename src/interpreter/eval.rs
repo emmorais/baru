@@ -531,298 +531,328 @@ pub fn reduce_expression(
                             }
                         };
 
-                        let out = match op {
-                            super::parser::BinOp::Add
-                            | super::parser::BinOp::Sub
-                            | super::parser::BinOp::Mul
-                            | super::parser::BinOp::DivExact
-                            | super::parser::BinOp::Mod => {
-                                // if either operand is a shared value, dispatch to backend
-                                match (&left_val, &val) {
+                        // Q16.16 shares (or a share mixed with a plain Fixed)
+                        // need scale-aware handling; the plain-share arms
+                        // below would silently drop the scaling.
+                        let is_share = |v: &Types| matches!(v, Types::Share(_));
+                        let fixed_share_mix = matches!(&left_val, Types::Share(s) if s.fixed)
+                            || matches!(&val, Types::Share(s) if s.fixed)
+                            || (is_share(&left_val) && is_fixed(&val))
+                            || (is_fixed(&left_val) && is_share(&val));
+
+                        let out = if fixed_share_mix {
+                            fixed_share_binop(&backend, op, &left_val, &val)
+                        } else {
+                            match op {
+                                super::parser::BinOp::Add
+                                | super::parser::BinOp::Sub
+                                | super::parser::BinOp::Mul
+                                | super::parser::BinOp::DivExact
+                                | super::parser::BinOp::Mod => {
+                                    // if either operand is a shared value, dispatch to backend
+                                    match (&left_val, &val) {
+                                        (Types::Share(sa), Types::Share(sb)) => {
+                                            let mut be =
+                                                backend.lock().unwrap_or_else(|e| e.into_inner());
+                                            let sr = match op {
+                                                super::parser::BinOp::Add => be.add(sa, sb),
+                                                super::parser::BinOp::Sub => be.sub(sa, sb),
+                                                super::parser::BinOp::Mul => be.mul(sa, sb),
+                                                _ => panic!("unsupported shared op"),
+                                            };
+                                            Types::Share(sr)
+                                        }
+                                        (Types::Share(sa), Types::Num(bn)) => {
+                                            let mut be =
+                                                backend.lock().unwrap_or_else(|e| e.into_inner());
+                                            // convert signed immediate into two's-complement field element for sa.nbits
+                                            let imm = int_to_fr_signed(*bn, sa.nbits);
+                                            let sb = be.share_secret(imm, sa.nbits, 0);
+                                            let sr = match op {
+                                                super::parser::BinOp::Add => be.add(sa, &sb),
+                                                super::parser::BinOp::Sub => be.sub(sa, &sb),
+                                                super::parser::BinOp::Mul => be.mul(sa, &sb),
+                                                _ => panic!("unsupported shared op"),
+                                            };
+                                            Types::Share(sr)
+                                        }
+                                        (Types::Num(an), Types::Share(sb)) => {
+                                            let mut be =
+                                                backend.lock().unwrap_or_else(|e| e.into_inner());
+                                            // convert signed immediate into two's-complement field element for sb.nbits
+                                            let imm = int_to_fr_signed(*an, sb.nbits);
+                                            let sa = be.share_secret(imm, sb.nbits, 0);
+                                            let sr = match op {
+                                                super::parser::BinOp::Add => be.add(&sa, sb),
+                                                super::parser::BinOp::Sub => be.sub(&sa, sb),
+                                                super::parser::BinOp::Mul => be.mul(&sa, sb),
+                                                _ => panic!("unsupported shared op"),
+                                            };
+                                            Types::Share(sr)
+                                        }
+                                        _ => {
+                                            // If either operand is Fixed, perform fixed-point arithmetic
+                                            if is_fixed(&left_val) || is_fixed(&val) {
+                                                let a = to_fixed(&left_val);
+                                                let b = to_fixed(&val);
+                                                let r = match op {
+                                                    super::parser::BinOp::Add => a.wrapping_add(b),
+                                                    super::parser::BinOp::Sub => a.wrapping_sub(b),
+                                                    super::parser::BinOp::Mul => {
+                                                        // (a * b) >> 16 using i128 to avoid overflow
+                                                        ((a as i128 * b as i128) >> 16) as i64
+                                                    }
+                                                    super::parser::BinOp::DivExact => {
+                                                        if b == 0 {
+                                                            panic!("division by zero");
+                                                        }
+                                                        // (a << 16) / b
+                                                        ((a as i128) << 16) as i64 / b
+                                                    }
+                                                    super::parser::BinOp::Mod => {
+                                                        if b == 0 {
+                                                            panic!("modulo by zero");
+                                                        }
+                                                        a % b
+                                                    }
+                                                    _ => unreachable!(),
+                                                };
+                                                Types::Fixed(r)
+                                            } else {
+                                                let a = maybe_num(&left_val).expect(
+                                                "binary arithmetic left operand must be NUM or BOOL",
+                                            );
+                                                let b = maybe_num(&val).expect(
+                                                "binary arithmetic right operand must be NUM or BOOL",
+                                            );
+                                                let r = match op {
+                                                    super::parser::BinOp::Add => a.wrapping_add(b),
+                                                    super::parser::BinOp::Sub => a.wrapping_sub(b),
+                                                    super::parser::BinOp::Mul => a.wrapping_mul(b),
+                                                    super::parser::BinOp::DivExact => {
+                                                        if b == 0 {
+                                                            panic!("division by zero");
+                                                        }
+                                                        if a % b != 0 {
+                                                            panic!(
+                                                                "non-exact division: {} / {}",
+                                                                a, b
+                                                            );
+                                                        }
+                                                        a / b
+                                                    }
+                                                    super::parser::BinOp::Mod => {
+                                                        if b == 0 {
+                                                            panic!("modulo by zero");
+                                                        }
+                                                        a % b
+                                                    }
+                                                    _ => unreachable!(),
+                                                };
+                                                Types::Num(r)
+                                            }
+                                        }
+                                    }
+                                }
+                                super::parser::BinOp::Eq => match (&left_val, &val) {
+                                    (Types::Num(a), Types::Num(b)) => {
+                                        Types::Num(if a == b { 1 } else { 0 })
+                                    }
+                                    (Types::Fixed(a), Types::Fixed(b)) => {
+                                        Types::Num(if a == b { 1 } else { 0 })
+                                    }
+                                    (Types::Fixed(a), Types::Num(b)) => {
+                                        use crate::interpreter::ast::FIXED_SCALE;
+                                        Types::Num(if *a == b * FIXED_SCALE { 1 } else { 0 })
+                                    }
+                                    (Types::Num(a), Types::Fixed(b)) => {
+                                        use crate::interpreter::ast::FIXED_SCALE;
+                                        Types::Num(if a * FIXED_SCALE == *b { 1 } else { 0 })
+                                    }
+                                    (Types::Bool(a), Types::Bool(b)) => {
+                                        Types::Num(if a == b { 1 } else { 0 })
+                                    }
+                                    (Types::Str(a), Types::Str(b)) => {
+                                        Types::Num(if a == b { 1 } else { 0 })
+                                    }
+                                    (Types::Char(a), Types::Char(b)) => {
+                                        Types::Num(if a == b { 1 } else { 0 })
+                                    }
                                     (Types::Share(sa), Types::Share(sb)) => {
                                         let mut be =
                                             backend.lock().unwrap_or_else(|e| e.into_inner());
-                                        let sr = match op {
-                                            super::parser::BinOp::Add => be.add(sa, sb),
-                                            super::parser::BinOp::Sub => be.sub(sa, sb),
-                                            super::parser::BinOp::Mul => be.mul(sa, sb),
-                                            _ => panic!("unsupported shared op"),
-                                        };
-                                        Types::Share(sr)
+                                        Types::Share(be.eq(sa, sb))
                                     }
                                     (Types::Share(sa), Types::Num(bn)) => {
                                         let mut be =
                                             backend.lock().unwrap_or_else(|e| e.into_inner());
-                                        // convert signed immediate into two's-complement field element for sa.nbits
                                         let imm = int_to_fr_signed(*bn, sa.nbits);
                                         let sb = be.share_secret(imm, sa.nbits, 0);
-                                        let sr = match op {
-                                            super::parser::BinOp::Add => be.add(sa, &sb),
-                                            super::parser::BinOp::Sub => be.sub(sa, &sb),
-                                            super::parser::BinOp::Mul => be.mul(sa, &sb),
-                                            _ => panic!("unsupported shared op"),
-                                        };
-                                        Types::Share(sr)
+                                        Types::Share(be.eq(sa, &sb))
                                     }
                                     (Types::Num(an), Types::Share(sb)) => {
                                         let mut be =
                                             backend.lock().unwrap_or_else(|e| e.into_inner());
-                                        // convert signed immediate into two's-complement field element for sb.nbits
                                         let imm = int_to_fr_signed(*an, sb.nbits);
                                         let sa = be.share_secret(imm, sb.nbits, 0);
-                                        let sr = match op {
-                                            super::parser::BinOp::Add => be.add(&sa, sb),
-                                            super::parser::BinOp::Sub => be.sub(&sa, sb),
-                                            super::parser::BinOp::Mul => be.mul(&sa, sb),
-                                            _ => panic!("unsupported shared op"),
+                                        Types::Share(be.eq(&sa, sb))
+                                    }
+                                    _ => Types::Num(0),
+                                },
+                                super::parser::BinOp::Lt
+                                | super::parser::BinOp::Gt
+                                | super::parser::BinOp::Le
+                                | super::parser::BinOp::Ge => match (&left_val, &val) {
+                                    (Types::Num(a), Types::Num(b)) => {
+                                        let r = match op {
+                                            super::parser::BinOp::Lt => a < b,
+                                            super::parser::BinOp::Gt => a > b,
+                                            super::parser::BinOp::Le => a <= b,
+                                            super::parser::BinOp::Ge => a >= b,
+                                            _ => unreachable!(),
                                         };
-                                        Types::Share(sr)
+                                        Types::Num(if r { 1 } else { 0 })
                                     }
+                                    // Fixed vs Fixed (or Fixed vs Num via coercion)
+                                    (Types::Fixed(_), Types::Fixed(_))
+                                    | (Types::Fixed(_), Types::Num(_))
+                                    | (Types::Num(_), Types::Fixed(_)) => {
+                                        let a = to_fixed(&left_val);
+                                        let b = to_fixed(&val);
+                                        let r = match op {
+                                            super::parser::BinOp::Lt => a < b,
+                                            super::parser::BinOp::Gt => a > b,
+                                            super::parser::BinOp::Le => a <= b,
+                                            super::parser::BinOp::Ge => a >= b,
+                                            _ => unreachable!(),
+                                        };
+                                        Types::Num(if r { 1 } else { 0 })
+                                    }
+                                    (Types::Share(sa), Types::Share(sb)) => {
+                                        let mut be =
+                                            backend.lock().unwrap_or_else(|e| e.into_inner());
+                                        let out = match op {
+                                            super::parser::BinOp::Lt => be.lt(sa, sb),
+                                            super::parser::BinOp::Gt => be.lt(sb, sa),
+                                            super::parser::BinOp::Le => be.le(sa, sb),
+                                            super::parser::BinOp::Ge => be.le(sb, sa),
+                                            _ => unreachable!(),
+                                        };
+                                        Types::Share(out)
+                                    }
+                                    (Types::Share(sa), Types::Num(bn)) => {
+                                        let mut be =
+                                            backend.lock().unwrap_or_else(|e| e.into_inner());
+                                        let imm = int_to_fr_signed(*bn, sa.nbits);
+                                        let sb = be.share_secret(imm, sa.nbits, 0);
+                                        let out = match op {
+                                            super::parser::BinOp::Lt => be.lt(sa, &sb),
+                                            super::parser::BinOp::Gt => be.lt(&sb, sa),
+                                            super::parser::BinOp::Le => be.le(sa, &sb),
+                                            super::parser::BinOp::Ge => be.le(&sb, sa),
+                                            _ => unreachable!(),
+                                        };
+                                        Types::Share(out)
+                                    }
+                                    (Types::Num(an), Types::Share(sb)) => {
+                                        let mut be =
+                                            backend.lock().unwrap_or_else(|e| e.into_inner());
+                                        let imm = int_to_fr_signed(*an, sb.nbits);
+                                        let sa = be.share_secret(imm, sb.nbits, 0);
+                                        let out = match op {
+                                            super::parser::BinOp::Lt => be.lt(&sa, sb),
+                                            super::parser::BinOp::Gt => be.lt(sb, &sa),
+                                            super::parser::BinOp::Le => be.le(&sa, sb),
+                                            super::parser::BinOp::Ge => be.le(sb, &sa),
+                                            _ => unreachable!(),
+                                        };
+                                        Types::Share(out)
+                                    }
+                                    _ => Types::Num(0),
+                                },
+                                super::parser::BinOp::And => match (&left_val, &val) {
+                                    (Types::Share(sa), Types::Share(sb)) => {
+                                        let mut be =
+                                            backend.lock().unwrap_or_else(|e| e.into_inner());
+                                        Types::Share(be.and(sa, sb))
+                                    }
+                                    (Types::Share(sa), Types::Num(b)) => {
+                                        let mut be =
+                                            backend.lock().unwrap_or_else(|e| e.into_inner());
+                                        let imm = int_to_fr_signed(*b, sa.nbits);
+                                        let sb = be.share_secret(imm, sa.nbits, 0);
+                                        Types::Share(be.and(sa, &sb))
+                                    }
+                                    (Types::Num(a), Types::Share(sb)) => {
+                                        let mut be =
+                                            backend.lock().unwrap_or_else(|e| e.into_inner());
+                                        let imm = int_to_fr_signed(*a, sb.nbits);
+                                        let sa = be.share_secret(imm, sb.nbits, 0);
+                                        Types::Share(be.and(&sa, sb))
+                                    }
+                                    (Types::Num(a), Types::Num(b)) => Types::Num(a & b),
                                     _ => {
-                                        // If either operand is Fixed, perform fixed-point arithmetic
-                                        if is_fixed(&left_val) || is_fixed(&val) {
-                                            let a = to_fixed(&left_val);
-                                            let b = to_fixed(&val);
-                                            let r = match op {
-                                                super::parser::BinOp::Add => a.wrapping_add(b),
-                                                super::parser::BinOp::Sub => a.wrapping_sub(b),
-                                                super::parser::BinOp::Mul => {
-                                                    // (a * b) >> 16 using i128 to avoid overflow
-                                                    ((a as i128 * b as i128) >> 16) as i64
-                                                }
-                                                super::parser::BinOp::DivExact => {
-                                                    if b == 0 {
-                                                        panic!("division by zero");
-                                                    }
-                                                    // (a << 16) / b
-                                                    ((a as i128) << 16) as i64 / b
-                                                }
-                                                super::parser::BinOp::Mod => {
-                                                    if b == 0 {
-                                                        panic!("modulo by zero");
-                                                    }
-                                                    a % b
-                                                }
-                                                _ => unreachable!(),
-                                            };
-                                            Types::Fixed(r)
-                                        } else {
-                                            let a = maybe_num(&left_val).expect(
-                                                "binary arithmetic left operand must be NUM or BOOL",
-                                            );
-                                            let b = maybe_num(&val).expect(
-                                                "binary arithmetic right operand must be NUM or BOOL",
-                                            );
-                                            let r = match op {
-                                                super::parser::BinOp::Add => a.wrapping_add(b),
-                                                super::parser::BinOp::Sub => a.wrapping_sub(b),
-                                                super::parser::BinOp::Mul => a.wrapping_mul(b),
-                                                super::parser::BinOp::DivExact => {
-                                                    if b == 0 {
-                                                        panic!("division by zero");
-                                                    }
-                                                    if a % b != 0 {
-                                                        panic!("non-exact division: {} / {}", a, b);
-                                                    }
-                                                    a / b
-                                                }
-                                                super::parser::BinOp::Mod => {
-                                                    if b == 0 {
-                                                        panic!("modulo by zero");
-                                                    }
-                                                    a % b
-                                                }
-                                                _ => unreachable!(),
-                                            };
-                                            Types::Num(r)
-                                        }
+                                        let a = maybe_num(&left_val).expect("and expects NUM/BOOL");
+                                        let b = maybe_num(&val).expect("and expects NUM/BOOL");
+                                        Types::Num(if a != 0 && b != 0 { 1 } else { 0 })
                                     }
-                                }
+                                },
+                                super::parser::BinOp::Or => match (&left_val, &val) {
+                                    (Types::Share(sa), Types::Share(sb)) => {
+                                        let mut be =
+                                            backend.lock().unwrap_or_else(|e| e.into_inner());
+                                        Types::Share(be.or(sa, sb))
+                                    }
+                                    (Types::Share(sa), Types::Num(b)) => {
+                                        let mut be =
+                                            backend.lock().unwrap_or_else(|e| e.into_inner());
+                                        let imm = int_to_fr_signed(*b, sa.nbits);
+                                        let sb = be.share_secret(imm, sa.nbits, 0);
+                                        Types::Share(be.or(sa, &sb))
+                                    }
+                                    (Types::Num(a), Types::Share(sb)) => {
+                                        let mut be =
+                                            backend.lock().unwrap_or_else(|e| e.into_inner());
+                                        let imm = int_to_fr_signed(*a, sb.nbits);
+                                        let sa = be.share_secret(imm, sb.nbits, 0);
+                                        Types::Share(be.or(&sa, sb))
+                                    }
+                                    (Types::Num(a), Types::Num(b)) => Types::Num(a | b),
+                                    _ => {
+                                        let a = maybe_num(&left_val).expect("or expects NUM/BOOL");
+                                        let b = maybe_num(&val).expect("or expects NUM/BOOL");
+                                        Types::Num(if a != 0 || b != 0 { 1 } else { 0 })
+                                    }
+                                },
+                                super::parser::BinOp::AshRight => match (&left_val, &val) {
+                                    (Types::Share(sa), Types::Num(bn)) => {
+                                        let mut be =
+                                            backend.lock().unwrap_or_else(|e| e.into_inner());
+                                        // convert bn to usize
+                                        let b = usize::try_from(*bn).unwrap_or(0);
+                                        Types::Share(be.shift_right(sa, b))
+                                    }
+                                    (Types::Num(an), Types::Num(bn)) => {
+                                        let r = an.wrapping_shr(*bn as u32);
+                                        Types::Num(r)
+                                    }
+                                    _ => panic!("ash-right expects (SHARE, NUM) or (NUM, NUM)"),
+                                },
+                                super::parser::BinOp::AshLeft => match (&left_val, &val) {
+                                    (Types::Share(sa), Types::Num(bn)) => {
+                                        let mut be =
+                                            backend.lock().unwrap_or_else(|e| e.into_inner());
+                                        // convert bn to usize
+                                        let b = usize::try_from(*bn).unwrap_or(0);
+                                        Types::Share(be.shift_left(sa, b))
+                                    }
+                                    (Types::Num(an), Types::Num(bn)) => {
+                                        let r = an.wrapping_shl(*bn as u32);
+                                        Types::Num(r)
+                                    }
+                                    _ => panic!("ash-left expects (SHARE, NUM) or (NUM, NUM)"),
+                                },
                             }
-                            super::parser::BinOp::Eq => match (&left_val, &val) {
-                                (Types::Num(a), Types::Num(b)) => {
-                                    Types::Num(if a == b { 1 } else { 0 })
-                                }
-                                (Types::Fixed(a), Types::Fixed(b)) => {
-                                    Types::Num(if a == b { 1 } else { 0 })
-                                }
-                                (Types::Fixed(a), Types::Num(b)) => {
-                                    use crate::interpreter::ast::FIXED_SCALE;
-                                    Types::Num(if *a == b * FIXED_SCALE { 1 } else { 0 })
-                                }
-                                (Types::Num(a), Types::Fixed(b)) => {
-                                    use crate::interpreter::ast::FIXED_SCALE;
-                                    Types::Num(if a * FIXED_SCALE == *b { 1 } else { 0 })
-                                }
-                                (Types::Bool(a), Types::Bool(b)) => {
-                                    Types::Num(if a == b { 1 } else { 0 })
-                                }
-                                (Types::Str(a), Types::Str(b)) => {
-                                    Types::Num(if a == b { 1 } else { 0 })
-                                }
-                                (Types::Char(a), Types::Char(b)) => {
-                                    Types::Num(if a == b { 1 } else { 0 })
-                                }
-                                (Types::Share(sa), Types::Share(sb)) => {
-                                    let mut be = backend.lock().unwrap_or_else(|e| e.into_inner());
-                                    Types::Share(be.eq(sa, sb))
-                                }
-                                (Types::Share(sa), Types::Num(bn)) => {
-                                    let mut be = backend.lock().unwrap_or_else(|e| e.into_inner());
-                                    let imm = int_to_fr_signed(*bn, sa.nbits);
-                                    let sb = be.share_secret(imm, sa.nbits, 0);
-                                    Types::Share(be.eq(sa, &sb))
-                                }
-                                (Types::Num(an), Types::Share(sb)) => {
-                                    let mut be = backend.lock().unwrap_or_else(|e| e.into_inner());
-                                    let imm = int_to_fr_signed(*an, sb.nbits);
-                                    let sa = be.share_secret(imm, sb.nbits, 0);
-                                    Types::Share(be.eq(&sa, sb))
-                                }
-                                _ => Types::Num(0),
-                            },
-                            super::parser::BinOp::Lt
-                            | super::parser::BinOp::Gt
-                            | super::parser::BinOp::Le
-                            | super::parser::BinOp::Ge => match (&left_val, &val) {
-                                (Types::Num(a), Types::Num(b)) => {
-                                    let r = match op {
-                                        super::parser::BinOp::Lt => a < b,
-                                        super::parser::BinOp::Gt => a > b,
-                                        super::parser::BinOp::Le => a <= b,
-                                        super::parser::BinOp::Ge => a >= b,
-                                        _ => unreachable!(),
-                                    };
-                                    Types::Num(if r { 1 } else { 0 })
-                                }
-                                // Fixed vs Fixed (or Fixed vs Num via coercion)
-                                (Types::Fixed(_), Types::Fixed(_))
-                                | (Types::Fixed(_), Types::Num(_))
-                                | (Types::Num(_), Types::Fixed(_)) => {
-                                    let a = to_fixed(&left_val);
-                                    let b = to_fixed(&val);
-                                    let r = match op {
-                                        super::parser::BinOp::Lt => a < b,
-                                        super::parser::BinOp::Gt => a > b,
-                                        super::parser::BinOp::Le => a <= b,
-                                        super::parser::BinOp::Ge => a >= b,
-                                        _ => unreachable!(),
-                                    };
-                                    Types::Num(if r { 1 } else { 0 })
-                                }
-                                (Types::Share(sa), Types::Share(sb)) => {
-                                    let mut be = backend.lock().unwrap_or_else(|e| e.into_inner());
-                                    let out = match op {
-                                        super::parser::BinOp::Lt => be.lt(sa, sb),
-                                        super::parser::BinOp::Gt => be.lt(sb, sa),
-                                        super::parser::BinOp::Le => be.le(sa, sb),
-                                        super::parser::BinOp::Ge => be.le(sb, sa),
-                                        _ => unreachable!(),
-                                    };
-                                    Types::Share(out)
-                                }
-                                (Types::Share(sa), Types::Num(bn)) => {
-                                    let mut be = backend.lock().unwrap_or_else(|e| e.into_inner());
-                                    let imm = int_to_fr_signed(*bn, sa.nbits);
-                                    let sb = be.share_secret(imm, sa.nbits, 0);
-                                    let out = match op {
-                                        super::parser::BinOp::Lt => be.lt(sa, &sb),
-                                        super::parser::BinOp::Gt => be.lt(&sb, sa),
-                                        super::parser::BinOp::Le => be.le(sa, &sb),
-                                        super::parser::BinOp::Ge => be.le(&sb, sa),
-                                        _ => unreachable!(),
-                                    };
-                                    Types::Share(out)
-                                }
-                                (Types::Num(an), Types::Share(sb)) => {
-                                    let mut be = backend.lock().unwrap_or_else(|e| e.into_inner());
-                                    let imm = int_to_fr_signed(*an, sb.nbits);
-                                    let sa = be.share_secret(imm, sb.nbits, 0);
-                                    let out = match op {
-                                        super::parser::BinOp::Lt => be.lt(&sa, sb),
-                                        super::parser::BinOp::Gt => be.lt(sb, &sa),
-                                        super::parser::BinOp::Le => be.le(&sa, sb),
-                                        super::parser::BinOp::Ge => be.le(sb, &sa),
-                                        _ => unreachable!(),
-                                    };
-                                    Types::Share(out)
-                                }
-                                _ => Types::Num(0),
-                            },
-                            super::parser::BinOp::And => match (&left_val, &val) {
-                                (Types::Share(sa), Types::Share(sb)) => {
-                                    let mut be = backend.lock().unwrap_or_else(|e| e.into_inner());
-                                    Types::Share(be.and(sa, sb))
-                                }
-                                (Types::Share(sa), Types::Num(b)) => {
-                                    let mut be = backend.lock().unwrap_or_else(|e| e.into_inner());
-                                    let imm = int_to_fr_signed(*b, sa.nbits);
-                                    let sb = be.share_secret(imm, sa.nbits, 0);
-                                    Types::Share(be.and(sa, &sb))
-                                }
-                                (Types::Num(a), Types::Share(sb)) => {
-                                    let mut be = backend.lock().unwrap_or_else(|e| e.into_inner());
-                                    let imm = int_to_fr_signed(*a, sb.nbits);
-                                    let sa = be.share_secret(imm, sb.nbits, 0);
-                                    Types::Share(be.and(&sa, sb))
-                                }
-                                (Types::Num(a), Types::Num(b)) => Types::Num(a & b),
-                                _ => {
-                                    let a = maybe_num(&left_val).expect("and expects NUM/BOOL");
-                                    let b = maybe_num(&val).expect("and expects NUM/BOOL");
-                                    Types::Num(if a != 0 && b != 0 { 1 } else { 0 })
-                                }
-                            },
-                            super::parser::BinOp::Or => match (&left_val, &val) {
-                                (Types::Share(sa), Types::Share(sb)) => {
-                                    let mut be = backend.lock().unwrap_or_else(|e| e.into_inner());
-                                    Types::Share(be.or(sa, sb))
-                                }
-                                (Types::Share(sa), Types::Num(b)) => {
-                                    let mut be = backend.lock().unwrap_or_else(|e| e.into_inner());
-                                    let imm = int_to_fr_signed(*b, sa.nbits);
-                                    let sb = be.share_secret(imm, sa.nbits, 0);
-                                    Types::Share(be.or(sa, &sb))
-                                }
-                                (Types::Num(a), Types::Share(sb)) => {
-                                    let mut be = backend.lock().unwrap_or_else(|e| e.into_inner());
-                                    let imm = int_to_fr_signed(*a, sb.nbits);
-                                    let sa = be.share_secret(imm, sb.nbits, 0);
-                                    Types::Share(be.or(&sa, sb))
-                                }
-                                (Types::Num(a), Types::Num(b)) => Types::Num(a | b),
-                                _ => {
-                                    let a = maybe_num(&left_val).expect("or expects NUM/BOOL");
-                                    let b = maybe_num(&val).expect("or expects NUM/BOOL");
-                                    Types::Num(if a != 0 || b != 0 { 1 } else { 0 })
-                                }
-                            },
-                            super::parser::BinOp::AshRight => match (&left_val, &val) {
-                                (Types::Share(sa), Types::Num(bn)) => {
-                                    let mut be = backend.lock().unwrap_or_else(|e| e.into_inner());
-                                    // convert bn to usize
-                                    let b = usize::try_from(*bn).unwrap_or(0);
-                                    Types::Share(be.shift_right(sa, b))
-                                }
-                                (Types::Num(an), Types::Num(bn)) => {
-                                    let r = an.wrapping_shr(*bn as u32);
-                                    Types::Num(r)
-                                }
-                                _ => panic!("ash-right expects (SHARE, NUM) or (NUM, NUM)"),
-                            },
-                            super::parser::BinOp::AshLeft => match (&left_val, &val) {
-                                (Types::Share(sa), Types::Num(bn)) => {
-                                    let mut be = backend.lock().unwrap_or_else(|e| e.into_inner());
-                                    // convert bn to usize
-                                    let b = usize::try_from(*bn).unwrap_or(0);
-                                    Types::Share(be.shift_left(sa, b))
-                                }
-                                (Types::Num(an), Types::Num(bn)) => {
-                                    let r = an.wrapping_shl(*bn as u32);
-                                    Types::Num(r)
-                                }
-                                _ => panic!("ash-left expects (SHARE, NUM) or (NUM, NUM)"),
-                            },
                         };
                         stack.push(Apply(*cont, out, env.clone()));
                     }
@@ -1305,6 +1335,14 @@ impl Participant {
                     let sref = be.share_secret(imm, *nb as usize, canonical_owner);
                     Types::Share(sref)
                 }
+                (Types::Fixed(f), Types::Num(nb)) => {
+                    // Q16.16 value: share the scaled integer, flag the share.
+                    let mut be = share_backend.lock().unwrap_or_else(|e| e.into_inner());
+                    let imm = int_to_fr_signed(*f, *nb as usize);
+                    let mut sref = be.share_secret(imm, *nb as usize, 0);
+                    sref.fixed = true;
+                    Types::Share(sref)
+                }
                 (Types::Share(s), Types::Num(_nb)) => Types::Share(s.clone()),
                 _ => panic!("share expects (num nbits) or (share nbits)"),
             }
@@ -1332,6 +1370,13 @@ impl Participant {
                     let sref = be.share_secret(imm, *nb as usize, explicit_owner);
                     Types::Share(sref)
                 }
+                (Types::Num(owner_id), Types::Fixed(f), Types::Num(nb)) => {
+                    let mut be = share_from_backend.lock().unwrap_or_else(|e| e.into_inner());
+                    let imm = int_to_fr_signed(*f, *nb as usize);
+                    let mut sref = be.share_secret(imm, *nb as usize, *owner_id as usize);
+                    sref.fixed = true;
+                    Types::Share(sref)
+                }
                 _ => panic!("share-from expects (owner-id value nbits) all as numbers"),
             }
         });
@@ -1356,7 +1401,12 @@ impl Participant {
                     // and TransportBackend (in the single-party REPL, SimBackend
                     // ignores reveal_to anyway).
                     let plain = be.reveal(sref, None);
-                    Types::Num(plain as i64)
+                    if sref.fixed {
+                        // Q16.16 share: sign-extend the raw scaled value.
+                        Types::Fixed(fr_to_i64_signed(plain, sref.nbits))
+                    } else {
+                        Types::Num(plain as i64)
+                    }
                 }
                 Types::Num(n) => Types::Num(*n),
                 _ => panic!("reconstruct expects a shared value"),
@@ -2438,9 +2488,175 @@ fn decode_quoted_num_list(v: &Types, label: &str) -> Vec<i64> {
 
 // ─── Vector builtin helpers (dot / vsum / matvec) ────────────────────────────
 
+use crate::interpreter::backend::ShareRef;
+
+/// Sign-extend an nbits two's-complement field value to i64.
+fn fr_to_i64_signed(v: u128, nbits: usize) -> i64 {
+    if nbits >= 64 {
+        v as i64
+    } else {
+        let m = 1u128 << nbits;
+        let v = v & (m - 1);
+        if v & (m >> 1) != 0 {
+            (v as i128 - m as i128) as i64
+        } else {
+            v as i64
+        }
+    }
+}
+
+/// Arithmetic >>16 on a two's-complement share — the Q16.16 rescale after a
+/// fixed×fixed multiply.  Decompose to bits, drop the low 16, replicate the
+/// sign bit into the top 16, recompose.
+fn share_ashr16(be: &mut dyn Backend, a: &ShareRef) -> ShareRef {
+    assert!(
+        a.nbits > 16,
+        "fixed-point shares need more than 16 bits, got {}",
+        a.nbits
+    );
+    let bits = be.a2b(a, a.nbits);
+    let sign = bits[a.nbits - 1].clone();
+    let mut out_bits: Vec<ShareRef> = bits[16..].to_vec();
+    while out_bits.len() < a.nbits {
+        out_bits.push(sign.clone());
+    }
+    let mut r = be.b2a(&out_bits);
+    // b2a inherits the 1-bit width of its inputs; restore the real width.
+    r.nbits = a.nbits;
+    r
+}
+
+/// Lift an integer share into the Q16.16 domain (×2^16 via doubling).
+fn share_to_fixed(be: &mut dyn Backend, a: &ShareRef) -> ShareRef {
+    let mut r = be.shift_left(a, 16);
+    r.nbits = a.nbits;
+    r.fixed = true;
+    r
+}
+
+/// Share a plain operand at face value: Fixed keeps its scaled
+/// representation (share marked fixed), Num/Bool stay integers.
+fn share_imm_raw(be: &mut dyn Backend, v: &Types, nbits: usize) -> ShareRef {
+    match v {
+        Types::Num(n) => be.share_secret(int_to_fr_signed(*n, nbits), nbits, 0),
+        Types::Bool(b) => be.share_secret(if *b { 1 } else { 0 }, nbits, 0),
+        Types::Fixed(f) => {
+            let mut s = be.share_secret(int_to_fr_signed(*f, nbits), nbits, 0);
+            s.fixed = true;
+            s
+        }
+        _ => panic!("cannot share operand {:?}", v),
+    }
+}
+
+/// Bring an operand into the share domain; when `scaled` is set, integer
+/// operands are lifted to Q16.16 (mirrors the interpreter's Num→Fixed
+/// coercion).
+fn share_operand(be: &mut dyn Backend, v: &Types, nbits: usize, scaled: bool) -> ShareRef {
+    use crate::interpreter::ast::FIXED_SCALE;
+    match v {
+        Types::Share(s) => {
+            if scaled && !s.fixed {
+                share_to_fixed(be, s)
+            } else {
+                s.clone()
+            }
+        }
+        Types::Num(n) if scaled => {
+            let mut s = be.share_secret(int_to_fr_signed(n * FIXED_SCALE, nbits), nbits, 0);
+            s.fixed = true;
+            s
+        }
+        _ => share_imm_raw(be, v, nbits),
+    }
+}
+
+fn operand_nbits(a: &Types, b: &Types) -> usize {
+    match (a, b) {
+        (Types::Share(s), _) => s.nbits,
+        (_, Types::Share(s)) => s.nbits,
+        _ => panic!("fixed-share op needs at least one share operand"),
+    }
+}
+
+fn operand_is_fixed(v: &Types) -> bool {
+    matches!(v, Types::Fixed(_)) || matches!(v, Types::Share(s) if s.fixed)
+}
+
+/// Multiply in the share domain with Q16.16 awareness: a fixed×int product
+/// is already correctly scaled, so the (expensive) rescale runs only for
+/// fixed×fixed.
+fn share_mul_typed(be: &mut dyn Backend, a: &Types, b: &Types) -> ShareRef {
+    let nbits = operand_nbits(a, b);
+    let (fa, fb) = (operand_is_fixed(a), operand_is_fixed(b));
+    let sa = share_operand(be, a, nbits, false);
+    let sb = share_operand(be, b, nbits, false);
+    let prod = be.mul(&sa, &sb);
+    let mut r = if fa && fb {
+        share_ashr16(be, &prod)
+    } else {
+        prod
+    };
+    r.fixed = fa || fb;
+    r
+}
+
+/// Add/sub in the share domain with Q16.16 awareness (mixed int operands
+/// are lifted to the scaled domain first).
+fn share_addsub_typed(be: &mut dyn Backend, a: &Types, b: &Types, sub: bool) -> ShareRef {
+    let nbits = operand_nbits(a, b);
+    let any_fixed = operand_is_fixed(a) || operand_is_fixed(b);
+    let sa = share_operand(be, a, nbits, any_fixed);
+    let sb = share_operand(be, b, nbits, any_fixed);
+    let mut r = if sub {
+        be.sub(&sa, &sb)
+    } else {
+        be.add(&sa, &sb)
+    };
+    r.fixed = any_fixed;
+    r
+}
+
+/// Binary op where at least one operand is a Q16.16 share (or a share mixed
+/// with a plain Fixed).  Comparisons compare in the scaled domain and yield
+/// plain bit shares.
+fn fixed_share_binop(
+    backend: &Arc<Mutex<Box<dyn Backend>>>,
+    op: crate::interpreter::parser::BinOp,
+    a: &Types,
+    b: &Types,
+) -> Types {
+    use crate::interpreter::parser::BinOp;
+    let mut guard = backend.lock().unwrap_or_else(|e| e.into_inner());
+    let be: &mut dyn Backend = &mut **guard;
+    match op {
+        BinOp::Mul => Types::Share(share_mul_typed(be, a, b)),
+        BinOp::Add => Types::Share(share_addsub_typed(be, a, b, false)),
+        BinOp::Sub => Types::Share(share_addsub_typed(be, a, b, true)),
+        BinOp::Eq | BinOp::Lt | BinOp::Gt | BinOp::Le | BinOp::Ge => {
+            let nbits = operand_nbits(a, b);
+            let sa = share_operand(be, a, nbits, true);
+            let sb = share_operand(be, b, nbits, true);
+            let r = match op {
+                BinOp::Eq => be.eq(&sa, &sb),
+                BinOp::Lt => be.lt(&sa, &sb),
+                BinOp::Gt => be.lt(&sb, &sa),
+                BinOp::Le => be.le(&sa, &sb),
+                BinOp::Ge => be.le(&sb, &sa),
+                _ => unreachable!(),
+            };
+            Types::Share(r)
+        }
+        other => panic!(
+            "operation {:?} is not supported on fixed-point shares",
+            other
+        ),
+    }
+}
+
 /// Element-wise product for the vector builtins.  Handles Num, Fixed and
-/// Share operands; Fixed follows Q16.16 semantics, shares stay in the
-/// integer domain (fixed-point shares are not supported).
+/// Share operands (including Q16.16 shares) following the interpreter's
+/// scalar coercion rules.
 fn vec_mul(backend: &Arc<Mutex<Box<dyn Backend>>>, a: &Types, b: &Types) -> Types {
     use crate::interpreter::ast::FIXED_SCALE;
     let to_fixed = |v: &Types| -> i64 {
@@ -2458,15 +2674,9 @@ fn vec_mul(backend: &Arc<Mutex<Box<dyn Backend>>>, a: &Types, b: &Types) -> Type
             let prod = (to_fixed(a) as i128 * to_fixed(b) as i128) >> 16;
             Types::Fixed(prod as i64)
         }
-        (Types::Share(sa), Types::Share(sb)) => {
+        _ if matches!(a, Types::Share(_)) || matches!(b, Types::Share(_)) => {
             let mut be = backend.lock().unwrap_or_else(|e| e.into_inner());
-            Types::Share(be.mul(sa, sb))
-        }
-        (Types::Share(sa), Types::Num(n)) | (Types::Num(n), Types::Share(sa)) => {
-            let mut be = backend.lock().unwrap_or_else(|e| e.into_inner());
-            let imm = int_to_fr_signed(*n, sa.nbits);
-            let sb = be.share_secret(imm, sa.nbits, 0);
-            Types::Share(be.mul(sa, &sb))
+            Types::Share(share_mul_typed(&mut **be, a, b))
         }
         _ => panic!("vector builtins: cannot multiply {:?} and {:?}", a, b),
     }
@@ -2487,15 +2697,9 @@ fn vec_add(backend: &Arc<Mutex<Box<dyn Backend>>>, a: &Types, b: &Types) -> Type
         (Types::Fixed(_), Types::Fixed(_))
         | (Types::Fixed(_), Types::Num(_))
         | (Types::Num(_), Types::Fixed(_)) => Types::Fixed(to_fixed(a).wrapping_add(to_fixed(b))),
-        (Types::Share(sa), Types::Share(sb)) => {
+        _ if matches!(a, Types::Share(_)) || matches!(b, Types::Share(_)) => {
             let mut be = backend.lock().unwrap_or_else(|e| e.into_inner());
-            Types::Share(be.add(sa, sb))
-        }
-        (Types::Share(sa), Types::Num(n)) | (Types::Num(n), Types::Share(sa)) => {
-            let mut be = backend.lock().unwrap_or_else(|e| e.into_inner());
-            let imm = int_to_fr_signed(*n, sa.nbits);
-            let sb = be.share_secret(imm, sa.nbits, 0);
-            Types::Share(be.add(sa, &sb))
+            Types::Share(share_addsub_typed(&mut **be, a, b, false))
         }
         _ => panic!("vector builtins: cannot add {:?} and {:?}", a, b),
     }

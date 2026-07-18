@@ -48,19 +48,21 @@ fn score_expr_fixed() -> String {
     )
 }
 
-/// Same score over secret-shared pixels with integer weights (MPC has no
-/// fixed-point shares); classification is unchanged since both scores scale
-/// by the same 128.
+/// Same fixed-point score over secret-shared pixels.  Integer pixel shares
+/// × fixed public weights are exact (no share truncation needed), so the
+/// MPC score matches the plain Q16.16 score bit-for-bit.
 fn score_expr_mpc(img: &[i64; 784]) -> String {
     let mut pixels = String::new();
     let mut weights = String::new();
     for i in 0..784 {
         let _ = write!(pixels, " (share {} 32)", img[i]);
-        let _ = write!(weights, " {}", WEIGHTS[i]);
+        let _ = write!(weights, " {}", WEIGHTS[i] as f64 / WEIGHT_DIV);
     }
     format!(
         "(reconstruct (+ {} (dot (list{}) '({} ))))",
-        BIAS, pixels, weights
+        BIAS as f64 / WEIGHT_DIV,
+        pixels,
+        weights
     )
 }
 
@@ -165,19 +167,18 @@ fn main() {
         let scores: Vec<i64> = [&IMG_ZERO, &IMG_ONE]
             .iter()
             .map(|img| match eval_types(&score_expr_mpc(img)) {
-                Types::Num(n) => (n as u32) as i32 as i64,
-                other => panic!("expected Num from reconstruct, got {:?}", other),
+                Types::Fixed(f) => f,
+                other => panic!("expected Fixed from reconstruct, got {:?}", other),
             })
             .collect();
         println!(
-            "mpc-aby3   score(\"0\")={}  score(\"1\")={}  → predicts {}   ({:.1?}, integer weights)",
-            scores[0],
-            scores[1],
+            "mpc-aby3   score(\"0\")={:.4}  score(\"1\")={:.4}  → predicts {}   ({:.1?}, Q16.16 shares)",
+            as_decimal(scores[0]),
+            as_decimal(scores[1]),
             if scores[0] > scores[1] { '0' } else { '1' },
             t0.elapsed()
         );
-        // Integer scores are the fixed scores × 128.
-        if scores[0] * 512 != plain0 || scores[1] * 512 != plain1 {
+        if (scores[0], scores[1]) != (plain0, plain1) {
             eprintln!("mpc-aby3: DIVERGES from plain interpreter");
             failures += 1;
         }
