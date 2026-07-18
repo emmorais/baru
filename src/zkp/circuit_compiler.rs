@@ -238,12 +238,26 @@ pub struct CompiledCircuit {
 
 // ─── Flattening environment ───────────────────────────────────
 
-/// Maps variable names to SSA wires.
-type Env = HashMap<String, Wire>;
+/// A compile-time value produced by flattening: either a single SSA wire or a
+/// compile-time list of values.  Lists exist only at compile time — recursion
+/// over them is fully unrolled, so no list ever reaches the gate level.
+#[derive(Debug, Clone)]
+pub enum CVal {
+    Wire(Wire),
+    List(Vec<CVal>),
+}
+
+/// Maps variable names to compile-time values.
+type Env = HashMap<String, CVal>;
 
 /// Maps lambda names to their parameter lists and body, for inlining
 /// named functions bound in let/letrec.
 type LambdaStore = HashMap<String, (Vec<String>, Expr)>;
+
+/// Upper bound on nested lambda inlining.  Recursion over a compile-time list
+/// terminates via static `if` resolution; this guard turns runaway recursion
+/// (e.g. a missing base case) into a compile error instead of a hang.
+const MAX_INLINE_DEPTH: usize = 4096;
 
 // ─── CircuitCompiler ─────────────────────────────────────────
 
@@ -251,6 +265,12 @@ pub struct CircuitCompiler {
     var_counter: usize,
     witnesses: Vec<Wire>,
     public_inputs: Vec<Wire>,
+    /// Wires whose constant value is known during flattening (from literals).
+    /// Used to resolve `if` conditions statically, which is what terminates
+    /// unrolled recursion over compile-time lists.
+    flat_known: HashMap<Wire, i64>,
+    /// Current lambda-inlining depth (guarded by MAX_INLINE_DEPTH).
+    inline_depth: usize,
 }
 
 impl Default for CircuitCompiler {
@@ -265,6 +285,8 @@ impl CircuitCompiler {
             var_counter: 0,
             witnesses: Vec::new(),
             public_inputs: Vec::new(),
+            flat_known: HashMap::new(),
+            inline_depth: 0,
         }
     }
 
@@ -274,6 +296,28 @@ impl CircuitCompiler {
         let w = format!("{}_{}", prefix, self.var_counter);
         self.var_counter += 1;
         w
+    }
+
+    /// Emit a Const op and record its value for static `if` resolution.
+    fn emit_const(&mut self, value: i64, flat: &mut Vec<FlatOp>) -> Wire {
+        let dst = self.fresh("c");
+        self.flat_known.insert(dst.clone(), value);
+        flat.push(FlatOp::Const {
+            dst: dst.clone(),
+            value,
+        });
+        dst
+    }
+
+    /// Unwrap a CVal that must be a scalar wire.
+    fn expect_wire(val: CVal, ctx: &str) -> Result<Wire, String> {
+        match val {
+            CVal::Wire(w) => Ok(w),
+            CVal::List(_) => Err(format!(
+                "{}: expected a scalar value, got a compile-time list",
+                ctx
+            )),
+        }
     }
 
     fn fresh_witness(&mut self, prefix: &str) -> Wire {
@@ -307,11 +351,20 @@ impl CircuitCompiler {
         let mut lambdas: LambdaStore = LambdaStore::new();
 
         // User variables map to themselves (they are input wires).
-        for var in self.witnesses.iter().chain(self.public_inputs.iter()) {
-            env.insert(var.clone(), var.clone());
+        let input_vars: Vec<Wire> = self
+            .witnesses
+            .iter()
+            .chain(self.public_inputs.iter())
+            .cloned()
+            .collect();
+        for var in input_vars {
+            env.insert(var.clone(), CVal::Wire(var));
         }
 
-        let result_wire = self.flatten(expr, &mut env, &mut lambdas, &mut flat)?;
+        let result_wire = Self::expect_wire(
+            self.flatten(expr, &mut env, &mut lambdas, &mut flat)?,
+            "circuit output",
+        )?;
 
         // ── Phase 1b: optimise flat IR ────────────────────────
         let flat = Self::fold_constants(flat);
@@ -351,11 +404,14 @@ impl CircuitCompiler {
         let mut env: Env = Env::new();
         let mut lambdas: LambdaStore = LambdaStore::new();
 
-        for var in &self.public_inputs {
-            env.insert(var.clone(), var.clone());
+        for var in self.public_inputs.clone() {
+            env.insert(var.clone(), CVal::Wire(var));
         }
 
-        let result_wire = self.flatten(expr, &mut env, &mut lambdas, &mut flat)?;
+        let result_wire = Self::expect_wire(
+            self.flatten(expr, &mut env, &mut lambdas, &mut flat)?,
+            "circuit output",
+        )?;
 
         let flat = Self::fold_constants(flat);
         let flat = Self::eliminate_dead_wires(
@@ -383,43 +439,15 @@ impl CircuitCompiler {
         env: &mut Env,
         lambdas: &mut LambdaStore,
         flat: &mut Vec<FlatOp>,
-    ) -> Result<Wire, String> {
+    ) -> Result<CVal, String> {
         match expr {
             // ── Literals ─────────────────────────────────────
-            Expr::Num(n) => {
-                let dst = self.fresh("c");
-                flat.push(FlatOp::Const {
-                    dst: dst.clone(),
-                    value: *n,
-                });
-                Ok(dst)
-            }
+            Expr::Num(n) => Ok(CVal::Wire(self.emit_const(*n, flat))),
             // Fixed-point literal: the circuit works on the scaled integer directly.
             // Truncation after multiplication is handled by the FixedMul / Shr gates.
-            Expr::Fixed(v) => {
-                let dst = self.fresh("c");
-                flat.push(FlatOp::Const {
-                    dst: dst.clone(),
-                    value: *v,
-                });
-                Ok(dst)
-            }
-            Expr::Bool(b) => {
-                let dst = self.fresh("c");
-                flat.push(FlatOp::Const {
-                    dst: dst.clone(),
-                    value: if *b { 1 } else { 0 },
-                });
-                Ok(dst)
-            }
-            Expr::Char(c) => {
-                let dst = self.fresh("c");
-                flat.push(FlatOp::Const {
-                    dst: dst.clone(),
-                    value: *c as i64,
-                });
-                Ok(dst)
-            }
+            Expr::Fixed(v) => Ok(CVal::Wire(self.emit_const(*v, flat))),
+            Expr::Bool(b) => Ok(CVal::Wire(self.emit_const(if *b { 1 } else { 0 }, flat))),
+            Expr::Char(c) => Ok(CVal::Wire(self.emit_const(*c as i64, flat))),
 
             // ── Variable reference ────────────────────────────
             Expr::Var(name) => env
@@ -430,18 +458,20 @@ impl CircuitCompiler {
             // ── Private annotation (witness metadata) ─────────
             Expr::Private(inner) => self.flatten(inner, env, lambdas, flat),
 
-            // ── Quote → constant 0 (non-evaluatable in circuit)
-            Expr::Quote(_) => {
-                let dst = self.fresh("c");
-                flat.push(FlatOp::Const {
-                    dst: dst.clone(),
-                    value: 0,
-                });
-                Ok(dst)
+            // ── Quote: literal data lists become compile-time lists ──
+            Expr::Quote(inner) => {
+                if let Some(list) = self.quote_to_cval(inner, flat) {
+                    Ok(list)
+                } else {
+                    // Quoted code is not evaluatable in a circuit — sentinel 0.
+                    Ok(CVal::Wire(self.emit_const(0, flat)))
+                }
             }
 
-            // ── Let: inline bindings, then compile body ───────
-            Expr::Let(bindings, body) => {
+            // ── Let / Letrec: inline bindings, then compile body ──
+            // (Letrec lambdas may call themselves — the recursion is unrolled
+            // at inlining time and terminated by static `if` resolution.)
+            Expr::Let(bindings, body) | Expr::LetRec(bindings, body) => {
                 let mut child_env = env.clone();
                 let mut child_lam = lambdas.clone();
                 for (name, rhs) in bindings {
@@ -450,38 +480,11 @@ impl CircuitCompiler {
                     if let Expr::Lambda(params, lam_body) = rhs {
                         child_lam.insert(name.clone(), (params.clone(), *lam_body.clone()));
                     } else {
-                        let wire = self.flatten(rhs, &mut child_env, &mut child_lam, flat)?;
-                        child_env.insert(name.clone(), wire);
+                        let val = self.flatten(rhs, &mut child_env, &mut child_lam, flat)?;
+                        child_env.insert(name.clone(), val);
                     }
                 }
-                let mut result = self.fresh("c");
-                flat.push(FlatOp::Const {
-                    dst: result.clone(),
-                    value: 0,
-                });
-                for e in body {
-                    result = self.flatten(e, &mut child_env, &mut child_lam, flat)?;
-                }
-                Ok(result)
-            }
-
-            // ── Letrec: same as Let for acyclic circuits ──────
-            Expr::LetRec(bindings, body) => {
-                let mut child_env = env.clone();
-                let mut child_lam = lambdas.clone();
-                for (name, rhs) in bindings {
-                    if let Expr::Lambda(params, lam_body) = rhs {
-                        child_lam.insert(name.clone(), (params.clone(), *lam_body.clone()));
-                    } else {
-                        let wire = self.flatten(rhs, &mut child_env, &mut child_lam, flat)?;
-                        child_env.insert(name.clone(), wire);
-                    }
-                }
-                let mut result = self.fresh("c");
-                flat.push(FlatOp::Const {
-                    dst: result.clone(),
-                    value: 0,
-                });
+                let mut result = CVal::Wire(self.emit_const(0, flat));
                 for e in body {
                     result = self.flatten(e, &mut child_env, &mut child_lam, flat)?;
                 }
@@ -490,11 +493,7 @@ impl CircuitCompiler {
 
             // ── Seq ───────────────────────────────────────────
             Expr::Seq(exprs) => {
-                let mut result = self.fresh("c");
-                flat.push(FlatOp::Const {
-                    dst: result.clone(),
-                    value: 0,
-                });
+                let mut result = CVal::Wire(self.emit_const(0, flat));
                 for e in exprs {
                     result = self.flatten(e, env, lambdas, flat)?;
                 }
@@ -506,7 +505,10 @@ impl CircuitCompiler {
                 // Special case: extract static shift amounts directly from AST
                 // so the Shl/Shr opcodes carry the correct literal amount.
                 if matches!(op, BinOp::AshLeft | BinOp::AshRight) {
-                    let src = self.flatten(left, env, lambdas, flat)?;
+                    let src = Self::expect_wire(
+                        self.flatten(left, env, lambdas, flat)?,
+                        "shift operand",
+                    )?;
                     let amount = if let Expr::Num(n) = right.as_ref() {
                         *n as u32
                     } else {
@@ -526,24 +528,52 @@ impl CircuitCompiler {
                             amount,
                         });
                     }
-                    return Ok(dst);
+                    return Ok(CVal::Wire(dst));
                 }
-                let l = self.flatten(left, env, lambdas, flat)?;
-                let r = self.flatten(right, env, lambdas, flat)?;
-                self.flatten_binop(*op, l, r, flat)
+                let l = Self::expect_wire(self.flatten(left, env, lambdas, flat)?, "left operand")?;
+                let r =
+                    Self::expect_wire(self.flatten(right, env, lambdas, flat)?, "right operand")?;
+                Ok(CVal::Wire(self.flatten_binop(*op, l, r, flat)?))
             }
 
             // ── Unary operations ──────────────────────────────
             Expr::UnOp(op, inner) => {
-                let src = self.flatten(inner, env, lambdas, flat)?;
-                self.flatten_unop(*op, src, flat)
+                // null? is a compile-time predicate on lists: it folds to a
+                // constant, which is what lets static `if` resolution stop
+                // recursion over compile-time lists.
+                if matches!(op, UnOp::IsNull) {
+                    return match self.flatten(inner, env, lambdas, flat)? {
+                        CVal::List(items) => Ok(CVal::Wire(
+                            self.emit_const(if items.is_empty() { 1 } else { 0 }, flat),
+                        )),
+                        CVal::Wire(_) => Err(
+                            "null? expects a compile-time list (lists exist only at compile time in circuits)"
+                                .to_string(),
+                        ),
+                    };
+                }
+                let src = Self::expect_wire(
+                    self.flatten(inner, env, lambdas, flat)?,
+                    "unary operand",
+                )?;
+                Ok(CVal::Wire(self.flatten_unop(*op, src, flat)?))
             }
 
-            // ── If → Mux (both branches evaluated; non-det select)
+            // ── If ────────────────────────────────────────────
+            // Compile-time-known condition → flatten only the taken branch
+            // (essential: this is what terminates unrolled list recursion).
+            // Unknown condition → Mux over both branches.
             Expr::If(cond, then_e, else_e) => {
-                let cond_wire = self.flatten(cond, env, lambdas, flat)?;
-                let then_wire = self.flatten(then_e, env, lambdas, flat)?;
-                let else_wire = self.flatten(else_e, env, lambdas, flat)?;
+                let cond_wire =
+                    Self::expect_wire(self.flatten(cond, env, lambdas, flat)?, "if condition")?;
+                if let Some(&cv) = self.flat_known.get(&cond_wire) {
+                    let taken = if cv != 0 { then_e } else { else_e };
+                    return self.flatten(taken, env, lambdas, flat);
+                }
+                let then_wire =
+                    Self::expect_wire(self.flatten(then_e, env, lambdas, flat)?, "then branch")?;
+                let else_wire =
+                    Self::expect_wire(self.flatten(else_e, env, lambdas, flat)?, "else branch")?;
                 let dst = self.fresh("mux");
                 flat.push(FlatOp::Mux {
                     dst: dst.clone(),
@@ -551,7 +581,7 @@ impl CircuitCompiler {
                     t_val: then_wire,
                     e_val: else_wire,
                 });
-                Ok(dst)
+                Ok(CVal::Wire(dst))
             }
 
             // ── Lambda / Call ─────────────────────────────────
@@ -563,18 +593,46 @@ impl CircuitCompiler {
                     value: 0,
                 });
                 let _ = (params, body);
-                Ok(dst)
+                Ok(CVal::Wire(dst))
             }
             Expr::Call(func, args) => self.flatten_call(func, args, env, lambdas, flat),
 
-            // ── List operations ───────────────────────────────
+            // ── List operations (compile-time only) ───────────
             Expr::Cons(left, right) => {
-                let _l = self.flatten(left, env, lambdas, flat)?;
-                let r = self.flatten(right, env, lambdas, flat)?;
-                Ok(r)
+                let head = self.flatten(left, env, lambdas, flat)?;
+                match self.flatten(right, env, lambdas, flat)? {
+                    CVal::List(mut items) => {
+                        items.insert(0, head);
+                        Ok(CVal::List(items))
+                    }
+                    CVal::Wire(_) => {
+                        Err("cons: second argument must be a compile-time list".to_string())
+                    }
+                }
             }
-            Expr::Car(inner) => self.flatten(inner, env, lambdas, flat),
-            Expr::Cdr(inner) => self.flatten(inner, env, lambdas, flat),
+            Expr::Car(inner) => match self.flatten(inner, env, lambdas, flat)? {
+                CVal::List(items) => items
+                    .first()
+                    .cloned()
+                    .ok_or_else(|| "car of empty list".to_string()),
+                CVal::Wire(_) => Err(
+                    "car expects a compile-time list (lists exist only at compile time in circuits)"
+                        .to_string(),
+                ),
+            },
+            Expr::Cdr(inner) => match self.flatten(inner, env, lambdas, flat)? {
+                CVal::List(items) => {
+                    if items.is_empty() {
+                        Err("cdr of empty list".to_string())
+                    } else {
+                        Ok(CVal::List(items[1..].to_vec()))
+                    }
+                }
+                CVal::Wire(_) => Err(
+                    "cdr expects a compile-time list (lists exist only at compile time in circuits)"
+                        .to_string(),
+                ),
+            },
             Expr::Eval(inner) => self.flatten(inner, env, lambdas, flat),
             Expr::Str(_) => {
                 let dst = self.fresh("str");
@@ -582,8 +640,42 @@ impl CircuitCompiler {
                     dst: dst.clone(),
                     value: 0,
                 });
-                Ok(dst)
+                Ok(CVal::Wire(dst))
             }
+        }
+    }
+
+    /// Interpret a quoted expression as a literal data list, emitting Const
+    /// wires for its elements.  Mirrors `quoted_literal_list` in the
+    /// interpreter: '(1 2 3) parses as Quote(Call(Num(1), [Num(2), Num(3)]))
+    /// and '() as Quote(Seq([])).  Returns None for quoted code.
+    fn quote_to_cval(&mut self, e: &Expr, flat: &mut Vec<FlatOp>) -> Option<CVal> {
+        fn elem(cc: &mut CircuitCompiler, e: &Expr, flat: &mut Vec<FlatOp>) -> Option<CVal> {
+            match e {
+                Expr::Num(n) => Some(CVal::Wire(cc.emit_const(*n, flat))),
+                Expr::Fixed(v) => Some(CVal::Wire(cc.emit_const(*v, flat))),
+                Expr::Bool(b) => Some(CVal::Wire(cc.emit_const(if *b { 1 } else { 0 }, flat))),
+                Expr::Char(c) => Some(CVal::Wire(cc.emit_const(*c as i64, flat))),
+                Expr::UnOp(UnOp::Neg, inner) => match inner.as_ref() {
+                    Expr::Num(n) => Some(CVal::Wire(cc.emit_const(-n, flat))),
+                    Expr::Fixed(v) => Some(CVal::Wire(cc.emit_const(-v, flat))),
+                    _ => None,
+                },
+                Expr::Call(_, _) | Expr::Seq(_) => cc.quote_to_cval(e, flat),
+                _ => None,
+            }
+        }
+        match e {
+            Expr::Seq(items) if items.is_empty() => Some(CVal::List(vec![])),
+            Expr::Call(head, rest) => {
+                let mut out = Vec::with_capacity(1 + rest.len());
+                out.push(elem(self, head, flat)?);
+                for item in rest {
+                    out.push(elem(self, item, flat)?);
+                }
+                Some(CVal::List(out))
+            }
+            _ => None,
         }
     }
 
@@ -764,6 +856,14 @@ impl CircuitCompiler {
                     src,
                 });
             }
+            // Handled in `flatten` (compile-time list predicate); a runtime
+            // wire can never be a list.
+            UnOp::IsNull => {
+                return Err(
+                    "null? expects a compile-time list (lists exist only at compile time in circuits)"
+                        .to_string(),
+                );
+            }
         }
         Ok(dst)
     }
@@ -777,7 +877,7 @@ impl CircuitCompiler {
         env: &mut Env,
         lambdas: &mut LambdaStore,
         flat: &mut Vec<FlatOp>,
-    ) -> Result<Wire, String> {
+    ) -> Result<CVal, String> {
         match func {
             // Direct lambda application — beta-reduce immediately.
             Expr::Lambda(params, body) => {
@@ -791,14 +891,22 @@ impl CircuitCompiler {
                 let mut child_env = env.clone();
                 let mut child_lam = lambdas.clone();
                 for (param, arg) in params.iter().zip(args.iter()) {
-                    let wire = self.flatten(arg, env, lambdas, flat)?;
-                    child_env.insert(param.clone(), wire);
+                    let val = self.flatten(arg, env, lambdas, flat)?;
+                    child_env.insert(param.clone(), val);
                 }
-                self.flatten(body, &mut child_env, &mut child_lam, flat)
+                self.inline_guard(|cc| cc.flatten(body, &mut child_env, &mut child_lam, flat))
             }
 
             // Named call — look up lambda store and inline if available.
             Expr::Var(name) => {
+                // (list a b c) — builtin list constructor.
+                if name == "list" {
+                    let mut items = Vec::with_capacity(args.len());
+                    for arg in args {
+                        items.push(self.flatten(arg, env, lambdas, flat)?);
+                    }
+                    return Ok(CVal::List(items));
+                }
                 if let Some((params, body)) = lambdas.get(name).cloned() {
                     if params.len() != args.len() {
                         return Err(format!(
@@ -811,10 +919,10 @@ impl CircuitCompiler {
                     let mut child_env = env.clone();
                     let mut child_lam = lambdas.clone();
                     for (param, arg) in params.iter().zip(args.iter()) {
-                        let wire = self.flatten(arg, env, lambdas, flat)?;
-                        child_env.insert(param.clone(), wire);
+                        let val = self.flatten(arg, env, lambdas, flat)?;
+                        child_env.insert(param.clone(), val);
                     }
-                    self.flatten(&body, &mut child_env, &mut child_lam, flat)
+                    self.inline_guard(|cc| cc.flatten(&body, &mut child_env, &mut child_lam, flat))
                 } else if env.contains_key(name.as_str()) {
                     // Variable exists but isn't a lambda — emit sentinel.
                     let dst = self.fresh("call");
@@ -822,7 +930,7 @@ impl CircuitCompiler {
                         dst: dst.clone(),
                         value: 0,
                     });
-                    Ok(dst)
+                    Ok(CVal::Wire(dst))
                 } else {
                     Err(format!("unbound function: {}", name))
                 }
@@ -830,6 +938,25 @@ impl CircuitCompiler {
 
             _ => Err("complex call target not supported in circuit compilation".to_string()),
         }
+    }
+
+    /// Run a lambda-body flatten with the inlining depth guard.
+    fn inline_guard<F>(&mut self, f: F) -> Result<CVal, String>
+    where
+        F: FnOnce(&mut Self) -> Result<CVal, String>,
+    {
+        self.inline_depth += 1;
+        if self.inline_depth > MAX_INLINE_DEPTH {
+            self.inline_depth -= 1;
+            return Err(format!(
+                "lambda inlining exceeded {} levels — recursion must terminate on a \
+                 compile-time condition (e.g. (null? lst) over a literal list)",
+                MAX_INLINE_DEPTH
+            ));
+        }
+        let result = f(self);
+        self.inline_depth -= 1;
+        result
     }
 
     // ── Phase 1b – constant folding ──────────────────────────

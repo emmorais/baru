@@ -263,7 +263,15 @@ pub fn reduce_expression(
                     stack.push(Apply(k, Types::Bool(b), eenv.clone()));
                 }
                 Expr::Quote(inner) => {
-                    stack.push(Apply(k, Types::Quoted(Box::new(*inner)), eenv.clone()));
+                    // Literal data lists like '(1 2 3) evaluate to Types::List so
+                    // car/cdr/null? work on them.  Anything else (quoted code such
+                    // as '(+ x y), or string lists used by zkp/fhe builtins) stays
+                    // Quoted.
+                    if let Some(vals) = quoted_literal_list(&inner) {
+                        stack.push(Apply(k, Types::List(vals), eenv.clone()));
+                    } else {
+                        stack.push(Apply(k, Types::Quoted(Box::new(*inner)), eenv.clone()));
+                    }
                 }
                 Expr::Private(inner) => {
                     // Private annotation is metadata for ZKP witness marking.
@@ -834,6 +842,18 @@ pub fn reduce_expression(
                             super::parser::UnOp::Neg => match val {
                                 Types::Num(n) => Types::Num(n.wrapping_neg()),
                                 _ => panic!("negation expects numeric value"),
+                            },
+                            super::parser::UnOp::IsNull => match val {
+                                Types::List(ref vs) => {
+                                    Types::Num(if vs.is_empty() { 1 } else { 0 })
+                                }
+                                Types::Quoted(ref e) => match e.as_ref() {
+                                    Expr::Seq(items) => {
+                                        Types::Num(if items.is_empty() { 1 } else { 0 })
+                                    }
+                                    _ => Types::Num(0),
+                                },
+                                _ => panic!("null? expects a list"),
                             },
                             super::parser::UnOp::BitLen => match val {
                                 Types::Num(n) => {
@@ -2227,6 +2247,44 @@ fn cont_short(c: &Continuation) -> String {
 
 /// Decode a quoted list of strings from a Types value.
 /// Accepts '("a" "b") → Quote(Call(Str("a"), [Str("b"), ...])) or Quote(Seq([...])) for zero/multiple items
+/// Convert a quoted expression into a literal data list, if it is one.
+///
+/// A quote shorthand like '(1 2 3) parses as Quote(Call(Num(1), [Num(2), Num(3)]))
+/// and '() as Quote(Seq([])).  When every element is a literal (number, fixed,
+/// bool, char, negated number, or a nested literal list) the quote denotes
+/// *data*, and we materialise it as a Vec<Types> so car/cdr/null? work on it.
+/// Quoted code ('(+ x y)) and string lists ('("x") — used as argument lists by
+/// the zkp/fhe builtins) return None and stay Quoted.
+fn quoted_literal_list(e: &Expr) -> Option<Vec<Types>> {
+    fn literal_value(e: &Expr) -> Option<Types> {
+        match e {
+            Expr::Num(n) => Some(Types::Num(*n)),
+            Expr::Fixed(v) => Some(Types::Fixed(*v)),
+            Expr::Bool(b) => Some(Types::Bool(*b)),
+            Expr::Char(c) => Some(Types::Char(*c)),
+            Expr::UnOp(super::parser::UnOp::Neg, inner) => match inner.as_ref() {
+                Expr::Num(n) => Some(Types::Num(-n)),
+                Expr::Fixed(v) => Some(Types::Fixed(-v)),
+                _ => None,
+            },
+            Expr::Call(_, _) | Expr::Seq(_) => quoted_literal_list(e).map(Types::List),
+            _ => None,
+        }
+    }
+    match e {
+        Expr::Seq(items) if items.is_empty() => Some(vec![]),
+        Expr::Call(head, rest) => {
+            let mut out = Vec::with_capacity(1 + rest.len());
+            out.push(literal_value(head)?);
+            for item in rest {
+                out.push(literal_value(item)?);
+            }
+            Some(out)
+        }
+        _ => None,
+    }
+}
+
 fn decode_quoted_str_list(v: &Types, label: &str) -> Vec<String> {
     use crate::interpreter::ast::Expr;
     match v {

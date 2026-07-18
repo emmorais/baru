@@ -69,6 +69,7 @@ impl std::fmt::Display for Expr {
                 super::parser::UnOp::Not => write!(f, "(not {})", expr),
                 super::parser::UnOp::Atom => write!(f, "(atom {})", expr),
                 super::parser::UnOp::BitLen => write!(f, "(bitlen {})", expr),
+                super::parser::UnOp::IsNull => write!(f, "(null? {})", expr),
             },
             Expr::Let(bindings, body) => {
                 write!(f, "(let (")?;

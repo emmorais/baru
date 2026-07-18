@@ -97,6 +97,38 @@ fn diff_div_mod() {
     assert_differential("(mod x 3)", &[0, 1, 5, 7, 12]);
 }
 
+const DOT_PRODUCT_SRC: &str = "(letrec ((dot (lambda (a b)
+       (if (null? a)
+           0
+           (+ (* (car a) (car b)) (dot (cdr a) (cdr b)))))))
+     (dot (list x y) '(2 3)))";
+
+/// Compile the recursive dot product with x and y as encrypted inputs and
+/// evaluate it homomorphically: dot([x, y], [2, 3]) = 2x + 3y.
+fn eval_dot_product_fhe<B: baru::fhe::FheBackend>(be: &B, ck: &[u8], x: i64, y: i64) -> i64 {
+    let expr = parse(DOT_PRODUCT_SRC).expect("parse");
+    let mut cc = CircuitCompiler::new();
+    let mut circuit = cc.compile_fhe(&expr).expect("compile_fhe");
+    circuit.encrypted_inputs = vec!["x".to_string(), "y".to_string()];
+    circuit.public_inputs = vec![];
+
+    let mut enc = HashMap::new();
+    enc.insert("x".to_string(), be.encrypt(ck, x as u64));
+    enc.insert("y".to_string(), be.encrypt(ck, y as u64));
+    let ct = evaluate_fhe(&circuit, &HashMap::new(), &enc, be);
+    be.decrypt(ck, &ct) as i64
+}
+
+#[test]
+fn diff_dot_product_recursion_mock() {
+    // Recursion over a compile-time list is unrolled by the circuit compiler;
+    // the encrypted scalars flow through the unrolled multiply-add chain.
+    let be = MockFheBackend;
+    let (ck, _) = be.keygen();
+    assert_eq!(eval_dot_product_fhe(&be, &ck, 4, 5), 23); // 2*4 + 3*5
+    assert_eq!(eval_dot_product_fhe(&be, &ck, -1, 7), 19); // -2 + 21
+}
+
 // ---------------------------------------------------------------------------
 // Real TFHE backend — small subset (keygen once, a few evaluations).
 // ---------------------------------------------------------------------------
@@ -128,4 +160,7 @@ fn diff_tfhe_subset() {
             );
         }
     }
+
+    // Recursive dot product, unrolled at compile time: 2*4 + 3*5 = 23.
+    assert_eq!(eval_dot_product_fhe(&be, &ck, 4, 5), 23);
 }

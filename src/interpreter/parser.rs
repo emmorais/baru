@@ -22,6 +22,8 @@ pub enum UnOp {
     Not,
     Neg,
     BitLen,
+    /// `(null? lst)` — 1 if the list is empty, 0 otherwise.
+    IsNull,
 }
 
 // Very small tokenizer + parser extracted from main.rs (keeps same behavior)
@@ -30,6 +32,14 @@ pub fn tokenize(src: &str) -> Vec<String> {
     let mut chars = src.chars().peekable();
     while let Some(&ch) = chars.peek() {
         match ch {
+            ';' => {
+                // Line comment: skip to end of line.
+                for c in chars.by_ref() {
+                    if c == '\n' {
+                        break;
+                    }
+                }
+            }
             '(' | ')' => {
                 tokens.push(ch.to_string());
                 chars.next();
@@ -142,6 +152,14 @@ pub fn tokenize(src: &str) -> Vec<String> {
                                     saw_first = true;
                                     if depth == 0 {
                                         break;
+                                    }
+                                }
+                                ';' => {
+                                    // Line comment inside a quoted form.
+                                    for cc in chars.by_ref() {
+                                        if cc == '\n' {
+                                            break;
+                                        }
                                     }
                                 }
                                 c if c.is_whitespace() => {
@@ -343,6 +361,15 @@ pub fn parse_tokens(tokens: &[String], pos: &mut usize) -> Result<Expr, String> 
             }
             *pos += 1;
             return Ok(Expr::UnOp(super::parser::UnOp::Not, Box::new(inner)));
+        }
+        if next_tok == "null?" {
+            *pos += 1;
+            let inner = parse_tokens(tokens, pos)?;
+            if *pos >= tokens.len() || tokens[*pos] != ")" {
+                return Err("expected ')' after null?".to_string());
+            }
+            *pos += 1;
+            return Ok(Expr::UnOp(super::parser::UnOp::IsNull, Box::new(inner)));
         }
         if next_tok == "bitlen" {
             *pos += 1;
