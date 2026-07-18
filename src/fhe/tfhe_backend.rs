@@ -78,6 +78,14 @@ impl FheBackend for TfheBackend {
         Self::encrypt_with_ck(ck, v)
     }
 
+    fn encrypt_trivial(&self, value: i64) -> Self::Ct {
+        let ct = FheUint64::try_encrypt_trivial(value as u64)
+            .expect("TfheBackend: trivial encryption failed");
+        TfheCt {
+            bytes: encode_ct(&ct),
+        }
+    }
+
     fn decrypt(&self, ck: &[u8], ct: &Self::Ct) -> u64 {
         Self::decrypt_with_ck(ck, ct)
     }
@@ -134,6 +142,18 @@ impl FheBackend for TfheBackend {
         }
     }
 
+    fn cmpslt(&self, a: &Self::Ct, b: &Self::Ct) -> Self::Ct {
+        // Signed compare over FheUint64 in two's complement: flipping the sign
+        // bit of both operands turns signed order into unsigned order.
+        const SIGN_BIT: u64 = 1u64 << 63;
+        let fa = decode_ct(&a.bytes) ^ SIGN_BIT;
+        let fb = decode_ct(&b.bytes) ^ SIGN_BIT;
+        let lt: FheBool = fa.lt(&fb);
+        TfheCt {
+            bytes: encode_ct(&bool_to_uint64(lt)),
+        }
+    }
+
     fn band(&self, a: &Self::Ct, b: &Self::Ct) -> Self::Ct {
         TfheCt {
             bytes: encode_ct(&(decode_ct(&a.bytes) & decode_ct(&b.bytes))),
@@ -174,8 +194,9 @@ impl FheBackend for TfheBackend {
         let fc = decode_ct(&cond.bytes);
         let ft = decode_ct(&t.bytes);
         let fe = decode_ct(&e.bytes);
-        let one: FheUint64 = FheUint64::try_encrypt_trivial(1u64).expect("TfheBackend: trivial 1");
-        let result = fc.eq(&one).if_then_else(&ft, &fe);
+        // Treat any nonzero condition as true (same semantics as the mock backend).
+        let zero: FheUint64 = FheUint64::try_encrypt_trivial(0u64).expect("TfheBackend: trivial 0");
+        let result = fc.ne(&zero).if_then_else(&ft, &fe);
         TfheCt {
             bytes: encode_ct(&result),
         }
@@ -303,17 +324,26 @@ mod tests {
     }
 
     #[test]
-    fn test_tfhe_encrypt_zero() {
+    fn test_tfhe_encrypt_trivial_mixes_with_real_ct() {
         let (b, ck) = setup();
-        // encrypt_zero() via the blanket impl generates a *new* keypair internally,
-        // so the trivial-zero ciphertext is under a different key.  Instead we
-        // build the zero directly from try_encrypt_trivial, which produces a
-        // public constant that mixes correctly with any key's ciphertexts.
-        let zero = TfheCt {
-            bytes: encode_ct(&FheUint64::try_encrypt_trivial(0u64).expect("trivial 0")),
-        };
+        // A trivial ciphertext is a public constant that must combine
+        // correctly with ciphertexts under any client key.
+        let zero = b.encrypt_trivial(0);
         let forty_two = b.encrypt(&ck, 42u64);
         let result = b.add(&zero, &forty_two);
         assert_eq!(b.decrypt(&ck, &result), 42);
+    }
+
+    #[test]
+    fn test_tfhe_cmpslt_signed() {
+        let (b, ck) = setup();
+        let neg_four = b.encrypt(&ck, (-4i64) as u64);
+        let zero = b.encrypt_trivial(0);
+        // signed: -4 < 0  →  1
+        assert_eq!(b.decrypt(&ck, &b.cmpslt(&neg_four, &zero)), 1);
+        // signed: 0 < -4  →  0
+        assert_eq!(b.decrypt(&ck, &b.cmpslt(&zero, &neg_four)), 0);
+        // unsigned: -4 as u64 is huge, so 0 < -4  →  1
+        assert_eq!(b.decrypt(&ck, &b.cmplt(&zero, &neg_four)), 1);
     }
 }

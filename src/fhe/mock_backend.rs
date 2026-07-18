@@ -38,6 +38,10 @@ impl FheBackend for MockFheBackend {
         value // plaintext "encryption"
     }
 
+    fn encrypt_trivial(&self, value: i64) -> Self::Ct {
+        value as u64
+    }
+
     fn decrypt(&self, _client_key_bytes: &[u8], ct: &Self::Ct) -> u64 {
         *ct
     }
@@ -85,6 +89,14 @@ impl FheBackend for MockFheBackend {
     }
 
     fn cmplt(&self, a: &Self::Ct, b: &Self::Ct) -> Self::Ct {
+        if a < b {
+            1
+        } else {
+            0
+        }
+    }
+
+    fn cmpslt(&self, a: &Self::Ct, b: &Self::Ct) -> Self::Ct {
         if (*a as i64) < (*b as i64) {
             1
         } else {

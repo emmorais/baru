@@ -77,6 +77,14 @@ pub trait FheBackend {
     /// Encrypt a 64-bit integer value using the client key.
     fn encrypt(&self, client_key_bytes: &[u8], value: u64) -> Self::Ct;
 
+    /// Trivially "encrypt" a public constant, without any key.
+    ///
+    /// The result is a noiseless ciphertext that is compatible with
+    /// ciphertexts under *any* client key of this backend.  The circuit
+    /// emitter uses this to promote plaintext constants into the ciphertext
+    /// domain.  The value is public — this provides no privacy.
+    fn encrypt_trivial(&self, value: i64) -> Self::Ct;
+
     /// Decrypt a ciphertext using the client key.
     fn decrypt(&self, client_key_bytes: &[u8], ct: &Self::Ct) -> u64;
 
@@ -104,7 +112,13 @@ pub trait FheBackend {
     // ── Comparisons (return encrypted booleans: 0 or 1) ──────────────────────
 
     fn cmpeq(&self, a: &Self::Ct, b: &Self::Ct) -> Self::Ct;
+
+    /// Unsigned less-than: interprets both operands as u64.
     fn cmplt(&self, a: &Self::Ct, b: &Self::Ct) -> Self::Ct;
+
+    /// Signed less-than: interprets both operands as two's-complement i64.
+    /// This is what Baru's `<` / `>` compile to (`ICmpSlt`).
+    fn cmpslt(&self, a: &Self::Ct, b: &Self::Ct) -> Self::Ct;
 
     // ── Bitwise ──────────────────────────────────────────────────────────────
 

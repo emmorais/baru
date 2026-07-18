@@ -57,7 +57,8 @@ pub fn evaluate_fhe<B: FheBackend>(
     }
 
     // Helper: get or promote a wire to a ciphertext.
-    // Plain constants are encrypted on-the-fly using `add_plain(0, v)`.
+    // Plain constants are lifted via trivial (noiseless, keyless) encryption,
+    // which is compatible with ciphertexts under any client key.
     macro_rules! ct {
         ($wire:expr) => {
             match env
@@ -65,7 +66,7 @@ pub fn evaluate_fhe<B: FheBackend>(
                 .unwrap_or_else(|| panic!("fhe-eval: unbound wire '{}'", $wire))
             {
                 WireVal::Cipher(c) => c.clone(),
-                WireVal::Plain(v) => backend.add_plain(&backend.encrypt_zero(), *v),
+                WireVal::Plain(v) => backend.encrypt_trivial(*v),
             }
         };
     }
@@ -138,12 +139,11 @@ pub fn evaluate_fhe<B: FheBackend>(
             }
 
             FlatOp::ICmpSlt { dst, lhs, rhs } => {
-                let result = backend.cmplt(&ct!(lhs), &ct!(rhs));
+                let result = backend.cmpslt(&ct!(lhs), &ct!(rhs));
                 env.insert(dst.clone(), WireVal::Cipher(result));
             }
 
             FlatOp::ICmpUlt { dst, lhs, rhs } => {
-                // Unsigned: reinterpret as signed for mock; real TFHE uses separate API
                 let result = backend.cmplt(&ct!(lhs), &ct!(rhs));
                 env.insert(dst.clone(), WireVal::Cipher(result));
             }
@@ -189,10 +189,14 @@ pub fn evaluate_fhe<B: FheBackend>(
             }
 
             FlatOp::PopCount { dst, src } => {
-                // Approximate: encrypt the popcount of the plaintext/ciphertext.
-                // For a real backend this would be a sequence of bit-extract + add gates.
-                let result = backend.shr(&ct!(src), 0); // identity placeholder
-                env.insert(dst.clone(), WireVal::Cipher(result));
+                // Not implemented homomorphically yet.  Failing loudly is better
+                // than the previous identity placeholder, which silently returned
+                // the wrong value.
+                let _ = (dst, src);
+                panic!(
+                    "fhe-eval: PopCount/bitlen is not yet supported by FHE backends. \
+                     Rewrite the expression without bitlen."
+                );
             }
         }
     }
@@ -203,23 +207,7 @@ pub fn evaluate_fhe<B: FheBackend>(
         .unwrap_or_else(|| panic!("fhe-eval: output wire '{}' not found", circuit.output_wire))
     {
         WireVal::Cipher(ct) => ct,
-        WireVal::Plain(v) => backend.add_plain(&backend.encrypt_zero(), v),
-    }
-}
-
-/// Helper trait extension — backends need a "zero ciphertext" for plain→cipher promotion.
-/// Added as a separate trait to avoid breaking the core `FheBackend` interface.
-pub trait FheBackendExt: FheBackend {
-    /// Return an encryption of zero (used to lift plaintext constants into the
-    /// ciphertext domain when mixing plain and cipher wires in the same gate).
-    fn encrypt_zero(&self) -> Self::Ct;
-}
-
-// Blanket implementation: keygen + encrypt(0).
-impl<B: FheBackend> FheBackendExt for B {
-    fn encrypt_zero(&self) -> Self::Ct {
-        let (ck, _) = self.keygen();
-        self.encrypt(&ck, 0)
+        WireVal::Plain(v) => backend.encrypt_trivial(v),
     }
 }
 
@@ -270,6 +258,52 @@ mod tests {
 
         let result_ct = evaluate_fhe(&circuit, &pub_in, &enc_in, &be);
         assert_eq!(be.decrypt(&ck, &result_ct), 15);
+    }
+
+    #[test]
+    fn test_fhe_eval_relu_negative() {
+        // ReLU: (if (> z 0) z 0) with z encrypted — requires SIGNED comparison,
+        // since a negative z is a huge number in unsigned two's complement.
+        let mut circuit = compile_fhe_circuit("(if (> z 0) z 0)");
+        circuit.encrypted_inputs = vec!["z".to_string()];
+        circuit.public_inputs = vec![];
+
+        let be = MockFheBackend;
+        let (ck, _) = be.keygen();
+
+        // z = 5 → 5
+        let mut enc_in = HashMap::new();
+        enc_in.insert("z".to_string(), be.encrypt(&ck, 5));
+        let r = evaluate_fhe(&circuit, &HashMap::new(), &enc_in, &be);
+        assert_eq!(be.decrypt(&ck, &r), 5);
+
+        // z = -4 → 0
+        enc_in.insert("z".to_string(), be.encrypt(&ck, (-4i64) as u64));
+        let r = evaluate_fhe(&circuit, &HashMap::new(), &enc_in, &be);
+        assert_eq!(be.decrypt(&ck, &r), 0);
+    }
+
+    #[test]
+    fn test_fhe_eval_le_logical_not() {
+        // (if (<= x 5) 10 20) — exercises the XOR-with-1 logical NOT lowering;
+        // a bitwise BNot here would produce a non-boolean mux condition.
+        let mut circuit = compile_fhe_circuit("(if (<= x 5) 10 20)");
+        circuit.encrypted_inputs = vec!["x".to_string()];
+        circuit.public_inputs = vec![];
+
+        let be = MockFheBackend;
+        let (ck, _) = be.keygen();
+
+        // x = 5 → 10  (5 ≤ 5 is true)
+        let mut enc_in = HashMap::new();
+        enc_in.insert("x".to_string(), be.encrypt(&ck, 5));
+        let r = evaluate_fhe(&circuit, &HashMap::new(), &enc_in, &be);
+        assert_eq!(be.decrypt(&ck, &r), 10);
+
+        // x = 7 → 20  (7 ≤ 5 is false)
+        enc_in.insert("x".to_string(), be.encrypt(&ck, 7));
+        let r = evaluate_fhe(&circuit, &HashMap::new(), &enc_in, &be);
+        assert_eq!(be.decrypt(&ck, &r), 20);
     }
 
     #[test]

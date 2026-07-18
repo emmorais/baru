@@ -650,29 +650,43 @@ impl CircuitCompiler {
                 rhs: l,
             }),
             BinOp::Le => {
-                // a ≤ b  ⟺  NOT (b < a)
+                // a ≤ b  ⟺  (b < a) XOR 1
+                // XOR with 1 is a *logical* NOT on the 0/1 comparison wire;
+                // bitwise BNot would yield 0xFFFF…FE, which is not a boolean.
                 let lt = self.fresh("lt");
                 flat.push(FlatOp::ICmpSlt {
                     dst: lt.clone(),
                     lhs: r,
                     rhs: l,
                 });
-                flat.push(FlatOp::BNot {
+                let one = self.fresh("c");
+                flat.push(FlatOp::Const {
+                    dst: one.clone(),
+                    value: 1,
+                });
+                flat.push(FlatOp::BXor {
                     dst: dst.clone(),
-                    src: lt,
+                    lhs: lt,
+                    rhs: one,
                 });
             }
             BinOp::Ge => {
-                // a ≥ b  ⟺  NOT (a < b)
+                // a ≥ b  ⟺  (a < b) XOR 1   (logical NOT, see BinOp::Le)
                 let lt = self.fresh("lt");
                 flat.push(FlatOp::ICmpSlt {
                     dst: lt.clone(),
                     lhs: l,
                     rhs: r,
                 });
-                flat.push(FlatOp::BNot {
+                let one = self.fresh("c");
+                flat.push(FlatOp::Const {
+                    dst: one.clone(),
+                    value: 1,
+                });
+                flat.push(FlatOp::BXor {
                     dst: dst.clone(),
-                    src: lt,
+                    lhs: lt,
+                    rhs: one,
                 });
             }
             BinOp::And => flat.push(FlatOp::BAnd {
@@ -712,10 +726,20 @@ impl CircuitCompiler {
     ) -> Result<Wire, String> {
         let dst = self.fresh("t");
         match op {
-            UnOp::Not => flat.push(FlatOp::BNot {
-                dst: dst.clone(),
-                src,
-            }),
+            UnOp::Not => {
+                // Logical NOT on a 0/1 boolean wire: XOR with 1.
+                // Bitwise BNot would turn 1 into 0xFFFF…FE (still truthy).
+                let one = self.fresh("c");
+                flat.push(FlatOp::Const {
+                    dst: one.clone(),
+                    value: 1,
+                });
+                flat.push(FlatOp::BXor {
+                    dst: dst.clone(),
+                    lhs: src,
+                    rhs: one,
+                });
+            }
             UnOp::Neg => {
                 let zero = self.fresh("c");
                 flat.push(FlatOp::Const {

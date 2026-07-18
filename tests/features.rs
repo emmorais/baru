@@ -934,3 +934,56 @@ fn test_fhe_mock_compile_eval_mul() {
                          (fhe-eval circuit keys '() '() '("a" "b") (list ct-a ct-b))))))"#;
     assert_eq!(eval_fhe(src), 42);
 }
+
+#[test]
+fn test_fhe_mock_negative_roundtrip() {
+    // Negative values survive encrypt/decrypt via two's complement.
+    let src = "(let ((keys (fhe-keygen)))
+                 (fhe-dec keys (fhe-enc keys -4)))";
+    assert_eq!(eval_fhe(src), -4);
+}
+
+#[test]
+fn test_fhe_mock_relu_positive() {
+    // ReLU(5) = 5, evaluated homomorphically on the mock backend.
+    let src = r#"(let ((keys (fhe-keygen)))
+                   (let ((ct-z (fhe-enc keys 5)))
+                     (let ((circuit (fhe-compile '(if (> z 0) z 0) '("z"))))
+                       (fhe-dec keys
+                         (fhe-eval circuit keys '() '() '("z") (list ct-z))))))"#;
+    assert_eq!(eval_fhe(src), 5);
+}
+
+#[test]
+fn test_fhe_mock_relu_negative() {
+    // ReLU(-4) = 0 — requires signed comparison on the encrypted value.
+    let src = r#"(let ((keys (fhe-keygen)))
+                   (let ((ct-z (fhe-enc keys -4)))
+                     (let ((circuit (fhe-compile '(if (> z 0) z 0) '("z"))))
+                       (fhe-dec keys
+                         (fhe-eval circuit keys '() '() '("z") (list ct-z))))))"#;
+    assert_eq!(eval_fhe(src), 0);
+}
+
+// ---------------------------------------------------------------------------
+// FHE builtins — real TFHE-rs backend (fhe-keygen-tfhe)
+// Slow: keygen alone takes a few seconds; homomorphic gates take longer.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_fhe_tfhe_relu() {
+    // ReLU over real TFHE ciphertexts, both branches.  This exercises:
+    //   - trivial encryption of the constant 0 (must mix with real ciphertexts)
+    //   - signed comparison (ReLU(-4) would be wrong under unsigned compare)
+    //   - mux on an encrypted boolean
+    let src = r#"(let ((keys (fhe-keygen-tfhe)))
+                   (let ((ct-pos (fhe-enc keys 5))
+                         (ct-neg (fhe-enc keys -4)))
+                     (let ((circuit (fhe-compile '(if (> z 0) z 0) '("z"))))
+                       (+ (fhe-dec keys
+                            (fhe-eval circuit keys '() '() '("z") (list ct-pos)))
+                          (fhe-dec keys
+                            (fhe-eval circuit keys '() '() '("z") (list ct-neg)))))))"#;
+    // ReLU(5) + ReLU(-4) = 5 + 0 = 5
+    assert_eq!(eval_fhe(src), 5);
+}
