@@ -7,4 +7,6 @@ pub mod zkp;
 
 pub mod fhe;
 
+pub mod bench;
+
 pub mod repl;
