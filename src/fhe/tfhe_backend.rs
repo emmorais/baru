@@ -19,23 +19,15 @@ fn encode_server_key(sk: &ServerKey) -> Vec<u8> {
 fn decode_server_key(bytes: &[u8]) -> ServerKey {
     bincode::deserialize(bytes).expect("TfheBackend: deserialize ServerKey")
 }
-fn encode_ct(ct: &FheUint64) -> Vec<u8> {
-    bincode::serialize(ct).expect("TfheBackend: serialize FheUint64")
-}
-fn decode_ct(bytes: &[u8]) -> FheUint64 {
-    bincode::deserialize(bytes).expect("TfheBackend: deserialize FheUint64")
-}
 fn bool_to_uint64(b: FheBool) -> FheUint64 {
     b.cast_into()
 }
 
-/// Serialisable wrapper around an `FheUint64` ciphertext.
-#[derive(Debug, Clone)]
-pub struct TfheCt {
-    pub bytes: Vec<u8>,
-}
-
 /// Concrete TFHE-rs v1.6 FHE backend.
+///
+/// `Ct` is the native `FheUint64` — ciphertexts stay in memory between gates
+/// and are only (de)serialised at the runtime boundary (`serialize_ct` /
+/// `deserialize_ct`), not once per operation.
 #[derive(Debug, Default)]
 pub struct TfheBackend;
 
@@ -50,20 +42,18 @@ impl TfheBackend {
         set_server_key(decode_server_key(sk_bytes));
     }
 
-    pub fn encrypt_with_ck(ck_bytes: &[u8], value: u64) -> TfheCt {
+    pub fn encrypt_with_ck(ck_bytes: &[u8], value: u64) -> FheUint64 {
         let ck = decode_client_key(ck_bytes);
-        TfheCt {
-            bytes: encode_ct(&FheUint64::encrypt(value, &ck)),
-        }
+        FheUint64::encrypt(value, &ck)
     }
 
-    pub fn decrypt_with_ck(ck_bytes: &[u8], ct: &TfheCt) -> u64 {
-        decode_ct(&ct.bytes).decrypt(&decode_client_key(ck_bytes))
+    pub fn decrypt_with_ck(ck_bytes: &[u8], ct: &FheUint64) -> u64 {
+        ct.decrypt(&decode_client_key(ck_bytes))
     }
 }
 
 impl FheBackend for TfheBackend {
-    type Ct = TfheCt;
+    type Ct = FheUint64;
 
     fn backend_id(&self) -> &'static str {
         BACKEND_ID
@@ -79,11 +69,8 @@ impl FheBackend for TfheBackend {
     }
 
     fn encrypt_trivial(&self, value: i64) -> Self::Ct {
-        let ct = FheUint64::try_encrypt_trivial(value as u64)
-            .expect("TfheBackend: trivial encryption failed");
-        TfheCt {
-            bytes: encode_ct(&ct),
-        }
+        FheUint64::try_encrypt_trivial(value as u64)
+            .expect("TfheBackend: trivial encryption failed")
     }
 
     fn decrypt(&self, ck: &[u8], ct: &Self::Ct) -> u64 {
@@ -91,115 +78,82 @@ impl FheBackend for TfheBackend {
     }
 
     fn serialize_ct(&self, ct: &Self::Ct) -> Vec<u8> {
-        ct.bytes.clone()
+        bincode::serialize(ct).expect("TfheBackend: serialize FheUint64")
     }
 
-    fn deserialize_ct(&self, b: &[u8]) -> Self::Ct {
-        TfheCt { bytes: b.to_vec() }
+    fn deserialize_ct(&self, bytes: &[u8]) -> Self::Ct {
+        bincode::deserialize(bytes).expect("TfheBackend: deserialize FheUint64")
     }
 
     fn add(&self, a: &Self::Ct, b: &Self::Ct) -> Self::Ct {
-        TfheCt {
-            bytes: encode_ct(&(decode_ct(&a.bytes) + decode_ct(&b.bytes))),
-        }
+        a + b
     }
 
     fn sub(&self, a: &Self::Ct, b: &Self::Ct) -> Self::Ct {
-        TfheCt {
-            bytes: encode_ct(&(decode_ct(&a.bytes) - decode_ct(&b.bytes))),
-        }
+        a - b
     }
 
     fn mul(&self, a: &Self::Ct, b: &Self::Ct) -> Self::Ct {
-        TfheCt {
-            bytes: encode_ct(&(decode_ct(&a.bytes) * decode_ct(&b.bytes))),
-        }
+        a * b
     }
 
     fn add_plain(&self, a: &Self::Ct, b: i64) -> Self::Ct {
-        TfheCt {
-            bytes: encode_ct(&(decode_ct(&a.bytes) + b as u64)),
-        }
+        a + b as u64
     }
 
     fn mul_plain(&self, a: &Self::Ct, b: i64) -> Self::Ct {
-        TfheCt {
-            bytes: encode_ct(&(decode_ct(&a.bytes) * b as u64)),
-        }
+        a * b as u64
     }
 
     fn cmpeq(&self, a: &Self::Ct, b: &Self::Ct) -> Self::Ct {
-        let eq: FheBool = decode_ct(&a.bytes).eq(&decode_ct(&b.bytes));
-        TfheCt {
-            bytes: encode_ct(&bool_to_uint64(eq)),
-        }
+        bool_to_uint64(a.eq(b))
     }
 
     fn cmplt(&self, a: &Self::Ct, b: &Self::Ct) -> Self::Ct {
-        let lt: FheBool = decode_ct(&a.bytes).lt(&decode_ct(&b.bytes));
-        TfheCt {
-            bytes: encode_ct(&bool_to_uint64(lt)),
-        }
+        bool_to_uint64(a.lt(b))
     }
 
     fn cmpslt(&self, a: &Self::Ct, b: &Self::Ct) -> Self::Ct {
         // Signed compare over FheUint64 in two's complement: flipping the sign
         // bit of both operands turns signed order into unsigned order.
         const SIGN_BIT: u64 = 1u64 << 63;
-        let fa = decode_ct(&a.bytes) ^ SIGN_BIT;
-        let fb = decode_ct(&b.bytes) ^ SIGN_BIT;
-        let lt: FheBool = fa.lt(&fb);
-        TfheCt {
-            bytes: encode_ct(&bool_to_uint64(lt)),
-        }
+        let fa = a ^ SIGN_BIT;
+        let fb = b ^ SIGN_BIT;
+        bool_to_uint64(fa.lt(&fb))
     }
 
     fn band(&self, a: &Self::Ct, b: &Self::Ct) -> Self::Ct {
-        TfheCt {
-            bytes: encode_ct(&(decode_ct(&a.bytes) & decode_ct(&b.bytes))),
-        }
+        a & b
     }
 
     fn bor(&self, a: &Self::Ct, b: &Self::Ct) -> Self::Ct {
-        TfheCt {
-            bytes: encode_ct(&(decode_ct(&a.bytes) | decode_ct(&b.bytes))),
-        }
+        a | b
     }
 
     fn bxor(&self, a: &Self::Ct, b: &Self::Ct) -> Self::Ct {
-        TfheCt {
-            bytes: encode_ct(&(decode_ct(&a.bytes) ^ decode_ct(&b.bytes))),
-        }
+        a ^ b
     }
 
     fn bnot(&self, a: &Self::Ct) -> Self::Ct {
-        TfheCt {
-            bytes: encode_ct(&(!decode_ct(&a.bytes))),
-        }
+        !a.clone()
     }
 
     fn shl(&self, a: &Self::Ct, n: u32) -> Self::Ct {
-        TfheCt {
-            bytes: encode_ct(&(decode_ct(&a.bytes) << n)),
-        }
+        a << n
     }
 
     fn shr(&self, a: &Self::Ct, n: u32) -> Self::Ct {
-        TfheCt {
-            bytes: encode_ct(&(decode_ct(&a.bytes) >> n)),
-        }
+        a >> n
     }
 
     fn mux(&self, cond: &Self::Ct, t: &Self::Ct, e: &Self::Ct) -> Self::Ct {
-        let fc = decode_ct(&cond.bytes);
-        let ft = decode_ct(&t.bytes);
-        let fe = decode_ct(&e.bytes);
         // Treat any nonzero condition as true (same semantics as the mock backend).
-        let zero: FheUint64 = FheUint64::try_encrypt_trivial(0u64).expect("TfheBackend: trivial 0");
-        let result = fc.ne(&zero).if_then_else(&ft, &fe);
-        TfheCt {
-            bytes: encode_ct(&result),
-        }
+        let zero: FheUint64 = self.encrypt_trivial(0);
+        cond.ne(&zero).if_then_else(t, e)
+    }
+
+    fn divmod(&self, a: &Self::Ct, b: &Self::Ct) -> (Self::Ct, Self::Ct) {
+        a.div_rem(b)
     }
 }
 
@@ -317,6 +271,27 @@ mod tests {
     }
 
     #[test]
+    fn test_tfhe_cmpslt_signed() {
+        let (b, ck) = setup();
+        let neg_four = b.encrypt(&ck, (-4i64) as u64);
+        let zero = b.encrypt_trivial(0);
+        // signed: -4 < 0  →  1
+        assert_eq!(b.decrypt(&ck, &b.cmpslt(&neg_four, &zero)), 1);
+        // signed: 0 < -4  →  0
+        assert_eq!(b.decrypt(&ck, &b.cmpslt(&zero, &neg_four)), 0);
+        // unsigned: -4 as u64 is huge, so 0 < -4  →  1
+        assert_eq!(b.decrypt(&ck, &b.cmplt(&zero, &neg_four)), 1);
+    }
+
+    #[test]
+    fn test_tfhe_divmod() {
+        let (b, ck) = setup();
+        let (q, r) = b.divmod(&b.encrypt(&ck, 17u64), &b.encrypt(&ck, 5u64));
+        assert_eq!(b.decrypt(&ck, &q), 3);
+        assert_eq!(b.decrypt(&ck, &r), 2);
+    }
+
+    #[test]
     fn test_tfhe_serialize_roundtrip() {
         let (b, ck) = setup();
         let ct = b.encrypt(&ck, 99u64);
@@ -332,18 +307,5 @@ mod tests {
         let forty_two = b.encrypt(&ck, 42u64);
         let result = b.add(&zero, &forty_two);
         assert_eq!(b.decrypt(&ck, &result), 42);
-    }
-
-    #[test]
-    fn test_tfhe_cmpslt_signed() {
-        let (b, ck) = setup();
-        let neg_four = b.encrypt(&ck, (-4i64) as u64);
-        let zero = b.encrypt_trivial(0);
-        // signed: -4 < 0  →  1
-        assert_eq!(b.decrypt(&ck, &b.cmpslt(&neg_four, &zero)), 1);
-        // signed: 0 < -4  →  0
-        assert_eq!(b.decrypt(&ck, &b.cmpslt(&zero, &neg_four)), 0);
-        // unsigned: -4 as u64 is huge, so 0 < -4  →  1
-        assert_eq!(b.decrypt(&ck, &b.cmplt(&zero, &neg_four)), 1);
     }
 }

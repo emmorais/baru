@@ -936,19 +936,25 @@ impl CircuitCompiler {
             live.insert(w.clone());
         }
 
-        // Pre-compute (dst, inputs) pairs so we can do a borrow-free reverse pass.
-        let op_data: Vec<(String, Vec<String>)> = flat
+        // Pre-compute (dsts, inputs) pairs so we can do a borrow-free reverse pass.
+        // IDiv is the one op with two destinations (quotient and remainder);
+        // it is live if EITHER is consumed — using only `dst()` (the quotient)
+        // would prune the inputs of `(mod x 3)`, whose live output is dst_r.
+        let op_data: Vec<(Vec<String>, Vec<String>)> = flat
             .iter()
             .map(|op| {
-                let dst = op.dst().to_string();
+                let dsts: Vec<String> = match op {
+                    FlatOp::IDiv { dst_q, dst_r, .. } => vec![dst_q.clone(), dst_r.clone()],
+                    _ => vec![op.dst().to_string()],
+                };
                 let inputs: Vec<String> = op.inputs().iter().map(|s| s.to_string()).collect();
-                (dst, inputs)
+                (dsts, inputs)
             })
             .collect();
 
-        // Single backward pass over SSA: if a dst is live, all its inputs become live.
-        for (dst, inputs) in op_data.iter().rev() {
-            if live.contains(dst.as_str()) {
+        // Single backward pass over SSA: if any dst is live, all inputs become live.
+        for (dsts, inputs) in op_data.iter().rev() {
+            if dsts.iter().any(|d| live.contains(d.as_str())) {
                 for inp in inputs {
                     live.insert(inp.clone());
                 }
