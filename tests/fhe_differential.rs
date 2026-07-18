@@ -4,6 +4,7 @@
 //!   1. the plain CEK interpreter, and
 //!   2. the FHE circuit pipeline (compile_fhe → evaluate_fhe) with `x`
 //!      supplied as an encrypted input.
+//!
 //! Both must agree for every sample value.  A divergence is a bug in the
 //! compiler lowering, the circuit emitter, or a backend gate.
 //!

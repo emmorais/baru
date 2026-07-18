@@ -36,9 +36,9 @@ const BIAS: i64 = 80;
 fn score_expr_fixed() -> String {
     let mut pixels = String::new();
     let mut weights = String::new();
-    for i in 0..784 {
+    for (i, elem) in WEIGHTS.iter().enumerate() {
         let _ = write!(pixels, " p{}", i);
-        let _ = write!(weights, " {}", WEIGHTS[i] as f64 / WEIGHT_DIV);
+        let _ = write!(weights, " {}", *elem as f64 / WEIGHT_DIV);
     }
     format!(
         "(+ {} (dot (list{}) '({} )))",

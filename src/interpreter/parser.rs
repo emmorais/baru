@@ -32,14 +32,6 @@ pub fn tokenize(src: &str) -> Vec<String> {
     let mut chars = src.chars().peekable();
     while let Some(&ch) = chars.peek() {
         match ch {
-            ';' => {
-                // Line comment: skip to end of line.
-                for c in chars.by_ref() {
-                    if c == '\n' {
-                        break;
-                    }
-                }
-            }
             '(' | ')' => {
                 tokens.push(ch.to_string());
                 chars.next();

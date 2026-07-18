@@ -339,7 +339,7 @@ impl CircuitCompiler {
 
     /// Coerce an integer wire into the Q16.16 domain (<<16), like the
     /// interpreter's Num→Fixed coercion.
-    fn to_fixed_wire(&mut self, w: Wire, flat: &mut Vec<FlatOp>) -> Wire {
+    fn make_fixed_wire(&mut self, w: Wire, flat: &mut Vec<FlatOp>) -> Wire {
         let dst = self.fresh("fx");
         flat.push(FlatOp::Shl {
             dst: dst.clone(),
@@ -415,8 +415,8 @@ impl CircuitCompiler {
         let rf = self.is_fixed(&r);
         let (l, r) = if lf || rf {
             (
-                if lf { l } else { self.to_fixed_wire(l, flat) },
-                if rf { r } else { self.to_fixed_wire(r, flat) },
+                if lf { l } else { self.make_fixed_wire(l, flat) },
+                if rf { r } else { self.make_fixed_wire(r, flat) },
             )
         } else {
             (l, r)
@@ -713,16 +713,16 @@ impl CircuitCompiler {
                     match op {
                         BinOp::Mul => return Ok(CVal::Wire(self.emit_mul_typed(l, r, flat))),
                         BinOp::Add | BinOp::Sub | BinOp::Mod => {
-                            let l = if lf { l } else { self.to_fixed_wire(l, flat) };
-                            let r = if rf { r } else { self.to_fixed_wire(r, flat) };
+                            let l = if lf { l } else { self.make_fixed_wire(l, flat) };
+                            let r = if rf { r } else { self.make_fixed_wire(r, flat) };
                             let dst = self.flatten_binop(*op, l, r, flat)?;
                             self.fixed_wires.insert(dst.clone());
                             return Ok(CVal::Wire(dst));
                         }
                         BinOp::DivExact => {
                             // (a << 16) / b, both operands scaled.
-                            let l = if lf { l } else { self.to_fixed_wire(l, flat) };
-                            let r = if rf { r } else { self.to_fixed_wire(r, flat) };
+                            let l = if lf { l } else { self.make_fixed_wire(l, flat) };
+                            let r = if rf { r } else { self.make_fixed_wire(r, flat) };
                             let num = self.fresh("t");
                             flat.push(FlatOp::Shl {
                                 dst: num.clone(),
@@ -735,8 +735,8 @@ impl CircuitCompiler {
                         }
                         BinOp::Eq | BinOp::Lt | BinOp::Gt | BinOp::Le | BinOp::Ge => {
                             // Compare in the scaled domain; result is a plain bit.
-                            let l = if lf { l } else { self.to_fixed_wire(l, flat) };
-                            let r = if rf { r } else { self.to_fixed_wire(r, flat) };
+                            let l = if lf { l } else { self.make_fixed_wire(l, flat) };
+                            let r = if rf { r } else { self.make_fixed_wire(r, flat) };
                             return Ok(CVal::Wire(self.flatten_binop(*op, l, r, flat)?));
                         }
                         // Bitwise / shift ops stay in the raw integer domain.
@@ -789,12 +789,12 @@ impl CircuitCompiler {
                 let tf = self.is_fixed(&then_wire);
                 let ef = self.is_fixed(&else_wire);
                 let then_wire = if ef && !tf {
-                    self.to_fixed_wire(then_wire, flat)
+                    self.make_fixed_wire(then_wire, flat)
                 } else {
                     then_wire
                 };
                 let else_wire = if tf && !ef {
-                    self.to_fixed_wire(else_wire, flat)
+                    self.make_fixed_wire(else_wire, flat)
                 } else {
                     else_wire
                 };
@@ -1175,7 +1175,7 @@ impl CircuitCompiler {
                         Ok(CVal::Wire(if already_fixed {
                             w
                         } else {
-                            self.to_fixed_wire(w, flat)
+                            self.make_fixed_wire(w, flat)
                         }))
                     } else {
                         // fixed->int on an int wire is the identity, like the
