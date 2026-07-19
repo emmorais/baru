@@ -34,6 +34,12 @@ pub struct FheCircuit {
     /// (decrypt yields the scaled integer).
     #[serde(default)]
     pub output_fixed: bool,
+    /// True when the circuit was compiled in real-arithmetic mode
+    /// (`CircuitCompiler::new_real`) for approximate backends like CKKS:
+    /// wires carry true real values and no Q16.16 gadgets are present.
+    /// Such circuits must be evaluated with `evaluate_fhe_real`.
+    #[serde(default)]
+    pub real_arith: bool,
 }
 
 // ─── Key handles (serialisable for REPL round-trips) ─────────────────────────
@@ -174,4 +180,61 @@ pub trait FheBackend {
         let (q, _) = self.divmod(&shifted, b);
         q
     }
+}
+
+// ─── Real-arithmetic backend trait (CKKS) ─────────────────────────────────────
+
+/// Backend trait for approximate real-number FHE schemes (CKKS).
+///
+/// Differences from `FheBackend`:
+///   - Values are `f64` reals, not two's-complement integers.  Fixed-point
+///     Baru values cross this boundary as their true value (`v / 2^16`).
+///   - Only ring operations exist: add / sub / mul (+ plaintext variants).
+///     Comparisons, bit operations, shifts, mux and division are impossible
+///     on approximate ciphertexts; circuits must be compiled with
+///     `CircuitCompiler::new_real` so no such gate is emitted for supported
+///     programs.
+///   - Results are approximate — decrypt returns a real close to, not equal
+///     to, the true value.
+///   - Ciphertexts are SIMD vectors of slots.  The scalar circuit path uses
+///     slot 0 only; `encrypt_vec` / `dot_plain` expose the batched form that
+///     makes CKKS competitive for NN workloads.
+pub trait RealFheBackend {
+    type Ct: Clone;
+
+    /// Generate a fresh key set.  Returns `(client_key_bytes, server_key_bytes)`.
+    /// Client bytes decrypt (and encrypt); server bytes evaluate (public,
+    /// galois and relinearization keys).
+    fn keygen(&self) -> (Vec<u8>, Vec<u8>);
+
+    /// Encrypt a single real (slot 0; remaining slots zero).
+    fn encrypt(&self, client_key_bytes: &[u8], value: f64) -> Self::Ct;
+
+    /// Encrypt a vector of reals into the ciphertext's SIMD slots.
+    fn encrypt_vec(&self, client_key_bytes: &[u8], values: &[f64]) -> Self::Ct;
+
+    /// Decrypt slot 0.
+    fn decrypt(&self, client_key_bytes: &[u8], ct: &Self::Ct) -> f64;
+
+    /// Decrypt the first `n` slots.
+    fn decrypt_vec(&self, client_key_bytes: &[u8], ct: &Self::Ct, n: usize) -> Vec<f64>;
+
+    /// Lift a public constant into the ciphertext domain (server side —
+    /// uses the evaluation public key, provides no privacy for the value).
+    fn encrypt_public(&self, value: f64) -> Self::Ct;
+
+    fn serialize_ct(&self, ct: &Self::Ct) -> Vec<u8>;
+    fn deserialize_ct(&self, bytes: &[u8]) -> Self::Ct;
+    fn backend_id(&self) -> &'static str;
+
+    fn add(&self, a: &Self::Ct, b: &Self::Ct) -> Self::Ct;
+    fn sub(&self, a: &Self::Ct, b: &Self::Ct) -> Self::Ct;
+    fn mul(&self, a: &Self::Ct, b: &Self::Ct) -> Self::Ct;
+    fn add_plain(&self, a: &Self::Ct, b: f64) -> Self::Ct;
+    fn mul_plain(&self, a: &Self::Ct, b: f64) -> Self::Ct;
+
+    /// Batched dot product against plaintext weights: elementwise
+    /// multiply_plain, then a rotate-and-add tree sums every slot into
+    /// slot 0.  `weights` is zero-padded to the slot count.
+    fn dot_plain(&self, a: &Self::Ct, weights: &[f64]) -> Self::Ct;
 }

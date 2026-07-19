@@ -71,10 +71,21 @@ pub fn evaluate_fhe<B: FheBackend>(
         };
     }
 
+    if circuit.real_arith {
+        panic!(
+            "fhe-eval: this circuit was compiled in real-arithmetic (CKKS) mode; \
+             evaluate it with a CKKS backend, or recompile with fhe-compile"
+        );
+    }
+
     for op in &circuit.flat_ops {
         match op {
             FlatOp::Const { dst, value } => {
                 env.insert(dst.clone(), WireVal::Plain(*value));
+            }
+
+            FlatOp::ConstF { .. } => {
+                unreachable!("ConstF cannot appear outside real-arithmetic circuits")
             }
 
             FlatOp::IAdd32 { dst, lhs, rhs } => {
@@ -208,6 +219,144 @@ pub fn evaluate_fhe<B: FheBackend>(
     {
         WireVal::Cipher(ct) => ct,
         WireVal::Plain(v) => backend.encrypt_trivial(v),
+    }
+}
+
+// ─── Real-arithmetic evaluation (CKKS) ────────────────────────────────────────
+
+/// Evaluate a real-arithmetic `FheCircuit` (from `CircuitCompiler::new_real`)
+/// against a `RealFheBackend`.
+///
+/// Mirrors `evaluate_fhe` with two differences: plaintext wires carry `f64`
+/// true values, and only `Const`/`ConstF`/`IAdd32`/`ISub32`/`IMul` gates are
+/// accepted — approximate schemes have no comparisons, bit ops, shifts, mux
+/// or division, so any other gate is a compile-target mismatch and fails
+/// loudly with the offending construct named.
+pub fn evaluate_fhe_real<B: crate::fhe::backend::RealFheBackend>(
+    circuit: &FheCircuit,
+    public_inputs: &HashMap<String, f64>,
+    encrypted_inputs: &HashMap<String, B::Ct>,
+    backend: &B,
+) -> B::Ct {
+    if !circuit.real_arith {
+        panic!(
+            "fhe-eval: this circuit was compiled for integer backends; \
+             recompile it with fhe-compile-ckks for a CKKS backend"
+        );
+    }
+
+    enum RVal<Ct> {
+        Plain(f64),
+        Cipher(Ct),
+    }
+
+    let mut env: HashMap<String, RVal<B::Ct>> = HashMap::new();
+
+    for name in &circuit.public_inputs {
+        let val = *public_inputs
+            .get(name)
+            .unwrap_or_else(|| panic!("fhe-eval: missing public input '{}'", name));
+        env.insert(name.clone(), RVal::Plain(val));
+    }
+    for name in &circuit.encrypted_inputs {
+        let ct = encrypted_inputs
+            .get(name)
+            .unwrap_or_else(|| panic!("fhe-eval: missing encrypted input '{}'", name))
+            .clone();
+        env.insert(name.clone(), RVal::Cipher(ct));
+    }
+
+    macro_rules! ct {
+        ($wire:expr) => {
+            match env
+                .get($wire)
+                .unwrap_or_else(|| panic!("fhe-eval: unbound wire '{}'", $wire))
+            {
+                RVal::Cipher(c) => c.clone(),
+                RVal::Plain(v) => backend.encrypt_public(*v),
+            }
+        };
+    }
+
+    for op in &circuit.flat_ops {
+        match op {
+            FlatOp::Const { dst, value } => {
+                env.insert(dst.clone(), RVal::Plain(*value as f64));
+            }
+            FlatOp::ConstF { dst, value } => {
+                env.insert(dst.clone(), RVal::Plain(*value));
+            }
+
+            FlatOp::IAdd32 { dst, lhs, rhs } => {
+                let result = match (env.get(lhs), env.get(rhs)) {
+                    (Some(RVal::Plain(a)), Some(RVal::Plain(b))) => RVal::Plain(a + b),
+                    (Some(RVal::Plain(a)), Some(RVal::Cipher(_))) => {
+                        RVal::Cipher(backend.add_plain(&ct!(rhs), *a))
+                    }
+                    (Some(RVal::Cipher(_)), Some(RVal::Plain(b))) => {
+                        RVal::Cipher(backend.add_plain(&ct!(lhs), *b))
+                    }
+                    _ => RVal::Cipher(backend.add(&ct!(lhs), &ct!(rhs))),
+                };
+                env.insert(dst.clone(), result);
+            }
+
+            FlatOp::ISub32 { dst, lhs, rhs } => {
+                let result = match (env.get(lhs), env.get(rhs)) {
+                    (Some(RVal::Plain(a)), Some(RVal::Plain(b))) => RVal::Plain(a - b),
+                    (Some(RVal::Cipher(_)), Some(RVal::Plain(b))) => {
+                        RVal::Cipher(backend.add_plain(&ct!(lhs), -b))
+                    }
+                    _ => RVal::Cipher(backend.sub(&ct!(lhs), &ct!(rhs))),
+                };
+                env.insert(dst.clone(), result);
+            }
+
+            FlatOp::IMul { dst, lhs, rhs } => {
+                let result = match (env.get(lhs), env.get(rhs)) {
+                    (Some(RVal::Plain(a)), Some(RVal::Plain(b))) => RVal::Plain(a * b),
+                    (Some(RVal::Plain(a)), Some(RVal::Cipher(_))) => {
+                        RVal::Cipher(backend.mul_plain(&ct!(rhs), *a))
+                    }
+                    (Some(RVal::Cipher(_)), Some(RVal::Plain(b))) => {
+                        RVal::Cipher(backend.mul_plain(&ct!(lhs), *b))
+                    }
+                    _ => RVal::Cipher(backend.mul(&ct!(lhs), &ct!(rhs))),
+                };
+                env.insert(dst.clone(), result);
+            }
+
+            FlatOp::IDiv {
+                lhs, rhs, dst_q, ..
+            } => {
+                // Division only folds when both sides are public.
+                match (env.get(lhs), env.get(rhs)) {
+                    (Some(RVal::Plain(a)), Some(RVal::Plain(b))) => {
+                        let v = a / b;
+                        env.insert(dst_q.clone(), RVal::Plain(v));
+                    }
+                    _ => panic!(
+                        "fhe-eval: encrypted division is not supported by CKKS backends \
+                         (approximate FHE has no division); precompute the quotient client-side"
+                    ),
+                }
+            }
+
+            other => panic!(
+                "fhe-eval: gate {:?} is not supported by CKKS backends — approximate \
+                 FHE evaluates only +, -, *; rewrite the expression without \
+                 comparisons, if/mux, bit operations or shifts",
+                other
+            ),
+        }
+    }
+
+    match env
+        .remove(&circuit.output_wire)
+        .unwrap_or_else(|| panic!("fhe-eval: output wire '{}' not found", circuit.output_wire))
+    {
+        RVal::Cipher(ct) => ct,
+        RVal::Plain(v) => backend.encrypt_public(v),
     }
 }
 

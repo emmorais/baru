@@ -1875,6 +1875,51 @@ impl Participant {
             Rc::new(RefCell::new(Types::NativeFunc(fhe_keygen_tfhe_fn))),
         );
 
+        // fhe-keygen-ckks  (SEAL CKKS backend — approximate real arithmetic;
+        // pair with circuits from fhe-compile-ckks)
+        let fhe_keygen_ckks_fn = Arc::new(move |args: Vec<Types>| -> Types {
+            if !args.is_empty() {
+                panic!("fhe-keygen-ckks takes no arguments");
+            }
+            use crate::fhe::RealFheBackend;
+            let be = crate::fhe::CkksBackend::new();
+            let (ck, sk) = be.keygen();
+            let kp = crate::fhe::backend::FheKeyPair {
+                backend_id: be.backend_id().to_string(),
+                client_key_bytes: ck,
+                server_key_bytes: sk,
+            };
+            let json = serde_json::to_string(&kp)
+                .unwrap_or_else(|e| panic!("fhe-keygen-ckks: serialise error: {}", e));
+            Types::Str(json)
+        });
+        self.store.borrow_mut().insert(
+            "fhe-keygen-ckks".to_string(),
+            Rc::new(RefCell::new(Types::NativeFunc(fhe_keygen_ckks_fn))),
+        );
+
+        // fhe-keygen-ckks-mock  (exact f64 twin of the CKKS backend)
+        let fhe_keygen_ckks_mock_fn = Arc::new(move |args: Vec<Types>| -> Types {
+            if !args.is_empty() {
+                panic!("fhe-keygen-ckks-mock takes no arguments");
+            }
+            use crate::fhe::RealFheBackend;
+            let be = crate::fhe::MockCkksBackend;
+            let (ck, sk) = be.keygen();
+            let kp = crate::fhe::backend::FheKeyPair {
+                backend_id: be.backend_id().to_string(),
+                client_key_bytes: ck,
+                server_key_bytes: sk,
+            };
+            let json = serde_json::to_string(&kp)
+                .unwrap_or_else(|e| panic!("fhe-keygen-ckks-mock: serialise error: {}", e));
+            Types::Str(json)
+        });
+        self.store.borrow_mut().insert(
+            "fhe-keygen-ckks-mock".to_string(),
+            Rc::new(RefCell::new(Types::NativeFunc(fhe_keygen_ckks_mock_fn))),
+        );
+
         // fhe-enc
         let fhe_enc_fn = Arc::new(move |args: Vec<Types>| -> Types {
             if args.len() != 2 {
@@ -1910,6 +1955,43 @@ impl Participant {
                     };
                     Types::FheCiphertext(handle)
                 }
+                "seal-ckks" | "ckks-mock" => {
+                    // Real-arithmetic backends encrypt the true value: fixed
+                    // Q16.16 integers cross the boundary as v / 2^16.
+                    let real = if is_fixed {
+                        plaintext as i64 as f64 / 65536.0
+                    } else {
+                        plaintext as i64 as f64
+                    };
+                    fn enc<B: crate::fhe::RealFheBackend>(
+                        be: &B,
+                        ck: &[u8],
+                        v: f64,
+                        fixed: bool,
+                    ) -> Types {
+                        let ct = be.encrypt(ck, v);
+                        Types::FheCiphertext(crate::fhe::backend::FheCiphertextHandle {
+                            backend_id: be.backend_id().to_string(),
+                            bytes: be.serialize_ct(&ct),
+                            fixed,
+                        })
+                    }
+                    if kp.backend_id == "seal-ckks" {
+                        enc(
+                            &crate::fhe::CkksBackend::new(),
+                            &kp.client_key_bytes,
+                            real,
+                            is_fixed,
+                        )
+                    } else {
+                        enc(
+                            &crate::fhe::MockCkksBackend,
+                            &kp.client_key_bytes,
+                            real,
+                            is_fixed,
+                        )
+                    }
+                }
                 _ => {
                     let be = crate::fhe::MockFheBackend;
                     let ct = be.encrypt(&kp.client_key_bytes, plaintext);
@@ -1944,6 +2026,25 @@ impl Participant {
             };
             use crate::fhe::FheBackend;
             let plain = match kp.backend_id.as_str() {
+                "seal-ckks" | "ckks-mock" => {
+                    // Real-arithmetic decrypt: recover the approximate real
+                    // and re-enter the Q16.16 domain (or round to int).
+                    use crate::fhe::RealFheBackend;
+                    let v = if kp.backend_id == "seal-ckks" {
+                        let be = crate::fhe::CkksBackend::new();
+                        let ct = be.deserialize_ct(&handle.bytes);
+                        be.decrypt(&kp.client_key_bytes, &ct)
+                    } else {
+                        let be = crate::fhe::MockCkksBackend;
+                        let ct = be.deserialize_ct(&handle.bytes);
+                        be.decrypt(&kp.client_key_bytes, &ct)
+                    };
+                    return if handle.fixed {
+                        Types::Fixed((v * 65536.0).round() as i64)
+                    } else {
+                        Types::Num(v.round() as i64)
+                    };
+                }
                 "tfhe-rs-v1.6" => {
                     let be = crate::fhe::TfheBackend::new();
                     let ct = be.deserialize_ct(&handle.bytes);
@@ -2018,6 +2119,59 @@ impl Participant {
             Rc::new(RefCell::new(Types::NativeFunc(fhe_compile_fn))),
         );
 
+        // fhe-compile-ckks — like fhe-compile, but in real-arithmetic mode:
+        // fixed-point literals keep their true value and no Q16.16 gadgets
+        // are emitted.  Required for evaluation on CKKS backends.
+        let fhe_compile_ckks_fn = Arc::new(move |args: Vec<Types>| -> Types {
+            if args.len() != 2 {
+                panic!("fhe-compile-ckks expects 2 args: (fhe-compile-ckks 'expr '(\"enc-var\"))");
+            }
+            let expr = match &args[0] {
+                Types::Quoted(e) => *e.clone(),
+                _ => panic!("fhe-compile-ckks: first arg must be a quoted expression"),
+            };
+            let enc_vars: Vec<String> = match &args[1] {
+                Types::List(items) => items
+                    .iter()
+                    .map(|v| match v {
+                        Types::Str(s) => s.clone(),
+                        _ => panic!("fhe-compile-ckks: enc-vars must be a list of strings"),
+                    })
+                    .collect(),
+                Types::Quoted(inner) => match inner.as_ref() {
+                    Expr::Str(s) => vec![s.clone()],
+                    Expr::Seq(items) if items.is_empty() => vec![],
+                    Expr::Call(head, rest) => {
+                        let mut vars = Vec::new();
+                        if let Expr::Str(s) = head.as_ref() {
+                            vars.push(s.clone());
+                        }
+                        for e in rest {
+                            if let Expr::Str(s) = e {
+                                vars.push(s.clone());
+                            }
+                        }
+                        vars
+                    }
+                    _ => panic!("fhe-compile-ckks: enc-vars must be a quoted list of strings"),
+                },
+                _ => panic!("fhe-compile-ckks: second arg must be a list of strings"),
+            };
+            let mut cc = crate::zkp::circuit_compiler::CircuitCompiler::new_real();
+            let mut circuit = cc
+                .compile_fhe(&expr)
+                .unwrap_or_else(|e| panic!("fhe-compile-ckks failed: {}", e));
+            circuit.encrypted_inputs = enc_vars.clone();
+            circuit.public_inputs.retain(|v| !enc_vars.contains(v));
+            let json = serde_json::to_string(&circuit)
+                .unwrap_or_else(|e| panic!("fhe-compile-ckks: serialise error: {}", e));
+            Types::Str(json)
+        });
+        self.store.borrow_mut().insert(
+            "fhe-compile-ckks".to_string(),
+            Rc::new(RefCell::new(Types::NativeFunc(fhe_compile_ckks_fn))),
+        );
+
         // fhe-eval
         // (fhe-eval circuit-str keys '("pub-x") '(3) '("enc-y") '(ct))
         let fhe_eval_fn = Arc::new(move |args: Vec<Types>| -> Types {
@@ -2076,6 +2230,45 @@ impl Participant {
                 pub_keys.into_iter().zip(pub_nums).collect();
 
             match kp.backend_id.as_str() {
+                "seal-ckks" | "ckks-mock" => {
+                    // Real-arithmetic path: public inputs cross as true reals.
+                    let pub_map_f: std::collections::HashMap<String, f64> = pub_map
+                        .iter()
+                        .map(|(k, v)| (k.clone(), *v as f64))
+                        .collect();
+                    fn run<B: crate::fhe::RealFheBackend>(
+                        be: &B,
+                        circuit: &crate::fhe::backend::FheCircuit,
+                        pub_map: &std::collections::HashMap<String, f64>,
+                        enc_keys: Vec<String>,
+                        enc_cts: &[crate::fhe::backend::FheCiphertextHandle],
+                    ) -> Types {
+                        let enc_map: std::collections::HashMap<String, B::Ct> = enc_keys
+                            .into_iter()
+                            .zip(enc_cts.iter().map(|h| be.deserialize_ct(&h.bytes)))
+                            .collect();
+                        let result_ct = crate::fhe::circuit_emitter::evaluate_fhe_real(
+                            circuit, pub_map, &enc_map, be,
+                        );
+                        Types::FheCiphertext(crate::fhe::backend::FheCiphertextHandle {
+                            backend_id: be.backend_id().to_string(),
+                            bytes: be.serialize_ct(&result_ct),
+                            fixed: circuit.output_fixed,
+                        })
+                    }
+                    if kp.backend_id == "seal-ckks" {
+                        let be = crate::fhe::CkksBackend::with_server_keys(&kp.server_key_bytes);
+                        run(&be, &circuit, &pub_map_f, enc_keys, &enc_cts)
+                    } else {
+                        run(
+                            &crate::fhe::MockCkksBackend,
+                            &circuit,
+                            &pub_map_f,
+                            enc_keys,
+                            &enc_cts,
+                        )
+                    }
+                }
                 "tfhe-rs-v1.6" => {
                     // Ensure the server key is installed (caller may have used
                     // fhe-keygen-tfhe which installs it, but re-install to be safe).

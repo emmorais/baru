@@ -46,6 +46,10 @@ pub type Wire = String;
 pub enum FlatOp {
     /// dst = constant
     Const { dst: Wire, value: i64 },
+    /// dst = real-valued constant — only emitted in real-arithmetic (CKKS)
+    /// compilation mode, where fixed-point literals keep their true value
+    /// instead of the Q16.16 scaled integer.  Never valid in ZKP circuits.
+    ConstF { dst: Wire, value: f64 },
     /// dst = iadd_32(lhs, rhs)
     IAdd32 { dst: Wire, lhs: Wire, rhs: Wire },
     /// dst = isub_32(lhs, rhs)
@@ -93,6 +97,7 @@ impl FlatOp {
     pub fn dst(&self) -> &str {
         match self {
             FlatOp::Const { dst, .. }
+            | FlatOp::ConstF { dst, .. }
             | FlatOp::IAdd32 { dst, .. }
             | FlatOp::ISub32 { dst, .. }
             | FlatOp::IMul { dst, .. }
@@ -115,7 +120,7 @@ impl FlatOp {
     /// All wires this op reads (inputs).
     pub fn inputs(&self) -> Vec<&str> {
         match self {
-            FlatOp::Const { .. } => vec![],
+            FlatOp::Const { .. } | FlatOp::ConstF { .. } => vec![],
             FlatOp::IAdd32 { lhs, rhs, .. }
             | FlatOp::ISub32 { lhs, rhs, .. }
             | FlatOp::IMul { lhs, rhs, .. }
@@ -275,6 +280,10 @@ pub struct CircuitCompiler {
     /// arithmetic can insert the rescale (>>16 after multiply) and coerce
     /// mixed int/fixed operands, mirroring the interpreter's semantics.
     fixed_wires: HashSet<Wire>,
+    /// Real-arithmetic mode (CKKS): wires carry true real values, so
+    /// fixed-point literals become `ConstF`, int→fixed coercion is the
+    /// identity, and no Q16.16 shift/rescale gadgets are emitted.
+    real_arith: bool,
 }
 
 impl Default for CircuitCompiler {
@@ -292,6 +301,16 @@ impl CircuitCompiler {
             flat_known: HashMap::new(),
             inline_depth: 0,
             fixed_wires: HashSet::new(),
+            real_arith: false,
+        }
+    }
+
+    /// A compiler in real-arithmetic mode, for CKKS-style backends that
+    /// compute on approximate reals instead of 64-bit integers.
+    pub fn new_real() -> Self {
+        CircuitCompiler {
+            real_arith: true,
+            ..Self::new()
         }
     }
 
@@ -312,6 +331,23 @@ impl CircuitCompiler {
             value,
         });
         dst
+    }
+
+    /// Emit a Q16.16 fixed-point literal and mark its wire: the scaled
+    /// integer for integer backends, a `ConstF` true real in real mode.
+    fn emit_fixed_const(&mut self, v: i64, flat: &mut Vec<FlatOp>) -> Wire {
+        let w = if self.real_arith {
+            let dst = self.fresh("cf");
+            flat.push(FlatOp::ConstF {
+                dst: dst.clone(),
+                value: v as f64 / 65536.0,
+            });
+            dst
+        } else {
+            self.emit_const(v, flat)
+        };
+        self.fixed_wires.insert(w.clone());
+        w
     }
 
     /// Unwrap a CVal that must be a scalar wire.
@@ -338,8 +374,13 @@ impl CircuitCompiler {
     }
 
     /// Coerce an integer wire into the Q16.16 domain (<<16), like the
-    /// interpreter's Num→Fixed coercion.
+    /// interpreter's Num→Fixed coercion.  In real-arithmetic mode int wires
+    /// already carry their true value, so coercion is just a domain marking.
     fn make_fixed_wire(&mut self, w: Wire, flat: &mut Vec<FlatOp>) -> Wire {
+        if self.real_arith {
+            self.fixed_wires.insert(w.clone());
+            return w;
+        }
         let dst = self.fresh("fx");
         flat.push(FlatOp::Shl {
             dst: dst.clone(),
@@ -398,7 +439,9 @@ impl CircuitCompiler {
             lhs: l,
             rhs: r,
         });
-        let dst = if lf && rf {
+        let dst = if lf && rf && !self.real_arith {
+            // Integer backends emulate reals in Q16.16: rescale the product.
+            // Real mode multiplies true values, so no rescale exists at all.
             self.emit_ashr16(prod, flat)
         } else {
             prod
@@ -594,6 +637,7 @@ impl CircuitCompiler {
             output_wire: result_wire,
             num_gates,
             output_fixed,
+            real_arith: self.real_arith,
         })
     }
 
@@ -611,11 +655,8 @@ impl CircuitCompiler {
             Expr::Num(n) => Ok(CVal::Wire(self.emit_const(*n, flat))),
             // Fixed-point literal: the circuit works on the scaled integer
             // directly; the wire is marked so arithmetic inserts rescales.
-            Expr::Fixed(v) => {
-                let w = self.emit_const(*v, flat);
-                self.fixed_wires.insert(w.clone());
-                Ok(CVal::Wire(w))
-            }
+            // Real mode carries the true value in a ConstF instead.
+            Expr::Fixed(v) => Ok(CVal::Wire(self.emit_fixed_const(*v, flat))),
             Expr::Bool(b) => Ok(CVal::Wire(self.emit_const(if *b { 1 } else { 0 }, flat))),
             Expr::Char(c) => Ok(CVal::Wire(self.emit_const(*c as i64, flat))),
 
@@ -720,15 +761,21 @@ impl CircuitCompiler {
                             return Ok(CVal::Wire(dst));
                         }
                         BinOp::DivExact => {
-                            // (a << 16) / b, both operands scaled.
+                            // (a << 16) / b, both operands scaled.  Real mode
+                            // divides true values — no pre-shift.
                             let l = if lf { l } else { self.make_fixed_wire(l, flat) };
                             let r = if rf { r } else { self.make_fixed_wire(r, flat) };
-                            let num = self.fresh("t");
-                            flat.push(FlatOp::Shl {
-                                dst: num.clone(),
-                                src: l,
-                                amount: 16,
-                            });
+                            let num = if self.real_arith {
+                                l
+                            } else {
+                                let num = self.fresh("t");
+                                flat.push(FlatOp::Shl {
+                                    dst: num.clone(),
+                                    src: l,
+                                    amount: 16,
+                                });
+                                num
+                            };
                             let dst = self.flatten_binop(BinOp::DivExact, num, r, flat)?;
                             self.fixed_wires.insert(dst.clone());
                             return Ok(CVal::Wire(dst));
@@ -880,20 +927,12 @@ impl CircuitCompiler {
         fn elem(cc: &mut CircuitCompiler, e: &Expr, flat: &mut Vec<FlatOp>) -> Option<CVal> {
             match e {
                 Expr::Num(n) => Some(CVal::Wire(cc.emit_const(*n, flat))),
-                Expr::Fixed(v) => {
-                    let w = cc.emit_const(*v, flat);
-                    cc.fixed_wires.insert(w.clone());
-                    Some(CVal::Wire(w))
-                }
+                Expr::Fixed(v) => Some(CVal::Wire(cc.emit_fixed_const(*v, flat))),
                 Expr::Bool(b) => Some(CVal::Wire(cc.emit_const(if *b { 1 } else { 0 }, flat))),
                 Expr::Char(c) => Some(CVal::Wire(cc.emit_const(*c as i64, flat))),
                 Expr::UnOp(UnOp::Neg, inner) => match inner.as_ref() {
                     Expr::Num(n) => Some(CVal::Wire(cc.emit_const(-n, flat))),
-                    Expr::Fixed(v) => {
-                        let w = cc.emit_const(-v, flat);
-                        cc.fixed_wires.insert(w.clone());
-                        Some(CVal::Wire(w))
-                    }
+                    Expr::Fixed(v) => Some(CVal::Wire(cc.emit_fixed_const(-v, flat))),
                     _ => None,
                 },
                 Expr::Call(_, _) | Expr::Seq(_) => cc.quote_to_cval(e, flat),
@@ -1180,6 +1219,14 @@ impl CircuitCompiler {
                     } else {
                         // fixed->int on an int wire is the identity, like the
                         // interpreter's Num passthrough.
+                        if already_fixed && self.real_arith {
+                            // Truncation needs comparisons and muxes, which
+                            // approximate-real backends cannot evaluate.
+                            return Err(
+                                "fixed->int is not supported in real-arithmetic (CKKS) circuits"
+                                    .to_string(),
+                            );
+                        }
                         Ok(CVal::Wire(if already_fixed {
                             self.emit_fixed_to_int(w, flat)
                         } else {
@@ -1455,6 +1502,10 @@ impl CircuitCompiler {
                     dst: dst.clone(),
                     value: *value,
                 }),
+
+                FlatOp::ConstF { .. } => {
+                    unreachable!("ConstF is only emitted in real-arithmetic (CKKS) mode, never ZKP")
+                }
 
                 FlatOp::IAdd32 { dst, lhs, rhs } => out.push(Constraint::IAdd32 {
                     dst: dst.clone(),

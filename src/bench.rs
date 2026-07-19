@@ -308,6 +308,72 @@ fn run_fhe<B: FheBackend>(
     }
 }
 
+/// CKKS (real-arithmetic) FHE pipeline: compile in real mode → keygen →
+/// encrypt → eval → decrypt-and-round.  Approximate arithmetic: integer
+/// results round exactly for the supported (+,-,*) circuits, so the
+/// baseline comparison stays exact; unsupported gates fail into an error
+/// row via `guarded`, which is the honest outcome for comparison/mux cases.
+fn run_fhe_real<B: crate::fhe::RealFheBackend>(
+    label: &str,
+    be_client: &B,
+    mk_eval: impl FnOnce(&[u8]) -> B,
+    expr: &str,
+    inputs: &[(String, i64)],
+    baseline: Option<i64>,
+) -> BackendReport {
+    use crate::fhe::circuit_emitter::evaluate_fhe_real;
+
+    let mut t = Timer::new();
+    let parsed = parse(expr).unwrap_or_else(|e| panic!("parse error: {}", e));
+    let circuit = t.phase("compile", || {
+        let mut cc = CircuitCompiler::new_real();
+        let mut circuit = cc
+            .compile_fhe(&parsed)
+            .unwrap_or_else(|e| panic!("compile_fhe (real): {}", e));
+        circuit.public_inputs = Vec::new();
+        circuit.encrypted_inputs = inputs.iter().map(|(k, _)| k.clone()).collect();
+        circuit
+    });
+
+    let (ck, be_eval) = t.phase("keygen", || {
+        let (ck, sk) = be_client.keygen();
+        (ck, mk_eval(&sk))
+    });
+
+    let mut ct_bytes = 0usize;
+    let enc = t.phase("encrypt", || {
+        let mut enc: HashMap<String, B::Ct> = HashMap::new();
+        for (k, v) in inputs {
+            let ct = be_client.encrypt(&ck, *v as f64);
+            if ct_bytes == 0 {
+                ct_bytes = be_client.serialize_ct(&ct).len();
+            }
+            enc.insert(k.clone(), ct);
+        }
+        enc
+    });
+
+    let out = t.phase("eval", || {
+        evaluate_fhe_real(&circuit, &HashMap::new(), &enc, &be_eval)
+    });
+    let real = t.phase("decrypt", || be_client.decrypt(&ck, &out));
+    let result = real.round() as i64;
+
+    BackendReport {
+        backend: label.to_string(),
+        total_micros: t.total().as_micros(),
+        phases: t.phases,
+        result: Some(result),
+        ok: baseline.map(|b| b == result),
+        notes: vec![
+            format!("gates={}", circuit.num_gates),
+            format!("ct-bytes={}", ct_bytes),
+            format!("approx result={:.6}", real),
+        ],
+        error: None,
+    }
+}
+
 fn run_zkp(expr: &str, inputs: &[(String, i64)]) -> BackendReport {
     let mut t = Timer::new();
     let be = Binius64Backend::new();
@@ -356,6 +422,8 @@ pub enum Backend {
     Mpc,
     FheMock,
     FheTfhe,
+    FheCkks,
+    FheCkksMock,
     Zkp,
 }
 
@@ -366,9 +434,12 @@ impl Backend {
             "mpc" | "mpc-aby3" => Ok(Backend::Mpc),
             "fhe-mock" | "mock" => Ok(Backend::FheMock),
             "fhe-tfhe" | "tfhe" | "fhe" => Ok(Backend::FheTfhe),
+            "fhe-ckks" | "ckks" => Ok(Backend::FheCkks),
+            "fhe-ckks-mock" | "ckks-mock" => Ok(Backend::FheCkksMock),
             "zkp" | "zkp-binius64" | "binius64" => Ok(Backend::Zkp),
             other => Err(format!(
-                "unknown backend '{}' (expected plain, mpc, fhe-mock, fhe-tfhe, zkp)",
+                "unknown backend '{}' (expected plain, mpc, fhe-mock, fhe-tfhe, fhe-ckks, \
+                 fhe-ckks-mock, zkp)",
                 other
             )),
         }
@@ -380,6 +451,7 @@ impl Backend {
             Backend::Mpc,
             Backend::FheMock,
             Backend::FheTfhe,
+            Backend::FheCkks,
             Backend::Zkp,
         ]
     }
@@ -456,6 +528,30 @@ pub fn run_case(case: &BenchCase, backends: &[Backend], iters: u32) -> CaseRepor
                     })
                 })
             }),
+            Backend::FheCkks => guarded("fhe-ckks", || {
+                averaged(iters, || {
+                    run_fhe_real(
+                        "fhe-ckks",
+                        &crate::fhe::CkksBackend::new(),
+                        crate::fhe::CkksBackend::with_server_keys,
+                        case.expr,
+                        &inputs,
+                        baseline,
+                    )
+                })
+            }),
+            Backend::FheCkksMock => guarded("fhe-ckks-mock", || {
+                averaged(iters, || {
+                    run_fhe_real(
+                        "fhe-ckks-mock",
+                        &crate::fhe::MockCkksBackend,
+                        |_| crate::fhe::MockCkksBackend,
+                        case.expr,
+                        &inputs,
+                        baseline,
+                    )
+                })
+            }),
             Backend::Zkp => guarded("zkp-binius64", || {
                 averaged(iters, || run_zkp(case.expr, &inputs))
             }),
@@ -480,7 +576,8 @@ Runs each case on every selected backend and reports per-phase timings.
 With no case names, the built-in suite runs (use --list to see it).
 
 options:
-  --backends LIST   comma-separated: plain,mpc,fhe-mock,fhe-tfhe,zkp (default: all)
+  --backends LIST   comma-separated: plain,mpc,fhe-mock,fhe-tfhe,fhe-ckks,fhe-ckks-mock,zkp
+                    (default: all except fhe-ckks-mock)
   --iters N         average timings over N runs (default 1)
   --expr SRC        benchmark a custom expression instead of the suite
   --mpc-expr SRC    MPC-compatible rewrite of --expr (mux style, no secret ifs)

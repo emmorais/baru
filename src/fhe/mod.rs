@@ -49,9 +49,11 @@
 
 pub mod backend;
 pub mod circuit_emitter;
+pub mod ckks_backend;
 pub mod mock_backend;
 pub mod tfhe_backend;
 
-pub use backend::{FheBackend, FheCircuit};
+pub use backend::{FheBackend, FheCircuit, RealFheBackend};
+pub use ckks_backend::{CkksBackend, MockCkksBackend};
 pub use mock_backend::MockFheBackend;
 pub use tfhe_backend::TfheBackend;

@@ -15,6 +15,9 @@ hex = "0.4"
 binius-field = { git = "https://github.com/binius-zk/binius64", rev = "de81069" }
 binius-core = { git = "https://github.com/binius-zk/binius64", rev = "de81069" }
 tfhe = { version = "1.6", features = ["integer"] }
+# Vendored + patched SEAL bindings for the CKKS backend
+# (see third_party/sealy/BARU_PATCHES.md)
+sealy = { path = "third_party/sealy" }
 
 
 [dev-dependencies]
