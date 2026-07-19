@@ -22,3 +22,8 @@ sealy = { path = "third_party/sealy" }
 
 [dev-dependencies]
 tempfile = "3"
+
+# Keep the vendored sealy crate out of the workspace so cargo fmt/clippy
+# don't touch its (differently formatted) sources.
+[workspace]
+exclude = ["third_party/sealy"]
