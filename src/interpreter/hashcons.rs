@@ -80,6 +80,14 @@ pub enum Tag {
     Binding,
     EnvNode,
     State,
+    // ── appended after the initial release (see comment above: do not
+    //    reorder existing variants above this line) ──
+    /// Q16.16 fixed-point value (`Types::Fixed`).
+    VFixed,
+    /// Opaque FHE ciphertext handle (`Types::FheCiphertext`).
+    VFheCiphertext,
+    /// Q16.16 fixed-point literal (`Expr::Fixed`).
+    EFixed,
 }
 
 /// An interned node: a tag, an inline byte payload for leaves, and links to
@@ -221,6 +229,7 @@ impl Store {
     pub fn intern_value(&mut self, v: &Types) -> NodeId {
         match v {
             Types::Num(n) => self.num(*n),
+            Types::Fixed(v) => self.intern(Tag::VFixed, v.to_le_bytes().to_vec(), vec![]),
             Types::Bool(b) => self.boolean(*b),
             Types::Str(s) => self.string(s),
             Types::Char(c) => self.ch(*c),
@@ -247,6 +256,18 @@ impl Store {
             }
             // Native builtins are opaque: their behavior is not content-addressable.
             Types::NativeFunc(_) => self.intern(Tag::VNative, vec![], vec![]),
+            // FHE ciphertexts commit to their backend id + serialised bytes;
+            // the `fixed` flag is folded into the atom so Q16.16 and integer
+            // ciphertexts with identical bytes (impossible in practice, but
+            // not structurally guaranteed) still intern distinctly.
+            Types::FheCiphertext(h) => {
+                let mut atom = Vec::with_capacity(h.backend_id.len() + h.bytes.len() + 9);
+                atom.extend_from_slice(&(h.backend_id.len() as u64).to_le_bytes());
+                atom.extend_from_slice(h.backend_id.as_bytes());
+                atom.push(h.fixed as u8);
+                atom.extend_from_slice(&h.bytes);
+                self.intern(Tag::VFheCiphertext, atom, vec![])
+            }
         }
     }
 
@@ -282,6 +303,7 @@ impl Store {
     pub fn intern_expr(&mut self, e: &Expr) -> NodeId {
         match e {
             Expr::Num(n) => self.intern(Tag::ENum, n.to_le_bytes().to_vec(), vec![]),
+            Expr::Fixed(v) => self.intern(Tag::EFixed, v.to_le_bytes().to_vec(), vec![]),
             Expr::Var(s) => self.intern(Tag::EVar, s.as_bytes().to_vec(), vec![]),
             Expr::Str(s) => self.intern(Tag::EStr, s.as_bytes().to_vec(), vec![]),
             Expr::Char(c) => self.intern(Tag::EChar, (*c as u32).to_le_bytes().to_vec(), vec![]),

@@ -1,0 +1,48 @@
+name: Nightly (slow / ignored tests)
+
+# Most tests that touch real cryptography (TFHE-rs bootstrapping, SEAL CKKS
+# keygen/rotation keys, spawned tcp_party subprocesses) are marked #[ignore]
+# so the main CI job (see ci.yml) stays fast. This workflow runs the full
+# suite, ignored tests included, on a schedule so regressions in that slow
+# path still get caught — just not on every push.
+on:
+  schedule:
+    # 03:17 UTC daily (off-peak, avoids the top-of-hour cron thundering herd).
+    - cron: "17 3 * * *"
+  workflow_dispatch: {}
+
+jobs:
+  slow-tests:
+    name: Run ignored tests (release)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust (stable)
+        uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+          profile: minimal
+          override: true
+
+      - name: Cache Cargo registry and target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-nightly-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Build (release)
+        run: cargo build --release
+
+      - name: Run full test suite, including ignored tests
+        env:
+          RUST_BACKTRACE: 1
+        run: |
+          # tcp_integration's process tests expect a release binary on disk.
+          cargo build --release --bin tcp_party
+          cargo test --release -- --include-ignored --test-threads=1 --nocapture

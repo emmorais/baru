@@ -157,6 +157,12 @@ impl FheBackend for TfheBackend {
     }
 }
 
+// Every test below pays for a real TFHE-rs keygen (`setup()`) plus at least
+// one bootstrapped gate — ~13s minimum each even for the cheapest op, and
+// much more for comparisons/mux/divmod. All are `#[ignore]`d so `cargo test`
+// stays fast; run them explicitly with `cargo test --release -- --ignored`
+// (see the differential suite in `tests/fhe_differential.rs` for the same
+// pattern applied to whole-program TFHE/CKKS coverage).
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -169,12 +175,14 @@ mod tests {
     }
 
     #[test]
+    #[ignore]
     fn test_tfhe_encrypt_decrypt() {
         let (b, ck) = setup();
         assert_eq!(b.decrypt(&ck, &b.encrypt(&ck, 42)), 42);
     }
 
     #[test]
+    #[ignore]
     fn test_tfhe_add() {
         let (b, ck) = setup();
         assert_eq!(
@@ -194,12 +202,14 @@ mod tests {
     }
 
     #[test]
+    #[ignore]
     fn test_tfhe_mul_plain() {
         let (b, ck) = setup();
         assert_eq!(b.decrypt(&ck, &b.mul_plain(&b.encrypt(&ck, 6), 7)), 42);
     }
 
     #[test]
+    #[ignore]
     fn test_tfhe_shl_shr() {
         let (b, ck) = setup();
         let s = b.shl(&b.encrypt(&ck, 1u64), 5);
@@ -244,6 +254,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore]
     fn test_tfhe_cmpeq_true() {
         let (b, ck) = setup();
         assert_eq!(
@@ -253,6 +264,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore]
     fn test_tfhe_cmpeq_false() {
         let (b, ck) = setup();
         assert_eq!(
@@ -262,6 +274,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore]
     fn test_tfhe_cmplt() {
         let (b, ck) = setup();
         assert_eq!(
@@ -289,6 +302,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore]
     fn test_tfhe_divmod() {
         let (b, ck) = setup();
         let (q, r) = b.divmod(&b.encrypt(&ck, 17u64), &b.encrypt(&ck, 5u64));
@@ -297,6 +311,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore]
     fn test_tfhe_serialize_roundtrip() {
         let (b, ck) = setup();
         let ct = b.encrypt(&ck, 99u64);
