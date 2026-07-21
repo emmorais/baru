@@ -14,10 +14,14 @@
 //! Folding is integer-only and order-independent over a `BTreeMap`, so all nodes
 //! derive the same ledger and the same root.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 
 use sha2::{Digest, Sha256};
 
+use crate::consensus::{
+    leader_round, ConsensusBackend, ConsensusError, ConsensusMsg, Epoch, EpochCommit, RootSet,
+};
+use crate::crypto::net::{PartyId, Transport};
 use crate::fhe::lifecycle::{Effect, Id, Stake};
 use crate::interpreter::merkle::merkle_root;
 
@@ -157,6 +161,107 @@ fn draw_below(seed: &[u8; 32], counter: u64, bound: u128) -> u128 {
     let mut buf = [0u8; 16];
     buf.copy_from_slice(&digest[..16]);
     u128::from_le_bytes(buf) % bound
+}
+
+/// Reputation-weighted single-leader consensus backend.
+///
+/// Each epoch's leader is chosen by [`ReputationLedger::select_committee`] over
+/// the agreed ledger, seeded by a chain that evolves with the group root (a VRF
+/// stand-in), so verified useful work — not a hardcoded index — decides who
+/// coordinates.  During bootstrap (no reputation yet) it falls back to
+/// round-robin for liveness.  The agreed [`EpochCommit`] carries the ledger's
+/// root, so the reputation state is itself part of what the network agrees on.
+///
+/// Implements the same [`ConsensusBackend`] as `SingleLeader`, so a node swaps
+/// one for the other without touching callers.
+pub struct ReputationPoUW<T: Transport> {
+    me: PartyId,
+    n: usize,
+    /// Identity of each party, indexed by party id.
+    roster: Vec<Id>,
+    ledger: ReputationLedger,
+    transport: T,
+    timeout_ms: u64,
+    buf: VecDeque<(PartyId, ConsensusMsg)>,
+    /// Evolves each epoch (chained to the group root) for leader randomness.
+    seed_chain: Hash,
+}
+
+impl<T: Transport> ReputationPoUW<T> {
+    pub fn new(
+        me: PartyId,
+        n: usize,
+        roster: Vec<Id>,
+        ledger: ReputationLedger,
+        transport: T,
+        genesis_seed: Hash,
+    ) -> Self {
+        ReputationPoUW {
+            me,
+            n,
+            roster,
+            ledger,
+            transport,
+            timeout_ms: 10_000,
+            buf: VecDeque::new(),
+            seed_chain: genesis_seed,
+        }
+    }
+
+    pub fn with_timeout(mut self, timeout_ms: u64) -> Self {
+        self.timeout_ms = timeout_ms;
+        self
+    }
+
+    /// Replace the reputation ledger — a node calls this after folding the
+    /// epoch's settlement effects, so the next leader election reflects them.
+    pub fn set_ledger(&mut self, ledger: ReputationLedger) {
+        self.ledger = ledger;
+    }
+
+    pub fn ledger(&self) -> &ReputationLedger {
+        &self.ledger
+    }
+
+    /// Deterministic leader for `epoch`: a reputation-weighted draw, falling
+    /// back to round-robin when no reputation exists yet (bootstrap liveness).
+    pub fn leader_for(&self, epoch: Epoch) -> PartyId {
+        let mut h = Sha256::new();
+        h.update(self.seed_chain);
+        h.update(epoch.to_le_bytes());
+        let seed: Hash = h.finalize().into();
+        if let Some(leader_id) = self.ledger.select_committee(1, &seed).first() {
+            if let Some(idx) = self.roster.iter().position(|r| r == leader_id) {
+                return idx;
+            }
+        }
+        (epoch as usize) % self.n
+    }
+}
+
+impl<T: Transport> ConsensusBackend for ReputationPoUW<T> {
+    fn commit_epoch(&mut self, epoch: Epoch, my: RootSet) -> Result<EpochCommit, ConsensusError> {
+        let leader = self.leader_for(epoch);
+        let reputation_root = self.ledger.root();
+        let commit = leader_round(
+            self.me,
+            self.n,
+            leader,
+            epoch,
+            my,
+            reputation_root,
+            &self.transport,
+            &mut self.buf,
+            self.timeout_ms,
+        )?;
+        // Chain the seed so the next epoch's election draws fresh randomness.
+        self.seed_chain = commit.group_root;
+        Ok(commit)
+    }
+
+    fn name(&self) -> &'static str {
+        "reputation-pouw"
+    }
 }
 
 #[cfg(test)]
@@ -341,5 +446,69 @@ mod tests {
                 assert!(m == honest_a || m == honest_b);
             }
         }
+    }
+
+    #[test]
+    fn pouw_elects_reputation_leader_and_all_agree() {
+        use crate::consensus::{ConsensusBackend, RootSet};
+        use crate::crypto::net::InprocHandle;
+        use std::sync::mpsc;
+        use std::thread;
+
+        let roster = vec![id(20), id(21), id(22)];
+        // Only party 1's identity has positive reputation → it is always leader.
+        let mut ledger = ReputationLedger::new();
+        ledger.apply(&Effect::Reputation { id: id(21), delta: 100 });
+        let rep_root = ledger.root();
+
+        let handles = InprocHandle::create(3);
+        let (tx, rx) = mpsc::channel();
+        let mut joins = vec![];
+        for (me, h) in handles.into_iter().enumerate() {
+            let roster = roster.clone();
+            let ledger = ledger.clone();
+            let tx = tx.clone();
+            joins.push(thread::spawn(move || {
+                let mut be =
+                    ReputationPoUW::new(me, 3, roster, ledger, h, [0u8; 32]).with_timeout(5_000);
+                assert_eq!(be.leader_for(0), 1, "party 1 must be the elected leader");
+                let commit = be.commit_epoch(0, RootSet::default()).expect("commit");
+                tx.send((me, commit)).unwrap();
+            }));
+        }
+        drop(tx);
+        for j in joins {
+            j.join().unwrap();
+        }
+
+        let commits: Vec<_> = rx.iter().collect();
+        assert_eq!(commits.len(), 3);
+        let reference = &commits[0].1;
+        for (_, c) in &commits {
+            assert_eq!(c, reference, "parties disagree");
+        }
+        assert_eq!(
+            reference.reputation_root, rep_root,
+            "reputation ledger root must be committed"
+        );
+    }
+
+    #[test]
+    fn pouw_bootstraps_round_robin_without_reputation() {
+        use crate::crypto::net::InprocHandle;
+        let h = InprocHandle::create(3).pop().unwrap();
+        let be = ReputationPoUW::new(
+            0,
+            3,
+            vec![id(20), id(21), id(22)],
+            ReputationLedger::new(),
+            h,
+            [0u8; 32],
+        );
+        // No reputation yet → round-robin leader for liveness.
+        assert_eq!(be.leader_for(0), 0);
+        assert_eq!(be.leader_for(1), 1);
+        assert_eq!(be.leader_for(2), 2);
+        assert_eq!(be.leader_for(3), 0);
     }
 }

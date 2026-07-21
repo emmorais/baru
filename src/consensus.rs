@@ -58,24 +58,29 @@ pub struct EpochCommit {
     /// Merkle commitment over all participants' root sets — one hash naming the
     /// entire network's agreed state for this epoch.
     pub group_root: Hash,
+    /// Commitment to the reputation ledger agreed this epoch.  Zero when the
+    /// backend does not track reputation (e.g. `SingleLeader`).
+    #[serde(default)]
+    pub reputation_root: Hash,
 }
 
 impl EpochCommit {
     /// Build a commit from the collected per-party roots, computing the group root.
-    pub fn new(epoch: Epoch, party_roots: Vec<RootSet>) -> Self {
+    pub fn new(epoch: Epoch, party_roots: Vec<RootSet>, reputation_root: Hash) -> Self {
         let leaves: Vec<Hash> = party_roots.iter().map(RootSet::leaf).collect();
         let group_root = merkle_root(&leaves);
         EpochCommit {
             epoch,
             party_roots,
             group_root,
+            reputation_root,
         }
     }
 }
 
 /// Wire messages for the consensus transport.
 #[derive(Clone, Serialize, Deserialize)]
-enum ConsensusMsg {
+pub(crate) enum ConsensusMsg {
     /// A follower's root set for an epoch, sent to the leader.
     Submit {
         epoch: Epoch,
@@ -145,81 +150,110 @@ impl<T: Transport> SingleLeader<T> {
         self.timeout_ms = timeout_ms;
         self
     }
+}
 
-    /// Receive the next consensus message satisfying `pred`, buffering others.
-    fn recv_matching<F>(&mut self, deadline: Instant, pred: F) -> Option<(PartyId, ConsensusMsg)>
-    where
-        F: Fn(&ConsensusMsg) -> bool,
-    {
-        if let Some(pos) = self.buf.iter().position(|(_, m)| pred(m)) {
-            return self.buf.remove(pos);
-        }
-        loop {
-            if let Some((from, bytes)) = self.transport.recv() {
-                let m: ConsensusMsg = deserialize_msg(&bytes);
-                if pred(&m) {
-                    return Some((from, m));
-                }
-                self.buf.push_back((from, m));
-            } else if Instant::now() >= deadline {
-                return None;
-            } else {
-                std::thread::sleep(Duration::from_millis(2));
+/// Receive the next consensus message satisfying `pred`, buffering out-of-turn
+/// messages so they are not dropped.  Shared by the consensus backends.
+pub(crate) fn buffered_recv<T, F>(
+    transport: &T,
+    buf: &mut VecDeque<(PartyId, ConsensusMsg)>,
+    deadline: Instant,
+    pred: F,
+) -> Option<(PartyId, ConsensusMsg)>
+where
+    T: Transport,
+    F: Fn(&ConsensusMsg) -> bool,
+{
+    if let Some(pos) = buf.iter().position(|(_, m)| pred(m)) {
+        return buf.remove(pos);
+    }
+    loop {
+        if let Some((from, bytes)) = transport.recv() {
+            let m: ConsensusMsg = deserialize_msg(&bytes);
+            if pred(&m) {
+                return Some((from, m));
             }
+            buf.push_back((from, m));
+        } else if Instant::now() >= deadline {
+            return None;
+        } else {
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+}
+
+/// Run one single-leader agreement round with a caller-chosen `leader` and
+/// `reputation_root`.  The leader collects submissions and broadcasts the
+/// commit; followers submit and adopt.  This is the shared core of both
+/// consensus backends — they differ only in how the leader is chosen.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn leader_round<T: Transport>(
+    me: PartyId,
+    n: usize,
+    leader: PartyId,
+    epoch: Epoch,
+    my: RootSet,
+    reputation_root: Hash,
+    transport: &T,
+    buf: &mut VecDeque<(PartyId, ConsensusMsg)>,
+    timeout_ms: u64,
+) -> Result<EpochCommit, ConsensusError> {
+    let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+    if me == leader {
+        let mut party_roots = vec![RootSet::default(); n];
+        party_roots[me] = my;
+        let mut have = vec![false; n];
+        have[me] = true;
+        let mut remaining = n - 1;
+        while remaining > 0 {
+            match buffered_recv(transport, buf, deadline, |m| {
+                matches!(m, ConsensusMsg::Submit { epoch: e, .. } if *e == epoch)
+            }) {
+                Some((_from, ConsensusMsg::Submit { from, roots, .. })) => {
+                    if from < n && !have[from] {
+                        party_roots[from] = roots;
+                        have[from] = true;
+                        remaining -= 1;
+                    }
+                }
+                _ => return Err(ConsensusError::Timeout),
+            }
+        }
+        let commit = EpochCommit::new(epoch, party_roots, reputation_root);
+        transport.broadcast(serialize_msg(&ConsensusMsg::Commit(commit.clone())));
+        Ok(commit)
+    } else {
+        transport.send(
+            leader,
+            serialize_msg(&ConsensusMsg::Submit {
+                epoch,
+                from: me,
+                roots: my,
+            }),
+        );
+        match buffered_recv(transport, buf, deadline, |m| {
+            matches!(m, ConsensusMsg::Commit(c) if c.epoch == epoch)
+        }) {
+            Some((_from, ConsensusMsg::Commit(c))) => Ok(c),
+            _ => Err(ConsensusError::Timeout),
         }
     }
 }
 
 impl<T: Transport> ConsensusBackend for SingleLeader<T> {
     fn commit_epoch(&mut self, epoch: Epoch, my: RootSet) -> Result<EpochCommit, ConsensusError> {
-        let deadline = Instant::now() + Duration::from_millis(self.timeout_ms);
-
-        if self.me == self.leader {
-            // Collect every follower's root set for this epoch.
-            let mut party_roots = vec![RootSet::default(); self.n];
-            party_roots[self.me] = my;
-            let mut have = vec![false; self.n];
-            have[self.me] = true;
-            let mut remaining = self.n - 1;
-
-            while remaining > 0 {
-                match self.recv_matching(
-                    deadline,
-                    |m| matches!(m, ConsensusMsg::Submit { epoch: e, .. } if *e == epoch),
-                ) {
-                    Some((_from, ConsensusMsg::Submit { from, roots, .. })) => {
-                        if from < self.n && !have[from] {
-                            party_roots[from] = roots;
-                            have[from] = true;
-                            remaining -= 1;
-                        }
-                    }
-                    _ => return Err(ConsensusError::Timeout),
-                }
-            }
-
-            let commit = EpochCommit::new(epoch, party_roots);
-            self.transport
-                .broadcast(serialize_msg(&ConsensusMsg::Commit(commit.clone())));
-            Ok(commit)
-        } else {
-            // Submit to the leader and adopt its decision.
-            self.transport.send(
-                self.leader,
-                serialize_msg(&ConsensusMsg::Submit {
-                    epoch,
-                    from: self.me,
-                    roots: my,
-                }),
-            );
-            match self.recv_matching(
-                deadline,
-                |m| matches!(m, ConsensusMsg::Commit(c) if c.epoch == epoch),
-            ) {
-                Some((_from, ConsensusMsg::Commit(c))) => Ok(c),
-                _ => Err(ConsensusError::Timeout),
-            }
-        }
+        // A fixed leader and no reputation commitment (zero root).
+        leader_round(
+            self.me,
+            self.n,
+            self.leader,
+            epoch,
+            my,
+            [0u8; 32],
+            &self.transport,
+            &mut self.buf,
+            self.timeout_ms,
+        )
     }
 
     fn name(&self) -> &'static str {
