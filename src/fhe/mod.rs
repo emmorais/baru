@@ -50,6 +50,7 @@
 pub mod backend;
 pub mod circuit_emitter;
 pub mod ckks_backend;
+pub mod market;
 pub mod mock_backend;
 pub mod tfhe_backend;
 
