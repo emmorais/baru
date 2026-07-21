@@ -262,6 +262,10 @@ impl<T: Transport> ConsensusBackend for ReputationPoUW<T> {
     fn name(&self) -> &'static str {
         "reputation-pouw"
     }
+
+    fn epoch_leader(&self, epoch: Epoch) -> Option<PartyId> {
+        Some(self.leader_for(epoch))
+    }
 }
 
 #[cfg(test)]

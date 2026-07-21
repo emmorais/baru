@@ -22,12 +22,16 @@ use colored::*;
 use rustyline::error::ReadlineError;
 use rustyline::Editor;
 
+use sha2::{Digest, Sha256};
+
 use baru::consensus::{ConsensusBackend, RootSet, SingleLeader};
 use baru::crypto::net::{
     deserialize_msg, recv_blocking, recv_forever, serialize_msg, InprocHandle, MpcMsg,
     TcpTransport, Transport,
 };
+use baru::fhe::lifecycle::Effect;
 use baru::interpreter::{parse, Participant, Types};
+use baru::reputation::{ReputationLedger, ReputationPoUW};
 use baru::repl::{print_examples_for, print_examples_list, print_help, ReplHelper, EXAMPLES};
 
 // ---------------------------------------------------------------------------
@@ -222,10 +226,54 @@ fn launch(me: usize, mpc_addrs: Vec<String>, dist_addrs: Vec<String>) {
     run_tcp(me, mpc, dist, cons);
 }
 
+/// Deterministic roster identity for a party — every node computes the same
+/// value, so they agree on the reputation roster without exchanging keys.
+fn roster_id(party: usize) -> [u8; 32] {
+    let mut h = Sha256::new();
+    h.update(b"baru-roster-v1");
+    h.update((party as u64).to_le_bytes());
+    h.finalize().into()
+}
+
+/// Build the consensus backend: `ReputationPoUW` when `BARU_POUW` is set
+/// (leader elected by reputation; optional genesis from `BARU_POUW_REP` as
+/// "party:delta,party:delta"), otherwise the `SingleLeader` parity baseline.
+fn build_consensus<T: Transport + 'static>(
+    me: usize,
+    n: usize,
+    transport: T,
+) -> Box<dyn ConsensusBackend> {
+    if std::env::var("BARU_POUW").is_ok() {
+        let roster: Vec<[u8; 32]> = (0..n).map(roster_id).collect();
+        let mut ledger = ReputationLedger::new();
+        // Optional deterministic genesis reputation — all parties set the same
+        // env, so they build the same ledger.  In production this reputation
+        // comes from settled FHE jobs (see baru::fhe::lifecycle).
+        if let Ok(spec) = std::env::var("BARU_POUW_REP") {
+            for entry in spec.split(',') {
+                if let Some((p, amt)) = entry.split_once(':') {
+                    if let (Ok(p), Ok(amt)) = (p.trim().parse::<usize>(), amt.trim().parse::<i128>())
+                    {
+                        if p < n {
+                            ledger.apply(&Effect::Reputation {
+                                id: roster_id(p),
+                                delta: amt,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+        Box::new(ReputationPoUW::new(me, n, roster, ledger, transport, [0u8; 32]))
+    } else {
+        Box::new(SingleLeader::new(me, n, 0, transport))
+    }
+}
+
 /// Run one consensus epoch committing this participant's current environment
 /// root, and advance the epoch counter.  No-op (with a log) if consensus is off.
-fn commit_state<T: Transport>(
-    consensus: &mut Option<SingleLeader<T>>,
+fn commit_state(
+    consensus: &mut Option<Box<dyn ConsensusBackend>>,
     epoch: &mut u64,
     participant: &Participant,
     me: usize,
@@ -234,6 +282,10 @@ fn commit_state<T: Transport>(
         eprintln!("[party {}] :commit ignored — consensus disabled", me);
         return;
     };
+    let leader = cb
+        .epoch_leader(*epoch)
+        .map(|l| l.to_string())
+        .unwrap_or_else(|| "?".to_string());
     let root = participant.env_root();
     let roots = RootSet {
         private_root: [0u8; 32],
@@ -242,10 +294,16 @@ fn commit_state<T: Transport>(
     };
     match cb.commit_epoch(*epoch, roots) {
         Ok(commit) => {
-            let short = hex::encode(&commit.group_root[..8]);
+            let group = hex::encode(&commit.group_root[..8]);
+            let rep = hex::encode(&commit.reputation_root[..8]);
             let line = format!(
-                "[party {}] epoch {} committed — group_root={}…",
-                me, *epoch, short
+                "[party {}] epoch {} committed via {} — leader={} group_root={}… rep_root={}…",
+                me,
+                *epoch,
+                cb.name(),
+                leader,
+                group,
+                rep
             );
             if me == 0 {
                 println!("{}", line.bright_green());
@@ -277,11 +335,11 @@ fn run_tcp<T: Transport + 'static>(
         .bright_yellow()
     );
 
-    // Optional consensus backend over its dedicated transport.  Single-leader
-    // (party 0) for parity; swappable for BFT / reputation later.
-    let mut consensus: Option<SingleLeader<T>> = consensus_transport.map(|ct| {
+    // Optional consensus backend over its dedicated transport: single-leader
+    // parity by default, reputation-weighted (ReputationPoUW) with BARU_POUW.
+    let mut consensus: Option<Box<dyn ConsensusBackend>> = consensus_transport.map(|ct| {
         let _ = ct.wait_ready(10_000);
-        SingleLeader::new(me, 3, 0, ct)
+        build_consensus(me, 3, ct)
     });
     let mut epoch: u64 = 0;
 

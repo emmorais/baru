@@ -116,6 +116,12 @@ pub trait ConsensusBackend {
 
     /// Human-readable backend name.
     fn name(&self) -> &'static str;
+
+    /// The party this backend will coordinate `epoch` with, when it can be
+    /// known before the round (for display / diagnostics).  Default: unknown.
+    fn epoch_leader(&self, _epoch: Epoch) -> Option<PartyId> {
+        None
+    }
 }
 
 /// Single-leader consensus: one designated leader collects every participant's
@@ -258,6 +264,10 @@ impl<T: Transport> ConsensusBackend for SingleLeader<T> {
 
     fn name(&self) -> &'static str {
         "single-leader"
+    }
+
+    fn epoch_leader(&self, _epoch: Epoch) -> Option<PartyId> {
+        Some(self.leader)
     }
 }
 

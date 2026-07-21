@@ -93,6 +93,12 @@ impl std::fmt::Debug for PublicIdentity {
 #[derive(Clone, Copy)]
 pub struct IdentitySig(pub [u8; 64]);
 
+impl std::fmt::Debug for IdentitySig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "IdentitySig({}…)", hex::encode(&self.0[..8]))
+    }
+}
+
 // `serde` derives don't cover `[u8; 64]` (arrays > 32), so serialize the
 // signature as a length-prefixed byte string.
 impl Serialize for IdentitySig {

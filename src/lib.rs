@@ -14,3 +14,7 @@ pub mod repl;
 pub mod consensus;
 
 pub mod reputation;
+
+pub mod storage;
+
+pub mod messaging;
