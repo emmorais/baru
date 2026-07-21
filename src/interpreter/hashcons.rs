@@ -442,11 +442,7 @@ mod tests {
         let e2 = parse("(+ (* 2 3) 4)").unwrap();
         let e3 = parse("(+ (* 2 3) 5)").unwrap();
         let mut s = Store::new();
-        let (i1, i2, i3) = (
-            s.intern_expr(&e1),
-            s.intern_expr(&e2),
-            s.intern_expr(&e3),
-        );
+        let (i1, i2, i3) = (s.intern_expr(&e1), s.intern_expr(&e2), s.intern_expr(&e3));
         let (h1, h2, h3) = (s.hash(i1), s.hash(i2), s.hash(i3));
         assert_eq!(h1, h2, "identical programs must share a root");
         assert_ne!(h1, h3, "different programs must differ");

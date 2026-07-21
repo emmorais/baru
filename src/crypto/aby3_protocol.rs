@@ -71,9 +71,10 @@ pub fn share_input<T: Transport>(
     } else {
         let mut components: Vec<Fr> = Vec::new();
         while components.len() < 2 {
-            if let Some((_from, m)) = mbx.recv_matching(TIMEOUT_MS, |m| {
-                matches!(m, MpcMsg::InputShare { share_id: sid, .. } if *sid == share_id)
-            }) {
+            if let Some((_from, m)) = mbx.recv_matching(
+                TIMEOUT_MS,
+                |m| matches!(m, MpcMsg::InputShare { share_id: sid, .. } if *sid == share_id),
+            ) {
                 if let MpcMsg::InputShare { value: v, .. } = m {
                     components.push(v);
                 }
@@ -140,9 +141,10 @@ pub fn reveal<T: Transport>(
         let mut sum = start;
         let mut received = 0usize;
         while received < N - 1 {
-            if let Some((_from, m)) = mbx.recv_matching(TIMEOUT_MS, |m| {
-                matches!(m, MpcMsg::RevealShare { share_id: sid, .. } if *sid == share_id)
-            }) {
+            if let Some((_from, m)) = mbx.recv_matching(
+                TIMEOUT_MS,
+                |m| matches!(m, MpcMsg::RevealShare { share_id: sid, .. } if *sid == share_id),
+            ) {
                 if let MpcMsg::RevealShare { value: v, .. } = m {
                     sum = sum.wrapping_add(v);
                     received += 1;
@@ -373,9 +375,10 @@ pub fn a2b_party<T: Transport>(
     let mut remaining = N - 1;
 
     while remaining > 0 {
-        if let Some((from, m)) = mbx.recv_matching(TIMEOUT_MS, |m| {
-            matches!(m, MpcMsg::TaggedD { op_id: oid, .. } if *oid == op_id)
-        }) {
+        if let Some((from, m)) = mbx.recv_matching(
+            TIMEOUT_MS,
+            |m| matches!(m, MpcMsg::TaggedD { op_id: oid, .. } if *oid == op_id),
+        ) {
             if let MpcMsg::TaggedD { value: v, .. } = m {
                 if !got_d[from] {
                     d_shares[from] = v;

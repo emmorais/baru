@@ -28,9 +28,7 @@ use serde::{Deserialize, Serialize};
 
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::crypto::{verify_tls12_signature, verify_tls13_signature, WebPkiSupportedAlgorithms};
-use rustls::pki_types::{
-    CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName, UnixTime,
-};
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName, UnixTime};
 use rustls::{
     ClientConfig, ClientConnection, DigitallySignedStruct, ServerConfig, ServerConnection,
     SignatureScheme, StreamOwned,
@@ -115,9 +113,7 @@ impl TlsConfigs {
         let cert = rcgen::generate_simple_self_signed(vec!["baru".to_string()])
             .map_err(|e| format!("rcgen: {e}"))?;
         let cert_der = cert.cert.der().clone();
-        let key_der = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
-            cert.key_pair.serialize_der(),
-        ));
+        let key_der = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der()));
 
         let server = ServerConfig::builder_with_provider(provider.clone())
             .with_safe_default_protocol_versions()
@@ -312,7 +308,10 @@ fn accept_peer(
         return;
     }
     let mut ekm = [0u8; EKM_LEN];
-    if conn.export_keying_material(&mut ekm, EKM_LABEL, None).is_err() {
+    if conn
+        .export_keying_material(&mut ekm, EKM_LABEL, None)
+        .is_err()
+    {
         return;
     }
     let mut stream = StreamOwned::new(conn, sock);

@@ -449,11 +449,7 @@ impl Transport for TcpTransport {
         // Wait until we have seen inbound Hellos from all peers.
         let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
         loop {
-            let seen = self
-                .peers_seen
-                .lock()
-                .map(|p| p.len())
-                .unwrap_or(0);
+            let seen = self.peers_seen.lock().map(|p| p.len()).unwrap_or(0);
             if seen >= npeers {
                 return true;
             }
