@@ -173,9 +173,18 @@ fn display_result(result: &Types, participant: &Participant) -> String {
 fn run_tcp(me: usize, mpc_addrs: Vec<String>, dist_addrs: Vec<String>) {
     let mpc_transport = TcpTransport::new(me, mpc_addrs);
     let dist_transport = TcpTransport::new(me, dist_addrs);
+
+    // Readiness barrier: block until fully connected to all peers on both
+    // transports before doing any protocol work.  Replaces startup `sleep`s.
+    let mpc_ok = mpc_transport.wait_ready(10_000);
+    let dist_ok = dist_transport.wait_ready(10_000);
     eprintln!(
         "{}",
-        format!("[party {}] TCP transports ready", me).bright_yellow()
+        format!(
+            "[party {}] TCP transports ready (mpc={}, dist={})",
+            me, mpc_ok, dist_ok
+        )
+        .bright_yellow()
     );
 
     let participant = Participant::new_transport(me, mpc_transport);
@@ -571,7 +580,6 @@ fn main() {
         }
         // fourth arg is dist_addrs (MPC interactive mode)
         let dist_addrs: Vec<String> = args[3].split(',').map(|s| s.to_string()).collect();
-        thread::sleep(Duration::from_millis(300 + me as u64 * 150));
         run_tcp(me, addrs, dist_addrs);
         return;
     }

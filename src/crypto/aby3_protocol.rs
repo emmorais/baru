@@ -5,14 +5,10 @@
 //! and related operations. These are specific to the ABY3 scheme and should not
 //! be used directly by the evaluator or generic backends.
 
-use std::thread::sleep;
-
 use rand::Rng;
 
 use crate::crypto::arith::gen_beaver_triple;
-use crate::crypto::net::{
-    deserialize_msg, recv_blocking, serialize_msg, MpcMsg, PartyId, Transport,
-};
+use crate::crypto::net::{serialize_msg, Mailbox, MpcMsg, PartyId, Transport};
 use crate::crypto::types::{Fr, Share3};
 
 const N: usize = 3;
@@ -39,7 +35,7 @@ pub fn share_input<T: Transport>(
     share_id: u64,
     owner: PartyId,
     me: PartyId,
-    transport: &T,
+    mbx: &Mailbox<T>,
 ) -> PartyShare {
     if me == owner {
         let mut rng = rand::thread_rng();
@@ -52,14 +48,14 @@ pub fn share_input<T: Transport>(
         for i in 0..N {
             let right_idx = (i + 1) % N;
             if i != me {
-                transport.send(
+                mbx.send(
                     i,
                     serialize_msg(&MpcMsg::InputShare {
                         share_id,
                         value: s[i],
                     }),
                 );
-                transport.send(
+                mbx.send(
                     i,
                     serialize_msg(&MpcMsg::InputShare {
                         share_id,
@@ -75,16 +71,11 @@ pub fn share_input<T: Transport>(
     } else {
         let mut components: Vec<Fr> = Vec::new();
         while components.len() < 2 {
-            if let Some((_from, msg)) = recv_blocking(transport, TIMEOUT_MS) {
-                let m: MpcMsg = deserialize_msg(&msg);
-                if let MpcMsg::InputShare {
-                    share_id: sid,
-                    value: v,
-                } = m
-                {
-                    if sid == share_id {
-                        components.push(v);
-                    }
+            if let Some((_from, m)) = mbx.recv_matching(TIMEOUT_MS, |m| {
+                matches!(m, MpcMsg::InputShare { share_id: sid, .. } if *sid == share_id)
+            }) {
+                if let MpcMsg::InputShare { value: v, .. } = m {
+                    components.push(v);
                 }
             } else {
                 panic!(
@@ -141,12 +132,35 @@ pub fn reveal<T: Transport>(
     share_id: u64,
     reveal_to: Option<PartyId>,
     me: PartyId,
-    transport: &T,
+    mbx: &Mailbox<T>,
 ) -> Fr {
+    // Collect `N - 1` RevealShare contributions for `share_id`, summing them
+    // into `start`.  Buffering means peer contributions can arrive in any order.
+    fn collect<T: Transport>(mbx: &Mailbox<T>, share_id: u64, start: Fr) -> Fr {
+        let mut sum = start;
+        let mut received = 0usize;
+        while received < N - 1 {
+            if let Some((_from, m)) = mbx.recv_matching(TIMEOUT_MS, |m| {
+                matches!(m, MpcMsg::RevealShare { share_id: sid, .. } if *sid == share_id)
+            }) {
+                if let MpcMsg::RevealShare { value: v, .. } = m {
+                    sum = sum.wrapping_add(v);
+                    received += 1;
+                }
+            } else {
+                panic!(
+                    "reveal: timeout waiting for RevealShare share_id={}",
+                    share_id
+                );
+            }
+        }
+        sum
+    }
+
     match reveal_to {
         Some(target) => {
             if me != target {
-                transport.send(
+                mbx.send(
                     target,
                     serialize_msg(&MpcMsg::RevealShare {
                         share_id,
@@ -155,58 +169,14 @@ pub fn reveal<T: Transport>(
                 );
                 return 0;
             }
-            let mut sum = share.left;
-            let mut received = 0usize;
-            while received < N - 1 {
-                if let Some((_from, msg)) = recv_blocking(transport, TIMEOUT_MS) {
-                    let m: MpcMsg = deserialize_msg(&msg);
-                    if let MpcMsg::RevealShare {
-                        share_id: sid,
-                        value: v,
-                    } = m
-                    {
-                        if sid == share_id {
-                            sum = sum.wrapping_add(v);
-                            received += 1;
-                        }
-                    }
-                } else {
-                    panic!(
-                        "reveal: timeout waiting for RevealShare share_id={}",
-                        share_id
-                    );
-                }
-            }
-            sum
+            collect(mbx, share_id, share.left)
         }
         None => {
-            transport.broadcast(serialize_msg(&MpcMsg::RevealShare {
+            mbx.broadcast(serialize_msg(&MpcMsg::RevealShare {
                 share_id,
                 value: share.left,
             }));
-            let mut sum = share.left;
-            let mut received = 0usize;
-            while received < N - 1 {
-                if let Some((_from, msg)) = recv_blocking(transport, TIMEOUT_MS) {
-                    let m: MpcMsg = deserialize_msg(&msg);
-                    if let MpcMsg::RevealShare {
-                        share_id: sid,
-                        value: v,
-                    } = m
-                    {
-                        if sid == share_id {
-                            sum = sum.wrapping_add(v);
-                            received += 1;
-                        }
-                    }
-                } else {
-                    panic!(
-                        "reveal: timeout waiting for RevealShare share_id={}",
-                        share_id
-                    );
-                }
-            }
-            sum
+            collect(mbx, share_id, share.left)
         }
     }
 }
@@ -216,7 +186,7 @@ pub fn reveal<T: Transport>(
 pub fn deal_triple<T: Transport>(
     triple_id: u64,
     me: PartyId,
-    transport: &T,
+    mbx: &Mailbox<T>,
 ) -> (PartyShare, PartyShare, PartyShare) {
     let (x_sh, y_sh, z_sh) = gen_beaver_triple();
 
@@ -228,7 +198,7 @@ pub fn deal_triple<T: Transport>(
         if i == me {
             continue;
         }
-        transport.send(
+        mbx.send(
             i,
             serialize_msg(&MpcMsg::TripleComponent {
                 triple_id,
@@ -236,7 +206,7 @@ pub fn deal_triple<T: Transport>(
                 right: x_parts[i].right,
             }),
         );
-        transport.send(
+        mbx.send(
             i,
             serialize_msg(&MpcMsg::TripleComponent {
                 triple_id: triple_id + 1,
@@ -244,7 +214,7 @@ pub fn deal_triple<T: Transport>(
                 right: y_parts[i].right,
             }),
         );
-        transport.send(
+        mbx.send(
             i,
             serialize_msg(&MpcMsg::TripleComponent {
                 triple_id: triple_id + 2,
@@ -264,15 +234,17 @@ pub fn deal_triple<T: Transport>(
 /// Receive a triple that was dealt by another party.
 pub fn receive_triple<T: Transport>(
     triple_id: u64,
-    transport: &T,
+    mbx: &Mailbox<T>,
 ) -> (PartyShare, PartyShare, PartyShare) {
     let mut x: Option<PartyShare> = None;
     let mut y: Option<PartyShare> = None;
     let mut z: Option<PartyShare> = None;
 
     while x.is_none() || y.is_none() || z.is_none() {
-        if let Some((_from, msg)) = recv_blocking(transport, TIMEOUT_MS) {
-            let m: MpcMsg = deserialize_msg(&msg);
+        if let Some((_from, m)) = mbx.recv_matching(TIMEOUT_MS, |m| {
+            matches!(m, MpcMsg::TripleComponent { triple_id: tid, .. }
+                if (triple_id..=triple_id + 2).contains(tid))
+        }) {
             if let MpcMsg::TripleComponent {
                 triple_id: tid,
                 left,
@@ -300,25 +272,24 @@ pub fn mul_party<T: Transport>(
     b: &PartyShare,
     op_id: u64,
     me: PartyId,
-    transport: &T,
+    mbx: &Mailbox<T>,
 ) -> PartyShare {
-    println!("mul_party: op_id={}, me={}", op_id, me);
     let triple_id = op_id + 1;
 
+    // Party 0 deals the triple; the others receive it.  The `Mailbox` buffers
+    // any D/E messages that race ahead of the triple, so no ordering hack (the
+    // former `sleep`) is needed on the receiving parties.
     let (x, y, z) = if me == 0 {
-        deal_triple(triple_id, me, transport)
+        deal_triple(triple_id, me, mbx)
     } else {
-        sleep(std::time::Duration::from_millis(500));
-        receive_triple(triple_id, transport)
+        receive_triple(triple_id, mbx)
     };
 
     let d_i = a.left.wrapping_sub(x.left);
     let e_i = b.left.wrapping_sub(y.left);
 
-    transport.broadcast(serialize_msg(&MpcMsg::TaggedD { op_id, value: d_i }));
-    println!("broadcast d_i for op_id={}", op_id);
-    transport.broadcast(serialize_msg(&MpcMsg::TaggedE { op_id, value: e_i }));
-    println!("broadcast e_i for op_id={}", op_id);
+    mbx.broadcast(serialize_msg(&MpcMsg::TaggedD { op_id, value: d_i }));
+    mbx.broadcast(serialize_msg(&MpcMsg::TaggedE { op_id, value: e_i }));
 
     let mut d_shares = [0u128; N];
     let mut e_shares = [0u128; N];
@@ -331,29 +302,18 @@ pub fn mul_party<T: Transport>(
     let mut remaining = (N - 1) * 2;
 
     while remaining > 0 {
-        println!("remaining = {}", remaining);
-        if let Some((from, msg)) = recv_blocking(transport, TIMEOUT_MS) {
-            println!(
-                "mul_party: op_id={}, me={}, received from {}",
-                op_id, me, from
-            );
-            let m: MpcMsg = deserialize_msg(&msg);
-            println!("m: {:?}", m);
+        if let Some((from, m)) = mbx.recv_matching(TIMEOUT_MS, |m| {
+            matches!(m,
+                MpcMsg::TaggedD { op_id: oid, .. } | MpcMsg::TaggedE { op_id: oid, .. }
+                    if *oid == op_id)
+        }) {
             match m {
-                MpcMsg::TaggedD {
-                    op_id: oid,
-                    value: v,
-                } if oid == op_id => {
-                    if !got_d[from] {
-                        d_shares[from] = v;
-                        got_d[from] = true;
-                        remaining -= 1;
-                    }
+                MpcMsg::TaggedD { value: v, .. } if !got_d[from] => {
+                    d_shares[from] = v;
+                    got_d[from] = true;
+                    remaining -= 1;
                 }
-                MpcMsg::TaggedE {
-                    op_id: oid,
-                    value: v,
-                } if oid == op_id && !got_e[from] => {
+                MpcMsg::TaggedE { value: v, .. } if !got_e[from] => {
                     e_shares[from] = v;
                     got_e[from] = true;
                     remaining -= 1;
@@ -382,9 +342,8 @@ pub fn a2b_party<T: Transport>(
     nbits: usize,
     op_id: u64,
     me: PartyId,
-    transport: &T,
+    mbx: &Mailbox<T>,
 ) -> Vec<PartyShare> {
-    println!("a2b_party: op_id={}, me={}", op_id, me);
     let mut rng_seed = [0u8; 32];
     rng_seed[..8].copy_from_slice(&op_id.to_le_bytes());
     use rand::SeedableRng;
@@ -405,7 +364,7 @@ pub fn a2b_party<T: Transport>(
     }
 
     let d_i = a.left.wrapping_sub(r_sh.left);
-    transport.broadcast(serialize_msg(&MpcMsg::TaggedD { op_id, value: d_i }));
+    mbx.broadcast(serialize_msg(&MpcMsg::TaggedD { op_id, value: d_i }));
 
     let mut d_shares = [0u128; N];
     d_shares[me] = d_i;
@@ -414,18 +373,11 @@ pub fn a2b_party<T: Transport>(
     let mut remaining = N - 1;
 
     while remaining > 0 {
-        if let Some((from, msg)) = recv_blocking(transport, TIMEOUT_MS) {
-            println!(
-                "a2b_party: op_id={}, me={}, received from {}",
-                op_id, me, from
-            );
-            let m: MpcMsg = deserialize_msg(&msg);
-            if let MpcMsg::TaggedD {
-                op_id: oid,
-                value: v,
-            } = m
-            {
-                if oid == op_id && !got_d[from] {
+        if let Some((from, m)) = mbx.recv_matching(TIMEOUT_MS, |m| {
+            matches!(m, MpcMsg::TaggedD { op_id: oid, .. } if *oid == op_id)
+        }) {
+            if let MpcMsg::TaggedD { value: v, .. } = m {
+                if !got_d[from] {
                     d_shares[from] = v;
                     got_d[from] = true;
                     remaining -= 1;
@@ -474,9 +426,9 @@ pub fn reveal_bit_to_all<T: Transport>(
     share: &PartyShare,
     share_id: u64,
     me: PartyId,
-    transport: &T,
+    mbx: &Mailbox<T>,
 ) -> bool {
-    let v = reveal(share, share_id, None, me, transport);
+    let v = reveal(share, share_id, None, me, mbx);
     v % 2 != 0
 }
 

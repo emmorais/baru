@@ -6,14 +6,17 @@ use std::time::{Duration, Instant};
 
 // ── helpers ──────────────────────────────────────────────────────────────────
 
-fn find_bin() -> &'static Path {
-    let release = Path::new("./target/release/tcp_party");
-    let debug = Path::new("./target/debug/tcp_party");
-    if release.exists() {
-        return release;
-    }
-    if debug.exists() {
-        return debug;
+fn find_bin() -> std::path::PathBuf {
+    // Check both extension-less (Unix) and `.exe` (Windows) names.
+    const CANDIDATES: [&str; 4] = [
+        "./target/release/tcp_party.exe",
+        "./target/release/tcp_party",
+        "./target/debug/tcp_party.exe",
+        "./target/debug/tcp_party",
+    ];
+    let first_existing = || CANDIDATES.iter().map(Path::new).find(|p| p.exists());
+    if let Some(p) = first_existing() {
+        return p.to_path_buf();
     }
     // Binary not found — build it automatically so tests work without a prior `cargo build`.
     let status = Command::new("cargo")
@@ -21,11 +24,9 @@ fn find_bin() -> &'static Path {
         .status()
         .expect("failed to run cargo build");
     assert!(status.success(), "cargo build --bin tcp_party failed");
-    if debug.exists() {
-        debug
-    } else {
-        panic!("tcp_party binary still missing after build")
-    }
+    first_existing()
+        .map(|p| p.to_path_buf())
+        .expect("tcp_party binary still missing after build")
 }
 
 /// Reserve `n` consecutive free ports and return their addresses.
@@ -52,7 +53,7 @@ fn tcp_process_integration() {
 
     let mut children = Vec::new();
     for i in 0..3usize {
-        let child = Command::new(bin_path)
+        let child = Command::new(&bin_path)
             .arg(i.to_string())
             .arg(&addrs_str)
             .arg(match i {
@@ -156,7 +157,7 @@ fn run_cases(cases: &[Case]) {
     // Spawn workers 1 and 2 first; they need to be listening before party 0 connects.
     let mut worker_children = Vec::new();
     for i in 1..3usize {
-        let child = Command::new(bin_path)
+        let child = Command::new(&bin_path)
             .arg(i.to_string())
             .arg(&mpc_str)
             .arg(&dist_str)
@@ -170,7 +171,7 @@ fn run_cases(cases: &[Case]) {
     }
 
     // Spawn party 0 with piped stdin so we can drive it programmatically.
-    let mut party0 = Command::new(bin_path)
+    let mut party0 = Command::new(&bin_path)
         .arg("0")
         .arg(&mpc_str)
         .arg(&dist_str)
@@ -443,7 +444,7 @@ fn tcp_mpc_error_recovery() {
 
     let mut workers: Vec<_> = (1..3)
         .map(|i| {
-            let c = Command::new(bin_path)
+            let c = Command::new(&bin_path)
                 .arg(i.to_string())
                 .arg(&mpc_str)
                 .arg(&dist_str)
@@ -457,7 +458,7 @@ fn tcp_mpc_error_recovery() {
         })
         .collect();
 
-    let mut party0 = Command::new(bin_path)
+    let mut party0 = Command::new(&bin_path)
         .arg("0")
         .arg(&mpc_str)
         .arg(&dist_str)
