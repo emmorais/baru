@@ -32,6 +32,32 @@ cargo test
 cargo run --bin baru
 ```
 
+### Building on Windows
+
+The vendored SEAL/CKKS backend (`third_party/sealy`) is a C++ library built via
+cmake + MSVC, so a plain `cargo build` from a bare shell fails — bindgen can't
+find the Windows SDK headers. Use the helper, which enters the Visual Studio
+developer environment and adds the extra include/PATH entries SEAL needs:
+
+```bat
+build-windows.cmd build
+build-windows.cmd test --lib
+build-windows.cmd build --features pq-tls
+```
+
+One-time prerequisites:
+
+- **Visual Studio 2022** (or Build Tools) with the *Desktop development with
+  C++* workload — provides MSVC + cmake.
+- **CorError.h** — SEAL's C wrapper includes it, but the modern Windows SDK no
+  longer ships it. Install an older SDK that also lays down the .NET Framework
+  SDK: `winget install Microsoft.WindowsSDK.10.0.18362`.
+- **NASM** — only for `--features pq-tls` (post-quantum TLS via aws-lc-rs):
+  `winget install NASM.NASM`.
+
+The Windows-specific source patches to the vendored crate are documented in
+[`third_party/sealy/BARU_PATCHES.md`](third_party/sealy/BARU_PATCHES.md).
+
 ---
 
 ## Secret sharing — how it works
