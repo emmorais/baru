@@ -15,22 +15,26 @@
 use std::env;
 use std::panic;
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
 use colored::*;
 use rustyline::error::ReadlineError;
 use rustyline::Editor;
+use serde::{Deserialize, Serialize};
 
 use sha2::{Digest, Sha256};
 
 use baru::consensus::{ConsensusBackend, RootSet, SingleLeader};
+use baru::crypto::identity::Identity;
 use baru::crypto::net::{
     deserialize_msg, recv_blocking, recv_forever, serialize_msg, InprocHandle, MpcMsg,
     TcpTransport, Transport,
 };
 use baru::fhe::lifecycle::Effect;
 use baru::interpreter::{parse, Participant, Types};
+use baru::messaging::{open, seal, ChatSecret, Contact, Forum, ForumPost};
 use baru::reputation::{ReputationLedger, ReputationPoUW};
 use baru::repl::{print_examples_for, print_examples_list, print_help, ReplHelper, EXAMPLES};
 
@@ -191,12 +195,13 @@ fn bump_port(addr: &str, delta: u16) -> String {
 /// consensus transport is added when `BARU_CONSENSUS` is set.
 fn launch(me: usize, mpc_addrs: Vec<String>, dist_addrs: Vec<String>) {
     let want_consensus = std::env::var("BARU_CONSENSUS").is_ok();
+    let want_messaging = std::env::var("BARU_CHAT").is_ok();
     let cons_addrs: Vec<String> = mpc_addrs.iter().map(|a| bump_port(a, 200)).collect();
+    let msg_addrs: Vec<String> = mpc_addrs.iter().map(|a| bump_port(a, 300)).collect();
 
     #[cfg(feature = "pq-tls")]
     {
         if std::env::var("BARU_TLS").is_ok() {
-            use baru::crypto::identity::Identity;
             use baru::crypto::tls::TlsTransport;
             // One long-term identity for this party, shared by all channels.
             let id = Identity::generate();
@@ -208,22 +213,23 @@ fn launch(me: usize, mpc_addrs: Vec<String>, dist_addrs: Vec<String>) {
             let mpc = TlsTransport::new(me, mpc_addrs, id).expect("tls mpc transport");
             let dist = TlsTransport::new(me, dist_addrs, Identity::from_secret_bytes(secret))
                 .expect("tls dist transport");
-            let cons = if want_consensus {
-                Some(
-                    TlsTransport::new(me, cons_addrs, Identity::from_secret_bytes(secret))
-                        .expect("tls consensus transport"),
-                )
-            } else {
-                None
-            };
-            run_tcp(me, mpc, dist, cons);
+            let cons = want_consensus.then(|| {
+                TlsTransport::new(me, cons_addrs, Identity::from_secret_bytes(secret))
+                    .expect("tls consensus transport")
+            });
+            let msg = want_messaging.then(|| {
+                TlsTransport::new(me, msg_addrs, Identity::from_secret_bytes(secret))
+                    .expect("tls messaging transport")
+            });
+            run_tcp(me, mpc, dist, cons, msg);
             return;
         }
     }
     let mpc = TcpTransport::new(me, mpc_addrs);
     let dist = TcpTransport::new(me, dist_addrs);
     let cons = want_consensus.then(|| TcpTransport::new(me, cons_addrs));
-    run_tcp(me, mpc, dist, cons);
+    let msg = want_messaging.then(|| TcpTransport::new(me, msg_addrs));
+    run_tcp(me, mpc, dist, cons, msg);
 }
 
 /// Deterministic roster identity for a party — every node computes the same
@@ -316,11 +322,155 @@ fn commit_state(
     }
 }
 
+// ── P2P chat + forum ───────────────────────────────────────────────────────────
+//
+// Delivery for baru::messaging over a dedicated transport.  For the demo each
+// party derives its identity and chat key deterministically from its index, so
+// everyone can address everyone without a discovery protocol (in production
+// keys are self-generated and contacts exchanged over the overlay).
+
+/// Envelope for messages carried on the messaging transport.
+#[derive(Serialize, Deserialize)]
+enum MsgEnvelope {
+    Chat(baru::messaging::ChatMessage),
+    Post(ForumPost),
+}
+
+fn msg_identity(party: usize) -> Identity {
+    let mut h = Sha256::new();
+    h.update(b"baru-msg-id-v1");
+    h.update((party as u64).to_le_bytes());
+    Identity::from_secret_bytes(h.finalize().into())
+}
+
+fn msg_chat(party: usize) -> ChatSecret {
+    let mut h = Sha256::new();
+    h.update(b"baru-msg-chat-v1");
+    h.update((party as u64).to_le_bytes());
+    ChatSecret::from_bytes(h.finalize().into())
+}
+
+fn msg_contact(party: usize) -> Contact {
+    Contact {
+        identity: msg_identity(party).public(),
+        chat_pk: msg_chat(party).public(),
+    }
+}
+
+/// Background loop: decrypt incoming chat addressed to us and append forum posts.
+fn messaging_receiver<T: Transport>(me: usize, transport: Arc<T>, forum: Arc<Mutex<Forum>>) {
+    let my_id = msg_identity(me);
+    let my_chat = msg_chat(me);
+    loop {
+        if let Some((_from, bytes)) = transport.recv() {
+            match bincode::deserialize::<MsgEnvelope>(&bytes) {
+                Ok(MsgEnvelope::Chat(msg)) => match open(&my_id, &my_chat, &msg) {
+                    Ok(pt) => eprintln!(
+                        "{}",
+                        format!(
+                            "[party {}] 📩 chat from {}: {}",
+                            me,
+                            msg.from.id(),
+                            String::from_utf8_lossy(&pt)
+                        )
+                        .bright_cyan()
+                    ),
+                    Err(baru::messaging::ChatError::WrongRecipient) => {}
+                    Err(e) => eprintln!("[party {}] chat error: {}", me, e),
+                },
+                Ok(MsgEnvelope::Post(post)) => {
+                    if let Ok(mut f) = forum.lock() {
+                        if f.append(post.clone()).is_ok() {
+                            eprintln!(
+                                "{}",
+                                format!(
+                                    "[party {}] 📰 forum {}: {}  (root={})",
+                                    me,
+                                    post.author.id(),
+                                    post.body,
+                                    hex::encode(&f.root()[..6])
+                                )
+                                .bright_blue()
+                            );
+                        }
+                    }
+                }
+                Err(_) => {}
+            }
+        } else {
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+}
+
+/// Chat + forum delivery for this party.
+struct Messaging<T: Transport> {
+    me: usize,
+    n: usize,
+    transport: Arc<T>,
+    forum: Arc<Mutex<Forum>>,
+    post_seq: u64,
+}
+
+impl<T: Transport + 'static> Messaging<T> {
+    fn new(me: usize, n: usize, transport: T) -> Self {
+        let transport = Arc::new(transport);
+        let _ = transport.wait_ready(10_000);
+        let forum = Arc::new(Mutex::new(Forum::new()));
+        let rx_t = transport.clone();
+        let rx_f = forum.clone();
+        thread::spawn(move || messaging_receiver(me, rx_t, rx_f));
+        Messaging {
+            me,
+            n,
+            transport,
+            forum,
+            post_seq: 0,
+        }
+    }
+
+    /// Seal an end-to-end encrypted DM and unicast it to `to`.
+    fn send_chat(&self, to: usize, text: &str) {
+        if to >= self.n || to == self.me {
+            println!("{}", "chat: pick another party's index".bright_red());
+            return;
+        }
+        let msg = seal(
+            &msg_identity(self.me),
+            &msg_chat(self.me),
+            &msg_contact(to),
+            text.as_bytes(),
+        );
+        self.transport
+            .send(to, serialize_msg(&MsgEnvelope::Chat(msg)));
+        println!(
+            "{}",
+            format!("🔒 encrypted chat sent to party {}", to).bright_cyan()
+        );
+    }
+
+    /// Broadcast a signed forum post and append it locally.
+    fn post(&mut self, text: &str) {
+        self.post_seq += 1;
+        let post = ForumPost::create(&msg_identity(self.me), self.post_seq, text);
+        self.transport
+            .broadcast(serialize_msg(&MsgEnvelope::Post(post.clone())));
+        if let Ok(mut f) = self.forum.lock() {
+            let _ = f.append(post);
+            println!(
+                "{}",
+                format!("📰 posted to forum (root={})", hex::encode(&f.root()[..6])).bright_blue()
+            );
+        }
+    }
+}
+
 fn run_tcp<T: Transport + 'static>(
     me: usize,
     mpc_transport: T,
     dist_transport: T,
     consensus_transport: Option<T>,
+    messaging_transport: Option<T>,
 ) {
     // Readiness barrier: block until fully connected to all peers on both
     // transports before doing any protocol work.  Replaces startup `sleep`s.
@@ -342,6 +492,9 @@ fn run_tcp<T: Transport + 'static>(
         build_consensus(me, 3, ct)
     });
     let mut epoch: u64 = 0;
+
+    // Optional p2p chat + forum over a dedicated transport (spawns a receiver).
+    let mut messaging = messaging_transport.map(|mt| Messaging::new(me, 3, mt));
 
     let participant = Participant::new_transport(me, mpc_transport);
 
@@ -519,6 +672,40 @@ fn run_tcp<T: Transport + 'static>(
                                 "{}",
                                 "consensus disabled — set BARU_CONSENSUS=1 on all parties"
                                     .bright_yellow()
+                            );
+                        }
+                        continue;
+                    }
+                    ":chat" => {
+                        // Send an end-to-end encrypted DM to a peer.
+                        if let Some(m) = messaging.as_ref() {
+                            let to = parts.next().and_then(|s| s.parse::<usize>().ok());
+                            let text = parts.next().unwrap_or("");
+                            match to {
+                                Some(p) if !text.is_empty() => m.send_chat(p, text),
+                                _ => println!("usage: :chat <party-index> <message>"),
+                            }
+                        } else {
+                            println!(
+                                "{}",
+                                "chat disabled — set BARU_CHAT=1 on all parties".bright_yellow()
+                            );
+                        }
+                        continue;
+                    }
+                    ":post" => {
+                        // Broadcast a signed post to the forum.
+                        if let Some(m) = messaging.as_mut() {
+                            let body = src.strip_prefix(":post").map(|s| s.trim()).unwrap_or("");
+                            if body.is_empty() {
+                                println!("usage: :post <message>");
+                            } else {
+                                m.post(body);
+                            }
+                        } else {
+                            println!(
+                                "{}",
+                                "forum disabled — set BARU_CHAT=1 on all parties".bright_yellow()
                             );
                         }
                         continue;
