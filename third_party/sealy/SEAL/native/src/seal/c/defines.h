@@ -16,7 +16,11 @@ static_assert(false, "Require architecture == x64");
 #if defined(SEAL_C_EXPORTS) || defined(seal_c_EXPORTS) || defined(sealc_EXPORTS)
 #define SEAL_C_DECOR extern "C" __declspec(dllexport)
 #else
-#define SEAL_C_DECOR extern "C" __declspec(dllimport)
+// BARU patch: sealy links SEAL_C statically (never as a DLL), so the C API
+// definitions must not be `dllimport` (MSVC C2491: cannot define a dllimport
+// function).  cmake only auto-defines `sealc_EXPORTS` for shared libs, so on a
+// static MSVC build we fall through to here — use plain `extern "C"`.
+#define SEAL_C_DECOR extern "C"
 #endif
 
 #define SEAL_C_CALL __cdecl

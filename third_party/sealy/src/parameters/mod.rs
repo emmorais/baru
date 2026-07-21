@@ -1,6 +1,5 @@
 use std::ffi::c_void;
 use std::mem::forget;
-use std::os::raw::c_ulong;
 use std::ptr::null_mut;
 
 use crate::bindgen::{self};
@@ -200,7 +199,9 @@ impl EncryptionParameters {
 
 	/// Returns the parms id.
 	pub fn get_parms_id(&self) -> u64 {
-		let mut parms_id: c_ulong = 0;
+		// The C API takes `uint64_t*` (u64 on all platforms); the original
+		// `c_ulong` is only u64 on LP64 (Unix) and breaks on Windows (LLP64).
+		let mut parms_id: u64 = 0;
 
 		unsafe {
 			convert_seal_error(bindgen::EncParams_GetParmsId(self.handle, &mut parms_id))

@@ -58,11 +58,13 @@ impl MemoryPool {
 
 	/// Returns the number of bytes used in the pool.
 	pub fn pool_used_byte_count(&self) -> Result<i64> {
-		let mut count: i64 = 0;
+		// SEAL's C API takes `long*`; `c_long` is i32 on Windows (LLP64) and i64
+		// on Unix (LP64), so match the binding then widen for the return.
+		let mut count: std::os::raw::c_long = 0;
 
 		try_seal!(unsafe { bindgen::MemoryPoolHandle_UseCount(self.get_handle(), &mut count) })?;
 
-		Ok(count)
+		Ok(count as i64)
 	}
 
 	/// Returns true if the pool is initialized.
