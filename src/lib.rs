@@ -12,3 +12,5 @@ pub mod bench;
 pub mod repl;
 
 pub mod consensus;
+
+pub mod reputation;
