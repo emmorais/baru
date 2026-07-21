@@ -10,3 +10,5 @@ pub mod fhe;
 pub mod bench;
 
 pub mod repl;
+
+pub mod consensus;

@@ -22,6 +22,7 @@ use colored::*;
 use rustyline::error::ReadlineError;
 use rustyline::Editor;
 
+use baru::consensus::{ConsensusBackend, RootSet, SingleLeader};
 use baru::crypto::net::{
     deserialize_msg, recv_blocking, recv_forever, serialize_msg, InprocHandle, MpcMsg,
     TcpTransport, Transport,
@@ -170,33 +171,99 @@ fn display_result(result: &Types, participant: &Participant) -> String {
     }
 }
 
-/// Build the pair of transports (plaintext TCP, or PQ-TLS when compiled with
-/// `--features pq-tls` and `BARU_TLS` is set) and run the party.
+/// Shift the port of a `host:port` address by `delta` (used to derive the
+/// dist / consensus address sets from the MPC one).
+fn bump_port(addr: &str, delta: u16) -> String {
+    if let Some(colon) = addr.rfind(':') {
+        let port: u16 = addr[colon + 1..].parse().unwrap_or(7000);
+        format!("{}:{}", &addr[..colon], port.wrapping_add(delta))
+    } else {
+        format!("{}:{}", addr, 7000 + delta)
+    }
+}
+
+/// Build the transports (plaintext TCP, or PQ-TLS when compiled with
+/// `--features pq-tls` and `BARU_TLS` is set) and run the party.  A dedicated
+/// consensus transport is added when `BARU_CONSENSUS` is set.
 fn launch(me: usize, mpc_addrs: Vec<String>, dist_addrs: Vec<String>) {
+    let want_consensus = std::env::var("BARU_CONSENSUS").is_ok();
+    let cons_addrs: Vec<String> = mpc_addrs.iter().map(|a| bump_port(a, 200)).collect();
+
     #[cfg(feature = "pq-tls")]
     {
         if std::env::var("BARU_TLS").is_ok() {
             use baru::crypto::identity::Identity;
             use baru::crypto::tls::TlsTransport;
-            // One long-term identity for this party, shared by both channels.
+            // One long-term identity for this party, shared by all channels.
             let id = Identity::generate();
-            let id_dist = Identity::from_secret_bytes(id.to_secret_bytes());
+            let secret = id.to_secret_bytes();
             eprintln!(
                 "{}",
                 format!("[party {}] identity {}", me, id.id()).bright_magenta()
             );
             let mpc = TlsTransport::new(me, mpc_addrs, id).expect("tls mpc transport");
-            let dist = TlsTransport::new(me, dist_addrs, id_dist).expect("tls dist transport");
-            run_tcp(me, mpc, dist);
+            let dist = TlsTransport::new(me, dist_addrs, Identity::from_secret_bytes(secret))
+                .expect("tls dist transport");
+            let cons = if want_consensus {
+                Some(
+                    TlsTransport::new(me, cons_addrs, Identity::from_secret_bytes(secret))
+                        .expect("tls consensus transport"),
+                )
+            } else {
+                None
+            };
+            run_tcp(me, mpc, dist, cons);
             return;
         }
     }
     let mpc = TcpTransport::new(me, mpc_addrs);
     let dist = TcpTransport::new(me, dist_addrs);
-    run_tcp(me, mpc, dist);
+    let cons = want_consensus.then(|| TcpTransport::new(me, cons_addrs));
+    run_tcp(me, mpc, dist, cons);
 }
 
-fn run_tcp<T: Transport + 'static>(me: usize, mpc_transport: T, dist_transport: T) {
+/// Run one consensus epoch committing this participant's current environment
+/// root, and advance the epoch counter.  No-op (with a log) if consensus is off.
+fn commit_state<T: Transport>(
+    consensus: &mut Option<SingleLeader<T>>,
+    epoch: &mut u64,
+    participant: &Participant,
+    me: usize,
+) {
+    let Some(cb) = consensus.as_mut() else {
+        eprintln!("[party {}] :commit ignored — consensus disabled", me);
+        return;
+    };
+    let root = participant.env_root();
+    let roots = RootSet {
+        private_root: [0u8; 32],
+        public_root: root,
+        state_root: root,
+    };
+    match cb.commit_epoch(*epoch, roots) {
+        Ok(commit) => {
+            let short = hex::encode(&commit.group_root[..8]);
+            let line = format!(
+                "[party {}] epoch {} committed — group_root={}…",
+                me, *epoch, short
+            );
+            if me == 0 {
+                println!("{}", line.bright_green());
+            } else {
+                eprintln!("{}", line.bright_black());
+            }
+            *epoch += 1;
+        }
+        Err(e) => eprintln!("[party {}] consensus error: {}", me, e),
+    }
+}
+
+fn run_tcp<T: Transport + 'static>(
+    me: usize,
+    mpc_transport: T,
+    dist_transport: T,
+    consensus_transport: Option<T>,
+) {
     // Readiness barrier: block until fully connected to all peers on both
     // transports before doing any protocol work.  Replaces startup `sleep`s.
     let mpc_ok = mpc_transport.wait_ready(10_000);
@@ -209,6 +276,14 @@ fn run_tcp<T: Transport + 'static>(me: usize, mpc_transport: T, dist_transport: 
         )
         .bright_yellow()
     );
+
+    // Optional consensus backend over its dedicated transport.  Single-leader
+    // (party 0) for parity; swappable for BFT / reputation later.
+    let mut consensus: Option<SingleLeader<T>> = consensus_transport.map(|ct| {
+        let _ = ct.wait_ready(10_000);
+        SingleLeader::new(me, 3, 0, ct)
+    });
+    let mut epoch: u64 = 0;
 
     let participant = Participant::new_transport(me, mpc_transport);
 
@@ -375,6 +450,21 @@ fn run_tcp<T: Transport + 'static>(me: usize, mpc_transport: T, dist_transport: 
                         }
                         continue;
                     }
+                    ":commit" => {
+                        // Run one live consensus epoch over the network: signal
+                        // the workers, then commit everyone's state roots.
+                        if consensus.is_some() {
+                            broadcast_expr(":commit", &dist_transport);
+                            commit_state(&mut consensus, &mut epoch, &participant, me);
+                        } else {
+                            println!(
+                                "{}",
+                                "consensus disabled — set BARU_CONSENSUS=1 on all parties"
+                                    .bright_yellow()
+                            );
+                        }
+                        continue;
+                    }
                     _ => {
                         println!(
                             "{} {}  (type '{}' for reference)",
@@ -463,6 +553,11 @@ fn run_tcp<T: Transport + 'static>(me: usize, mpc_transport: T, dist_transport: 
                     "{}",
                     format!("[party {}] received :abort, skipping expression.", me).bright_yellow()
                 );
+                continue;
+            }
+            if src == ":commit" {
+                // Party 0 triggered a consensus epoch; participate.
+                commit_state(&mut consensus, &mut epoch, &participant, me);
                 continue;
             }
             eprintln!(
