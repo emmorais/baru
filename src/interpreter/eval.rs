@@ -1536,6 +1536,15 @@ impl Participant {
         be.reset_per_expression();
     }
 
+    /// Content-addressed commitment to this participant's current top-level
+    /// environment, via the hash-consed store.  Serves as a state root that
+    /// consensus can agree on each epoch.
+    pub fn env_root(&self) -> [u8; 32] {
+        let mut store = crate::interpreter::hashcons::Store::new();
+        let root = store.intern_env(&self.store);
+        store.hash(root)
+    }
+
     /// Reset the persistent store (clears user bindings, re-registers builtins)
     pub fn reset_store(&self) {
         self.store.borrow_mut().clear();

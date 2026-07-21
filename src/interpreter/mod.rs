@@ -4,6 +4,8 @@ pub mod ast;
 pub mod backend;
 pub mod eval;
 pub mod gc_backend;
+pub mod hashcons;
+pub mod merkle;
 pub mod parser;
 pub mod transport_backend;
 
