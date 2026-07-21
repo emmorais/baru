@@ -170,10 +170,33 @@ fn display_result(result: &Types, participant: &Participant) -> String {
     }
 }
 
-fn run_tcp(me: usize, mpc_addrs: Vec<String>, dist_addrs: Vec<String>) {
-    let mpc_transport = TcpTransport::new(me, mpc_addrs);
-    let dist_transport = TcpTransport::new(me, dist_addrs);
+/// Build the pair of transports (plaintext TCP, or PQ-TLS when compiled with
+/// `--features pq-tls` and `BARU_TLS` is set) and run the party.
+fn launch(me: usize, mpc_addrs: Vec<String>, dist_addrs: Vec<String>) {
+    #[cfg(feature = "pq-tls")]
+    {
+        if std::env::var("BARU_TLS").is_ok() {
+            use baru::crypto::identity::Identity;
+            use baru::crypto::tls::TlsTransport;
+            // One long-term identity for this party, shared by both channels.
+            let id = Identity::generate();
+            let id_dist = Identity::from_secret_bytes(id.to_secret_bytes());
+            eprintln!(
+                "{}",
+                format!("[party {}] identity {}", me, id.id()).bright_magenta()
+            );
+            let mpc = TlsTransport::new(me, mpc_addrs, id).expect("tls mpc transport");
+            let dist = TlsTransport::new(me, dist_addrs, id_dist).expect("tls dist transport");
+            run_tcp(me, mpc, dist);
+            return;
+        }
+    }
+    let mpc = TcpTransport::new(me, mpc_addrs);
+    let dist = TcpTransport::new(me, dist_addrs);
+    run_tcp(me, mpc, dist);
+}
 
+fn run_tcp<T: Transport + 'static>(me: usize, mpc_transport: T, dist_transport: T) {
     // Readiness barrier: block until fully connected to all peers on both
     // transports before doing any protocol work.  Replaces startup `sleep`s.
     let mpc_ok = mpc_transport.wait_ready(10_000);
@@ -181,7 +204,7 @@ fn run_tcp(me: usize, mpc_addrs: Vec<String>, dist_addrs: Vec<String>) {
     eprintln!(
         "{}",
         format!(
-            "[party {}] TCP transports ready (mpc={}, dist={})",
+            "[party {}] transports ready (mpc={}, dist={})",
             me, mpc_ok, dist_ok
         )
         .bright_yellow()
@@ -580,7 +603,7 @@ fn main() {
         }
         // fourth arg is dist_addrs (MPC interactive mode)
         let dist_addrs: Vec<String> = args[3].split(',').map(|s| s.to_string()).collect();
-        run_tcp(me, addrs, dist_addrs);
+        launch(me, addrs, dist_addrs);
         return;
     }
 
@@ -596,6 +619,5 @@ fn main() {
             }
         })
         .collect();
-    thread::sleep(Duration::from_millis(300 + me as u64 * 150));
-    run_tcp(me, addrs, dist_addrs);
+    launch(me, addrs, dist_addrs);
 }
