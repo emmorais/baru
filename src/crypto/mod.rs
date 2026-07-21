@@ -3,11 +3,14 @@
 pub mod aby3_protocol;
 pub mod arith;
 pub mod bits;
+pub mod identity;
 pub mod net;
 pub mod party;
 pub mod protocol;
 pub mod scheduler;
 pub mod sim;
+#[cfg(feature = "pq-tls")]
+pub mod tls;
 pub mod types;
 
 pub use arith::*;
