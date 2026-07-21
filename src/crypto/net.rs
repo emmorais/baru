@@ -276,7 +276,7 @@ impl<T: Transport> Mailbox<T> {
 /// persistent connection (used by the readiness barrier); `Msg` carries a
 /// payload.  Both are length-prefixed on the wire.
 #[derive(Serialize, Deserialize, Debug, Clone)]
-enum Frame {
+pub(crate) enum Frame {
     Hello(PartyId),
     Msg(PartyId, Message),
 }
@@ -307,8 +307,9 @@ pub struct TcpTransport {
     peers_seen: Arc<Mutex<HashSet<PartyId>>>,
 }
 
-/// Write a length-prefixed bincode-serialized frame to a stream.
-fn write_frame(s: &mut TcpStream, frame: &Frame) -> std::io::Result<()> {
+/// Write a length-prefixed bincode-serialized frame to any writable stream.
+/// Generic over the stream type so both plaintext TCP and TLS reuse it.
+pub(crate) fn write_frame<S: Write>(s: &mut S, frame: &Frame) -> std::io::Result<()> {
     let bytes = bincode::serialize(frame)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
     let len = (bytes.len() as u32).to_be_bytes();
@@ -318,9 +319,10 @@ fn write_frame(s: &mut TcpStream, frame: &Frame) -> std::io::Result<()> {
 }
 
 /// Read length-prefixed frames from a peer connection until EOF/error, routing
-/// `Hello` into `peers_seen` and `Msg` into `inbox`.
-fn read_frames(
-    mut s: TcpStream,
+/// `Hello` into `peers_seen` and `Msg` into `inbox`.  Generic over the stream
+/// type so both plaintext TCP and TLS reuse it.
+pub(crate) fn read_frames<S: Read>(
+    mut s: S,
     inbox: Arc<Mutex<VecDeque<(PartyId, Message)>>>,
     peers_seen: Arc<Mutex<HashSet<PartyId>>>,
 ) {

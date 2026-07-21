@@ -7,12 +7,24 @@ edition = "2021"
 rand = "0.8"
 serde = { version = "1.0", features = ["derive"] }
 bincode = "1.3"
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+sha2 = "0.10"
 rustyline = "11"
 colored = "2"
 serde_json = "1"
 hex = "0.4"
 binius-field = { git = "https://github.com/binius-zk/binius64", rev = "de81069" }
 binius-core = { git = "https://github.com/binius-zk/binius64", rev = "de81069" }
+
+# Post-quantum TLS secure channels (opt-in; requires NASM + MSVC to build the
+# aws-lc-rs backend). Enable with `--features pq-tls`.
+rustls = { version = "0.23", optional = true }
+rustls-post-quantum = { version = "0.2", optional = true }
+rcgen = { version = "0.13", optional = true }
+
+[features]
+default = []
+pq-tls = ["dep:rustls", "dep:rustls-post-quantum", "dep:rcgen"]
 
 
 [dev-dependencies]
