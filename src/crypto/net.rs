@@ -18,6 +18,14 @@ pub trait Transport: Send + Sync {
     /// receive the next message addressed to this participant, if any.
     /// Non-blocking: returns None if no message is available.
     fn recv(&self) -> Option<(PartyId, Message)>;
+
+    /// Block until this participant has a live connection to every peer (in
+    /// both directions), or until `timeout_ms` elapses.  Returns `true` on full
+    /// connectivity.  This is the readiness barrier that lets protocols start
+    /// without startup `sleep`s.  In-process transports are always ready.
+    fn wait_ready(&self, _timeout_ms: u64) -> bool {
+        true
+    }
 }
 
 /// Simple MPC message types for simulator usage.
@@ -177,25 +185,169 @@ pub fn recv_forever<T: Transport>(t: &T) -> (PartyId, Message) {
     }
 }
 
-/// TCP wire format: include sender id and raw payload bytes.
-#[derive(Serialize, Deserialize, Debug, Clone)]
-struct Wire {
-    from: PartyId,
-    payload: Message,
+/// A buffering demultiplexer layered over a `Transport`.
+///
+/// Protocol steps routinely need a *specific* message (identified by op/share
+/// id) while messages belonging to *later* steps may arrive first — a plain TCP
+/// send carries no cross-message ordering guarantee.  The previous receive
+/// helpers polled the transport directly and silently **dropped** any message
+/// that did not match what they were currently waiting for; a message that
+/// raced ahead of its consumer was lost, and the later step blocked until it
+/// timed out.  (The `sleep` hacks existed to bias arrival order so this would
+/// happen less often.)
+///
+/// `Mailbox` fixes the root cause: `recv_matching` returns the first message
+/// satisfying the caller's predicate and **buffers every other message** so it
+/// stays available to a subsequent step.  The buffer persists across calls, so
+/// the protocols become order-independent and no timing hacks are required.
+pub struct Mailbox<T: Transport> {
+    transport: T,
+    // `Mutex` (rather than `RefCell`) so `Mailbox`/`TransportBackend` stay
+    // `Send + Sync` as the `Backend` trait requires; a party drives its mailbox
+    // single-threaded, so the lock is uncontended.
+    buf: Mutex<VecDeque<(PartyId, MpcMsg)>>,
 }
 
+impl<T: Transport> Mailbox<T> {
+    /// Wrap a transport in a fresh (empty) mailbox.
+    pub fn new(transport: T) -> Self {
+        Mailbox {
+            transport,
+            buf: Mutex::new(VecDeque::new()),
+        }
+    }
+
+    /// This participant's id.
+    pub fn id(&self) -> PartyId {
+        self.transport.id()
+    }
+
+    /// Borrow the underlying transport (e.g. for raw sends).
+    pub fn transport(&self) -> &T {
+        &self.transport
+    }
+
+    /// Send a message to a specific party.
+    pub fn send(&self, to: PartyId, msg: Message) {
+        self.transport.send(to, msg);
+    }
+
+    /// Broadcast a message to all other parties.
+    pub fn broadcast(&self, msg: Message) {
+        self.transport.broadcast(msg);
+    }
+
+    /// Receive the next message satisfying `pred`, buffering any others so they
+    /// remain available to later steps.  Blocks up to `timeout_ms`; returns
+    /// `None` only on timeout.
+    pub fn recv_matching<F>(&self, timeout_ms: u64, pred: F) -> Option<(PartyId, MpcMsg)>
+    where
+        F: Fn(&MpcMsg) -> bool,
+    {
+        // 1) Serve from the buffer if a matching message is already held.
+        {
+            let mut buf = self.buf.lock().expect("mailbox buffer poisoned");
+            if let Some(pos) = buf.iter().position(|(_, m)| pred(m)) {
+                return buf.remove(pos);
+            }
+        }
+        // 2) Poll the transport until a match arrives or we time out.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
+        loop {
+            if let Some((from, bytes)) = self.transport.recv() {
+                let m: MpcMsg = deserialize_msg(&bytes);
+                if pred(&m) {
+                    return Some((from, m));
+                }
+                self.buf
+                    .lock()
+                    .expect("mailbox buffer poisoned")
+                    .push_back((from, m));
+            } else if std::time::Instant::now() >= deadline {
+                return None;
+            } else {
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+        }
+    }
+}
+
+/// TCP wire frames.  `Hello` announces the sender on a freshly-opened
+/// persistent connection (used by the readiness barrier); `Msg` carries a
+/// payload.  Both are length-prefixed on the wire.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+enum Frame {
+    Hello(PartyId),
+    Msg(PartyId, Message),
+}
+
+use std::collections::HashSet;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::thread;
 
-/// TCP-based Transport implementation. Creates a listener (background thread)
-/// to accept incoming framed messages and pushes them into a local inbox queue.
-/// Sending performs a connect-and-send to the peer address and writes a
-/// 4-byte big-endian length followed by the bincode-serialized Wire payload.
+/// TCP-based `Transport` using **one persistent, ordered connection per peer**
+/// in each direction.
+///
+/// * Outbound: a lazily-established `TcpStream` per peer, reused for every send,
+///   so messages to a given peer are delivered in send order (this closes the
+///   reordering hazards the old connect-per-message design had).
+/// * Inbound: a listener accepts a persistent connection per peer and a reader
+///   thread streams length-prefixed frames from it into the shared inbox.
+/// * Readiness: each side sends a `Hello` on connect; `wait_ready` blocks until
+///   this participant is connected outbound to all peers and has seen inbound
+///   `Hello`s from all peers — removing the need for startup `sleep`s.
 pub struct TcpTransport {
     id: PartyId,
     addrs: Vec<String>,
     inbox: Arc<Mutex<VecDeque<(PartyId, Message)>>>,
+    /// Persistent outbound stream per peer (index == peer id; own slot unused).
+    outbound: Vec<Mutex<Option<TcpStream>>>,
+    /// Set of peers whose inbound `Hello` we have received.
+    peers_seen: Arc<Mutex<HashSet<PartyId>>>,
+}
+
+/// Write a length-prefixed bincode-serialized frame to a stream.
+fn write_frame(s: &mut TcpStream, frame: &Frame) -> std::io::Result<()> {
+    let bytes = bincode::serialize(frame)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
+    let len = (bytes.len() as u32).to_be_bytes();
+    s.write_all(&len)
+        .and_then(|_| s.write_all(&bytes))
+        .and_then(|_| s.flush())
+}
+
+/// Read length-prefixed frames from a peer connection until EOF/error, routing
+/// `Hello` into `peers_seen` and `Msg` into `inbox`.
+fn read_frames(
+    mut s: TcpStream,
+    inbox: Arc<Mutex<VecDeque<(PartyId, Message)>>>,
+    peers_seen: Arc<Mutex<HashSet<PartyId>>>,
+) {
+    loop {
+        let mut lenbuf = [0u8; 4];
+        if s.read_exact(&mut lenbuf).is_err() {
+            return;
+        }
+        let len = u32::from_be_bytes(lenbuf) as usize;
+        let mut buf = vec![0u8; len];
+        if s.read_exact(&mut buf).is_err() {
+            return;
+        }
+        match bincode::deserialize::<Frame>(&buf) {
+            Ok(Frame::Hello(from)) => {
+                if let Ok(mut p) = peers_seen.lock() {
+                    p.insert(from);
+                }
+            }
+            Ok(Frame::Msg(from, payload)) => {
+                if let Ok(mut q) = inbox.lock() {
+                    q.push_back((from, payload));
+                }
+            }
+            Err(_) => { /* skip malformed frame */ }
+        }
+    }
 }
 
 impl TcpTransport {
@@ -204,74 +356,52 @@ impl TcpTransport {
     /// thread bound to addrs[id].
     pub fn new(id: PartyId, addrs: Vec<String>) -> Self {
         let inbox = Arc::new(Mutex::new(VecDeque::new()));
+        let peers_seen = Arc::new(Mutex::new(HashSet::new()));
         let listener_addr = addrs[id].clone();
         let inbox_clone = inbox.clone();
+        let peers_clone = peers_seen.clone();
 
-        // spawn listener thread
+        // Listener: accept persistent connections and stream frames from each.
         thread::spawn(move || {
             if let Ok(listener) = TcpListener::bind(&listener_addr) {
-                for stream in listener.incoming() {
-                    match stream {
-                        Ok(mut s) => {
-                            // read length prefix
-                            let mut lenbuf = [0u8; 4];
-                            if s.read_exact(&mut lenbuf).is_err() {
-                                continue;
-                            }
-                            let len = u32::from_be_bytes(lenbuf) as usize;
-                            let mut buf = vec![0u8; len];
-                            if s.read_exact(&mut buf).is_err() {
-                                continue;
-                            }
-                            if let Ok(wire) = bincode::deserialize::<Wire>(&buf) {
-                                if let Ok(mut q) = inbox_clone.lock() {
-                                    q.push_back((wire.from, wire.payload));
-                                }
-                            }
-                        }
-                        Err(_) => { /* ignore accept errors */ }
-                    }
+                for stream in listener.incoming().flatten() {
+                    let inbox = inbox_clone.clone();
+                    let peers = peers_clone.clone();
+                    thread::spawn(move || read_frames(stream, inbox, peers));
                 }
             }
         });
 
-        TcpTransport { id, addrs, inbox }
+        let outbound = (0..addrs.len()).map(|_| Mutex::new(None)).collect();
+        TcpTransport {
+            id,
+            addrs,
+            inbox,
+            outbound,
+            peers_seen,
+        }
     }
 
-    /// Helper: connect and send a Wire to an address (best-effort).
-    fn send_to_addr(addr: &str, wire: &Wire) -> std::io::Result<()> {
-        // serialize once outside the retry loop
-        let bytes = bincode::serialize(wire)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
-        let len = (bytes.len() as u32).to_be_bytes();
-
-        // retry connecting/sending a few times to tolerate races where the
-        // peer hasn't yet bound its listener. This improves reliability in
-        // CI and on slow machines.
-        let mut last_err: Option<std::io::Error> = None;
-        let attempts = 8;
-        for _ in 0..attempts {
-            match TcpStream::connect(addr) {
-                Ok(mut s) => {
-                    s.write_all(&len)
-                        .and_then(|_| s.write_all(&bytes))
-                        .and_then(|_| s.flush())?;
-                    // writing failed even though we connected; return the error
-                    return Ok(());
-                }
-                Err(e) => {
-                    last_err = Some(e);
-                    // short backoff before retrying
-                    thread::sleep(std::time::Duration::from_millis(100));
+    /// Ensure a persistent outbound connection to `to` exists, establishing it
+    /// (with retry + `Hello`) if necessary.  Returns whether we are connected.
+    fn ensure_connected(&self, to: PartyId) -> bool {
+        let mut slot = match self.outbound[to].lock() {
+            Ok(s) => s,
+            Err(_) => return false,
+        };
+        if slot.is_some() {
+            return true;
+        }
+        for _ in 0..8 {
+            if let Ok(mut s) = TcpStream::connect(&self.addrs[to]) {
+                if write_frame(&mut s, &Frame::Hello(self.id)).is_ok() {
+                    *slot = Some(s);
+                    return true;
                 }
             }
+            thread::sleep(std::time::Duration::from_millis(100));
         }
-        // all attempts failed — return last error if any
-        if let Some(e) = last_err {
-            Err(e)
-        } else {
-            Ok(())
-        }
+        false
     }
 }
 
@@ -281,15 +411,20 @@ impl Transport for TcpTransport {
     }
 
     fn send(&self, to: PartyId, msg: Message) {
-        if to >= self.addrs.len() {
+        if to >= self.addrs.len() || to == self.id {
             return;
         }
-        let wire = Wire {
-            from: self.id,
-            payload: msg,
-        };
-        // best-effort send; ignore result
-        let _ = Self::send_to_addr(&self.addrs[to], &wire);
+        if !self.ensure_connected(to) {
+            return; // best-effort: peer unreachable
+        }
+        if let Ok(mut slot) = self.outbound[to].lock() {
+            if let Some(s) = slot.as_mut() {
+                // On write failure, drop the stream so the next send reconnects.
+                if write_frame(s, &Frame::Msg(self.id, msg)).is_err() {
+                    *slot = None;
+                }
+            }
+        }
     }
 
     fn broadcast(&self, msg: Message) {
@@ -298,6 +433,32 @@ impl Transport for TcpTransport {
                 continue;
             }
             self.send(p, msg.clone());
+        }
+    }
+
+    fn wait_ready(&self, timeout_ms: u64) -> bool {
+        let npeers = self.addrs.len().saturating_sub(1);
+        // Establish outbound connections (each sends our Hello).
+        for p in 0..self.addrs.len() {
+            if p != self.id {
+                self.ensure_connected(p);
+            }
+        }
+        // Wait until we have seen inbound Hellos from all peers.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
+        loop {
+            let seen = self
+                .peers_seen
+                .lock()
+                .map(|p| p.len())
+                .unwrap_or(0);
+            if seen >= npeers {
+                return true;
+            }
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
+            thread::sleep(std::time::Duration::from_millis(5));
         }
     }
 

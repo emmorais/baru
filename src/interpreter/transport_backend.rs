@@ -8,7 +8,7 @@
 use std::collections::HashMap;
 
 use crate::crypto::aby3_protocol::PartyShare;
-use crate::crypto::net::{PartyId, Transport};
+use crate::crypto::net::{Mailbox, PartyId, Transport};
 use crate::crypto::types::Fr;
 
 use super::backend::{Backend, ShareRef};
@@ -22,7 +22,9 @@ use super::backend::{Backend, ShareRef};
 /// `local: None`; the actual per-party components live in `shares`.
 pub struct TransportBackend<T: Transport> {
     me: PartyId,
-    transport: T,
+    /// Buffering demultiplexer over the transport: receive helpers wait for a
+    /// specific message while out-of-order arrivals are retained, not dropped.
+    mailbox: Mailbox<T>,
     /// Map from share id to this party's two local components.
     shares: HashMap<u64, PartyShare>,
     /// Per-instance monotonic counter — all parties executing the same
@@ -34,7 +36,7 @@ impl<T: Transport> TransportBackend<T> {
     pub fn new(me: PartyId, transport: T) -> Self {
         TransportBackend {
             me,
-            transport,
+            mailbox: Mailbox::new(transport),
             shares: HashMap::new(),
             next_id: 1,
         }
@@ -71,7 +73,7 @@ impl<T: Transport + 'static> Backend for TransportBackend<T> {
     fn share_secret(&mut self, value: Fr, nbits: usize, owner: usize) -> ShareRef {
         let id = self.alloc_id();
         let ps =
-            crate::crypto::aby3_protocol::share_input(value, id, owner, self.me, &self.transport);
+            crate::crypto::aby3_protocol::share_input(value, id, owner, self.me, &self.mailbox);
         self.store(id, ps, nbits, owner)
     }
 
@@ -95,7 +97,7 @@ impl<T: Transport + 'static> Backend for TransportBackend<T> {
         let id = self.alloc_id();
         let pa = self.get_cloned(a);
         let pb = self.get_cloned(b);
-        let ps = crate::crypto::aby3_protocol::mul_party(&pa, &pb, id, self.me, &self.transport);
+        let ps = crate::crypto::aby3_protocol::mul_party(&pa, &pb, id, self.me, &self.mailbox);
         self.store(id, ps, a.nbits.max(b.nbits), a.owner)
     }
 
@@ -153,7 +155,7 @@ impl<T: Transport + 'static> Backend for TransportBackend<T> {
             let _mul_id_triple3 = self.alloc_id();
             println!("TransportBackend: computing mul for OR, mul_id={}", mul_id);
             let prod =
-                crate::crypto::aby3_protocol::mul_party(&pa, &pb, mul_id, self.me, &self.transport);
+                crate::crypto::aby3_protocol::mul_party(&pa, &pb, mul_id, self.me, &self.mailbox);
             let or_ps = crate::crypto::aby3_protocol::sub_party(&sum, &prod);
             let new_id = self.alloc_id();
             println!("TransportBackend: inserting OR share id {}", new_id);
@@ -198,7 +200,7 @@ impl<T: Transport + 'static> Backend for TransportBackend<T> {
         let sum = crate::crypto::aby3_protocol::add_party(&pa, &pb);
         let mul_id = self.alloc_id();
         let prod =
-            crate::crypto::aby3_protocol::mul_party(&pa, &pb, mul_id, self.me, &self.transport);
+            crate::crypto::aby3_protocol::mul_party(&pa, &pb, mul_id, self.me, &self.mailbox);
         let ps = crate::crypto::aby3_protocol::sub_party(&sum, &prod);
         let id = self.alloc_id();
         self.store(id, ps, 1, a.owner)
@@ -206,14 +208,14 @@ impl<T: Transport + 'static> Backend for TransportBackend<T> {
 
     fn reveal(&mut self, a: &ShareRef, reveal_to: Option<usize>) -> Fr {
         let ps = self.get_cloned(a);
-        crate::crypto::aby3_protocol::reveal(&ps, a.id, reveal_to, self.me, &self.transport)
+        crate::crypto::aby3_protocol::reveal(&ps, a.id, reveal_to, self.me, &self.mailbox)
     }
 
     fn a2b(&mut self, a: &ShareRef, nbits: usize) -> Vec<ShareRef> {
         let pa = self.get_cloned(a);
         let op_id = self.alloc_id();
         let bit_shares =
-            crate::crypto::aby3_protocol::a2b_party(&pa, nbits, op_id, self.me, &self.transport);
+            crate::crypto::aby3_protocol::a2b_party(&pa, nbits, op_id, self.me, &self.mailbox);
         bit_shares
             .into_iter()
             .map(|ps| {
