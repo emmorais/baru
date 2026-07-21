@@ -183,9 +183,10 @@ impl<T: Transport> ConsensusBackend for SingleLeader<T> {
             let mut remaining = self.n - 1;
 
             while remaining > 0 {
-                match self.recv_matching(deadline, |m| {
-                    matches!(m, ConsensusMsg::Submit { epoch: e, .. } if *e == epoch)
-                }) {
+                match self.recv_matching(
+                    deadline,
+                    |m| matches!(m, ConsensusMsg::Submit { epoch: e, .. } if *e == epoch),
+                ) {
                     Some((_from, ConsensusMsg::Submit { from, roots, .. })) => {
                         if from < self.n && !have[from] {
                             party_roots[from] = roots;
@@ -211,9 +212,10 @@ impl<T: Transport> ConsensusBackend for SingleLeader<T> {
                     roots: my,
                 }),
             );
-            match self.recv_matching(deadline, |m| {
-                matches!(m, ConsensusMsg::Commit(c) if c.epoch == epoch)
-            }) {
+            match self.recv_matching(
+                deadline,
+                |m| matches!(m, ConsensusMsg::Commit(c) if c.epoch == epoch),
+            ) {
                 Some((_from, ConsensusMsg::Commit(c))) => Ok(c),
                 _ => Err(ConsensusError::Timeout),
             }
