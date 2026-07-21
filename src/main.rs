@@ -23,6 +23,11 @@ fn history_path() -> Option<PathBuf> {
 
 #[allow(clippy::format_in_format_args)]
 fn main() -> Result<(), Box<dyn Error>> {
+    let args: Vec<String> = env::args().skip(1).collect();
+    if args.first().map(String::as_str) == Some("bench") {
+        return baru::bench::run_cli(&args[1..]).map_err(|e| e.into());
+    }
+
     let participants: Vec<Participant> = (0..3).map(Participant::new).collect();
 
     println!(

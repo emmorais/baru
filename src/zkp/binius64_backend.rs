@@ -26,74 +26,163 @@ impl Binius64Backend {
         }
     }
 
-    /// Convert Baru constraint to Binius field element (u128 in GF(2^128))
+    /// Map a constraint to a representative field element (used for hashing).
     #[allow(dead_code)]
     fn constraint_to_field_value(constraint: &Constraint) -> u128 {
         match constraint {
-            Constraint::Assign { value, .. } => {
-                // Convert i64 value to u128 field element
-                *value as u128
-            }
-            Constraint::Add { .. } => 1u128,
-            Constraint::Multiply { .. } => 2u128,
-            Constraint::Linear { .. } => 3u128,
+            Constraint::Constant { value, .. } => *value as u128,
+            Constraint::IAdd32 { .. } => 0x02,
+            Constraint::ISub32 { .. } => 0x03,
+            Constraint::IMul { .. } => 0x04,
+            Constraint::NDivCheck { .. } => 0x05,
+            Constraint::ICmpEq { .. } => 0x06,
+            Constraint::ICmpUlt { .. } => 0x07,
+            Constraint::ICmpSlt { .. } => 0x08,
+            Constraint::BAnd { .. } => 0x09,
+            Constraint::BOr { .. } => 0x0A,
+            Constraint::BXor { .. } => 0x0B,
+            Constraint::BNot { .. } => 0x0C,
+            Constraint::Shl { .. } => 0x0D,
+            Constraint::Shr { .. } => 0x0E,
+            Constraint::Mux { .. } => 0x0F,
+            Constraint::PopCount { .. } => 0x10,
         }
     }
 
-    /// Serialize constraints for binary format compatible with Binius64
+    /// Serialize constraints for binary format compatible with Binius64.
+    /// Each opcode byte maps to the Binius64 gate opcode it corresponds to.
     fn serialize_constraints(constraints: &[Constraint]) -> Vec<u8> {
         let mut data = Vec::new();
         data.extend_from_slice(&(constraints.len() as u32).to_le_bytes());
 
+        // Helper: write a wire name (length-prefixed)
+        fn push_wire(data: &mut Vec<u8>, w: &str) {
+            data.push(w.len() as u8);
+            data.extend_from_slice(w.as_bytes());
+        }
+
         for constraint in constraints {
             match constraint {
-                Constraint::Assign { var, value } => {
-                    data.push(1);
-                    data.push(var.len() as u8);
-                    data.extend_from_slice(var.as_bytes());
+                // 0x01  add_constant_64
+                Constraint::Constant { dst, value } => {
+                    data.push(0x01);
+                    push_wire(&mut data, dst);
                     data.extend_from_slice(&value.to_le_bytes());
                 }
-                Constraint::Add {
-                    var_x,
-                    var_y,
-                    var_z,
-                } => {
-                    data.push(2);
-                    data.push(var_x.len() as u8);
-                    data.extend_from_slice(var_x.as_bytes());
-                    data.push(var_y.len() as u8);
-                    data.extend_from_slice(var_y.as_bytes());
-                    data.push(var_z.len() as u8);
-                    data.extend_from_slice(var_z.as_bytes());
+                // 0x02  iadd_32
+                Constraint::IAdd32 { dst, lhs, rhs } => {
+                    data.push(0x02);
+                    push_wire(&mut data, dst);
+                    push_wire(&mut data, lhs);
+                    push_wire(&mut data, rhs);
                 }
-                Constraint::Multiply {
-                    var_x,
-                    var_y,
-                    var_z,
-                } => {
-                    data.push(3);
-                    data.push(var_x.len() as u8);
-                    data.extend_from_slice(var_x.as_bytes());
-                    data.push(var_y.len() as u8);
-                    data.extend_from_slice(var_y.as_bytes());
-                    data.push(var_z.len() as u8);
-                    data.extend_from_slice(var_z.as_bytes());
+                // 0x03  isub_32
+                Constraint::ISub32 { dst, lhs, rhs } => {
+                    data.push(0x03);
+                    push_wire(&mut data, dst);
+                    push_wire(&mut data, lhs);
+                    push_wire(&mut data, rhs);
                 }
-                Constraint::Linear {
-                    var_x,
-                    coeff_x,
-                    var_y,
-                    coeff_y,
-                    constant,
+                // 0x04  imul
+                Constraint::IMul { dst, lhs, rhs } => {
+                    data.push(0x04);
+                    push_wire(&mut data, dst);
+                    push_wire(&mut data, lhs);
+                    push_wire(&mut data, rhs);
+                }
+                // 0x05  non-deterministic div: witness q,r  check q*rhs+r==lhs
+                Constraint::NDivCheck {
+                    dst_q,
+                    dst_r,
+                    lhs,
+                    rhs,
                 } => {
-                    data.push(4);
-                    data.push(var_x.len() as u8);
-                    data.extend_from_slice(var_x.as_bytes());
-                    data.extend_from_slice(&coeff_x.to_le_bytes());
-                    data.push(var_y.len() as u8);
-                    data.extend_from_slice(var_y.as_bytes());
-                    data.extend_from_slice(&coeff_y.to_le_bytes());
-                    data.extend_from_slice(&constant.to_le_bytes());
+                    data.push(0x05);
+                    push_wire(&mut data, dst_q);
+                    push_wire(&mut data, dst_r);
+                    push_wire(&mut data, lhs);
+                    push_wire(&mut data, rhs);
+                }
+                // 0x06  icmp_eq
+                Constraint::ICmpEq { dst, lhs, rhs } => {
+                    data.push(0x06);
+                    push_wire(&mut data, dst);
+                    push_wire(&mut data, lhs);
+                    push_wire(&mut data, rhs);
+                }
+                // 0x07  icmp_ult
+                Constraint::ICmpUlt { dst, lhs, rhs } => {
+                    data.push(0x07);
+                    push_wire(&mut data, dst);
+                    push_wire(&mut data, lhs);
+                    push_wire(&mut data, rhs);
+                }
+                // 0x08  icmp_slt
+                Constraint::ICmpSlt { dst, lhs, rhs } => {
+                    data.push(0x08);
+                    push_wire(&mut data, dst);
+                    push_wire(&mut data, lhs);
+                    push_wire(&mut data, rhs);
+                }
+                // 0x09  band
+                Constraint::BAnd { dst, lhs, rhs } => {
+                    data.push(0x09);
+                    push_wire(&mut data, dst);
+                    push_wire(&mut data, lhs);
+                    push_wire(&mut data, rhs);
+                }
+                // 0x0A  bor
+                Constraint::BOr { dst, lhs, rhs } => {
+                    data.push(0x0A);
+                    push_wire(&mut data, dst);
+                    push_wire(&mut data, lhs);
+                    push_wire(&mut data, rhs);
+                }
+                // 0x0B  bxor
+                Constraint::BXor { dst, lhs, rhs } => {
+                    data.push(0x0B);
+                    push_wire(&mut data, dst);
+                    push_wire(&mut data, lhs);
+                    push_wire(&mut data, rhs);
+                }
+                // 0x0C  bnot
+                Constraint::BNot { dst, src } => {
+                    data.push(0x0C);
+                    push_wire(&mut data, dst);
+                    push_wire(&mut data, src);
+                }
+                // 0x0D  shl  (amount encoded as u8)
+                Constraint::Shl { dst, src, amount } => {
+                    data.push(0x0D);
+                    push_wire(&mut data, dst);
+                    push_wire(&mut data, src);
+                    data.push(*amount as u8);
+                }
+                // 0x0E  shr
+                Constraint::Shr { dst, src, amount } => {
+                    data.push(0x0E);
+                    push_wire(&mut data, dst);
+                    push_wire(&mut data, src);
+                    data.push(*amount as u8);
+                }
+                // 0x0F  mux gadget: dst = band(cond,t) bor band(bnot(cond),e)
+                Constraint::Mux {
+                    dst,
+                    cond,
+                    t_val,
+                    e_val,
+                } => {
+                    data.push(0x0F);
+                    push_wire(&mut data, dst);
+                    push_wire(&mut data, cond);
+                    push_wire(&mut data, t_val);
+                    push_wire(&mut data, e_val);
+                }
+                // 0x10  popcount gadget
+                Constraint::PopCount { dst, src } => {
+                    data.push(0x10);
+                    push_wire(&mut data, dst);
+                    push_wire(&mut data, src);
                 }
             }
         }

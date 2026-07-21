@@ -2,6 +2,7 @@
 name = "baru"
 version = "0.1.0"
 edition = "2021"
+default-run = "baru"
 
 [dependencies]
 rand = "0.8"
@@ -15,6 +16,10 @@ serde_json = "1"
 hex = "0.4"
 binius-field = { git = "https://github.com/binius-zk/binius64", rev = "de81069" }
 binius-core = { git = "https://github.com/binius-zk/binius64", rev = "de81069" }
+tfhe = { version = "1.6", features = ["integer"] }
+# Vendored + patched SEAL bindings for the CKKS backend
+# (see third_party/sealy/BARU_PATCHES.md)
+sealy = { path = "third_party/sealy" }
 
 # Post-quantum TLS secure channels (opt-in; requires NASM + MSVC to build the
 # aws-lc-rs backend). Enable with `--features pq-tls`.
@@ -26,6 +31,10 @@ rcgen = { version = "0.13", optional = true }
 default = []
 pq-tls = ["dep:rustls", "dep:rustls-post-quantum", "dep:rcgen"]
 
-
 [dev-dependencies]
 tempfile = "3"
+
+# Keep the vendored sealy crate out of the workspace so cargo fmt/clippy
+# don't touch its (differently formatted) sources.
+[workspace]
+exclude = ["third_party/sealy"]

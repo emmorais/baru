@@ -168,6 +168,12 @@ pub fn reduce_expression(
             fn colored_expr(e: &Expr) -> String {
                 match e {
                     Expr::Num(n) => format!("{}", format!("Num({})", n).green()),
+                    Expr::Fixed(v) => {
+                        use crate::interpreter::ast::FIXED_SCALE;
+                        let whole = v / FIXED_SCALE;
+                        let frac = ((v % FIXED_SCALE).abs() * 10_000) / FIXED_SCALE;
+                        format!("{}", format!("Fixed({}.{:04})", whole, frac).green())
+                    }
                     Expr::Var(s) => format!("{}", format!("Var({})", s).cyan()),
                     Expr::Str(s) => format!("{}", format!("Str(\"{}\")", s).magenta()),
                     Expr::Char(c) => format!("{}", format!("Char({})", c).magenta()),
@@ -198,6 +204,12 @@ pub fn reduce_expression(
             fn colored_value(v: &Types) -> String {
                 match v {
                     Types::Num(n) => format!("{}", format!("Num({})", n).green()),
+                    Types::Fixed(val) => {
+                        use crate::interpreter::ast::FIXED_SCALE;
+                        let whole = val / FIXED_SCALE;
+                        let frac = ((val % FIXED_SCALE).abs() * 10_000) / FIXED_SCALE;
+                        format!("{}", format!("{}.{:04}", whole, frac).green())
+                    }
                     Types::Bool(b) => format!("{}", format!("Bool({})", b).yellow()),
                     Types::Str(s) => format!("{}", format!("Str(\"{}\")", s).magenta()),
                     Types::Char(c) => format!("{}", format!("Char({})", c).magenta()),
@@ -209,6 +221,9 @@ pub fn reduce_expression(
                         format!("Share(id={},nbits={},owner={})", sr.id, sr.nbits, sr.owner).red()
                     ),
                     Types::NativeFunc(_) => "NativeFunc".cyan().to_string(),
+                    Types::FheCiphertext(h) => {
+                        format!("{}", format!("FheCt({})", h.backend_id).red())
+                    }
                 }
             }
 
@@ -235,6 +250,9 @@ pub fn reduce_expression(
                 Expr::Num(n) => {
                     stack.push(Apply(k, Types::Num(n), eenv.clone()));
                 }
+                Expr::Fixed(v) => {
+                    stack.push(Apply(k, Types::Fixed(v), eenv.clone()));
+                }
                 Expr::Str(s) => {
                     stack.push(Apply(k, Types::Str(s), eenv.clone()));
                 }
@@ -245,7 +263,15 @@ pub fn reduce_expression(
                     stack.push(Apply(k, Types::Bool(b), eenv.clone()));
                 }
                 Expr::Quote(inner) => {
-                    stack.push(Apply(k, Types::Quoted(Box::new(*inner)), eenv.clone()));
+                    // Literal data lists like '(1 2 3) evaluate to Types::List so
+                    // car/cdr/null? work on them.  Anything else (quoted code such
+                    // as '(+ x y), or string lists used by zkp/fhe builtins) stays
+                    // Quoted.
+                    if let Some(vals) = quoted_literal_list(&inner) {
+                        stack.push(Apply(k, Types::List(vals), eenv.clone()));
+                    } else {
+                        stack.push(Apply(k, Types::Quoted(Box::new(*inner)), eenv.clone()));
+                    }
                 }
                 Expr::Private(inner) => {
                     // Private annotation is metadata for ZKP witness marking.
@@ -493,244 +519,340 @@ pub fn reduce_expression(
                                 _ => None,
                             }
                         };
+                        // helper: is a value a Fixed-point number?
+                        let is_fixed = |v: &Types| matches!(v, Types::Fixed(_));
+                        // coerce Num → Fixed by scaling; Fixed stays as-is
+                        let to_fixed = |v: &Types| -> i64 {
+                            use crate::interpreter::ast::FIXED_SCALE;
+                            match v {
+                                Types::Fixed(f) => *f,
+                                Types::Num(n) => n * FIXED_SCALE,
+                                _ => panic!("cannot coerce to fixed-point"),
+                            }
+                        };
 
-                        let out = match op {
-                            super::parser::BinOp::Add
-                            | super::parser::BinOp::Sub
-                            | super::parser::BinOp::Mul
-                            | super::parser::BinOp::DivExact
-                            | super::parser::BinOp::Mod => {
-                                // if either operand is a shared value, dispatch to backend
-                                match (&left_val, &val) {
+                        // Q16.16 shares (or a share mixed with a plain Fixed)
+                        // need scale-aware handling; the plain-share arms
+                        // below would silently drop the scaling.
+                        let is_share = |v: &Types| matches!(v, Types::Share(_));
+                        let fixed_share_mix = matches!(&left_val, Types::Share(s) if s.fixed)
+                            || matches!(&val, Types::Share(s) if s.fixed)
+                            || (is_share(&left_val) && is_fixed(&val))
+                            || (is_fixed(&left_val) && is_share(&val));
+
+                        let out = if fixed_share_mix {
+                            fixed_share_binop(&backend, op, &left_val, &val)
+                        } else {
+                            match op {
+                                super::parser::BinOp::Add
+                                | super::parser::BinOp::Sub
+                                | super::parser::BinOp::Mul
+                                | super::parser::BinOp::DivExact
+                                | super::parser::BinOp::Mod => {
+                                    // if either operand is a shared value, dispatch to backend
+                                    match (&left_val, &val) {
+                                        (Types::Share(sa), Types::Share(sb)) => {
+                                            let mut be =
+                                                backend.lock().unwrap_or_else(|e| e.into_inner());
+                                            let sr = match op {
+                                                super::parser::BinOp::Add => be.add(sa, sb),
+                                                super::parser::BinOp::Sub => be.sub(sa, sb),
+                                                super::parser::BinOp::Mul => be.mul(sa, sb),
+                                                _ => panic!("unsupported shared op"),
+                                            };
+                                            Types::Share(sr)
+                                        }
+                                        (Types::Share(sa), Types::Num(bn)) => {
+                                            let mut be =
+                                                backend.lock().unwrap_or_else(|e| e.into_inner());
+                                            // convert signed immediate into two's-complement field element for sa.nbits
+                                            let imm = int_to_fr_signed(*bn, sa.nbits);
+                                            let sb = be.share_secret(imm, sa.nbits, 0);
+                                            let sr = match op {
+                                                super::parser::BinOp::Add => be.add(sa, &sb),
+                                                super::parser::BinOp::Sub => be.sub(sa, &sb),
+                                                super::parser::BinOp::Mul => be.mul(sa, &sb),
+                                                _ => panic!("unsupported shared op"),
+                                            };
+                                            Types::Share(sr)
+                                        }
+                                        (Types::Num(an), Types::Share(sb)) => {
+                                            let mut be =
+                                                backend.lock().unwrap_or_else(|e| e.into_inner());
+                                            // convert signed immediate into two's-complement field element for sb.nbits
+                                            let imm = int_to_fr_signed(*an, sb.nbits);
+                                            let sa = be.share_secret(imm, sb.nbits, 0);
+                                            let sr = match op {
+                                                super::parser::BinOp::Add => be.add(&sa, sb),
+                                                super::parser::BinOp::Sub => be.sub(&sa, sb),
+                                                super::parser::BinOp::Mul => be.mul(&sa, sb),
+                                                _ => panic!("unsupported shared op"),
+                                            };
+                                            Types::Share(sr)
+                                        }
+                                        _ => {
+                                            // If either operand is Fixed, perform fixed-point arithmetic
+                                            if is_fixed(&left_val) || is_fixed(&val) {
+                                                let a = to_fixed(&left_val);
+                                                let b = to_fixed(&val);
+                                                let r = match op {
+                                                    super::parser::BinOp::Add => a.wrapping_add(b),
+                                                    super::parser::BinOp::Sub => a.wrapping_sub(b),
+                                                    super::parser::BinOp::Mul => {
+                                                        // (a * b) >> 16 using i128 to avoid overflow
+                                                        ((a as i128 * b as i128) >> 16) as i64
+                                                    }
+                                                    super::parser::BinOp::DivExact => {
+                                                        if b == 0 {
+                                                            panic!("division by zero");
+                                                        }
+                                                        // (a << 16) / b
+                                                        ((a as i128) << 16) as i64 / b
+                                                    }
+                                                    super::parser::BinOp::Mod => {
+                                                        if b == 0 {
+                                                            panic!("modulo by zero");
+                                                        }
+                                                        a % b
+                                                    }
+                                                    _ => unreachable!(),
+                                                };
+                                                Types::Fixed(r)
+                                            } else {
+                                                let a = maybe_num(&left_val).expect(
+                                                "binary arithmetic left operand must be NUM or BOOL",
+                                            );
+                                                let b = maybe_num(&val).expect(
+                                                "binary arithmetic right operand must be NUM or BOOL",
+                                            );
+                                                let r = match op {
+                                                    super::parser::BinOp::Add => a.wrapping_add(b),
+                                                    super::parser::BinOp::Sub => a.wrapping_sub(b),
+                                                    super::parser::BinOp::Mul => a.wrapping_mul(b),
+                                                    super::parser::BinOp::DivExact => {
+                                                        if b == 0 {
+                                                            panic!("division by zero");
+                                                        }
+                                                        if a % b != 0 {
+                                                            panic!(
+                                                                "non-exact division: {} / {}",
+                                                                a, b
+                                                            );
+                                                        }
+                                                        a / b
+                                                    }
+                                                    super::parser::BinOp::Mod => {
+                                                        if b == 0 {
+                                                            panic!("modulo by zero");
+                                                        }
+                                                        a % b
+                                                    }
+                                                    _ => unreachable!(),
+                                                };
+                                                Types::Num(r)
+                                            }
+                                        }
+                                    }
+                                }
+                                super::parser::BinOp::Eq => match (&left_val, &val) {
+                                    (Types::Num(a), Types::Num(b)) => {
+                                        Types::Num(if a == b { 1 } else { 0 })
+                                    }
+                                    (Types::Fixed(a), Types::Fixed(b)) => {
+                                        Types::Num(if a == b { 1 } else { 0 })
+                                    }
+                                    (Types::Fixed(a), Types::Num(b)) => {
+                                        use crate::interpreter::ast::FIXED_SCALE;
+                                        Types::Num(if *a == b * FIXED_SCALE { 1 } else { 0 })
+                                    }
+                                    (Types::Num(a), Types::Fixed(b)) => {
+                                        use crate::interpreter::ast::FIXED_SCALE;
+                                        Types::Num(if a * FIXED_SCALE == *b { 1 } else { 0 })
+                                    }
+                                    (Types::Bool(a), Types::Bool(b)) => {
+                                        Types::Num(if a == b { 1 } else { 0 })
+                                    }
+                                    (Types::Str(a), Types::Str(b)) => {
+                                        Types::Num(if a == b { 1 } else { 0 })
+                                    }
+                                    (Types::Char(a), Types::Char(b)) => {
+                                        Types::Num(if a == b { 1 } else { 0 })
+                                    }
                                     (Types::Share(sa), Types::Share(sb)) => {
                                         let mut be =
                                             backend.lock().unwrap_or_else(|e| e.into_inner());
-                                        let sr = match op {
-                                            super::parser::BinOp::Add => be.add(sa, sb),
-                                            super::parser::BinOp::Sub => be.sub(sa, sb),
-                                            super::parser::BinOp::Mul => be.mul(sa, sb),
-                                            _ => panic!("unsupported shared op"),
-                                        };
-                                        Types::Share(sr)
+                                        Types::Share(be.eq(sa, sb))
                                     }
                                     (Types::Share(sa), Types::Num(bn)) => {
                                         let mut be =
                                             backend.lock().unwrap_or_else(|e| e.into_inner());
-                                        // convert signed immediate into two's-complement field element for sa.nbits
                                         let imm = int_to_fr_signed(*bn, sa.nbits);
                                         let sb = be.share_secret(imm, sa.nbits, 0);
-                                        let sr = match op {
-                                            super::parser::BinOp::Add => be.add(sa, &sb),
-                                            super::parser::BinOp::Sub => be.sub(sa, &sb),
-                                            super::parser::BinOp::Mul => be.mul(sa, &sb),
-                                            _ => panic!("unsupported shared op"),
-                                        };
-                                        Types::Share(sr)
+                                        Types::Share(be.eq(sa, &sb))
                                     }
                                     (Types::Num(an), Types::Share(sb)) => {
                                         let mut be =
                                             backend.lock().unwrap_or_else(|e| e.into_inner());
-                                        // convert signed immediate into two's-complement field element for sb.nbits
                                         let imm = int_to_fr_signed(*an, sb.nbits);
                                         let sa = be.share_secret(imm, sb.nbits, 0);
-                                        let sr = match op {
-                                            super::parser::BinOp::Add => be.add(&sa, sb),
-                                            super::parser::BinOp::Sub => be.sub(&sa, sb),
-                                            super::parser::BinOp::Mul => be.mul(&sa, sb),
-                                            _ => panic!("unsupported shared op"),
-                                        };
-                                        Types::Share(sr)
+                                        Types::Share(be.eq(&sa, sb))
                                     }
-                                    _ => {
-                                        let a = maybe_num(&left_val).expect(
-                                            "binary arithmetic left operand must be NUM or BOOL",
-                                        );
-                                        let b = maybe_num(&val).expect(
-                                            "binary arithmetic right operand must be NUM or BOOL",
-                                        );
+                                    _ => Types::Num(0),
+                                },
+                                super::parser::BinOp::Lt
+                                | super::parser::BinOp::Gt
+                                | super::parser::BinOp::Le
+                                | super::parser::BinOp::Ge => match (&left_val, &val) {
+                                    (Types::Num(a), Types::Num(b)) => {
                                         let r = match op {
-                                            super::parser::BinOp::Add => a.wrapping_add(b),
-                                            super::parser::BinOp::Sub => a.wrapping_sub(b),
-                                            super::parser::BinOp::Mul => a.wrapping_mul(b),
-                                            super::parser::BinOp::DivExact => {
-                                                if b == 0 {
-                                                    panic!("division by zero");
-                                                }
-                                                if a % b != 0 {
-                                                    panic!("non-exact division: {} / {}", a, b);
-                                                }
-                                                a / b
-                                            }
-                                            super::parser::BinOp::Mod => {
-                                                if b == 0 {
-                                                    panic!("modulo by zero");
-                                                }
-                                                a % b
-                                            }
+                                            super::parser::BinOp::Lt => a < b,
+                                            super::parser::BinOp::Gt => a > b,
+                                            super::parser::BinOp::Le => a <= b,
+                                            super::parser::BinOp::Ge => a >= b,
                                             _ => unreachable!(),
                                         };
+                                        Types::Num(if r { 1 } else { 0 })
+                                    }
+                                    // Fixed vs Fixed (or Fixed vs Num via coercion)
+                                    (Types::Fixed(_), Types::Fixed(_))
+                                    | (Types::Fixed(_), Types::Num(_))
+                                    | (Types::Num(_), Types::Fixed(_)) => {
+                                        let a = to_fixed(&left_val);
+                                        let b = to_fixed(&val);
+                                        let r = match op {
+                                            super::parser::BinOp::Lt => a < b,
+                                            super::parser::BinOp::Gt => a > b,
+                                            super::parser::BinOp::Le => a <= b,
+                                            super::parser::BinOp::Ge => a >= b,
+                                            _ => unreachable!(),
+                                        };
+                                        Types::Num(if r { 1 } else { 0 })
+                                    }
+                                    (Types::Share(sa), Types::Share(sb)) => {
+                                        let mut be =
+                                            backend.lock().unwrap_or_else(|e| e.into_inner());
+                                        let out = match op {
+                                            super::parser::BinOp::Lt => be.lt(sa, sb),
+                                            super::parser::BinOp::Gt => be.lt(sb, sa),
+                                            super::parser::BinOp::Le => be.le(sa, sb),
+                                            super::parser::BinOp::Ge => be.le(sb, sa),
+                                            _ => unreachable!(),
+                                        };
+                                        Types::Share(out)
+                                    }
+                                    (Types::Share(sa), Types::Num(bn)) => {
+                                        let mut be =
+                                            backend.lock().unwrap_or_else(|e| e.into_inner());
+                                        let imm = int_to_fr_signed(*bn, sa.nbits);
+                                        let sb = be.share_secret(imm, sa.nbits, 0);
+                                        let out = match op {
+                                            super::parser::BinOp::Lt => be.lt(sa, &sb),
+                                            super::parser::BinOp::Gt => be.lt(&sb, sa),
+                                            super::parser::BinOp::Le => be.le(sa, &sb),
+                                            super::parser::BinOp::Ge => be.le(&sb, sa),
+                                            _ => unreachable!(),
+                                        };
+                                        Types::Share(out)
+                                    }
+                                    (Types::Num(an), Types::Share(sb)) => {
+                                        let mut be =
+                                            backend.lock().unwrap_or_else(|e| e.into_inner());
+                                        let imm = int_to_fr_signed(*an, sb.nbits);
+                                        let sa = be.share_secret(imm, sb.nbits, 0);
+                                        let out = match op {
+                                            super::parser::BinOp::Lt => be.lt(&sa, sb),
+                                            super::parser::BinOp::Gt => be.lt(sb, &sa),
+                                            super::parser::BinOp::Le => be.le(&sa, sb),
+                                            super::parser::BinOp::Ge => be.le(sb, &sa),
+                                            _ => unreachable!(),
+                                        };
+                                        Types::Share(out)
+                                    }
+                                    _ => Types::Num(0),
+                                },
+                                super::parser::BinOp::And => match (&left_val, &val) {
+                                    (Types::Share(sa), Types::Share(sb)) => {
+                                        let mut be =
+                                            backend.lock().unwrap_or_else(|e| e.into_inner());
+                                        Types::Share(be.and(sa, sb))
+                                    }
+                                    (Types::Share(sa), Types::Num(b)) => {
+                                        let mut be =
+                                            backend.lock().unwrap_or_else(|e| e.into_inner());
+                                        let imm = int_to_fr_signed(*b, sa.nbits);
+                                        let sb = be.share_secret(imm, sa.nbits, 0);
+                                        Types::Share(be.and(sa, &sb))
+                                    }
+                                    (Types::Num(a), Types::Share(sb)) => {
+                                        let mut be =
+                                            backend.lock().unwrap_or_else(|e| e.into_inner());
+                                        let imm = int_to_fr_signed(*a, sb.nbits);
+                                        let sa = be.share_secret(imm, sb.nbits, 0);
+                                        Types::Share(be.and(&sa, sb))
+                                    }
+                                    (Types::Num(a), Types::Num(b)) => Types::Num(a & b),
+                                    _ => {
+                                        let a = maybe_num(&left_val).expect("and expects NUM/BOOL");
+                                        let b = maybe_num(&val).expect("and expects NUM/BOOL");
+                                        Types::Num(if a != 0 && b != 0 { 1 } else { 0 })
+                                    }
+                                },
+                                super::parser::BinOp::Or => match (&left_val, &val) {
+                                    (Types::Share(sa), Types::Share(sb)) => {
+                                        let mut be =
+                                            backend.lock().unwrap_or_else(|e| e.into_inner());
+                                        Types::Share(be.or(sa, sb))
+                                    }
+                                    (Types::Share(sa), Types::Num(b)) => {
+                                        let mut be =
+                                            backend.lock().unwrap_or_else(|e| e.into_inner());
+                                        let imm = int_to_fr_signed(*b, sa.nbits);
+                                        let sb = be.share_secret(imm, sa.nbits, 0);
+                                        Types::Share(be.or(sa, &sb))
+                                    }
+                                    (Types::Num(a), Types::Share(sb)) => {
+                                        let mut be =
+                                            backend.lock().unwrap_or_else(|e| e.into_inner());
+                                        let imm = int_to_fr_signed(*a, sb.nbits);
+                                        let sa = be.share_secret(imm, sb.nbits, 0);
+                                        Types::Share(be.or(&sa, sb))
+                                    }
+                                    (Types::Num(a), Types::Num(b)) => Types::Num(a | b),
+                                    _ => {
+                                        let a = maybe_num(&left_val).expect("or expects NUM/BOOL");
+                                        let b = maybe_num(&val).expect("or expects NUM/BOOL");
+                                        Types::Num(if a != 0 || b != 0 { 1 } else { 0 })
+                                    }
+                                },
+                                super::parser::BinOp::AshRight => match (&left_val, &val) {
+                                    (Types::Share(sa), Types::Num(bn)) => {
+                                        let mut be =
+                                            backend.lock().unwrap_or_else(|e| e.into_inner());
+                                        // convert bn to usize
+                                        let b = usize::try_from(*bn).unwrap_or(0);
+                                        Types::Share(be.shift_right(sa, b))
+                                    }
+                                    (Types::Num(an), Types::Num(bn)) => {
+                                        let r = an.wrapping_shr(*bn as u32);
                                         Types::Num(r)
                                     }
-                                }
+                                    _ => panic!("ash-right expects (SHARE, NUM) or (NUM, NUM)"),
+                                },
+                                super::parser::BinOp::AshLeft => match (&left_val, &val) {
+                                    (Types::Share(sa), Types::Num(bn)) => {
+                                        let mut be =
+                                            backend.lock().unwrap_or_else(|e| e.into_inner());
+                                        // convert bn to usize
+                                        let b = usize::try_from(*bn).unwrap_or(0);
+                                        Types::Share(be.shift_left(sa, b))
+                                    }
+                                    (Types::Num(an), Types::Num(bn)) => {
+                                        let r = an.wrapping_shl(*bn as u32);
+                                        Types::Num(r)
+                                    }
+                                    _ => panic!("ash-left expects (SHARE, NUM) or (NUM, NUM)"),
+                                },
                             }
-                            super::parser::BinOp::Eq => match (&left_val, &val) {
-                                (Types::Num(a), Types::Num(b)) => {
-                                    Types::Num(if a == b { 1 } else { 0 })
-                                }
-                                (Types::Bool(a), Types::Bool(b)) => {
-                                    Types::Num(if a == b { 1 } else { 0 })
-                                }
-                                (Types::Str(a), Types::Str(b)) => {
-                                    Types::Num(if a == b { 1 } else { 0 })
-                                }
-                                (Types::Char(a), Types::Char(b)) => {
-                                    Types::Num(if a == b { 1 } else { 0 })
-                                }
-                                (Types::Share(sa), Types::Share(sb)) => {
-                                    let mut be = backend.lock().unwrap_or_else(|e| e.into_inner());
-                                    Types::Share(be.eq(sa, sb))
-                                }
-                                (Types::Share(sa), Types::Num(bn)) => {
-                                    let mut be = backend.lock().unwrap_or_else(|e| e.into_inner());
-                                    let imm = int_to_fr_signed(*bn, sa.nbits);
-                                    let sb = be.share_secret(imm, sa.nbits, 0);
-                                    Types::Share(be.eq(sa, &sb))
-                                }
-                                (Types::Num(an), Types::Share(sb)) => {
-                                    let mut be = backend.lock().unwrap_or_else(|e| e.into_inner());
-                                    let imm = int_to_fr_signed(*an, sb.nbits);
-                                    let sa = be.share_secret(imm, sb.nbits, 0);
-                                    Types::Share(be.eq(&sa, sb))
-                                }
-                                _ => Types::Num(0),
-                            },
-                            super::parser::BinOp::Lt
-                            | super::parser::BinOp::Gt
-                            | super::parser::BinOp::Le
-                            | super::parser::BinOp::Ge => match (&left_val, &val) {
-                                (Types::Num(a), Types::Num(b)) => {
-                                    let r = match op {
-                                        super::parser::BinOp::Lt => a < b,
-                                        super::parser::BinOp::Gt => a > b,
-                                        super::parser::BinOp::Le => a <= b,
-                                        super::parser::BinOp::Ge => a >= b,
-                                        _ => unreachable!(),
-                                    };
-                                    Types::Num(if r { 1 } else { 0 })
-                                }
-                                (Types::Share(sa), Types::Share(sb)) => {
-                                    let mut be = backend.lock().unwrap_or_else(|e| e.into_inner());
-                                    let out = match op {
-                                        super::parser::BinOp::Lt => be.lt(sa, sb),
-                                        super::parser::BinOp::Gt => be.lt(sb, sa),
-                                        super::parser::BinOp::Le => be.le(sa, sb),
-                                        super::parser::BinOp::Ge => be.le(sb, sa),
-                                        _ => unreachable!(),
-                                    };
-                                    Types::Share(out)
-                                }
-                                (Types::Share(sa), Types::Num(bn)) => {
-                                    let mut be = backend.lock().unwrap_or_else(|e| e.into_inner());
-                                    let imm = int_to_fr_signed(*bn, sa.nbits);
-                                    let sb = be.share_secret(imm, sa.nbits, 0);
-                                    let out = match op {
-                                        super::parser::BinOp::Lt => be.lt(sa, &sb),
-                                        super::parser::BinOp::Gt => be.lt(&sb, sa),
-                                        super::parser::BinOp::Le => be.le(sa, &sb),
-                                        super::parser::BinOp::Ge => be.le(&sb, sa),
-                                        _ => unreachable!(),
-                                    };
-                                    Types::Share(out)
-                                }
-                                (Types::Num(an), Types::Share(sb)) => {
-                                    let mut be = backend.lock().unwrap_or_else(|e| e.into_inner());
-                                    let imm = int_to_fr_signed(*an, sb.nbits);
-                                    let sa = be.share_secret(imm, sb.nbits, 0);
-                                    let out = match op {
-                                        super::parser::BinOp::Lt => be.lt(&sa, sb),
-                                        super::parser::BinOp::Gt => be.lt(sb, &sa),
-                                        super::parser::BinOp::Le => be.le(&sa, sb),
-                                        super::parser::BinOp::Ge => be.le(sb, &sa),
-                                        _ => unreachable!(),
-                                    };
-                                    Types::Share(out)
-                                }
-                                _ => Types::Num(0),
-                            },
-                            super::parser::BinOp::And => match (&left_val, &val) {
-                                (Types::Share(sa), Types::Share(sb)) => {
-                                    let mut be = backend.lock().unwrap_or_else(|e| e.into_inner());
-                                    Types::Share(be.and(sa, sb))
-                                }
-                                (Types::Share(sa), Types::Num(b)) => {
-                                    let mut be = backend.lock().unwrap_or_else(|e| e.into_inner());
-                                    let imm = int_to_fr_signed(*b, sa.nbits);
-                                    let sb = be.share_secret(imm, sa.nbits, 0);
-                                    Types::Share(be.and(sa, &sb))
-                                }
-                                (Types::Num(a), Types::Share(sb)) => {
-                                    let mut be = backend.lock().unwrap_or_else(|e| e.into_inner());
-                                    let imm = int_to_fr_signed(*a, sb.nbits);
-                                    let sa = be.share_secret(imm, sb.nbits, 0);
-                                    Types::Share(be.and(&sa, sb))
-                                }
-                                (Types::Num(a), Types::Num(b)) => Types::Num(a & b),
-                                _ => {
-                                    let a = maybe_num(&left_val).expect("and expects NUM/BOOL");
-                                    let b = maybe_num(&val).expect("and expects NUM/BOOL");
-                                    Types::Num(if a != 0 && b != 0 { 1 } else { 0 })
-                                }
-                            },
-                            super::parser::BinOp::Or => match (&left_val, &val) {
-                                (Types::Share(sa), Types::Share(sb)) => {
-                                    let mut be = backend.lock().unwrap_or_else(|e| e.into_inner());
-                                    Types::Share(be.or(sa, sb))
-                                }
-                                (Types::Share(sa), Types::Num(b)) => {
-                                    let mut be = backend.lock().unwrap_or_else(|e| e.into_inner());
-                                    let imm = int_to_fr_signed(*b, sa.nbits);
-                                    let sb = be.share_secret(imm, sa.nbits, 0);
-                                    Types::Share(be.or(sa, &sb))
-                                }
-                                (Types::Num(a), Types::Share(sb)) => {
-                                    let mut be = backend.lock().unwrap_or_else(|e| e.into_inner());
-                                    let imm = int_to_fr_signed(*a, sb.nbits);
-                                    let sa = be.share_secret(imm, sb.nbits, 0);
-                                    Types::Share(be.or(&sa, sb))
-                                }
-                                (Types::Num(a), Types::Num(b)) => Types::Num(a | b),
-                                _ => {
-                                    let a = maybe_num(&left_val).expect("or expects NUM/BOOL");
-                                    let b = maybe_num(&val).expect("or expects NUM/BOOL");
-                                    Types::Num(if a != 0 || b != 0 { 1 } else { 0 })
-                                }
-                            },
-                            super::parser::BinOp::AshRight => match (&left_val, &val) {
-                                (Types::Share(sa), Types::Num(bn)) => {
-                                    let mut be = backend.lock().unwrap_or_else(|e| e.into_inner());
-                                    // convert bn to usize
-                                    let b = usize::try_from(*bn).unwrap_or(0);
-                                    Types::Share(be.shift_right(sa, b))
-                                }
-                                (Types::Num(an), Types::Num(bn)) => {
-                                    let r = an.wrapping_shr(*bn as u32);
-                                    Types::Num(r)
-                                }
-                                _ => panic!("ash-right expects (SHARE, NUM) or (NUM, NUM)"),
-                            },
-                            super::parser::BinOp::AshLeft => match (&left_val, &val) {
-                                (Types::Share(sa), Types::Num(bn)) => {
-                                    let mut be = backend.lock().unwrap_or_else(|e| e.into_inner());
-                                    // convert bn to usize
-                                    let b = usize::try_from(*bn).unwrap_or(0);
-                                    Types::Share(be.shift_left(sa, b))
-                                }
-                                (Types::Num(an), Types::Num(bn)) => {
-                                    let r = an.wrapping_shl(*bn as u32);
-                                    Types::Num(r)
-                                }
-                                _ => panic!("ash-left expects (SHARE, NUM) or (NUM, NUM)"),
-                            },
                         };
                         stack.push(Apply(*cont, out, env.clone()));
                     }
@@ -750,6 +872,18 @@ pub fn reduce_expression(
                             super::parser::UnOp::Neg => match val {
                                 Types::Num(n) => Types::Num(n.wrapping_neg()),
                                 _ => panic!("negation expects numeric value"),
+                            },
+                            super::parser::UnOp::IsNull => match val {
+                                Types::List(ref vs) => {
+                                    Types::Num(if vs.is_empty() { 1 } else { 0 })
+                                }
+                                Types::Quoted(ref e) => match e.as_ref() {
+                                    Expr::Seq(items) => {
+                                        Types::Num(if items.is_empty() { 1 } else { 0 })
+                                    }
+                                    _ => Types::Num(0),
+                                },
+                                _ => panic!("null? expects a list"),
                             },
                             super::parser::UnOp::BitLen => match val {
                                 Types::Num(n) => {
@@ -952,6 +1086,10 @@ pub fn reduce_expression(
                                     let call_env =
                                         Rc::new(RefCell::new(closure_env.borrow().clone()));
                                     stack.push(Eval(*body, *cont, call_env));
+                                }
+                                Types::NativeFunc(f) => {
+                                    let result = f(vec![]);
+                                    stack.push(Apply(*cont, result, env.clone()));
                                 }
                                 _ => panic!("attempt to call non-function: {:?}", val),
                             }
@@ -1197,6 +1335,14 @@ impl Participant {
                     let sref = be.share_secret(imm, *nb as usize, canonical_owner);
                     Types::Share(sref)
                 }
+                (Types::Fixed(f), Types::Num(nb)) => {
+                    // Q16.16 value: share the scaled integer, flag the share.
+                    let mut be = share_backend.lock().unwrap_or_else(|e| e.into_inner());
+                    let imm = int_to_fr_signed(*f, *nb as usize);
+                    let mut sref = be.share_secret(imm, *nb as usize, 0);
+                    sref.fixed = true;
+                    Types::Share(sref)
+                }
                 (Types::Share(s), Types::Num(_nb)) => Types::Share(s.clone()),
                 _ => panic!("share expects (num nbits) or (share nbits)"),
             }
@@ -1224,6 +1370,13 @@ impl Participant {
                     let sref = be.share_secret(imm, *nb as usize, explicit_owner);
                     Types::Share(sref)
                 }
+                (Types::Num(owner_id), Types::Fixed(f), Types::Num(nb)) => {
+                    let mut be = share_from_backend.lock().unwrap_or_else(|e| e.into_inner());
+                    let imm = int_to_fr_signed(*f, *nb as usize);
+                    let mut sref = be.share_secret(imm, *nb as usize, *owner_id as usize);
+                    sref.fixed = true;
+                    Types::Share(sref)
+                }
                 _ => panic!("share-from expects (owner-id value nbits) all as numbers"),
             }
         });
@@ -1248,7 +1401,12 @@ impl Participant {
                     // and TransportBackend (in the single-party REPL, SimBackend
                     // ignores reveal_to anyway).
                     let plain = be.reveal(sref, None);
-                    Types::Num(plain as i64)
+                    if sref.fixed {
+                        // Q16.16 share: sign-extend the raw scaled value.
+                        Types::Fixed(fr_to_i64_signed(plain, sref.nbits))
+                    } else {
+                        Types::Num(plain as i64)
+                    }
                 }
                 Types::Num(n) => Types::Num(*n),
                 _ => panic!("reconstruct expects a shared value"),
@@ -1257,6 +1415,73 @@ impl Participant {
         self.store.borrow_mut().insert(
             "reconstruct".to_string(),
             Rc::new(RefCell::new(Types::NativeFunc(reconstruct_fn))),
+        );
+
+        // ── Vector builtins: dot, vsum, matvec ────────────────────────────────
+        // Native replacements for the recursive car/cdr dot-product pattern.
+        // Elements may be Num, Fixed, or Share; a user lambda named `dot`
+        // shadows the builtin (letrec bindings overwrite store entries).
+        let dot_backend = backend.clone();
+        let dot_fn = Arc::new(move |args: Vec<Types>| -> Types {
+            if args.len() != 2 {
+                panic!("dot expects 2 args: (dot vec-a vec-b)");
+            }
+            match (&args[0], &args[1]) {
+                (Types::List(a), Types::List(b)) => vec_dot(&dot_backend, a, b),
+                _ => panic!("dot expects two lists"),
+            }
+        });
+        self.store.borrow_mut().insert(
+            "dot".to_string(),
+            Rc::new(RefCell::new(Types::NativeFunc(dot_fn))),
+        );
+
+        let vsum_backend = backend.clone();
+        let vsum_fn = Arc::new(move |args: Vec<Types>| -> Types {
+            if args.len() != 1 {
+                panic!("vsum expects 1 arg: (vsum vec)");
+            }
+            match &args[0] {
+                Types::List(items) => {
+                    let mut acc: Option<Types> = None;
+                    for item in items {
+                        acc = Some(match acc {
+                            None => item.clone(),
+                            Some(s) => vec_add(&vsum_backend, &s, item),
+                        });
+                    }
+                    acc.unwrap_or(Types::Num(0))
+                }
+                _ => panic!("vsum expects a list"),
+            }
+        });
+        self.store.borrow_mut().insert(
+            "vsum".to_string(),
+            Rc::new(RefCell::new(Types::NativeFunc(vsum_fn))),
+        );
+
+        let matvec_backend = backend.clone();
+        let matvec_fn = Arc::new(move |args: Vec<Types>| -> Types {
+            if args.len() != 2 {
+                panic!("matvec expects 2 args: (matvec matrix vec)");
+            }
+            match (&args[0], &args[1]) {
+                (Types::List(rows), Types::List(v)) => {
+                    let out: Vec<Types> = rows
+                        .iter()
+                        .map(|row| match row {
+                            Types::List(r) => vec_dot(&matvec_backend, r, v),
+                            _ => panic!("matvec: matrix rows must be lists"),
+                        })
+                        .collect();
+                    Types::List(out)
+                }
+                _ => panic!("matvec expects a list of lists and a list"),
+            }
+        });
+        self.store.borrow_mut().insert(
+            "matvec".to_string(),
+            Rc::new(RefCell::new(Types::NativeFunc(matvec_fn))),
         );
 
         // a2b builtin
@@ -1308,6 +1533,15 @@ impl Participant {
         self.store.borrow_mut().insert(
             "b2a".to_string(),
             Rc::new(RefCell::new(Types::NativeFunc(b2a_fn))),
+        );
+
+        // list builtin: (list v1 v2 ...) → Types::List
+        // Collects all arguments into a list.  Useful for building ciphertext
+        // lists to pass to fhe-eval's enc-cts argument.
+        let list_fn = Arc::new(move |args: Vec<Types>| -> Types { Types::List(args) });
+        self.store.borrow_mut().insert(
+            "list".to_string(),
+            Rc::new(RefCell::new(Types::NativeFunc(list_fn))),
         );
 
         // zkp-compile builtin: (zkp-compile 'expr '("x" "y"))
@@ -1509,6 +1743,573 @@ impl Participant {
             "proof-load".to_string(),
             Rc::new(RefCell::new(Types::NativeFunc(proof_load_fn))),
         );
+
+        // ── Fixed-point conversion builtins ───────────────────────────────────
+        //
+        // (int->fixed n)   → Q16.16 fixed-point from integer
+        // (fixed->int f)   → truncate fixed-point to integer (floor toward zero)
+        // (fixed->str f)   → decimal string representation, e.g. "3.1416"
+
+        let int_to_fixed_fn = Arc::new(move |args: Vec<Types>| -> Types {
+            use crate::interpreter::ast::FIXED_SCALE;
+            if args.len() != 1 {
+                panic!("int->fixed expects 1 arg: (int->fixed n)");
+            }
+            match &args[0] {
+                Types::Num(n) => Types::Fixed(n * FIXED_SCALE),
+                Types::Fixed(v) => Types::Fixed(*v),
+                _ => panic!("int->fixed: argument must be a number"),
+            }
+        });
+        self.store.borrow_mut().insert(
+            "int->fixed".to_string(),
+            Rc::new(RefCell::new(Types::NativeFunc(int_to_fixed_fn))),
+        );
+
+        let fixed_to_int_fn = Arc::new(move |args: Vec<Types>| -> Types {
+            use crate::interpreter::ast::FIXED_SCALE;
+            if args.len() != 1 {
+                panic!("fixed->int expects 1 arg: (fixed->int f)");
+            }
+            match &args[0] {
+                Types::Fixed(v) => Types::Num(v / FIXED_SCALE),
+                Types::Num(n) => Types::Num(*n),
+                _ => panic!("fixed->int: argument must be a fixed-point or integer"),
+            }
+        });
+        self.store.borrow_mut().insert(
+            "fixed->int".to_string(),
+            Rc::new(RefCell::new(Types::NativeFunc(fixed_to_int_fn))),
+        );
+
+        let fixed_to_str_fn = Arc::new(move |args: Vec<Types>| -> Types {
+            use crate::interpreter::ast::FIXED_SCALE;
+            if args.len() != 1 {
+                panic!("fixed->str expects 1 arg: (fixed->str f)");
+            }
+            let v = match &args[0] {
+                Types::Fixed(v) => *v,
+                Types::Num(n) => n * FIXED_SCALE,
+                _ => panic!("fixed->str: argument must be a fixed-point or integer"),
+            };
+            let whole = v / FIXED_SCALE;
+            let frac = (v % FIXED_SCALE).abs();
+            let frac_digits = (frac * 10_000) / FIXED_SCALE;
+            Types::Str(format!("{}.{:04}", whole, frac_digits))
+        });
+        self.store.borrow_mut().insert(
+            "fixed->str".to_string(),
+            Rc::new(RefCell::new(Types::NativeFunc(fixed_to_str_fn))),
+        );
+
+        // ── FHE builtins ─────────────────────────────────────────────────────
+        //
+        // (fhe-keygen)
+        //   → returns a JSON string containing the key-pair (FheKeyPair).
+        //     Store it with let: (let ((keys (fhe-keygen))) ...)
+        //
+        // (fhe-enc keys value)
+        //   → encrypts a Num (or Fixed) using the client key embedded in `keys`
+        //   → returns Types::FheCiphertext
+        //
+        // (fhe-dec keys ciphertext)
+        //   → decrypts a Types::FheCiphertext → Types::Num
+        //
+        // (fhe-compile 'expr '("enc-var1" "enc-var2"))
+        //   → compiles the expression; the second arg names which variables will
+        //     be supplied as ciphertexts at eval time (analogous to zkp-compile's
+        //     private-vars list).
+        //   → returns a JSON string (FheCircuit)
+        //
+        // (fhe-eval circuit-str keys '("pub-x") '(3) '("enc-y") '(ct))
+        //   → evaluates circuit homomorphically
+        //   → public-keys / public-vals: plaintext inputs
+        //   → enc-keys / enc-cts:        ciphertext inputs (Types::FheCiphertext)
+        //   → returns Types::FheCiphertext (the encrypted result)
+
+        // fhe-keygen  (mock plaintext backend — instant, no crypto)
+        let fhe_keygen_fn = Arc::new(move |args: Vec<Types>| -> Types {
+            if !args.is_empty() {
+                panic!("fhe-keygen takes no arguments");
+            }
+            let be = crate::fhe::MockFheBackend;
+            use crate::fhe::FheBackend;
+            let (ck, sk) = be.keygen();
+            let kp = crate::fhe::backend::FheKeyPair {
+                backend_id: be.backend_id().to_string(),
+                client_key_bytes: ck,
+                server_key_bytes: sk,
+            };
+            let json = serde_json::to_string(&kp)
+                .unwrap_or_else(|e| panic!("fhe-keygen: serialise error: {}", e));
+            Types::Str(json)
+        });
+        self.store.borrow_mut().insert(
+            "fhe-keygen".to_string(),
+            Rc::new(RefCell::new(Types::NativeFunc(fhe_keygen_fn))),
+        );
+
+        // fhe-keygen-tfhe  (real TFHE-rs backend — slow first call ~3 s)
+        // Also installs the server key into the TFHE-rs global thread-local so
+        // subsequent fhe-enc / fhe-eval calls work without extra setup.
+        let fhe_keygen_tfhe_fn = Arc::new(move |args: Vec<Types>| -> Types {
+            if !args.is_empty() {
+                panic!("fhe-keygen-tfhe takes no arguments");
+            }
+            use crate::fhe::FheBackend;
+            let be = crate::fhe::TfheBackend::new();
+            let (ck, sk) = be.keygen();
+            // Install server key globally so all subsequent gates work.
+            crate::fhe::TfheBackend::install_server_key(&sk);
+            let kp = crate::fhe::backend::FheKeyPair {
+                backend_id: be.backend_id().to_string(),
+                client_key_bytes: ck,
+                server_key_bytes: sk,
+            };
+            let json = serde_json::to_string(&kp)
+                .unwrap_or_else(|e| panic!("fhe-keygen-tfhe: serialise error: {}", e));
+            Types::Str(json)
+        });
+        self.store.borrow_mut().insert(
+            "fhe-keygen-tfhe".to_string(),
+            Rc::new(RefCell::new(Types::NativeFunc(fhe_keygen_tfhe_fn))),
+        );
+
+        // fhe-keygen-ckks  (SEAL CKKS backend — approximate real arithmetic;
+        // pair with circuits from fhe-compile-ckks)
+        let fhe_keygen_ckks_fn = Arc::new(move |args: Vec<Types>| -> Types {
+            if !args.is_empty() {
+                panic!("fhe-keygen-ckks takes no arguments");
+            }
+            use crate::fhe::RealFheBackend;
+            let be = crate::fhe::CkksBackend::new();
+            let (ck, sk) = be.keygen();
+            let kp = crate::fhe::backend::FheKeyPair {
+                backend_id: be.backend_id().to_string(),
+                client_key_bytes: ck,
+                server_key_bytes: sk,
+            };
+            let json = serde_json::to_string(&kp)
+                .unwrap_or_else(|e| panic!("fhe-keygen-ckks: serialise error: {}", e));
+            Types::Str(json)
+        });
+        self.store.borrow_mut().insert(
+            "fhe-keygen-ckks".to_string(),
+            Rc::new(RefCell::new(Types::NativeFunc(fhe_keygen_ckks_fn))),
+        );
+
+        // fhe-keygen-ckks-mock  (exact f64 twin of the CKKS backend)
+        let fhe_keygen_ckks_mock_fn = Arc::new(move |args: Vec<Types>| -> Types {
+            if !args.is_empty() {
+                panic!("fhe-keygen-ckks-mock takes no arguments");
+            }
+            use crate::fhe::RealFheBackend;
+            let be = crate::fhe::MockCkksBackend;
+            let (ck, sk) = be.keygen();
+            let kp = crate::fhe::backend::FheKeyPair {
+                backend_id: be.backend_id().to_string(),
+                client_key_bytes: ck,
+                server_key_bytes: sk,
+            };
+            let json = serde_json::to_string(&kp)
+                .unwrap_or_else(|e| panic!("fhe-keygen-ckks-mock: serialise error: {}", e));
+            Types::Str(json)
+        });
+        self.store.borrow_mut().insert(
+            "fhe-keygen-ckks-mock".to_string(),
+            Rc::new(RefCell::new(Types::NativeFunc(fhe_keygen_ckks_mock_fn))),
+        );
+
+        // fhe-enc
+        let fhe_enc_fn = Arc::new(move |args: Vec<Types>| -> Types {
+            if args.len() != 2 {
+                panic!("fhe-enc expects 2 args: (fhe-enc keys value)");
+            }
+            let keys_json = match &args[0] {
+                Types::Str(s) => s.clone(),
+                _ => panic!("fhe-enc: first arg must be a key-pair JSON string (from fhe-keygen)"),
+            };
+            let kp: crate::fhe::backend::FheKeyPair = serde_json::from_str(&keys_json)
+                .unwrap_or_else(|e| panic!("fhe-enc: invalid key JSON: {}", e));
+            let (plaintext, is_fixed) = match &args[1] {
+                Types::Num(n) => (*n as u64, false),
+                Types::Fixed(v) => (*v as u64, true),
+                Types::Bool(b) => {
+                    if *b {
+                        (1u64, false)
+                    } else {
+                        (0u64, false)
+                    }
+                }
+                _ => panic!("fhe-enc: second arg must be a number or boolean"),
+            };
+            use crate::fhe::FheBackend;
+            match kp.backend_id.as_str() {
+                "tfhe-rs-v1.6" => {
+                    let be = crate::fhe::TfheBackend::new();
+                    let ct = be.encrypt(&kp.client_key_bytes, plaintext);
+                    let handle = crate::fhe::backend::FheCiphertextHandle {
+                        backend_id: be.backend_id().to_string(),
+                        bytes: be.serialize_ct(&ct),
+                        fixed: is_fixed,
+                    };
+                    Types::FheCiphertext(handle)
+                }
+                "seal-ckks" | "ckks-mock" => {
+                    // Real-arithmetic backends encrypt the true value: fixed
+                    // Q16.16 integers cross the boundary as v / 2^16.
+                    let real = if is_fixed {
+                        plaintext as i64 as f64 / 65536.0
+                    } else {
+                        plaintext as i64 as f64
+                    };
+                    fn enc<B: crate::fhe::RealFheBackend>(
+                        be: &B,
+                        ck: &[u8],
+                        v: f64,
+                        fixed: bool,
+                    ) -> Types {
+                        let ct = be.encrypt(ck, v);
+                        Types::FheCiphertext(crate::fhe::backend::FheCiphertextHandle {
+                            backend_id: be.backend_id().to_string(),
+                            bytes: be.serialize_ct(&ct),
+                            fixed,
+                        })
+                    }
+                    if kp.backend_id == "seal-ckks" {
+                        enc(
+                            &crate::fhe::CkksBackend::new(),
+                            &kp.client_key_bytes,
+                            real,
+                            is_fixed,
+                        )
+                    } else {
+                        enc(
+                            &crate::fhe::MockCkksBackend,
+                            &kp.client_key_bytes,
+                            real,
+                            is_fixed,
+                        )
+                    }
+                }
+                _ => {
+                    let be = crate::fhe::MockFheBackend;
+                    let ct = be.encrypt(&kp.client_key_bytes, plaintext);
+                    let handle = crate::fhe::backend::FheCiphertextHandle {
+                        backend_id: be.backend_id().to_string(),
+                        bytes: be.serialize_ct(&ct),
+                        fixed: is_fixed,
+                    };
+                    Types::FheCiphertext(handle)
+                }
+            }
+        });
+        self.store.borrow_mut().insert(
+            "fhe-enc".to_string(),
+            Rc::new(RefCell::new(Types::NativeFunc(fhe_enc_fn))),
+        );
+
+        // fhe-dec
+        let fhe_dec_fn = Arc::new(move |args: Vec<Types>| -> Types {
+            if args.len() != 2 {
+                panic!("fhe-dec expects 2 args: (fhe-dec keys ciphertext)");
+            }
+            let keys_json = match &args[0] {
+                Types::Str(s) => s.clone(),
+                _ => panic!("fhe-dec: first arg must be a key-pair JSON string"),
+            };
+            let kp: crate::fhe::backend::FheKeyPair = serde_json::from_str(&keys_json)
+                .unwrap_or_else(|e| panic!("fhe-dec: invalid key JSON: {}", e));
+            let handle = match &args[1] {
+                Types::FheCiphertext(h) => h.clone(),
+                _ => panic!("fhe-dec: second arg must be a FheCiphertext"),
+            };
+            use crate::fhe::FheBackend;
+            let plain = match kp.backend_id.as_str() {
+                "seal-ckks" | "ckks-mock" => {
+                    // Real-arithmetic decrypt: recover the approximate real
+                    // and re-enter the Q16.16 domain (or round to int).
+                    use crate::fhe::RealFheBackend;
+                    let v = if kp.backend_id == "seal-ckks" {
+                        let be = crate::fhe::CkksBackend::new();
+                        let ct = be.deserialize_ct(&handle.bytes);
+                        be.decrypt(&kp.client_key_bytes, &ct)
+                    } else {
+                        let be = crate::fhe::MockCkksBackend;
+                        let ct = be.deserialize_ct(&handle.bytes);
+                        be.decrypt(&kp.client_key_bytes, &ct)
+                    };
+                    return if handle.fixed {
+                        Types::Fixed((v * 65536.0).round() as i64)
+                    } else {
+                        Types::Num(v.round() as i64)
+                    };
+                }
+                "tfhe-rs-v1.6" => {
+                    let be = crate::fhe::TfheBackend::new();
+                    let ct = be.deserialize_ct(&handle.bytes);
+                    be.decrypt(&kp.client_key_bytes, &ct) as i64
+                }
+                _ => {
+                    let be = crate::fhe::MockFheBackend;
+                    let ct = be.deserialize_ct(&handle.bytes);
+                    be.decrypt(&kp.client_key_bytes, &ct) as i64
+                }
+            };
+            if handle.fixed {
+                Types::Fixed(plain)
+            } else {
+                Types::Num(plain)
+            }
+        });
+        self.store.borrow_mut().insert(
+            "fhe-dec".to_string(),
+            Rc::new(RefCell::new(Types::NativeFunc(fhe_dec_fn))),
+        );
+
+        // fhe-compile
+        let fhe_compile_fn = Arc::new(move |args: Vec<Types>| -> Types {
+            if args.len() != 2 {
+                panic!("fhe-compile expects 2 args: (fhe-compile 'expr '(\"enc-var\"))");
+            }
+            let expr = match &args[0] {
+                Types::Quoted(e) => *e.clone(),
+                _ => panic!("fhe-compile: first arg must be a quoted expression"),
+            };
+            let enc_vars: Vec<String> = match &args[1] {
+                Types::List(items) => items
+                    .iter()
+                    .map(|v| match v {
+                        Types::Str(s) => s.clone(),
+                        _ => panic!("fhe-compile: enc-vars must be a list of strings"),
+                    })
+                    .collect(),
+                Types::Quoted(inner) => match inner.as_ref() {
+                    Expr::Str(s) => vec![s.clone()],
+                    Expr::Seq(items) if items.is_empty() => vec![],
+                    Expr::Call(head, rest) => {
+                        let mut vars = Vec::new();
+                        if let Expr::Str(s) = head.as_ref() {
+                            vars.push(s.clone());
+                        }
+                        for e in rest {
+                            if let Expr::Str(s) = e {
+                                vars.push(s.clone());
+                            }
+                        }
+                        vars
+                    }
+                    _ => panic!("fhe-compile: enc-vars must be a quoted list of strings"),
+                },
+                _ => panic!("fhe-compile: second arg must be a list of strings"),
+            };
+            let mut cc = crate::zkp::circuit_compiler::CircuitCompiler::new();
+            let mut circuit = cc
+                .compile_fhe(&expr)
+                .unwrap_or_else(|e| panic!("fhe-compile failed: {}", e));
+            // Move declared enc-vars from public_inputs to encrypted_inputs
+            circuit.encrypted_inputs = enc_vars.clone();
+            circuit.public_inputs.retain(|v| !enc_vars.contains(v));
+            let json = serde_json::to_string(&circuit)
+                .unwrap_or_else(|e| panic!("fhe-compile: serialise error: {}", e));
+            Types::Str(json)
+        });
+        self.store.borrow_mut().insert(
+            "fhe-compile".to_string(),
+            Rc::new(RefCell::new(Types::NativeFunc(fhe_compile_fn))),
+        );
+
+        // fhe-compile-ckks — like fhe-compile, but in real-arithmetic mode:
+        // fixed-point literals keep their true value and no Q16.16 gadgets
+        // are emitted.  Required for evaluation on CKKS backends.
+        let fhe_compile_ckks_fn = Arc::new(move |args: Vec<Types>| -> Types {
+            if args.len() != 2 {
+                panic!("fhe-compile-ckks expects 2 args: (fhe-compile-ckks 'expr '(\"enc-var\"))");
+            }
+            let expr = match &args[0] {
+                Types::Quoted(e) => *e.clone(),
+                _ => panic!("fhe-compile-ckks: first arg must be a quoted expression"),
+            };
+            let enc_vars: Vec<String> = match &args[1] {
+                Types::List(items) => items
+                    .iter()
+                    .map(|v| match v {
+                        Types::Str(s) => s.clone(),
+                        _ => panic!("fhe-compile-ckks: enc-vars must be a list of strings"),
+                    })
+                    .collect(),
+                Types::Quoted(inner) => match inner.as_ref() {
+                    Expr::Str(s) => vec![s.clone()],
+                    Expr::Seq(items) if items.is_empty() => vec![],
+                    Expr::Call(head, rest) => {
+                        let mut vars = Vec::new();
+                        if let Expr::Str(s) = head.as_ref() {
+                            vars.push(s.clone());
+                        }
+                        for e in rest {
+                            if let Expr::Str(s) = e {
+                                vars.push(s.clone());
+                            }
+                        }
+                        vars
+                    }
+                    _ => panic!("fhe-compile-ckks: enc-vars must be a quoted list of strings"),
+                },
+                _ => panic!("fhe-compile-ckks: second arg must be a list of strings"),
+            };
+            let mut cc = crate::zkp::circuit_compiler::CircuitCompiler::new_real();
+            let mut circuit = cc
+                .compile_fhe(&expr)
+                .unwrap_or_else(|e| panic!("fhe-compile-ckks failed: {}", e));
+            circuit.encrypted_inputs = enc_vars.clone();
+            circuit.public_inputs.retain(|v| !enc_vars.contains(v));
+            let json = serde_json::to_string(&circuit)
+                .unwrap_or_else(|e| panic!("fhe-compile-ckks: serialise error: {}", e));
+            Types::Str(json)
+        });
+        self.store.borrow_mut().insert(
+            "fhe-compile-ckks".to_string(),
+            Rc::new(RefCell::new(Types::NativeFunc(fhe_compile_ckks_fn))),
+        );
+
+        // fhe-eval
+        // (fhe-eval circuit-str keys '("pub-x") '(3) '("enc-y") '(ct))
+        let fhe_eval_fn = Arc::new(move |args: Vec<Types>| -> Types {
+            if args.len() != 6 {
+                panic!(
+                    "fhe-eval expects 6 args: \
+                     (fhe-eval circuit-str keys '(pub-keys) '(pub-vals) '(enc-keys) '(enc-cts))"
+                );
+            }
+            let circuit_json = match &args[0] {
+                Types::Str(s) => s.clone(),
+                _ => panic!("fhe-eval: first arg must be a circuit JSON string (from fhe-compile)"),
+            };
+            let mut circuit: crate::fhe::backend::FheCircuit = serde_json::from_str(&circuit_json)
+                .unwrap_or_else(|e| panic!("fhe-eval: invalid circuit JSON: {}", e));
+            let keys_json = match &args[1] {
+                Types::Str(s) => s.clone(),
+                _ => panic!("fhe-eval: second arg must be a key-pair JSON string"),
+            };
+            let kp: crate::fhe::backend::FheKeyPair = serde_json::from_str(&keys_json)
+                .unwrap_or_else(|e| panic!("fhe-eval: invalid key JSON: {}", e));
+
+            let pub_keys = decode_quoted_str_list(&args[2], "fhe-eval pub-keys");
+            let pub_nums = decode_quoted_num_list(&args[3], "fhe-eval pub-vals");
+            let enc_keys = decode_quoted_str_list(&args[4], "fhe-eval enc-keys");
+            // enc-cts: list of FheCiphertext values
+            // Accepts Types::List (from `list` builtin) or an empty quoted seq '()
+            let enc_cts: Vec<crate::fhe::backend::FheCiphertextHandle> = match &args[5] {
+                Types::List(items) => items
+                    .iter()
+                    .map(|v| match v {
+                        Types::FheCiphertext(h) => h.clone(),
+                        _ => panic!("fhe-eval: enc-cts must be a list of FheCiphertext values"),
+                    })
+                    .collect(),
+                Types::Quoted(inner) => match inner.as_ref() {
+                    Expr::Seq(items) if items.is_empty() => vec![],
+                    _ => panic!("fhe-eval: enc-cts must be a list of FheCiphertext values (use (list ct1 ct2 ...) or '() for empty)"),
+                },
+                _ => panic!("fhe-eval: enc-cts must be a list of FheCiphertext values (use (list ct1 ct2 ...) or '() for empty)"),
+            };
+
+            if pub_keys.len() != pub_nums.len() {
+                panic!("fhe-eval: pub-keys and pub-vals must have the same length");
+            }
+            if enc_keys.len() != enc_cts.len() {
+                panic!("fhe-eval: enc-keys and enc-cts must have the same length");
+            }
+
+            // Update circuit's input classification to match caller's intent
+            circuit.public_inputs = pub_keys.clone();
+            circuit.encrypted_inputs = enc_keys.clone();
+
+            use crate::fhe::FheBackend;
+            let pub_map: std::collections::HashMap<String, i64> =
+                pub_keys.into_iter().zip(pub_nums).collect();
+
+            match kp.backend_id.as_str() {
+                "seal-ckks" | "ckks-mock" => {
+                    // Real-arithmetic path: public inputs cross as true reals.
+                    let pub_map_f: std::collections::HashMap<String, f64> = pub_map
+                        .iter()
+                        .map(|(k, v)| (k.clone(), *v as f64))
+                        .collect();
+                    fn run<B: crate::fhe::RealFheBackend>(
+                        be: &B,
+                        circuit: &crate::fhe::backend::FheCircuit,
+                        pub_map: &std::collections::HashMap<String, f64>,
+                        enc_keys: Vec<String>,
+                        enc_cts: &[crate::fhe::backend::FheCiphertextHandle],
+                    ) -> Types {
+                        let enc_map: std::collections::HashMap<String, B::Ct> = enc_keys
+                            .into_iter()
+                            .zip(enc_cts.iter().map(|h| be.deserialize_ct(&h.bytes)))
+                            .collect();
+                        let result_ct = crate::fhe::circuit_emitter::evaluate_fhe_real(
+                            circuit, pub_map, &enc_map, be,
+                        );
+                        Types::FheCiphertext(crate::fhe::backend::FheCiphertextHandle {
+                            backend_id: be.backend_id().to_string(),
+                            bytes: be.serialize_ct(&result_ct),
+                            fixed: circuit.output_fixed,
+                        })
+                    }
+                    if kp.backend_id == "seal-ckks" {
+                        let be = crate::fhe::CkksBackend::with_server_keys(&kp.server_key_bytes);
+                        run(&be, &circuit, &pub_map_f, enc_keys, &enc_cts)
+                    } else {
+                        run(
+                            &crate::fhe::MockCkksBackend,
+                            &circuit,
+                            &pub_map_f,
+                            enc_keys,
+                            &enc_cts,
+                        )
+                    }
+                }
+                "tfhe-rs-v1.6" => {
+                    // Ensure the server key is installed (caller may have used
+                    // fhe-keygen-tfhe which installs it, but re-install to be safe).
+                    crate::fhe::TfheBackend::install_server_key(&kp.server_key_bytes);
+                    let be = crate::fhe::TfheBackend::new();
+                    let enc_map: std::collections::HashMap<String, _> = enc_keys
+                        .into_iter()
+                        .zip(enc_cts.iter().map(|h| be.deserialize_ct(&h.bytes)))
+                        .collect();
+                    let result_ct = crate::fhe::circuit_emitter::evaluate_fhe(
+                        &circuit, &pub_map, &enc_map, &be,
+                    );
+                    let handle = crate::fhe::backend::FheCiphertextHandle {
+                        backend_id: be.backend_id().to_string(),
+                        bytes: be.serialize_ct(&result_ct),
+                        fixed: circuit.output_fixed,
+                    };
+                    Types::FheCiphertext(handle)
+                }
+                _ => {
+                    let be = crate::fhe::MockFheBackend;
+                    let enc_map: std::collections::HashMap<String, u64> = enc_keys
+                        .into_iter()
+                        .zip(enc_cts.iter().map(|h| be.deserialize_ct(&h.bytes)))
+                        .collect();
+                    let result_ct = crate::fhe::circuit_emitter::evaluate_fhe(
+                        &circuit, &pub_map, &enc_map, &be,
+                    );
+                    let handle = crate::fhe::backend::FheCiphertextHandle {
+                        backend_id: be.backend_id().to_string(),
+                        bytes: be.serialize_ct(&result_ct),
+                        fixed: circuit.output_fixed,
+                    };
+                    Types::FheCiphertext(handle)
+                }
+            }
+        });
+        self.store.borrow_mut().insert(
+            "fhe-eval".to_string(),
+            Rc::new(RefCell::new(Types::NativeFunc(fhe_eval_fn))),
+        );
     }
 
     /// Reveal a shared value to the caller (simulated reveal via backend).
@@ -1679,6 +2480,8 @@ impl Participant {
 fn to_persist_value(v: &Types) -> Option<PersistValue> {
     match v {
         Types::Num(n) => Some(PersistValue::Num(*n)),
+        // Persist Fixed as a specially-prefixed string "fixed:<scaled_i64>"
+        Types::Fixed(f) => Some(PersistValue::Str(format!("fixed:{}", f))),
         Types::Bool(b) => Some(PersistValue::Bool(*b)),
         Types::Str(s) => Some(PersistValue::Str(s.clone())),
         Types::Char(c) => Some(PersistValue::Char(*c)),
@@ -1698,7 +2501,15 @@ fn from_persist_value(p: PersistValue) -> Option<Types> {
     match p {
         PersistValue::Num(n) => Some(Types::Num(n)),
         PersistValue::Bool(b) => Some(Types::Bool(b)),
-        PersistValue::Str(s) => Some(Types::Str(s)),
+        PersistValue::Str(s) => {
+            // Restore Fixed values from persist format
+            if let Some(rest) = s.strip_prefix("fixed:") {
+                if let Ok(v) = rest.parse::<i64>() {
+                    return Some(Types::Fixed(v));
+                }
+            }
+            Some(Types::Str(s))
+        }
         PersistValue::Char(c) => Some(Types::Char(c)),
         PersistValue::List(vs) => {
             let mut out: Vec<Types> = Vec::new();
@@ -1720,6 +2531,12 @@ fn expr_short(e: &Expr) -> String {
         Expr::Char(_) => "Char".to_string(),
         Expr::Bool(b) => format!("Bool({})", b),
         Expr::Num(n) => format!("Num({})", n),
+        Expr::Fixed(v) => {
+            use crate::interpreter::ast::FIXED_SCALE;
+            let whole = v / FIXED_SCALE;
+            let frac = ((v % FIXED_SCALE).abs() * 10_000) / FIXED_SCALE;
+            format!("Fixed({}.{:04})", whole, frac)
+        }
         Expr::Var(s) => format!("Var({})", s),
         Expr::BinOp(_, _, _) => "BinOp".to_string(),
         Expr::Let(bs, _) => format!("Let(len={})", bs.len()),
@@ -1757,7 +2574,45 @@ fn cont_short(c: &Continuation) -> String {
 }
 
 /// Decode a quoted list of strings from a Types value.
-/// Accepts '("a" "b") → Quote(Call(Str("a"), [Str("b")])) or Quote(Str("a")) or Quote(Seq([])).
+/// Accepts '("a" "b") → Quote(Call(Str("a"), [Str("b"), ...])) or Quote(Seq([...])) for zero/multiple items
+/// Convert a quoted expression into a literal data list, if it is one.
+///
+/// A quote shorthand like '(1 2 3) parses as Quote(Call(Num(1), [Num(2), Num(3)]))
+/// and '() as Quote(Seq([])).  When every element is a literal (number, fixed,
+/// bool, char, negated number, or a nested literal list) the quote denotes
+/// *data*, and we materialise it as a Vec<Types> so car/cdr/null? work on it.
+/// Quoted code ('(+ x y)) and string lists ('("x") — used as argument lists by
+/// the zkp/fhe builtins) return None and stay Quoted.
+fn quoted_literal_list(e: &Expr) -> Option<Vec<Types>> {
+    fn literal_value(e: &Expr) -> Option<Types> {
+        match e {
+            Expr::Num(n) => Some(Types::Num(*n)),
+            Expr::Fixed(v) => Some(Types::Fixed(*v)),
+            Expr::Bool(b) => Some(Types::Bool(*b)),
+            Expr::Char(c) => Some(Types::Char(*c)),
+            Expr::UnOp(super::parser::UnOp::Neg, inner) => match inner.as_ref() {
+                Expr::Num(n) => Some(Types::Num(-n)),
+                Expr::Fixed(v) => Some(Types::Fixed(-v)),
+                _ => None,
+            },
+            Expr::Call(_, _) | Expr::Seq(_) => quoted_literal_list(e).map(Types::List),
+            _ => None,
+        }
+    }
+    match e {
+        Expr::Seq(items) if items.is_empty() => Some(vec![]),
+        Expr::Call(head, rest) => {
+            let mut out = Vec::with_capacity(1 + rest.len());
+            out.push(literal_value(head)?);
+            for item in rest {
+                out.push(literal_value(item)?);
+            }
+            Some(out)
+        }
+        _ => None,
+    }
+}
+
 fn decode_quoted_str_list(v: &Types, label: &str) -> Vec<String> {
     use crate::interpreter::ast::Expr;
     match v {
@@ -1833,6 +2688,241 @@ fn decode_quoted_num_list(v: &Types, label: &str) -> Vec<i64> {
     }
 }
 
+// ─── Vector builtin helpers (dot / vsum / matvec) ────────────────────────────
+
+use crate::interpreter::backend::ShareRef;
+
+/// Sign-extend an nbits two's-complement field value to i64.
+fn fr_to_i64_signed(v: u128, nbits: usize) -> i64 {
+    if nbits >= 64 {
+        v as i64
+    } else {
+        let m = 1u128 << nbits;
+        let v = v & (m - 1);
+        if v & (m >> 1) != 0 {
+            (v as i128 - m as i128) as i64
+        } else {
+            v as i64
+        }
+    }
+}
+
+/// Arithmetic >>16 on a two's-complement share — the Q16.16 rescale after a
+/// fixed×fixed multiply.  Decompose to bits, drop the low 16, replicate the
+/// sign bit into the top 16, recompose.
+fn share_ashr16(be: &mut dyn Backend, a: &ShareRef) -> ShareRef {
+    assert!(
+        a.nbits > 16,
+        "fixed-point shares need more than 16 bits, got {}",
+        a.nbits
+    );
+    let bits = be.a2b(a, a.nbits);
+    let sign = bits[a.nbits - 1].clone();
+    let mut out_bits: Vec<ShareRef> = bits[16..].to_vec();
+    while out_bits.len() < a.nbits {
+        out_bits.push(sign.clone());
+    }
+    let mut r = be.b2a(&out_bits);
+    // b2a inherits the 1-bit width of its inputs; restore the real width.
+    r.nbits = a.nbits;
+    r
+}
+
+/// Lift an integer share into the Q16.16 domain (×2^16 via doubling).
+fn share_to_fixed(be: &mut dyn Backend, a: &ShareRef) -> ShareRef {
+    let mut r = be.shift_left(a, 16);
+    r.nbits = a.nbits;
+    r.fixed = true;
+    r
+}
+
+/// Share a plain operand at face value: Fixed keeps its scaled
+/// representation (share marked fixed), Num/Bool stay integers.
+fn share_imm_raw(be: &mut dyn Backend, v: &Types, nbits: usize) -> ShareRef {
+    match v {
+        Types::Num(n) => be.share_secret(int_to_fr_signed(*n, nbits), nbits, 0),
+        Types::Bool(b) => be.share_secret(if *b { 1 } else { 0 }, nbits, 0),
+        Types::Fixed(f) => {
+            let mut s = be.share_secret(int_to_fr_signed(*f, nbits), nbits, 0);
+            s.fixed = true;
+            s
+        }
+        _ => panic!("cannot share operand {:?}", v),
+    }
+}
+
+/// Bring an operand into the share domain; when `scaled` is set, integer
+/// operands are lifted to Q16.16 (mirrors the interpreter's Num→Fixed
+/// coercion).
+fn share_operand(be: &mut dyn Backend, v: &Types, nbits: usize, scaled: bool) -> ShareRef {
+    use crate::interpreter::ast::FIXED_SCALE;
+    match v {
+        Types::Share(s) => {
+            if scaled && !s.fixed {
+                share_to_fixed(be, s)
+            } else {
+                s.clone()
+            }
+        }
+        Types::Num(n) if scaled => {
+            let mut s = be.share_secret(int_to_fr_signed(n * FIXED_SCALE, nbits), nbits, 0);
+            s.fixed = true;
+            s
+        }
+        _ => share_imm_raw(be, v, nbits),
+    }
+}
+
+fn operand_nbits(a: &Types, b: &Types) -> usize {
+    match (a, b) {
+        (Types::Share(s), _) => s.nbits,
+        (_, Types::Share(s)) => s.nbits,
+        _ => panic!("fixed-share op needs at least one share operand"),
+    }
+}
+
+fn operand_is_fixed(v: &Types) -> bool {
+    matches!(v, Types::Fixed(_)) || matches!(v, Types::Share(s) if s.fixed)
+}
+
+/// Multiply in the share domain with Q16.16 awareness: a fixed×int product
+/// is already correctly scaled, so the (expensive) rescale runs only for
+/// fixed×fixed.
+fn share_mul_typed(be: &mut dyn Backend, a: &Types, b: &Types) -> ShareRef {
+    let nbits = operand_nbits(a, b);
+    let (fa, fb) = (operand_is_fixed(a), operand_is_fixed(b));
+    let sa = share_operand(be, a, nbits, false);
+    let sb = share_operand(be, b, nbits, false);
+    let prod = be.mul(&sa, &sb);
+    let mut r = if fa && fb {
+        share_ashr16(be, &prod)
+    } else {
+        prod
+    };
+    r.fixed = fa || fb;
+    r
+}
+
+/// Add/sub in the share domain with Q16.16 awareness (mixed int operands
+/// are lifted to the scaled domain first).
+fn share_addsub_typed(be: &mut dyn Backend, a: &Types, b: &Types, sub: bool) -> ShareRef {
+    let nbits = operand_nbits(a, b);
+    let any_fixed = operand_is_fixed(a) || operand_is_fixed(b);
+    let sa = share_operand(be, a, nbits, any_fixed);
+    let sb = share_operand(be, b, nbits, any_fixed);
+    let mut r = if sub {
+        be.sub(&sa, &sb)
+    } else {
+        be.add(&sa, &sb)
+    };
+    r.fixed = any_fixed;
+    r
+}
+
+/// Binary op where at least one operand is a Q16.16 share (or a share mixed
+/// with a plain Fixed).  Comparisons compare in the scaled domain and yield
+/// plain bit shares.
+fn fixed_share_binop(
+    backend: &Arc<Mutex<Box<dyn Backend>>>,
+    op: crate::interpreter::parser::BinOp,
+    a: &Types,
+    b: &Types,
+) -> Types {
+    use crate::interpreter::parser::BinOp;
+    let mut guard = backend.lock().unwrap_or_else(|e| e.into_inner());
+    let be: &mut dyn Backend = &mut **guard;
+    match op {
+        BinOp::Mul => Types::Share(share_mul_typed(be, a, b)),
+        BinOp::Add => Types::Share(share_addsub_typed(be, a, b, false)),
+        BinOp::Sub => Types::Share(share_addsub_typed(be, a, b, true)),
+        BinOp::Eq | BinOp::Lt | BinOp::Gt | BinOp::Le | BinOp::Ge => {
+            let nbits = operand_nbits(a, b);
+            let sa = share_operand(be, a, nbits, true);
+            let sb = share_operand(be, b, nbits, true);
+            let r = match op {
+                BinOp::Eq => be.eq(&sa, &sb),
+                BinOp::Lt => be.lt(&sa, &sb),
+                BinOp::Gt => be.lt(&sb, &sa),
+                BinOp::Le => be.le(&sa, &sb),
+                BinOp::Ge => be.le(&sb, &sa),
+                _ => unreachable!(),
+            };
+            Types::Share(r)
+        }
+        other => panic!(
+            "operation {:?} is not supported on fixed-point shares",
+            other
+        ),
+    }
+}
+
+/// Element-wise product for the vector builtins.  Handles Num, Fixed and
+/// Share operands (including Q16.16 shares) following the interpreter's
+/// scalar coercion rules.
+fn vec_mul(backend: &Arc<Mutex<Box<dyn Backend>>>, a: &Types, b: &Types) -> Types {
+    use crate::interpreter::ast::FIXED_SCALE;
+    let to_fixed = |v: &Types| -> i64 {
+        match v {
+            Types::Fixed(f) => *f,
+            Types::Num(n) => n * FIXED_SCALE,
+            _ => unreachable!(),
+        }
+    };
+    match (a, b) {
+        (Types::Num(x), Types::Num(y)) => Types::Num(x.wrapping_mul(*y)),
+        (Types::Fixed(_), Types::Fixed(_))
+        | (Types::Fixed(_), Types::Num(_))
+        | (Types::Num(_), Types::Fixed(_)) => {
+            let prod = (to_fixed(a) as i128 * to_fixed(b) as i128) >> 16;
+            Types::Fixed(prod as i64)
+        }
+        _ if matches!(a, Types::Share(_)) || matches!(b, Types::Share(_)) => {
+            let mut be = backend.lock().unwrap_or_else(|e| e.into_inner());
+            Types::Share(share_mul_typed(&mut **be, a, b))
+        }
+        _ => panic!("vector builtins: cannot multiply {:?} and {:?}", a, b),
+    }
+}
+
+/// Element-wise sum for the vector builtins.  Same operand rules as `vec_mul`.
+fn vec_add(backend: &Arc<Mutex<Box<dyn Backend>>>, a: &Types, b: &Types) -> Types {
+    use crate::interpreter::ast::FIXED_SCALE;
+    let to_fixed = |v: &Types| -> i64 {
+        match v {
+            Types::Fixed(f) => *f,
+            Types::Num(n) => n * FIXED_SCALE,
+            _ => unreachable!(),
+        }
+    };
+    match (a, b) {
+        (Types::Num(x), Types::Num(y)) => Types::Num(x.wrapping_add(*y)),
+        (Types::Fixed(_), Types::Fixed(_))
+        | (Types::Fixed(_), Types::Num(_))
+        | (Types::Num(_), Types::Fixed(_)) => Types::Fixed(to_fixed(a).wrapping_add(to_fixed(b))),
+        _ if matches!(a, Types::Share(_)) || matches!(b, Types::Share(_)) => {
+            let mut be = backend.lock().unwrap_or_else(|e| e.into_inner());
+            Types::Share(share_addsub_typed(&mut **be, a, b, false))
+        }
+        _ => panic!("vector builtins: cannot add {:?} and {:?}", a, b),
+    }
+}
+
+/// Dot product of two element vectors (used by both `dot` and `matvec`).
+fn vec_dot(backend: &Arc<Mutex<Box<dyn Backend>>>, a: &[Types], b: &[Types]) -> Types {
+    if a.len() != b.len() {
+        panic!("dot: length mismatch ({} vs {})", a.len(), b.len());
+    }
+    let mut acc: Option<Types> = None;
+    for (x, y) in a.iter().zip(b.iter()) {
+        let p = vec_mul(backend, x, y);
+        acc = Some(match acc {
+            None => p,
+            Some(s) => vec_add(backend, &s, &p),
+        });
+    }
+    acc.unwrap_or(Types::Num(0))
+}
+
 // Convert a signed i64 value into an unsigned field element representing two's complement with `nbits` bits
 fn int_to_fr_signed(n: i64, nbits: usize) -> u128 {
     if nbits >= 128 {
@@ -1888,5 +2978,153 @@ pub fn eval_shared(src: &str) -> i64 {
             (raw as u32) as i32 as i64
         }
         other => panic!("expected Num or Share, got: {:?}", other),
+    }
+}
+
+/// Evaluate a Baru expression that uses FHE builtins (fhe-keygen, fhe-enc,
+/// fhe-dec, fhe-eval, fhe-keygen-tfhe).  Returns the numeric result.
+/// The expression must produce a `Types::Num` at the top level; use
+/// `fhe-dec` inside the expression to convert a ciphertext to a number.
+pub fn eval_fhe(src: &str) -> i64 {
+    let expr = parse(src).expect("parse failed");
+    let p = Participant::new(0);
+    match p.eval(&expr) {
+        Types::Num(n) => n,
+        other => panic!("eval_fhe: expected Num, got: {:?}", other),
+    }
+}
+
+#[cfg(test)]
+mod fixed_point_tests {
+    use super::*;
+    use crate::interpreter::ast::{Expr, FIXED_SCALE};
+    use crate::interpreter::parse;
+
+    /// Evaluate a Baru source string through a fresh Participant and return the result.
+    fn eval_str(src: &str) -> Types {
+        let expr = parse(src).expect("parse failed");
+        let p = Participant::new(0);
+        p.eval(&expr)
+    }
+
+    // ── Parser ────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_parse_fixed_literal() {
+        let expr = parse("3.5").unwrap();
+        assert!(
+            matches!(expr, Expr::Fixed(v) if v == (3 * FIXED_SCALE + FIXED_SCALE / 2)),
+            "3.5 should parse to Fixed(3.5 * 65536)"
+        );
+    }
+
+    #[test]
+    fn test_parse_negative_fixed() {
+        let expr = parse("-1.25").unwrap();
+        // -1.25 * 65536 = -81920
+        assert!(
+            matches!(expr, Expr::Fixed(v) if v == (-FIXED_SCALE - FIXED_SCALE / 4)),
+            "got: {:?}",
+            expr
+        );
+    }
+
+    #[test]
+    fn test_parse_zero_fixed() {
+        let expr = parse("0.0").unwrap();
+        assert!(matches!(expr, Expr::Fixed(0)));
+    }
+
+    // ── Arithmetic ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_fixed_add() {
+        // 1.5 + 2.25 = 3.75
+        let result = eval_str("(+ 1.5 2.25)");
+        match result {
+            Types::Fixed(v) => {
+                let expected = (3 * FIXED_SCALE + 3 * FIXED_SCALE / 4) as f64 / FIXED_SCALE as f64;
+                let got = v as f64 / FIXED_SCALE as f64;
+                assert!(
+                    (got - expected).abs() < 0.0002,
+                    "expected ~{}, got {}",
+                    expected,
+                    got
+                );
+            }
+            _ => panic!("expected Fixed, got {:?}", result),
+        }
+    }
+
+    #[test]
+    fn test_fixed_sub() {
+        // 3.0 - 1.5 = 1.5
+        let result = eval_str("(- 3.0 1.5)");
+        match result {
+            Types::Fixed(v) => {
+                let got = v as f64 / FIXED_SCALE as f64;
+                assert!((got - 1.5).abs() < 0.0002, "expected 1.5, got {}", got);
+            }
+            _ => panic!("expected Fixed, got {:?}", result),
+        }
+    }
+
+    #[test]
+    fn test_fixed_mul() {
+        // 2.0 * 3.5 = 7.0
+        let result = eval_str("(* 2.0 3.5)");
+        match result {
+            Types::Fixed(v) => {
+                let got = v as f64 / FIXED_SCALE as f64;
+                assert!((got - 7.0).abs() < 0.0002, "expected 7.0, got {}", got);
+            }
+            _ => panic!("expected Fixed, got {:?}", result),
+        }
+    }
+
+    #[test]
+    fn test_fixed_div() {
+        // 7.0 / 2.0 = 3.5
+        let result = eval_str("(/ 7.0 2.0)");
+        match result {
+            Types::Fixed(v) => {
+                let got = v as f64 / FIXED_SCALE as f64;
+                assert!((got - 3.5).abs() < 0.0002, "expected 3.5, got {}", got);
+            }
+            _ => panic!("expected Fixed, got {:?}", result),
+        }
+    }
+
+    #[test]
+    fn test_fixed_num_coercion_add() {
+        // 1 + 0.5 = 1.5  (Num coerced to Fixed)
+        let result = eval_str("(+ 1 0.5)");
+        match result {
+            Types::Fixed(v) => {
+                let got = v as f64 / FIXED_SCALE as f64;
+                assert!((got - 1.5).abs() < 0.0002, "expected 1.5, got {}", got);
+            }
+            _ => panic!("expected Fixed, got {:?}", result),
+        }
+    }
+
+    // ── Comparisons ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_fixed_eq() {
+        assert!(matches!(eval_str("(== 1.5 1.5)"), Types::Num(1)));
+        assert!(matches!(eval_str("(== 1.5 2.0)"), Types::Num(0)));
+    }
+
+    #[test]
+    fn test_fixed_lt() {
+        assert!(matches!(eval_str("(< 1.5 2.0)"), Types::Num(1)));
+        assert!(matches!(eval_str("(< 2.0 1.5)"), Types::Num(0)));
+    }
+
+    #[test]
+    fn test_fixed_mixed_comparison() {
+        // 2 (int) < 2.5 (fixed) should be true
+        assert!(matches!(eval_str("(< 2 2.5)"), Types::Num(1)));
     }
 }

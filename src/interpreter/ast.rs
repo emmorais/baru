@@ -2,9 +2,16 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 
+/// Fixed-point scale factor: Q16.16 representation.
+/// `42.5` is stored as `42.5 * 65536 = 2785280`.
+/// Multiplication requires a right-shift by 16 to truncate back.
+pub const FIXED_SCALE: i64 = 1 << 16; // 65_536
+
 #[derive(Debug, Clone)]
 pub enum Expr {
     Num(i64),
+    /// Fixed-point literal, stored as `value * FIXED_SCALE`.
+    Fixed(i64),
     Var(String),
     Quote(Box<Expr>),
     Eval(Box<Expr>),
@@ -30,6 +37,14 @@ impl std::fmt::Display for Expr {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Expr::Num(n) => write!(f, "{}", n),
+            Expr::Fixed(v) => {
+                // Display as decimal: divide scaled integer by FIXED_SCALE
+                let whole = v / FIXED_SCALE;
+                let frac = (v % FIXED_SCALE).abs();
+                // 4 decimal digits (65536 / 10000 ≈ 6.5, so multiply frac by 10000)
+                let frac_digits = (frac * 10_000) / FIXED_SCALE;
+                write!(f, "{}.{:04}", whole, frac_digits)
+            }
             Expr::Var(v) => write!(f, "{}", v),
             Expr::Quote(e) => write!(f, "'{}", e),
             Expr::Eval(e) => write!(f, "(eval {})", e),
@@ -54,6 +69,7 @@ impl std::fmt::Display for Expr {
                 super::parser::UnOp::Not => write!(f, "(not {})", expr),
                 super::parser::UnOp::Atom => write!(f, "(atom {})", expr),
                 super::parser::UnOp::BitLen => write!(f, "(bitlen {})", expr),
+                super::parser::UnOp::IsNull => write!(f, "(null? {})", expr),
             },
             Expr::Let(bindings, body) => {
                 write!(f, "(let (")?;
@@ -137,6 +153,8 @@ use std::sync::Arc;
 
 pub enum Types {
     Num(i64),
+    /// Fixed-point value (Q16.16 scaled integer).
+    Fixed(i64),
     List(Vec<Types>),
     Quoted(Box<Expr>),
     Closure(Vec<String>, Box<Expr>, Env),
@@ -145,12 +163,15 @@ pub enum Types {
     Char(char),
     Share(ShareRef),
     NativeFunc(Arc<dyn Fn(Vec<Types>) -> Types + Send + Sync>),
+    /// An FHE ciphertext handle (serialised as JSON for REPL round-trips).
+    FheCiphertext(crate::fhe::backend::FheCiphertextHandle),
 }
 
 impl Clone for Types {
     fn clone(&self) -> Self {
         match self {
             Types::Num(n) => Types::Num(*n),
+            Types::Fixed(v) => Types::Fixed(*v),
             Types::List(vs) => Types::List(vs.clone()),
             Types::Quoted(e) => Types::Quoted(e.clone()),
             Types::Closure(p, b, e) => Types::Closure(p.clone(), b.clone(), e.clone()),
@@ -159,6 +180,7 @@ impl Clone for Types {
             Types::Char(c) => Types::Char(*c),
             Types::Share(sref) => Types::Share(sref.clone()),
             Types::NativeFunc(f) => Types::NativeFunc(f.clone()),
+            Types::FheCiphertext(h) => Types::FheCiphertext(h.clone()),
         }
     }
 }
@@ -167,6 +189,12 @@ impl fmt::Debug for Types {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Types::Num(n) => write!(f, "Num({})", n),
+            Types::Fixed(v) => {
+                let whole = v / FIXED_SCALE;
+                let frac = (v % FIXED_SCALE).abs();
+                let frac_digits = (frac * 10_000) / FIXED_SCALE;
+                write!(f, "Fixed({}.{:04})", whole, frac_digits)
+            }
             Types::List(vs) => write!(f, "List(len={})", vs.len()),
             Types::Quoted(e) => write!(f, "Quoted({:?})", e),
             Types::Closure(_, _, _) => write!(f, "Closure"),
@@ -175,6 +203,14 @@ impl fmt::Debug for Types {
             Types::Char(c) => write!(f, "Char({})", c),
             Types::Share(sref) => write!(f, "Share(id={}, nbits={})", sref.id, sref.nbits),
             Types::NativeFunc(_) => write!(f, "NativeFunc"),
+            Types::FheCiphertext(h) => {
+                write!(
+                    f,
+                    "FheCiphertext(backend={}, bytes={})",
+                    h.backend_id,
+                    h.bytes.len()
+                )
+            }
         }
     }
 }
