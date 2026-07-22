@@ -17,6 +17,8 @@ pub mod reputation;
 
 pub mod storage;
 
+pub mod mpc_market;
+
 pub mod messaging;
 
 pub mod rest;
