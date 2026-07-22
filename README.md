@@ -413,6 +413,65 @@ Step-by-step with 3 parties:
 
 ---
 
+## Benchmarking
+
+Two complementary harnesses, both under `src/bench/`:
+
+- **`baru bench`** — correctness + per-phase timing for small hand-written
+  Lisp expressions, across *every* privacy backend (`plain`, `mpc-aby3`,
+  `fhe-mock`, `fhe-tfhe`, `fhe-ckks`, `zkp-binius64`). Good for "does this
+  expression still work / how fast is this specific case" checks.
+  ```sh
+  cargo run --release -- bench                 # built-in suite, tables
+  cargo run --release -- bench --json          # same, as JSON
+  cargo run --release -- bench --expr "(mod x y)" --input x=17 --input y=5
+  ```
+
+- **`baru bench-nn`** — size-swept private-inference benchmark, purpose-built
+  to characterize **MPC vs. FHE's complementary computation/communication
+  trade-off** for neural-network-shaped workloads (`dot`, `matvec`, `relu`,
+  `layer` = matvec + bias + ReLU), at multiple sizes. Unlike `bench`, it
+  drives `Backend`/`FheBackend` calls directly (bypassing the Lisp
+  interpreter) for precise cost attribution and to scale to realistic sizes
+  (e.g. MNIST's 784-pixel input layer via `--mnist-scale`).
+
+  For MPC it reports **real wire communication** — message counts and byte
+  totals — captured by wrapping the actual replicated-secret-sharing
+  transport (`TransportBackend` over `InprocHandle`) in counting/latency
+  decorators (`src/bench/comm.rs`) that observe traffic without touching any
+  protocol code. A `--rtt-ms`/`--bandwidth-mbps` network model can be
+  injected to see how a workload's wall time would change over a real link,
+  without needing real distributed processes. For FHE it reports ciphertext
+  count/size instead (MPC's cost is *rounds × messages*; FHE's is *bytes of
+  ciphertext material*, per the "MPC is compute-cheap/comm-expensive, FHE is
+  the reverse" intuition this tool exists to quantify).
+
+  ```sh
+  cargo build --release
+  ./target/release/baru bench-nn                          # mpc, fhe-mock, fhe-ckks; default sizes
+  ./target/release/baru bench-nn --backends mpc --workload matvec
+  ./target/release/baru bench-nn --mnist-scale             # also run the 784-input sizes (slow)
+  ./target/release/baru bench-nn --rtt-ms 20                # simulate a 20ms-RTT link for MPC
+  ./target/release/baru bench-nn --json > results.json      # for tracking across commits
+  ```
+
+  **What it already shows** (default sizes, this machine): MPC throughput is
+  *flat* at roughly 220–380 multiply-accumulates/sec regardless of shape —
+  cost and message count both scale exactly linearly with element count (no
+  batching of Beaver triples or wire messages across independent
+  multiplications), so `matvec(128×64)` — one modest dense layer — already
+  costs ~26s and ~115k messages. CKKS shows the opposite shape: its
+  "circuit" form (one ciphertext per input scalar) has encrypt cost growing
+  linearly with vector size (26s to encrypt 256 scalars), while its
+  "batched" SIMD form (`encrypt_vec` + `dot_plain`, one ciphertext for the
+  whole vector) holds encrypt/eval time roughly *constant* regardless of
+  size — the sharpest illustration in this codebase of FHE's O(1)-message,
+  large-payload communication profile versus MPC's O(n)-message,
+  small-payload one. These numbers are exactly what the framework exists to
+  keep re-measuring as the MPC/FHE backends are optimized.
+
+---
+
 ## Architecture summary
 
 ```

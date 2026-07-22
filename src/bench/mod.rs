@@ -13,6 +13,14 @@
 //! checked against it.  Cases whose control flow depends on secret values
 //! carry an `mpc_expr` variant written in mux style (`(* x (> x 0))`), since
 //! the MPC interpreter cannot branch on a shared condition.
+//!
+//! `baru bench-nn` (see [`nn`]) is the size-swept companion harness focused on
+//! private neural-network inference: it drives `Backend`/`FheBackend` calls
+//! directly (bypassing the Lisp interpreter, for precise cost attribution and
+//! scalability to larger sizes) over dot-product / matrix-vector / ReLU /
+//! full-layer workloads, and reports communication (message counts, bytes —
+//! see [`comm`]) alongside timing, to characterize MPC's and FHE's
+//! complementary computation/communication trade-off.
 
 use std::collections::HashMap;
 use std::panic::{catch_unwind, AssertUnwindSafe};
@@ -820,3 +828,6 @@ mod tests {
         assert_eq!(Backend::parse("tfhe"), Ok(Backend::FheTfhe));
     }
 }
+
+pub mod comm;
+pub mod nn;
