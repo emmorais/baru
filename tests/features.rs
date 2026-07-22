@@ -554,6 +554,87 @@ fn test_shared_scalar_mul() {
 }
 
 // ---------------------------------------------------------------------------
+// Shared (MPC) division and modulo — both operands shared, restoring-division
+// circuit (see Backend::divmod's default implementation).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_shared_div_both_shared() {
+    assert_eq!(
+        eval_shared("(reconstruct (/ (share 84 32) (share 7 32)))"),
+        12
+    );
+}
+
+#[test]
+fn test_shared_mod_both_shared() {
+    assert_eq!(
+        eval_shared("(reconstruct (mod (share 10 32) (share 3 32)))"),
+        1
+    );
+}
+
+#[test]
+fn test_shared_div_scalar_divisor() {
+    // shared dividend, plain (public) divisor
+    assert_eq!(eval_shared("(reconstruct (/ (share 84 32) 7))"), 12);
+}
+
+#[test]
+fn test_shared_mod_scalar_divisor() {
+    assert_eq!(eval_shared("(reconstruct (mod (share 10 32) 3))"), 1);
+}
+
+#[test]
+fn test_shared_div_scalar_dividend() {
+    // plain (public) dividend, shared divisor
+    assert_eq!(eval_shared("(reconstruct (/ 84 (share 7 32)))"), 12);
+}
+
+#[test]
+fn test_shared_mod_scalar_dividend() {
+    assert_eq!(eval_shared("(reconstruct (mod 10 (share 3 32)))"), 1);
+}
+
+#[test]
+fn test_shared_divmod_matches_plain_semantics_signed() {
+    // Truncating division / dividend-signed remainder, matching Rust's `/`
+    // and `%` on i64 (and this crate's own plain-value BinOp::Mod/DivExact
+    // arm) for a spread of signed cases, including negative operands.
+    let cases: &[(i64, i64)] = &[
+        (7, 3),
+        (-7, 3),
+        (7, -3),
+        (-7, -3),
+        (100, 9),
+        (-100, 9),
+        (1, 7),
+        (-1, 7),
+        (0, 5),
+        (6, 3),
+        (-6, 3),
+    ];
+    for &(a, b) in cases {
+        let expected_div = a / b;
+        let expected_mod = a % b;
+        let src_div = format!("(reconstruct (/ (share {a} 32) (share {b} 32)))");
+        let src_mod = format!("(reconstruct (mod (share {a} 32) (share {b} 32)))");
+        assert_eq!(
+            eval_shared(&src_div),
+            expected_div,
+            "shared {a} / {b} should be {expected_div}"
+        );
+        assert_eq!(
+            eval_shared(&src_mod),
+            expected_mod,
+            "shared {a} mod {b} should be {expected_mod}"
+        );
+        // a == b*q + r must hold, exactly as it does for the plain path.
+        assert_eq!(expected_div * b + expected_mod, a);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Shared arithmetic with signed values
 // ---------------------------------------------------------------------------
 

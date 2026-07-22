@@ -558,6 +558,10 @@ pub fn reduce_expression(
                                                 super::parser::BinOp::Add => be.add(sa, sb),
                                                 super::parser::BinOp::Sub => be.sub(sa, sb),
                                                 super::parser::BinOp::Mul => be.mul(sa, sb),
+                                                super::parser::BinOp::DivExact => {
+                                                    be.divmod(sa, sb).0
+                                                }
+                                                super::parser::BinOp::Mod => be.divmod(sa, sb).1,
                                                 _ => panic!("unsupported shared op"),
                                             };
                                             Types::Share(sr)
@@ -572,6 +576,10 @@ pub fn reduce_expression(
                                                 super::parser::BinOp::Add => be.add(sa, &sb),
                                                 super::parser::BinOp::Sub => be.sub(sa, &sb),
                                                 super::parser::BinOp::Mul => be.mul(sa, &sb),
+                                                super::parser::BinOp::DivExact => {
+                                                    be.divmod(sa, &sb).0
+                                                }
+                                                super::parser::BinOp::Mod => be.divmod(sa, &sb).1,
                                                 _ => panic!("unsupported shared op"),
                                             };
                                             Types::Share(sr)
@@ -586,6 +594,10 @@ pub fn reduce_expression(
                                                 super::parser::BinOp::Add => be.add(&sa, sb),
                                                 super::parser::BinOp::Sub => be.sub(&sa, sb),
                                                 super::parser::BinOp::Mul => be.mul(&sa, sb),
+                                                super::parser::BinOp::DivExact => {
+                                                    be.divmod(&sa, sb).0
+                                                }
+                                                super::parser::BinOp::Mod => be.divmod(&sa, sb).1,
                                                 _ => panic!("unsupported shared op"),
                                             };
                                             Types::Share(sr)

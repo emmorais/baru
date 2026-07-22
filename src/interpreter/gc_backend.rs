@@ -246,9 +246,10 @@ impl Backend for GCBackend {
         self.store(gs, nbits, a.owner)
     }
 
-    fn divmod(&mut self, _a: &ShareRef, _b: &ShareRef) -> (ShareRef, ShareRef) {
-        unimplemented!("division not yet supported in GC backend")
-    }
+    // divmod: uses the Backend trait's default restoring-division
+    // implementation (composed from a2b/mul/add/sub/le/b2a below). Note this
+    // backend's `a2b` ignores its `nbits` argument (see below), so `divmod`
+    // only behaves correctly here when `a.nbits == b.nbits`.
 
     fn eq(&mut self, a: &ShareRef, b: &ShareRef) -> ShareRef {
         let ga = self.get_cloned(a);

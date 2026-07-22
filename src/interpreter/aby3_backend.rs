@@ -84,9 +84,8 @@ impl Backend for Aby3Backend {
         self.store(prod, a.nbits.max(b.nbits), a.owner)
     }
 
-    fn divmod(&mut self, _a: &ShareRef, _b: &ShareRef) -> (ShareRef, ShareRef) {
-        unimplemented!("division not implemented yet")
-    }
+    // divmod: uses the Backend trait's default restoring-division
+    // implementation (composed from a2b/mul/add/sub/le/b2a below).
 
     fn eq(&mut self, a: &ShareRef, b: &ShareRef) -> ShareRef {
         let sa = self.get_cloned(a);

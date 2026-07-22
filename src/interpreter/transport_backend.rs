@@ -101,30 +101,12 @@ impl<T: Transport + 'static> Backend for TransportBackend<T> {
         self.store(id, ps, a.nbits.max(b.nbits), a.owner)
     }
 
-    // assume a > b
-    fn divmod(&mut self, _a: &ShareRef, _b: &ShareRef) -> (ShareRef, ShareRef) {
-        // Compute the bitlen of a and b, multiply b by 2^(bitlen(a)-bitlen(b)),
-        // then if the result is positive,
-        // subtract b until the remainder is less than b, otherwise add b until the remainder is non-negative
-        /*let bitlen_a = &self.bitlen(a);
-        let bitlen_b = &self.bitlen(b);
-        let mut diff = self.sub(bitlen_a, bitlen_b);
-        // multiply b by 2^diff
-        let mut rem = self.shift_left(&b, diff);
-
-        if rem.nbits > 0 {
-            // result is positive
-            while rem.nbits > 0 {
-                rem = self.sub(&rem, b);
-            }
-        } else {
-            while rem.nbits < 0 {
-                rem = self.add(&rem, b);
-            }
-        }
-        (rem, b)*/
-        unimplemented!("division not implemented yet")
-    }
+    // divmod: previously attempted here via bitlen-normalization, which needs
+    // `shift_left(b, diff)` for a *secret* `diff = bitlen(a)-bitlen(b)` —
+    // `shift_left` only takes a public `usize` amount, so that approach was a
+    // dead end. Uses the Backend trait's default restoring-division
+    // implementation instead (composed from a2b/mul/add/sub/le/b2a below),
+    // which only ever shifts by the public constant 1.
 
     fn eq(&mut self, a: &ShareRef, b: &ShareRef) -> ShareRef {
         println!(
