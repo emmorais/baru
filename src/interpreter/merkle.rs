@@ -10,6 +10,7 @@
 //! prefixes so a leaf can never be reinterpreted as an internal node.  An odd
 //! node at a level is promoted unchanged to the next level.
 
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use super::hashcons::ZHash;
@@ -18,7 +19,7 @@ use super::hashcons::ZHash;
 pub const EMPTY_ROOT: ZHash = [0u8; 32];
 
 /// One step of an inclusion proof: a sibling hash and which side it is on.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProofStep {
     pub sibling: ZHash,
     /// True if the sibling sits to the *right* of the running hash.

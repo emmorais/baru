@@ -29,6 +29,7 @@
 //!   distribution  base + 100     expression text from party 0
 //!   consensus     base + 200     epoch commits           (BARU_CONSENSUS)
 //!   messaging     base + 300     chat + forum            (BARU_CHAT)
+//!   settlement    base + 400     per-job MPC co-signing  (BARU_SETTLE)
 //!
 //! In two-argument mode the distribution roster is derived automatically by
 //! bumping each port by 100; a fourth CLI argument overrides it explicitly.
@@ -45,6 +46,9 @@
 //!   BARU_POUW_REP    deterministic genesis reputation as "party:delta,…"
 //!                    (every party must set the same value).
 //!   BARU_CHAT        enable p2p chat + forum on the messaging transport.
+//!   BARU_SETTLE      settle each evaluated MPC expression as a job: parties
+//!                    co-sign the result and settle it via `baru::mpc_market`,
+//!                    accruing reputation per job (fraud is excluded live).
 //!   BARU_REST[=port] serve the per-node REST control plane; party `i` listens
 //!                    on `port + i` (default base 8090).  See `baru::rest`.
 //!
@@ -83,9 +87,18 @@ use baru::crypto::net::{
     deserialize_msg, recv_blocking, recv_forever, serialize_msg, InprocHandle, MpcMsg,
     TcpTransport, Transport,
 };
-use baru::fhe::lifecycle::Effect;
+use baru::crypto::identity::IdentityId;
+use baru::fhe::backend::FheBackend;
+use baru::fhe::lifecycle::{Effect, Stake};
+use baru::fhe::market::{evaluate_job, verify_receipt, FheJob, Verdict as FheVerdict, WorkReceipt};
+use baru::fhe::mock_backend::MockFheBackend;
 use baru::interpreter::{parse, Participant, Types};
 use baru::messaging::{open, seal, ChatSecret, Contact, Forum, ForumPost};
+use baru::mpc_market::{
+    cosign, result_commitment, verify_cosignature, CoSignature, MpcJob, MpcReceipt, Verdict,
+};
+use baru::storage::{self, ChallengeResponse, StorageDeal, StoredData};
+use baru::zkp::circuit_compiler::CircuitCompiler;
 use baru::reputation::{ReputationLedger, ReputationPoUW};
 use baru::rest::{serve_blocking, AppState, NodeState};
 use baru::repl::{print_examples_for, print_examples_list, print_help, ReplHelper, EXAMPLES};
@@ -214,20 +227,20 @@ fn history_path() -> Option<PathBuf> {
     }
 }
 
-/// Display a SharedValue result with sign-extension for 32-bit MPC field values.
-fn display_result(result: &Types, participant: &Participant) -> String {
+/// Render a result (revealing a `Share` **exactly once**, sign-extended through
+/// 32 bits) and return its numeric value for settlement — `None` for
+/// non-numeric results, which don't settle.
+fn display_result(result: &Types, participant: &Participant) -> (String, Option<i64>) {
     match result {
         Types::Share(sr) => {
-            let raw = participant.reveal(sr);
-            let signed = (raw as u32) as i32 as i64;
-            format!("{}", signed.to_string().bright_green())
+            let signed = (participant.reveal(sr) as u32) as i32 as i64;
+            (signed.to_string().bright_green().to_string(), Some(signed))
         }
         Types::Num(n) => {
-            // sign-extend through 32 bits for MPC field values
             let signed = (*n as u32) as i32 as i64;
-            format!("{}", signed.to_string().bright_green())
+            (signed.to_string().bright_green().to_string(), Some(signed))
         }
-        other => format!("{}", format!("{:?}", other).bright_green()),
+        other => (format!("{:?}", other).bright_green().to_string(), None),
     }
 }
 
@@ -248,8 +261,10 @@ fn bump_port(addr: &str, delta: u16) -> String {
 fn launch(me: usize, mpc_addrs: Vec<String>, dist_addrs: Vec<String>) {
     let want_consensus = std::env::var("BARU_CONSENSUS").is_ok();
     let want_messaging = std::env::var("BARU_CHAT").is_ok();
+    let want_settlement = std::env::var("BARU_SETTLE").is_ok();
     let cons_addrs: Vec<String> = mpc_addrs.iter().map(|a| bump_port(a, 200)).collect();
     let msg_addrs: Vec<String> = mpc_addrs.iter().map(|a| bump_port(a, 300)).collect();
+    let settle_addrs: Vec<String> = mpc_addrs.iter().map(|a| bump_port(a, 400)).collect();
 
     #[cfg(feature = "pq-tls")]
     {
@@ -273,7 +288,11 @@ fn launch(me: usize, mpc_addrs: Vec<String>, dist_addrs: Vec<String>) {
                 TlsTransport::new(me, msg_addrs, Identity::from_secret_bytes(secret))
                     .expect("tls messaging transport")
             });
-            run_tcp(me, mpc, dist, cons, msg);
+            let settle = want_settlement.then(|| {
+                TlsTransport::new(me, settle_addrs, Identity::from_secret_bytes(secret))
+                    .expect("tls settlement transport")
+            });
+            run_tcp(me, mpc, dist, cons, msg, settle);
             return;
         }
     }
@@ -281,22 +300,32 @@ fn launch(me: usize, mpc_addrs: Vec<String>, dist_addrs: Vec<String>) {
     let dist = TcpTransport::new(me, dist_addrs);
     let cons = want_consensus.then(|| TcpTransport::new(me, cons_addrs));
     let msg = want_messaging.then(|| TcpTransport::new(me, msg_addrs));
-    run_tcp(me, mpc, dist, cons, msg);
+    let settle = want_settlement.then(|| TcpTransport::new(me, settle_addrs));
+    run_tcp(me, mpc, dist, cons, msg, settle);
 }
 
-/// Deterministic roster identity for a party — every node computes the same
-/// value, so they agree on the reputation roster without exchanging keys.
-fn roster_id(party: usize) -> [u8; 32] {
+/// Deterministic long-term identity for a party (demo stand-in for a
+/// self-generated key).  This one keypair is used both to co-sign MPC job
+/// results and — via its id — as the reputation-roster entry, so co-signing
+/// workers earn reputation under the same identity leader-election weights.
+fn party_identity(party: usize) -> Identity {
     let mut h = Sha256::new();
-    h.update(b"baru-roster-v1");
+    h.update(b"baru-party-id-v1");
     h.update((party as u64).to_le_bytes());
-    h.finalize().into()
+    Identity::from_secret_bytes(h.finalize().into())
 }
 
-/// Reputation credited to each committee member for one committed epoch of
-/// joint MPC work.  A stand-in unit; the co-signed receipt (see
-/// `baru::mpc_market`) is the externally-verifiable artifact.
-const MPC_EPOCH_REWARD: i128 = 10;
+/// The reputation-roster id of a party: the id of its [`party_identity`].
+fn roster_id(party: usize) -> [u8; 32] {
+    party_identity(party).id().0
+}
+
+/// Number of parties in this demo committee.
+const N_PARTIES: usize = 3;
+/// Co-signatures required to finalize an MPC job (honest majority of 3).
+const SETTLE_THRESHOLD: usize = 2;
+/// Reputation + stake a co-signing worker earns per finalized MPC job.
+const SETTLE_REWARD: Stake = 10;
 
 /// Build the consensus backend: `ReputationPoUW` when `BARU_POUW` is set (leader
 /// elected by the shared reputation ledger), else the `SingleLeader` baseline.
@@ -381,19 +410,9 @@ fn commit_state(
             }
             *epoch += 1;
 
-            // Fold this epoch's joint MPC work into the shared reputation
-            // ledger: every committee member that participated earns reputation.
-            // All parties fold identically, so their ledgers stay in sync and
-            // the *next* epoch's leader election reflects accrued work — the
-            // ledger is now live, not just genesis-seeded.
-            if let Ok(mut l) = ledger.lock() {
-                for p in 0..3 {
-                    l.apply(&Effect::Reputation {
-                        id: roster_id(p),
-                        delta: MPC_EPOCH_REWARD,
-                    });
-                }
-            }
+            // Reputation now accrues per MPC *job* (see `settle_expression`),
+            // not per epoch, so committing only snapshots the ledger for the
+            // REST view.
             let rep_snapshot = ledger.lock().ok().map(|l| l.clone());
 
             // Reflect the committed state in the REST control plane.
@@ -554,12 +573,341 @@ impl<T: Transport + 'static> Messaging<T> {
     }
 }
 
+// ── Per-job market settlement (MPC / FHE / storage) ────────────────────────────
+//
+// After a unit of verifiable work, the parties settle it over a dedicated
+// transport and fold the reward into the shared reputation ledger:
+//   * MPC     — after each evaluated expression, parties co-sign the result;
+//               co-signatures that disagree (a deviant's) are excluded, and a
+//               threshold receipt settles via `baru::mpc_market`.
+//   * FHE     — a worker evaluates a homomorphic job and broadcasts its receipt;
+//               every party re-executes to verify it (deterministic) and settles.
+//   * storage — a provider answers a Merkle retrievability challenge; every
+//               party verifies the proof against the known root and settles.
+// A wrong result / bad proof simply fails verification, so its author earns
+// nothing while the honest parties still settle.
+
+/// Messages on the settlement transport.
+#[derive(Serialize, Deserialize)]
+enum SettleMsg {
+    Mpc {
+        seq: u64,
+        from: usize,
+        cosig: CoSignature,
+    },
+    Fhe {
+        seq: u64,
+        worker: usize,
+        receipt: WorkReceipt,
+    },
+    Storage {
+        seq: u64,
+        provider: usize,
+        response: ChallengeResponse,
+    },
+}
+
+/// A deterministic request commitment for the `seq`-th MPC job.
+fn mpc_request(seq: u64) -> [u8; 32] {
+    let mut h = Sha256::new();
+    h.update(b"baru-mpc-job-v1");
+    h.update(seq.to_le_bytes());
+    h.finalize().into()
+}
+
+/// A fixed, deterministic FHE job `(+ 10 32)` on the mock backend.  Every party
+/// builds the identical job, so any party can re-execute it to verify a receipt.
+fn build_fhe_job() -> (FheJob, MockFheBackend) {
+    let be = MockFheBackend;
+    let (ck, _) = be.keygen();
+    let expr = parse("(+ x y)").expect("parse fhe expr");
+    let mut circuit = CircuitCompiler::new().compile_fhe(&expr).expect("compile fhe");
+    circuit.public_inputs.clear();
+    circuit.encrypted_inputs = vec!["x".into(), "y".into()];
+    let mut enc = std::collections::HashMap::new();
+    enc.insert("x".to_string(), be.serialize_ct(&be.encrypt(&ck, 10)));
+    enc.insert("y".to_string(), be.serialize_ct(&be.encrypt(&ck, 32)));
+    let job = FheJob {
+        circuit,
+        public_inputs: std::collections::HashMap::new(),
+        encrypted_inputs: enc,
+        backend_id: be.backend_id().to_string(),
+    };
+    (job, be)
+}
+
+/// A party's deterministic stored dataset (16 high-entropy chunks).  Every party
+/// can recompute any provider's Merkle root, so it can verify its proofs.
+fn build_stored_data(party: usize) -> StoredData {
+    StoredData::new(
+        (0..16u64)
+            .map(|i| {
+                let mut h = Sha256::new();
+                h.update(b"baru-storage-v1");
+                h.update((party as u64).to_le_bytes());
+                h.update(i.to_le_bytes());
+                h.finalize().to_vec()
+            })
+            .collect(),
+    )
+}
+
+/// Fold settlement effects into the ledger and refresh the REST view (no nested
+/// locks: snapshot the ledger, release it, then write `node_state`).
+fn fold_and_sync(
+    effects: &[Effect],
+    ledger: &Arc<Mutex<ReputationLedger>>,
+    node_state: &Option<Arc<Mutex<NodeState>>>,
+) {
+    let snapshot = ledger.lock().ok().map(|mut l| {
+        l.apply_all(effects);
+        l.clone()
+    });
+    if let (Some(ns), Some(snap)) = (node_state, snapshot) {
+        if let Ok(mut s) = ns.lock() {
+            s.reputation = snap;
+        }
+    }
+}
+
+/// Per-job settlement over a dedicated transport.
+struct Settlement<T: Transport> {
+    me: usize,
+    transport: T,
+    mpc_seq: u64,
+    fhe_seq: u64,
+    storage_seq: u64,
+    /// Messages for future rounds that arrived early.
+    buf: Vec<SettleMsg>,
+}
+
+impl<T: Transport> Settlement<T> {
+    fn new(me: usize, transport: T) -> Self {
+        let _ = transport.wait_ready(10_000);
+        Settlement {
+            me,
+            transport,
+            mpc_seq: 0,
+            fhe_seq: 0,
+            storage_seq: 0,
+            buf: Vec::new(),
+        }
+    }
+
+    /// Receive the next settlement message satisfying `pred`, buffering others.
+    fn recv_matching(
+        &mut self,
+        deadline: std::time::Instant,
+        pred: impl Fn(&SettleMsg) -> bool,
+    ) -> Option<SettleMsg> {
+        if let Some(pos) = self.buf.iter().position(&pred) {
+            return Some(self.buf.remove(pos));
+        }
+        loop {
+            match self.transport.recv() {
+                Some((_from, bytes)) => {
+                    let m: SettleMsg = deserialize_msg(&bytes);
+                    if pred(&m) {
+                        return Some(m);
+                    }
+                    self.buf.push(m);
+                }
+                None if std::time::Instant::now() >= deadline => return None,
+                None => thread::sleep(Duration::from_millis(2)),
+            }
+        }
+    }
+
+    /// MPC: co-sign the result, collect agreeing co-signatures, settle.
+    fn settle_expression(
+        &mut self,
+        result_val: i64,
+        ledger: &Arc<Mutex<ReputationLedger>>,
+        node_state: &Option<Arc<Mutex<NodeState>>>,
+    ) {
+        self.mpc_seq += 1;
+        let seq = self.mpc_seq;
+        let request = mpc_request(seq);
+        let result_root = result_commitment(result_val);
+
+        let my_cosig = cosign(&party_identity(self.me), &request, &result_root);
+        self.transport.broadcast(serialize_msg(&SettleMsg::Mpc {
+            seq,
+            from: self.me,
+            cosig: my_cosig.clone(),
+        }));
+
+        use std::collections::HashSet;
+        let mut cosigners = vec![my_cosig];
+        let mut seen: HashSet<usize> = HashSet::from([self.me]);
+        let deadline = std::time::Instant::now() + Duration::from_millis(4_000);
+        while cosigners.len() < N_PARTIES {
+            let Some(SettleMsg::Mpc { from, cosig, .. }) = self.recv_matching(deadline, |m| {
+                matches!(m, SettleMsg::Mpc { seq: s, .. } if *s == seq)
+            }) else {
+                break;
+            };
+            if seen.insert(from) && verify_cosignature(&cosig, &request, &result_root) {
+                cosigners.push(cosig);
+            }
+        }
+
+        let committee: Vec<IdentityId> = (0..N_PARTIES).map(|p| party_identity(p).id()).collect();
+        let job = MpcJob {
+            request,
+            owner: committee[0],
+            committee,
+            threshold: SETTLE_THRESHOLD,
+        };
+        let receipt = MpcReceipt {
+            request,
+            result_root,
+            cosigners,
+        };
+        let (verdict, effects) = baru::mpc_market::settle(&job, &receipt, SETTLE_REWARD);
+        if verdict == Verdict::Valid {
+            fold_and_sync(&effects, ledger, node_state);
+        } else {
+            eprintln!(
+                "[party {}] MPC job {} not finalized: {:?}",
+                self.me, seq, verdict
+            );
+        }
+    }
+
+    /// FHE: a worker evaluates the job and broadcasts its receipt; every party
+    /// re-executes to verify it and settles (rewarding the worker).
+    fn settle_fhe(
+        &mut self,
+        ledger: &Arc<Mutex<ReputationLedger>>,
+        node_state: &Option<Arc<Mutex<NodeState>>>,
+    ) {
+        self.fhe_seq += 1;
+        let seq = self.fhe_seq;
+        let worker = (seq as usize) % N_PARTIES;
+        let (job, be) = build_fhe_job();
+
+        let receipt = if self.me == worker {
+            let (_handle, r) = evaluate_job(&job, &be).expect("fhe eval");
+            self.transport.broadcast(serialize_msg(&SettleMsg::Fhe {
+                seq,
+                worker,
+                receipt: r.clone(),
+            }));
+            Some(r)
+        } else {
+            let deadline = std::time::Instant::now() + Duration::from_millis(4_000);
+            self.recv_matching(deadline, |m| matches!(m, SettleMsg::Fhe { seq: s, .. } if *s == seq))
+                .and_then(|m| match m {
+                    SettleMsg::Fhe { receipt, .. } => Some(receipt),
+                    _ => None,
+                })
+        };
+
+        let Some(receipt) = receipt else {
+            eprintln!("[party {}] FHE job {} timed out", self.me, seq);
+            return;
+        };
+        // Verify by deterministic re-execution — no decryption.
+        if verify_receipt(&job, &receipt, &be) == FheVerdict::Valid {
+            let id = party_identity(worker).id().0;
+            let effects = vec![
+                Effect::Release {
+                    to: id,
+                    amount: SETTLE_REWARD,
+                },
+                Effect::Reputation {
+                    id,
+                    delta: SETTLE_REWARD as i128,
+                },
+            ];
+            fold_and_sync(&effects, ledger, node_state);
+            if self.me == 0 {
+                println!(
+                    "{}",
+                    format!(
+                        "🔐 FHE job {} verified by re-execution → worker {} rewarded",
+                        seq, worker
+                    )
+                    .bright_cyan()
+                );
+            }
+        } else {
+            eprintln!(
+                "[party {}] FHE job {} FRAUD (re-execution mismatch)",
+                self.me, seq
+            );
+        }
+    }
+
+    /// Storage: a provider answers a Merkle retrievability challenge; every party
+    /// verifies the proof against the known root and settles.
+    fn settle_storage(
+        &mut self,
+        ledger: &Arc<Mutex<ReputationLedger>>,
+        node_state: &Option<Arc<Mutex<NodeState>>>,
+    ) {
+        self.storage_seq += 1;
+        let seq = self.storage_seq;
+        let provider = (seq as usize) % N_PARTIES;
+        let data = build_stored_data(provider);
+        let deal = StorageDeal {
+            data_root: data.root(),
+            n_chunks: data.len(),
+            owner: party_identity(0).id().0,
+            provider: party_identity(provider).id().0,
+            reward_per_epoch: SETTLE_REWARD,
+            until_epoch: u64::MAX,
+        };
+        let mut seed = [0u8; 32];
+        seed[..8].copy_from_slice(&seq.to_le_bytes());
+        let index = deal.challenge(seq, &seed);
+
+        let response = if self.me == provider {
+            let r = data.answer(index).expect("answer challenge");
+            self.transport.broadcast(serialize_msg(&SettleMsg::Storage {
+                seq,
+                provider,
+                response: r.clone(),
+            }));
+            Some(r)
+        } else {
+            let deadline = std::time::Instant::now() + Duration::from_millis(4_000);
+            self.recv_matching(deadline, |m| {
+                matches!(m, SettleMsg::Storage { seq: s, .. } if *s == seq)
+            })
+            .and_then(|m| match m {
+                SettleMsg::Storage { response, .. } => Some(response),
+                _ => None,
+            })
+        };
+
+        let (proven, effects) = storage::settle_epoch(&deal, seq, &seed, response.as_ref());
+        if proven {
+            fold_and_sync(&effects, ledger, node_state);
+            if self.me == 0 {
+                println!(
+                    "{}",
+                    format!(
+                        "💾 storage challenge {} (chunk {}) proven → provider {} rewarded",
+                        seq, index, provider
+                    )
+                    .bright_cyan()
+                );
+            }
+        } else {
+            eprintln!("[party {}] storage challenge {} unproven", self.me, seq);
+        }
+    }
+}
+
 fn run_tcp<T: Transport + 'static>(
     me: usize,
     mpc_transport: T,
     dist_transport: T,
     consensus_transport: Option<T>,
     messaging_transport: Option<T>,
+    settlement_transport: Option<T>,
 ) {
     // Readiness barrier: block until fully connected to all peers on both
     // transports before doing any protocol work.  Replaces startup `sleep`s.
@@ -589,6 +937,9 @@ fn run_tcp<T: Transport + 'static>(
 
     // Optional p2p chat + forum over a dedicated transport (spawns a receiver).
     let mut messaging = messaging_transport.map(|mt| Messaging::new(me, 3, mt));
+
+    // Optional per-job MPC settlement over a dedicated transport.
+    let mut settlement = settlement_transport.map(|st| Settlement::new(me, st));
 
     // Optional REST control plane (BARU_REST=<base-port>, default 8090; this
     // party listens on base+id).  Exposes health / state / reputation / forum /
@@ -710,11 +1061,16 @@ fn run_tcp<T: Transport + 'static>(
                                                 }
                                             }));
                                         match result {
-                                            Ok(val) => println!(
-                                                "{} {}",
-                                                "=>".bright_yellow(),
-                                                display_result(&val, &participant)
-                                            ),
+                                            Ok(val) => {
+                                                let (shown, num) =
+                                                    display_result(&val, &participant);
+                                                println!("{} {}", "=>".bright_yellow(), shown);
+                                                if let (Some(v), Some(s)) =
+                                                    (num, settlement.as_mut())
+                                                {
+                                                    s.settle_expression(v, &ledger, &node_state);
+                                                }
+                                            }
                                             Err(e) => {
                                                 let msg = if let Some(s) =
                                                     e.downcast_ref::<String>()
@@ -820,6 +1176,36 @@ fn run_tcp<T: Transport + 'static>(
                         }
                         continue;
                     }
+                    ":fhe" => {
+                        // Post an FHE job: a worker evaluates, all verify by
+                        // re-execution and settle.
+                        if let Some(s) = settlement.as_mut() {
+                            broadcast_expr(":fhe", &dist_transport);
+                            s.settle_fhe(&ledger, &node_state);
+                        } else {
+                            println!(
+                                "{}",
+                                "settlement disabled — set BARU_SETTLE=1 on all parties"
+                                    .bright_yellow()
+                            );
+                        }
+                        continue;
+                    }
+                    ":storage" => {
+                        // Issue a storage retrievability challenge; the provider
+                        // answers, all verify the Merkle proof and settle.
+                        if let Some(s) = settlement.as_mut() {
+                            broadcast_expr(":storage", &dist_transport);
+                            s.settle_storage(&ledger, &node_state);
+                        } else {
+                            println!(
+                                "{}",
+                                "settlement disabled — set BARU_SETTLE=1 on all parties"
+                                    .bright_yellow()
+                            );
+                        }
+                        continue;
+                    }
                     _ => {
                         println!(
                             "{} {}  (type '{}' for reference)",
@@ -856,11 +1242,12 @@ fn run_tcp<T: Transport + 'static>(
                     }));
                     match result {
                         Ok(val) => {
-                            println!(
-                                "{} {}",
-                                "=>".bright_yellow(),
-                                display_result(&val, &participant)
-                            );
+                            let (shown, num) = display_result(&val, &participant);
+                            println!("{} {}", "=>".bright_yellow(), shown);
+                            // Settle this MPC job (co-sign + exchange + reward).
+                            if let (Some(v), Some(s)) = (num, settlement.as_mut()) {
+                                s.settle_expression(v, &ledger, &node_state);
+                            }
                         }
                         Err(e) => {
                             let msg = if let Some(s) = e.downcast_ref::<String>() {
@@ -915,6 +1302,18 @@ fn run_tcp<T: Transport + 'static>(
                 commit_state(&mut consensus, &mut epoch, &participant, me, &node_state, &ledger);
                 continue;
             }
+            if src == ":fhe" {
+                if let Some(s) = settlement.as_mut() {
+                    s.settle_fhe(&ledger, &node_state);
+                }
+                continue;
+            }
+            if src == ":storage" {
+                if let Some(s) = settlement.as_mut() {
+                    s.settle_storage(&ledger, &node_state);
+                }
+                continue;
+            }
             eprintln!(
                 "{}",
                 format!("[party {}] evaluating: {}", me, src).bright_black()
@@ -928,23 +1327,20 @@ fn run_tcp<T: Transport + 'static>(
                     }));
                     match result {
                         Ok(val) => {
-                            // Mirror party 0's display_result to stay in sync on reveals.
-                            let display = match &val {
-                                Types::Share(sr) => {
-                                    let raw = participant.reveal(sr);
-                                    ((raw as u32) as i32 as i64).to_string()
-                                }
-                                Types::Num(n) => ((*n as u32) as i32 as i64).to_string(),
-                                other => format!("{:?}", other),
-                            };
+                            // Mirror party 0's reveal (exactly once) to stay in sync.
+                            let (shown, num) = display_result(&val, &participant);
                             eprintln!(
                                 "{}",
                                 format!(
                                     "[party {}] => {}  (waiting for next expression)",
-                                    me, display
+                                    me, shown
                                 )
                                 .bright_black()
                             );
+                            // Settle this MPC job in lockstep with party 0.
+                            if let (Some(v), Some(s)) = (num, settlement.as_mut()) {
+                                s.settle_expression(v, &ledger, &node_state);
+                            }
                         }
                         Err(e) => {
                             let msg = if let Some(s) = e.downcast_ref::<String>() {

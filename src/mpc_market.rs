@@ -81,6 +81,16 @@ pub fn cosign(worker: &Identity, request: &Hash, result_root: &Hash) -> CoSignat
     }
 }
 
+/// Check that `cosig` is a valid signature over `(request, result_root)`.  A
+/// collector uses this to keep only co-signatures that agree with the honest
+/// result — a worker that computed (or signed) a *different* result is silently
+/// excluded, so it earns nothing while the honest majority still settles.
+pub fn verify_cosignature(cosig: &CoSignature, request: &Hash, result_root: &Hash) -> bool {
+    cosig
+        .signer
+        .verify(&cosign_bytes(request, result_root), &cosig.sig)
+}
+
 /// Verdict on an MPC receipt.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Verdict {

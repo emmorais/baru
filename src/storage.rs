@@ -21,6 +21,7 @@
 //!   identities** holding the same root, not by proving one identity holds N
 //!   copies (true Proof-of-Replication is future work).
 
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::fhe::lifecycle::{Effect, Epoch, Id, Stake};
@@ -75,7 +76,7 @@ impl StoredData {
 }
 
 /// A provider's response to a storage challenge.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ChallengeResponse {
     pub chunk: Vec<u8>,
     pub proof: Vec<ProofStep>,
