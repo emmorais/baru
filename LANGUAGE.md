@@ -306,6 +306,76 @@ MNIST benchmark data point (784-input linear layer, 2365 gates): TFHE eval
 ≈ 2800 s; CKKS circuit form ≈ 1.6 s; CKKS batched SIMD form ≈ 92 ms with one
 393 KB ciphertext per image (see `examples/mnist.rs`).
 
+### 7.1 Delegated computation (the FHE job market)
+
+FHE's headline use is **delegation**: a data owner hands a heavy computation to
+an untrusted worker who runs it *on ciphertexts* and never sees the plaintext.
+`src/fhe/market.rs` models this as a verifiable job, and `src/fhe/lifecycle.rs`
+wraps it in economics.
+
+Three roles, none of which requires trusting the others:
+
+- **Requester** holds the client key. They compile the function, encrypt their
+  private inputs, and post an [`FheJob`] carrying only the circuit, the public
+  inputs, and the ciphertext bytes — **the client key never leaves them**.
+- **Worker** runs `evaluate_job`, producing the result ciphertext plus a
+  succinct `WorkReceipt` (a commitment to the output). It needs only the
+  evaluation/server key and never decrypts.
+- **Verifier** (anyone) calls `verify_receipt`, which **re-executes the circuit
+  on the ciphertexts** and compares the output commitment. Homomorphic
+  evaluation is a deterministic function of `(circuit, inputs, keys)`, so a
+  wrong result yields a different commitment and is *provable* fraud — the
+  verifier never decrypts either.
+
+```rust
+use std::collections::HashMap;
+use baru::fhe::market::{evaluate_job, verify_receipt, FheJob, Verdict};
+use baru::fhe::{FheBackend, MockFheBackend};
+use baru::interpreter::parse;
+use baru::zkp::circuit_compiler::CircuitCompiler;
+
+// ── Requester: compile f(x,y) = x + y, encrypt private inputs, post a job ──
+let backend = MockFheBackend;              // swap for the TFHE backend in production
+let (client_key, _server_key) = backend.keygen();
+
+let mut cc = CircuitCompiler::new();
+let mut circuit = cc.compile_fhe(&parse("(+ x y)").unwrap()).unwrap();
+circuit.public_inputs.retain(|v| v != "x" && v != "y");
+circuit.encrypted_inputs = vec!["x".into(), "y".into()];
+
+let mut encrypted_inputs = HashMap::new();
+encrypted_inputs.insert("x".into(), backend.serialize_ct(&backend.encrypt(&client_key, 10)));
+encrypted_inputs.insert("y".into(), backend.serialize_ct(&backend.encrypt(&client_key, 32)));
+
+let job = FheJob {
+    circuit,
+    public_inputs: HashMap::new(),
+    encrypted_inputs,                      // ciphertext bytes only — no client key
+    backend_id: backend.backend_id().to_string(),
+};
+
+// ── Worker: evaluate homomorphically; never decrypts ──
+let (output, receipt) = evaluate_job(&job, &backend).unwrap();
+
+// ── Anyone: verify by deterministic re-execution (no key, no decryption) ──
+assert_eq!(verify_receipt(&job, &receipt, &backend), Verdict::Valid);
+
+// ── Requester: decrypt the delivered result with the client key ──
+let out_ct = backend.deserialize_ct(&output.bytes);
+assert_eq!(backend.decrypt(&client_key, &out_ct), 42);
+```
+
+**Economic wrapper.** `fhe::lifecycle` turns that objective correctness check
+into an incentive-compatible market. A job moves
+`Open → Claimed → Delivered → {Settled | Challenged → Settled}`: the reward is
+escrowed, the worker posts a claim bond, and a challenge window lets anyone
+dispute a delivered result. A dispute is adjudicated by the same re-execution —
+`verdict_to_adjudication` maps a `Verdict` to the state machine's `Adjudicated`
+event — and settlement emits `Effect`s (stake releases/slashes and reputation
+deltas) that a consensus ledger folds at each epoch boundary. Those reputation
+deltas are exactly what `tcp_party`'s `BARU_POUW` consensus weights leader
+election by, so honest delegated work compounds into consensus influence.
+
 ---
 
 ## 8. ZKP layer

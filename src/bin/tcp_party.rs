@@ -1,16 +1,67 @@
-//! Multi-party REPL/evaluator binary.
+//! Multi-party node: an MPC REPL/evaluator plus optional consensus, p2p
+//! messaging, and a REST control plane.
 //!
-//! Usage (3 separate terminals, one per party):
+//! # Running
 //!
-//!   party 0: tcp_party 0 127.0.0.1:7000,127.0.0.1:7001,127.0.0.1:7002
-//!   party 1: tcp_party 1 127.0.0.1:7001,127.0.0.1:7001,127.0.0.1:7002
-//!   party 2: tcp_party 2 127.0.0.1:7002,127.0.0.1:7001,127.0.0.1:7002
+//! In-process demo (no arguments) — a handful of example expressions across 3
+//! threaded parties sharing an in-process network:
 //!
-//! Party 0 reads expressions from a full-featured REPL (colours, tab-completion,
-//! history, :help, :examples, :example <n>) and broadcasts them to peers.
-//! All parties evaluate jointly via `TransportBackend`.
+//!   tcp_party
 //!
-//! Run with no arguments for an in-process 3-party demo.
+//! TCP mode — one process per party, all given the *same* address roster and
+//! distinguished only by the leading party id:
+//!
+//!   tcp_party 0 127.0.0.1:7000,127.0.0.1:7001,127.0.0.1:7002
+//!   tcp_party 1 127.0.0.1:7000,127.0.0.1:7001,127.0.0.1:7002
+//!   tcp_party 2 127.0.0.1:7000,127.0.0.1:7001,127.0.0.1:7002
+//!
+//! Party 0 drives a full REPL (colours, tab-completion, history); parties 1/2
+//! are silent workers.  Party 0 broadcasts each expression's text over the
+//! distribution transport and every party evaluates it jointly via
+//! `TransportBackend`, so all parties run in lockstep.
+//!
+//! # Transports
+//!
+//! Each subsystem runs on its own transport, on a port range derived from the
+//! MPC base port so they never interfere:
+//!
+//!   MPC           base           ABY3 protocol traffic   (e.g. 7000–7002)
+//!   distribution  base + 100     expression text from party 0
+//!   consensus     base + 200     epoch commits           (BARU_CONSENSUS)
+//!   messaging     base + 300     chat + forum            (BARU_CHAT)
+//!
+//! In two-argument mode the distribution roster is derived automatically by
+//! bumping each port by 100; a fourth CLI argument overrides it explicitly.
+//!
+//! # Environment toggles
+//!
+//!   BARU_TLS         use PQ-TLS transports (requires `--features pq-tls`);
+//!                    each party mints one long-term Ed25519 identity shared
+//!                    across all its channels.
+//!   BARU_CONSENSUS   enable a consensus backend on the consensus transport.
+//!   BARU_POUW        with consensus on, elect the epoch leader by reputation
+//!                    (`ReputationPoUW`) instead of the fixed `SingleLeader`
+//!                    baseline (party 0).
+//!   BARU_POUW_REP    deterministic genesis reputation as "party:delta,…"
+//!                    (every party must set the same value).
+//!   BARU_CHAT        enable p2p chat + forum on the messaging transport.
+//!   BARU_REST[=port] serve the per-node REST control plane; party `i` listens
+//!                    on `port + i` (default base 8090).  See `baru::rest`.
+//!
+//! # REPL commands (party 0)
+//!
+//!   :help                     language reference
+//!   :examples [category]      list examples (optionally filtered)
+//!   :example <n>              run example n
+//!   :verbose [on|off]         toggle per-step evaluation tracing
+//!   :commit                   run one live consensus epoch across the parties
+//!   :chat <party> <message>   send an end-to-end encrypted direct message
+//!   :post <message>           broadcast a signed forum post
+//!   :quit                     signal all parties to exit
+//!
+//! Anything else is parsed as a Baru expression, broadcast, and evaluated
+//! jointly; a parse/runtime error on party 0 broadcasts `:abort` so the workers
+//! re-sync instead of hanging.
 
 use std::env;
 use std::panic;

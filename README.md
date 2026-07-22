@@ -302,30 +302,90 @@ Messages are serialised with `bincode` and tagged with operation IDs so concurre
 
 ## Multi-party binary
 
+The `tcp_party` binary is a full node: an MPC REPL/evaluator with optional consensus, peer-to-peer messaging, and a REST control plane layered on top.
+
 ```sh
 cargo build --bin tcp_party
 ```
 
-**In-process demo** (no arguments — runs 4 example expressions with 3 threaded parties sharing an `InprocHandle` network):
+**In-process demo** (no arguments — runs a handful of example expressions with 3 threaded parties sharing an `InprocHandle` network):
 
 ```sh
 ./target/debug/tcp_party
 ```
 
-**TCP mode** (3 separate terminals):
+**TCP mode** (3 separate terminals — every party gets the *same* address roster and differs only by the leading party id):
 
 ```sh
-# party 0 — reads expressions from stdin, broadcasts to peers
+# party 0 — drives the interactive REPL, broadcasts to peers
 ./target/debug/tcp_party 0 127.0.0.1:7000,127.0.0.1:7001,127.0.0.1:7002
 
-# party 1
+# party 1 — silent worker
 ./target/debug/tcp_party 1 127.0.0.1:7000,127.0.0.1:7001,127.0.0.1:7002
 
-# party 2
+# party 2 — silent worker
 ./target/debug/tcp_party 2 127.0.0.1:7000,127.0.0.1:7001,127.0.0.1:7002
 ```
 
-Party 0 uses two transports — one for MPC operations (`TransportBackend`) and one for broadcasting expression text to peers — so every party evaluates the same expression in lockstep.
+Party 0 broadcasts each expression's text over the distribution transport and every party evaluates it jointly via `TransportBackend`, so all parties run in lockstep.
+
+### Transports
+
+Each subsystem runs on its own transport, on a port range derived from the MPC base port so they never interfere:
+
+| Transport | Port | Carries | Enabled by |
+|---|---|---|---|
+| MPC | base | ABY3 protocol traffic | always |
+| distribution | base + 100 | expression text from party 0 | always |
+| consensus | base + 200 | epoch commits | `BARU_CONSENSUS` |
+| messaging | base + 300 | chat + forum | `BARU_CHAT` |
+
+### Environment toggles
+
+| Variable | Effect |
+|---|---|
+| `BARU_TLS` | Use PQ-TLS transports (requires `--features pq-tls`); each party mints one long-term Ed25519 identity shared across all its channels. |
+| `BARU_CONSENSUS` | Enable a consensus backend on the consensus transport. |
+| `BARU_POUW` | With consensus on, elect the epoch leader by reputation (`ReputationPoUW`) instead of the fixed `SingleLeader` baseline (party 0). |
+| `BARU_POUW_REP` | Deterministic genesis reputation as `"party:delta,…"` (every party must set the same value). |
+| `BARU_CHAT` | Enable p2p chat + forum on the messaging transport. |
+| `BARU_REST[=port]` | Serve the per-node REST control plane; party `i` listens on `port + i` (default base 8090). |
+
+### REPL commands (party 0)
+
+| Command | Purpose |
+|---|---|
+| `:help` | Language reference |
+| `:examples [category]` | List examples (optionally filtered) |
+| `:example <n>` | Run example n |
+| `:verbose [on\|off]` | Toggle per-step evaluation tracing |
+| `:commit` | Run one live consensus epoch across the parties |
+| `:chat <party> <message>` | Send an end-to-end encrypted direct message |
+| `:post <message>` | Broadcast a signed forum post |
+| `:quit` | Signal all parties to exit |
+
+Anything else is parsed as a Baru expression, broadcast, and evaluated jointly; a parse/runtime error on party 0 broadcasts `:abort` so the workers re-sync instead of hanging.
+
+### REST control plane
+
+When `BARU_REST` is set each node serves a small HTTP API (tokio + axum) for operators — separate from the machine-to-machine p2p protocol:
+
+| Method & path | Purpose |
+|---|---|
+| `GET /health` | Liveness + party id + current epoch |
+| `GET /state` | Committed roots (state / reputation / forum) |
+| `GET /reputation` | Reputation ledger (per-identity + treasury) |
+| `GET /forum` | Forum posts + Merkle root |
+| `POST /forum` | Publish a signed post (`{"body": "..."}`) |
+| `GET /programs` | Submitted program queue |
+| `POST /programs` | Submit a program for the network (`{"source": "..."}`) |
+
+### Messaging
+
+The `baru::messaging` module provides two identity-authenticated channels wired into the node:
+
+- **Chat** — end-to-end encrypted direct messages (X25519 ECDH → ChaCha20-Poly1305, Ed25519-signed). Confidentiality is end-to-end and independent of the transport. Uses static-static ECDH, so it lacks forward secrecy (an ephemeral ratchet is future work).
+- **Forum** — an append-only, tamper-evident log of signed public posts committed by a Merkle root, so every party that sees the same posts agrees on the same root.
 
 ---
 
