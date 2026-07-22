@@ -293,27 +293,39 @@ fn roster_id(party: usize) -> [u8; 32] {
     h.finalize().into()
 }
 
-/// Build the consensus backend: `ReputationPoUW` when `BARU_POUW` is set
-/// (leader elected by reputation; optional genesis from `BARU_POUW_REP` as
-/// "party:delta,party:delta"), otherwise the `SingleLeader` parity baseline.
+/// Reputation credited to each committee member for one committed epoch of
+/// joint MPC work.  A stand-in unit; the co-signed receipt (see
+/// `baru::mpc_market`) is the externally-verifiable artifact.
+const MPC_EPOCH_REWARD: i128 = 10;
+
+/// Build the consensus backend: `ReputationPoUW` when `BARU_POUW` is set (leader
+/// elected by the shared reputation ledger), else the `SingleLeader` baseline.
 fn build_consensus<T: Transport + 'static>(
     me: usize,
     n: usize,
     transport: T,
+    ledger: Arc<Mutex<ReputationLedger>>,
 ) -> Box<dyn ConsensusBackend> {
     if std::env::var("BARU_POUW").is_ok() {
         let roster: Vec<[u8; 32]> = (0..n).map(roster_id).collect();
-        let mut ledger = ReputationLedger::new();
-        // Optional deterministic genesis reputation — all parties set the same
-        // env, so they build the same ledger.  In production this reputation
-        // comes from settled FHE jobs (see baru::fhe::lifecycle).
-        if let Ok(spec) = std::env::var("BARU_POUW_REP") {
+        Box::new(ReputationPoUW::new(me, n, roster, ledger, transport, [0u8; 32]))
+    } else {
+        Box::new(SingleLeader::new(me, n, 0, transport))
+    }
+}
+
+/// Seed the ledger with an optional deterministic genesis reputation
+/// (`BARU_POUW_REP="party:delta,..."`).  All parties set the same env, so all
+/// build the same ledger.
+fn seed_genesis_reputation(ledger: &Arc<Mutex<ReputationLedger>>, n: usize) {
+    if let Ok(spec) = std::env::var("BARU_POUW_REP") {
+        if let Ok(mut l) = ledger.lock() {
             for entry in spec.split(',') {
                 if let Some((p, amt)) = entry.split_once(':') {
                     if let (Ok(p), Ok(amt)) = (p.trim().parse::<usize>(), amt.trim().parse::<i128>())
                     {
                         if p < n {
-                            ledger.apply(&Effect::Reputation {
+                            l.apply(&Effect::Reputation {
                                 id: roster_id(p),
                                 delta: amt,
                             });
@@ -322,9 +334,6 @@ fn build_consensus<T: Transport + 'static>(
                 }
             }
         }
-        Box::new(ReputationPoUW::new(me, n, roster, ledger, transport, [0u8; 32]))
-    } else {
-        Box::new(SingleLeader::new(me, n, 0, transport))
     }
 }
 
@@ -336,6 +345,7 @@ fn commit_state(
     participant: &Participant,
     me: usize,
     node_state: &Option<Arc<Mutex<NodeState>>>,
+    ledger: &Arc<Mutex<ReputationLedger>>,
 ) {
     let Some(cb) = consensus.as_mut() else {
         eprintln!("[party {}] :commit ignored — consensus disabled", me);
@@ -370,11 +380,30 @@ fn commit_state(
                 eprintln!("{}", line.bright_black());
             }
             *epoch += 1;
+
+            // Fold this epoch's joint MPC work into the shared reputation
+            // ledger: every committee member that participated earns reputation.
+            // All parties fold identically, so their ledgers stay in sync and
+            // the *next* epoch's leader election reflects accrued work — the
+            // ledger is now live, not just genesis-seeded.
+            if let Ok(mut l) = ledger.lock() {
+                for p in 0..3 {
+                    l.apply(&Effect::Reputation {
+                        id: roster_id(p),
+                        delta: MPC_EPOCH_REWARD,
+                    });
+                }
+            }
+            let rep_snapshot = ledger.lock().ok().map(|l| l.clone());
+
             // Reflect the committed state in the REST control plane.
             if let Some(ns) = node_state {
                 if let Ok(mut s) = ns.lock() {
                     s.epoch = *epoch;
                     s.state_root = participant.env_root();
+                    if let Some(r) = rep_snapshot {
+                        s.reputation = r;
+                    }
                 }
             }
         }
@@ -545,11 +574,16 @@ fn run_tcp<T: Transport + 'static>(
         .bright_yellow()
     );
 
+    // Reputation ledger shared with the consensus backend: seeded with an
+    // optional genesis, then folded with each committed epoch's real MPC work.
+    let ledger = Arc::new(Mutex::new(ReputationLedger::new()));
+    seed_genesis_reputation(&ledger, 3);
+
     // Optional consensus backend over its dedicated transport: single-leader
     // parity by default, reputation-weighted (ReputationPoUW) with BARU_POUW.
     let mut consensus: Option<Box<dyn ConsensusBackend>> = consensus_transport.map(|ct| {
         let _ = ct.wait_ready(10_000);
-        build_consensus(me, 3, ct)
+        build_consensus(me, 3, ct, ledger.clone())
     });
     let mut epoch: u64 = 0;
 
@@ -742,7 +776,7 @@ fn run_tcp<T: Transport + 'static>(
                         // the workers, then commit everyone's state roots.
                         if consensus.is_some() {
                             broadcast_expr(":commit", &dist_transport);
-                            commit_state(&mut consensus, &mut epoch, &participant, me, &node_state);
+                            commit_state(&mut consensus, &mut epoch, &participant, me, &node_state, &ledger);
                         } else {
                             println!(
                                 "{}",
@@ -878,7 +912,7 @@ fn run_tcp<T: Transport + 'static>(
             }
             if src == ":commit" {
                 // Party 0 triggered a consensus epoch; participate.
-                commit_state(&mut consensus, &mut epoch, &participant, me, &node_state);
+                commit_state(&mut consensus, &mut epoch, &participant, me, &node_state, &ledger);
                 continue;
             }
             eprintln!(

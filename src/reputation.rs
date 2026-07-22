@@ -15,6 +15,7 @@
 //! derive the same ledger and the same root.
 
 use std::collections::{BTreeMap, VecDeque};
+use std::sync::{Arc, Mutex};
 
 use sha2::{Digest, Sha256};
 
@@ -184,7 +185,9 @@ pub struct ReputationPoUW<T: Transport> {
     n: usize,
     /// Identity of each party, indexed by party id.
     roster: Vec<Id>,
-    ledger: ReputationLedger,
+    /// Shared with the node, which folds live settlements into it — so leader
+    /// election and the committed reputation root reflect real accrued work.
+    ledger: Arc<Mutex<ReputationLedger>>,
     transport: T,
     timeout_ms: u64,
     buf: VecDeque<(PartyId, ConsensusMsg)>,
@@ -197,7 +200,7 @@ impl<T: Transport> ReputationPoUW<T> {
         me: PartyId,
         n: usize,
         roster: Vec<Id>,
-        ledger: ReputationLedger,
+        ledger: Arc<Mutex<ReputationLedger>>,
         transport: T,
         genesis_seed: Hash,
     ) -> Self {
@@ -218,16 +221,6 @@ impl<T: Transport> ReputationPoUW<T> {
         self
     }
 
-    /// Replace the reputation ledger — a node calls this after folding the
-    /// epoch's settlement effects, so the next leader election reflects them.
-    pub fn set_ledger(&mut self, ledger: ReputationLedger) {
-        self.ledger = ledger;
-    }
-
-    pub fn ledger(&self) -> &ReputationLedger {
-        &self.ledger
-    }
-
     /// Deterministic leader for `epoch`: a reputation-weighted draw, falling
     /// back to round-robin when no reputation exists yet (bootstrap liveness).
     pub fn leader_for(&self, epoch: Epoch) -> PartyId {
@@ -235,7 +228,8 @@ impl<T: Transport> ReputationPoUW<T> {
         h.update(self.seed_chain);
         h.update(epoch.to_le_bytes());
         let seed: Hash = h.finalize().into();
-        if let Some(leader_id) = self.ledger.select_committee(1, &seed).first() {
+        let led = self.ledger.lock().expect("ledger lock");
+        if let Some(leader_id) = led.select_committee(1, &seed).first() {
             if let Some(idx) = self.roster.iter().position(|r| r == leader_id) {
                 return idx;
             }
@@ -247,7 +241,7 @@ impl<T: Transport> ReputationPoUW<T> {
 impl<T: Transport> ConsensusBackend for ReputationPoUW<T> {
     fn commit_epoch(&mut self, epoch: Epoch, my: RootSet) -> Result<EpochCommit, ConsensusError> {
         let leader = self.leader_for(epoch);
-        let reputation_root = self.ledger.root();
+        let reputation_root = self.ledger.lock().expect("ledger lock").root();
         let commit = leader_round(
             self.me,
             self.n,
@@ -479,7 +473,8 @@ mod tests {
             let tx = tx.clone();
             joins.push(thread::spawn(move || {
                 let mut be =
-                    ReputationPoUW::new(me, 3, roster, ledger, h, [0u8; 32]).with_timeout(5_000);
+                    ReputationPoUW::new(me, 3, roster, Arc::new(Mutex::new(ledger)), h, [0u8; 32])
+                        .with_timeout(5_000);
                 assert_eq!(be.leader_for(0), 1, "party 1 must be the elected leader");
                 let commit = be.commit_epoch(0, RootSet::default()).expect("commit");
                 tx.send((me, commit)).unwrap();
@@ -510,7 +505,7 @@ mod tests {
             0,
             3,
             vec![id(20), id(21), id(22)],
-            ReputationLedger::new(),
+            Arc::new(Mutex::new(ReputationLedger::new())),
             h,
             [0u8; 32],
         );
