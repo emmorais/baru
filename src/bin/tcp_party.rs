@@ -36,6 +36,7 @@ use baru::fhe::lifecycle::Effect;
 use baru::interpreter::{parse, Participant, Types};
 use baru::messaging::{open, seal, ChatSecret, Contact, Forum, ForumPost};
 use baru::reputation::{ReputationLedger, ReputationPoUW};
+use baru::rest::{serve_blocking, AppState, NodeState};
 use baru::repl::{print_examples_for, print_examples_list, print_help, ReplHelper, EXAMPLES};
 
 // ---------------------------------------------------------------------------
@@ -283,6 +284,7 @@ fn commit_state(
     epoch: &mut u64,
     participant: &Participant,
     me: usize,
+    node_state: &Option<Arc<Mutex<NodeState>>>,
 ) {
     let Some(cb) = consensus.as_mut() else {
         eprintln!("[party {}] :commit ignored — consensus disabled", me);
@@ -317,6 +319,13 @@ fn commit_state(
                 eprintln!("{}", line.bright_black());
             }
             *epoch += 1;
+            // Reflect the committed state in the REST control plane.
+            if let Some(ns) = node_state {
+                if let Ok(mut s) = ns.lock() {
+                    s.epoch = *epoch;
+                    s.state_root = participant.env_root();
+                }
+            }
         }
         Err(e) => eprintln!("[party {}] consensus error: {}", me, e),
     }
@@ -496,6 +505,22 @@ fn run_tcp<T: Transport + 'static>(
     // Optional p2p chat + forum over a dedicated transport (spawns a receiver).
     let mut messaging = messaging_transport.map(|mt| Messaging::new(me, 3, mt));
 
+    // Optional REST control plane (BARU_REST=<base-port>, default 8090; this
+    // party listens on base+id).  Exposes health / state / reputation / forum /
+    // programs; the shared NodeState is refreshed as the node commits epochs.
+    let node_state: Option<Arc<Mutex<NodeState>>> = std::env::var("BARU_REST").ok().map(|spec| {
+        let base: u16 = spec.trim().parse().unwrap_or(8090);
+        let addr = std::net::SocketAddr::from(([127, 0, 0, 1], base + me as u16));
+        let ns = Arc::new(Mutex::new(NodeState::new()));
+        let app = AppState::new(me, &msg_identity(me), ns.clone());
+        thread::spawn(move || serve_blocking(addr, app));
+        eprintln!(
+            "{}",
+            format!("[party {}] REST control plane on http://{}", me, addr).bright_magenta()
+        );
+        ns
+    });
+
     let participant = Participant::new_transport(me, mpc_transport);
 
     if me == 0 {
@@ -666,7 +691,7 @@ fn run_tcp<T: Transport + 'static>(
                         // the workers, then commit everyone's state roots.
                         if consensus.is_some() {
                             broadcast_expr(":commit", &dist_transport);
-                            commit_state(&mut consensus, &mut epoch, &participant, me);
+                            commit_state(&mut consensus, &mut epoch, &participant, me, &node_state);
                         } else {
                             println!(
                                 "{}",
@@ -802,7 +827,7 @@ fn run_tcp<T: Transport + 'static>(
             }
             if src == ":commit" {
                 // Party 0 triggered a consensus epoch; participate.
-                commit_state(&mut consensus, &mut epoch, &participant, me);
+                commit_state(&mut consensus, &mut epoch, &participant, me, &node_state);
                 continue;
             }
             eprintln!(

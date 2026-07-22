@@ -90,6 +90,11 @@ impl ReputationLedger {
         self.treasury
     }
 
+    /// All (identity, reputation) entries in id order — for API / inspection.
+    pub fn entries(&self) -> Vec<(Id, i128)> {
+        self.reputation.iter().map(|(id, r)| (*id, *r)).collect()
+    }
+
     /// Canonical Merkle commitment over the ledger: one leaf per identity
     /// `SHA-256(id ‖ reputation ‖ balance)`, in id order (plus the treasury).
     pub fn root(&self) -> Hash {

@@ -18,3 +18,5 @@ pub mod reputation;
 pub mod storage;
 
 pub mod messaging;
+
+pub mod rest;

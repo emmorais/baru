@@ -13,6 +13,9 @@ sha2 = "0.10"
 # End-to-end encryption for the p2p chat (pure Rust, no native toolchain).
 x25519-dalek = { version = "2", features = ["static_secrets"] }
 chacha20poly1305 = "0.10"
+# REST control plane (pure Rust async: tokio + axum).
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net"] }
+axum = "0.7"
 rustyline = "11"
 colored = "2"
 serde_json = "1"
@@ -36,6 +39,7 @@ pq-tls = ["dep:rustls", "dep:rustls-post-quantum", "dep:rcgen"]
 
 [dev-dependencies]
 tempfile = "3"
+tower = { version = "0.5", features = ["util"] }
 
 # Keep the vendored sealy crate out of the workspace so cargo fmt/clippy
 # don't touch its (differently formatted) sources.
