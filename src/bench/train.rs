@@ -182,6 +182,109 @@ fn accuracy(w: &[Vec<i64>], b: &[i64], ds: &Dataset) -> f64 {
     correct as f64 / ds.x.len() as f64
 }
 
+// ─── 1-hidden-layer MLP: plaintext integer-SGD reference ──────────────────────
+//
+// forward:  z1 = W1·x + b1 ;  a1 = ReLU(z1) ;  z2 = W2·a1 + b2
+// backward: δ2 = z2 − y ;  ∂W2 = δ2⊗a1 ;  da1 = W2ᵀ·δ2 ;
+//           δ1 = da1 ⊙ step(z1) ;  ∂W1 = δ1⊗x
+// The only nonlinearity in the backward pass is `step(z1) = (z1 > 0)` — a
+// comparison, i.e. `gadgets::relu`'s mask — so the whole MLP training loop
+// stays inside the gadget library (no softmax/exp anywhere).
+
+pub struct Mlp {
+    pub w1: Vec<Vec<i64>>, // [H][D]
+    pub b1: Vec<i64>,      // [H]
+    pub w2: Vec<Vec<i64>>, // [C][H]
+    pub b2: Vec<i64>,      // [C]
+}
+
+impl Mlp {
+    /// Random init. W1 must be nonzero to break symmetry (a zero W1 gives
+    /// `a1 = 0` and `step(0) = 0`, so W1 would never receive gradient).
+    pub fn random(d: usize, h: usize, c: usize, seed: u64) -> Self {
+        use rand::rngs::StdRng;
+        use rand::{Rng, SeedableRng};
+        let mut rng = StdRng::seed_from_u64(seed ^ 0x5EED);
+        Mlp {
+            w1: (0..h).map(|_| (0..d).map(|_| rng.gen_range(-3i64..=3)).collect()).collect(),
+            b1: vec![0; h],
+            w2: (0..c).map(|_| (0..h).map(|_| rng.gen_range(-2i64..=2)).collect()).collect(),
+            b2: vec![0; c],
+        }
+    }
+
+    fn forward(&self, x: &[i64]) -> (Vec<i64>, Vec<i64>, Vec<i64>) {
+        let z1: Vec<i64> = self
+            .w1
+            .iter()
+            .zip(&self.b1)
+            .map(|(row, &b)| row.iter().zip(x).map(|(&w, &xi)| w * xi).sum::<i64>() + b)
+            .collect();
+        let a1: Vec<i64> = z1.iter().map(|&v| v.max(0)).collect();
+        let z2: Vec<i64> = self
+            .w2
+            .iter()
+            .zip(&self.b2)
+            .map(|(row, &b)| row.iter().zip(&a1).map(|(&w, &ai)| w * ai).sum::<i64>() + b)
+            .collect();
+        (z1, a1, z2)
+    }
+
+    /// Per-layer learning rates: `lr2` for the output layer and `lr1` for
+    /// the hidden layer. They must differ because `∂W1 = W2ᵀδ2 ⊙ step ⊗ x`
+    /// is smaller than `∂W2 = δ2 ⊗ a1` by the scale of `W2`, so one shared
+    /// rate either freezes W1 or destabilizes W2.
+    #[allow(clippy::needless_range_loop)] // parallel index math reads clearer
+    fn step(&mut self, x: &[i64], y: &[i64], lr1: usize, lr2: usize) {
+        let (z1, a1, z2) = self.forward(x);
+        let c = self.w2.len();
+        let h = self.w1.len();
+        let delta2: Vec<i64> = (0..c).map(|cc| z2[cc] - y[cc]).collect();
+        // da1[hh] = Σ_c W2[c][hh]·δ2[c]  (before the update to W2)
+        let da1: Vec<i64> = (0..h)
+            .map(|hh| (0..c).map(|cc| self.w2[cc][hh] * delta2[cc]).sum::<i64>())
+            .collect();
+        let delta1: Vec<i64> = (0..h)
+            .map(|hh| if z1[hh] > 0 { da1[hh] } else { 0 })
+            .collect();
+        for cc in 0..c {
+            for hh in 0..h {
+                self.w2[cc][hh] -= (delta2[cc] * a1[hh]) >> lr2;
+            }
+            self.b2[cc] -= delta2[cc] >> lr2;
+        }
+        for hh in 0..h {
+            for i in 0..x.len() {
+                self.w1[hh][i] -= (delta1[hh] * x[i]) >> lr1;
+            }
+            self.b1[hh] -= delta1[hh] >> lr1;
+        }
+    }
+
+    fn predict(&self, x: &[i64]) -> usize {
+        let (_, _, z2) = self.forward(x);
+        z2.iter().enumerate().max_by(|a, b| a.1.cmp(b.1)).map(|(i, _)| i).unwrap()
+    }
+
+    fn loss(&self, ds: &Dataset) -> i64 {
+        let mut total = 0i64;
+        for s in 0..ds.x.len() {
+            let y = ds.onehot(s);
+            let (_, _, z2) = self.forward(&ds.x[s]);
+            for cc in 0..ds.n_classes {
+                let d = z2[cc] - y[cc];
+                total += d * d;
+            }
+        }
+        total / ds.x.len() as i64
+    }
+
+    fn accuracy(&self, ds: &Dataset) -> f64 {
+        let correct = (0..ds.x.len()).filter(|&s| self.predict(&ds.x[s]) == ds.label[s]).count();
+        correct as f64 / ds.x.len() as f64
+    }
+}
+
 // ─── The private SGD step (real 3-party protocol, gadget-composed) ────────────
 
 /// Run `epochs` full passes of SGD over `ds` under the real ABY3 protocol,
@@ -254,6 +357,126 @@ fn private_train(
     (w, b, comm)
 }
 
+/// Private training of the 1-hidden-layer MLP under the real ABY3 protocol,
+/// starting from the public random init in `init`. Bit-exact mirror of
+/// `Mlp::step`: the ReLU mask `step(z1) = (0 < z1)` is computed once in the
+/// forward pass and reused in the backward pass (it is both `a1`'s gate and
+/// `δ1`'s), so the only "nonlinearity" in the whole training loop is one
+/// comparison per hidden unit. Returns the trained (revealed) model and
+/// party-0 wire stats.
+fn private_train_mlp(
+    ds: &Dataset,
+    init: &Mlp,
+    epochs: usize,
+    lr1: usize,
+    lr2: usize,
+    profile: NetworkProfile,
+) -> (Mlp, CommStats) {
+    let d = ds.n_features;
+    let c = ds.n_classes;
+    let h = init.w1.len();
+    let x_data = ds.x.clone();
+    let onehots: Vec<Vec<i64>> = (0..ds.x.len()).map(|s| ds.onehot(s)).collect();
+    let init = Mlp {
+        w1: init.w1.clone(),
+        b1: init.b1.clone(),
+        w2: init.w2.clone(),
+        b2: init.b2.clone(),
+    };
+
+    let (mut per_party, comm) = run_parties(profile, move |me| {
+        let x_data = x_data.clone();
+        let onehots = onehots.clone();
+        let init = Mlp { w1: init.w1.clone(), b1: init.b1.clone(), w2: init.w2.clone(), b2: init.b2.clone() };
+        move |be: &mut TransportBackend<MpcTransport>| {
+            let pubv = |be: &mut TransportBackend<MpcTransport>, v: i64| be.share_public(residue(v, NBITS), NBITS);
+            let priv_ = |be: &mut TransportBackend<MpcTransport>, v: i64| {
+                be.share_secret(if me == 0 { residue(v, NBITS) } else { 0 }, NBITS, 0)
+            };
+            // Public random init.
+            let mut w1: Vec<Vec<ShareRef>> = init.w1.iter().map(|r| r.iter().map(|&v| pubv(be, v)).collect()).collect();
+            let mut b1: Vec<ShareRef> = init.b1.iter().map(|&v| pubv(be, v)).collect();
+            let mut w2: Vec<Vec<ShareRef>> = init.w2.iter().map(|r| r.iter().map(|&v| pubv(be, v)).collect()).collect();
+            let mut b2: Vec<ShareRef> = init.b2.iter().map(|&v| pubv(be, v)).collect();
+
+            for _ in 0..epochs {
+                for s in 0..x_data.len() {
+                    let x: Vec<ShareRef> = x_data[s].iter().map(|&v| priv_(be, v)).collect();
+                    let y: Vec<ShareRef> = onehots[s].iter().map(|&v| priv_(be, v)).collect();
+                    // forward: z1, mask = (0<z1), a1 = z1·mask, z2
+                    let mut z1 = Vec::with_capacity(h);
+                    let mut mask = Vec::with_capacity(h);
+                    let mut a1 = Vec::with_capacity(h);
+                    for hh in 0..h {
+                        let mut acc = b1[hh].clone();
+                        for i in 0..d {
+                            let p = be.mul(&w1[hh][i], &x[i]);
+                            acc = be.add(&acc, &p);
+                        }
+                        let zero = be.sub(&acc, &acc);
+                        let m = be.lt(&zero, &acc);
+                        let a = be.mul(&acc, &m);
+                        z1.push(acc);
+                        mask.push(m);
+                        a1.push(a);
+                    }
+                    let z2: Vec<ShareRef> = (0..c)
+                        .map(|cc| {
+                            let mut acc = b2[cc].clone();
+                            for hh in 0..h {
+                                let p = be.mul(&w2[cc][hh], &a1[hh]);
+                                acc = be.add(&acc, &p);
+                            }
+                            acc
+                        })
+                        .collect();
+                    // backward
+                    let delta2: Vec<ShareRef> = (0..c).map(|cc| be.sub(&z2[cc], &y[cc])).collect();
+                    // da1[hh] = Σ_c W2[c][hh]·δ2[c]  (W2 pre-update)
+                    let delta1: Vec<ShareRef> = (0..h)
+                        .map(|hh| {
+                            let mut acc: Option<ShareRef> = None;
+                            for cc in 0..c {
+                                let p = be.mul(&w2[cc][hh], &delta2[cc]);
+                                acc = Some(match acc { None => p, Some(a) => be.add(&a, &p) });
+                            }
+                            let da1 = acc.unwrap();
+                            be.mul(&da1, &mask[hh]) // ⊙ step(z1)
+                        })
+                        .collect();
+                    // updates (arith_shr for the signed shift)
+                    for cc in 0..c {
+                        for hh in 0..h {
+                            let g = be.mul(&delta2[cc], &a1[hh]);
+                            let u = arith_shr(be, &g, lr2, NBITS);
+                            w2[cc][hh] = be.sub(&w2[cc][hh], &u);
+                        }
+                        let u = arith_shr(be, &delta2[cc], lr2, NBITS);
+                        b2[cc] = be.sub(&b2[cc], &u);
+                    }
+                    for hh in 0..h {
+                        for i in 0..d {
+                            let g = be.mul(&delta1[hh], &x[i]);
+                            let u = arith_shr(be, &g, lr1, NBITS);
+                            w1[hh][i] = be.sub(&w1[hh][i], &u);
+                        }
+                        let u = arith_shr(be, &delta1[hh], lr1, NBITS);
+                        b1[hh] = be.sub(&b1[hh], &u);
+                    }
+                }
+            }
+            let rev2 = |be: &mut TransportBackend<MpcTransport>, s: &ShareRef| to_signed(be.reveal(s, None));
+            Mlp {
+                w1: w1.iter().map(|r| r.iter().map(|s| rev2(be, s)).collect()).collect(),
+                b1: b1.iter().map(|s| rev2(be, s)).collect(),
+                w2: w2.iter().map(|r| r.iter().map(|s| rev2(be, s)).collect()).collect(),
+                b2: b2.iter().map(|s| rev2(be, s)).collect(),
+            }
+        }
+    });
+    (per_party.swap_remove(0), comm)
+}
+
 /// Private inference: classify `x` under the trained (secret-shared) model,
 /// revealing only the class index (`gadgets::argmax`).
 fn private_predict(w: &[Vec<i64>], b: &[i64], x: &[i64], profile: NetworkProfile) -> usize {
@@ -312,8 +535,11 @@ options:
   --samples N          training set size (default 12)
   --features D         input features (default 6)
   --classes C          number of classes (default 3)
-  --epochs E           passes over the data (default 8)
-  --lr-shift K         learning rate = 2^-K (default 8)
+  --epochs E           passes over the data (default 20)
+  --lr-shift K         learning rate = 2^-K (linear; hidden layer if --hidden)
+  --hidden H           add a hidden layer of H ReLU units (backprop through
+                       ReLU; default 0 = linear model)
+  --lr2-shift K        output-layer learning rate = 2^-K when --hidden (default 9)
   --rtt-ms N           round-trip latency (default 0)
   --seed N             RNG seed (default 1)
   --json               emit JSON
@@ -325,6 +551,8 @@ pub fn run_cli(args: &[String]) -> Result<(), String> {
     let mut c = 3usize;
     let mut epochs = 20usize;
     let mut lr_shift = 4usize;
+    let mut hidden = 0usize;
+    let mut lr2_shift = 9usize;
     let mut rtt_ms = 0u64;
     let mut seed = 1u64;
     let mut json = false;
@@ -342,6 +570,8 @@ pub fn run_cli(args: &[String]) -> Result<(), String> {
             "--classes" => { i += 1; c = args.get(i).ok_or("--classes needs a value")?.parse().map_err(|_| "bad classes".to_string())?; }
             "--epochs" => { i += 1; epochs = args.get(i).ok_or("--epochs needs a value")?.parse().map_err(|_| "bad epochs".to_string())?; }
             "--lr-shift" => { i += 1; lr_shift = args.get(i).ok_or("--lr-shift needs a value")?.parse().map_err(|_| "bad lr-shift".to_string())?; }
+            "--hidden" => { i += 1; hidden = args.get(i).ok_or("--hidden needs a value")?.parse().map_err(|_| "bad hidden".to_string())?; }
+            "--lr2-shift" => { i += 1; lr2_shift = args.get(i).ok_or("--lr2-shift needs a value")?.parse().map_err(|_| "bad lr2-shift".to_string())?; }
             "--rtt-ms" => { i += 1; rtt_ms = args.get(i).ok_or("--rtt-ms needs a value")?.parse().map_err(|_| "bad rtt-ms".to_string())?; }
             "--seed" => { i += 1; seed = args.get(i).ok_or("--seed needs a value")?.parse().map_err(|_| "bad seed".to_string())?; }
             other => return Err(format!("unknown option '{other}'\n{USAGE}")),
@@ -351,6 +581,43 @@ pub fn run_cli(args: &[String]) -> Result<(), String> {
 
     let profile = NetworkProfile::fixed_latency(std::time::Duration::from_micros(rtt_ms * 500));
     let ds = make_dataset(n, d, c, seed);
+
+    // ── MLP path (backpropagation through ReLU) ──
+    if hidden > 0 {
+        let init = Mlp::random(d, hidden, c, seed);
+        let mut pmlp = Mlp::random(d, hidden, c, seed);
+        let l0 = pmlp.loss(&ds);
+        let mut curve = vec![l0];
+        for _ in 0..epochs {
+            for s in 0..ds.x.len() {
+                let y = ds.onehot(s);
+                pmlp.step(&ds.x[s], &y, lr_shift, lr2_shift);
+            }
+            curve.push(pmlp.loss(&ds));
+        }
+        let (emlp, comm) = private_train_mlp(&ds, &init, epochs, lr_shift, lr2_shift, profile);
+        let exact = emlp.w1 == pmlp.w1 && emlp.w2 == pmlp.w2 && emlp.b1 == pmlp.b1 && emlp.b2 == pmlp.b2;
+        println!("Private MLP training — backpropagation THROUGH ReLU under real 3-party ABY3");
+        println!("data secret-shared; forward + backprop + update all oblivious (gadget-composed)");
+        println!(
+            "architecture: {d} -> {hidden} (ReLU) -> {c} | epochs={epochs}, lr1=2^-{lr_shift}, lr2=2^-{lr2_shift}\n"
+        );
+        println!("  loss (MSE) curve : {curve:?}");
+        println!("  loss {} -> {}   ({:.0}% reduction)", l0, curve.last().unwrap(),
+            100.0 * (l0 - curve.last().unwrap()) as f64 / l0.max(1) as f64);
+        println!("  train accuracy   : {:.0}%", pmlp.accuracy(&ds) * 100.0);
+        println!(
+            "  encrypted == plaintext model (backprop through ReLU) : {}",
+            if exact { "EXACT (bit-for-bit)" } else { "MISMATCH" }
+        );
+        println!("  FHE bootstraps   : 0");
+        println!("  MPC wire traffic : {} messages, {} bytes", comm.messages, comm.bytes);
+        println!(
+            "\n  note: integer SGD diverges past the stable regime without regularization\n\
+             \x20       (an ML matter); the *private backprop* is exact regardless."
+        );
+        return Ok(());
+    }
 
     // Plaintext reference (the exact ground truth + loss curve).
     let mut pw = vec![vec![0i64; d]; c];
@@ -436,6 +703,27 @@ mod tests {
     }
 
     #[test]
+    fn plaintext_mlp_sgd_reduces_loss() {
+        let ds = make_dataset(16, 6, 3, 2);
+        let mut mlp = Mlp::random(6, 8, 3, 2);
+        let l0 = mlp.loss(&ds);
+        // Stable regime (integer SGD diverges past ~16 epochs without
+        // regularization — an ML matter, not a crypto one).
+        let mut curve = vec![l0];
+        for _ in 0..16 {
+            for s in 0..ds.x.len() {
+                let y = ds.onehot(s);
+                mlp.step(&ds.x[s], &y, 6, 9);
+            }
+            curve.push(mlp.loss(&ds));
+        }
+        for w in curve.windows(2) {
+            assert!(w[1] <= w[0], "loss must be monotone in the stable regime: {curve:?}");
+        }
+        assert!(*curve.last().unwrap() < l0);
+    }
+
+    #[test]
     #[ignore] // real 3-party protocol — slow in debug, fine in release
     fn private_training_matches_plaintext_exactly() {
         let ds = make_dataset(8, 4, 2, 5);
@@ -450,5 +738,26 @@ mod tests {
         assert_eq!(w, pw, "encrypted weights must match plaintext exactly");
         assert_eq!(b, pb, "encrypted bias must match plaintext exactly");
         assert!(comm.messages > 0, "must use the real MPC protocol");
+    }
+
+    #[test]
+    #[ignore] // real 3-party protocol — slow in debug, fine in release
+    fn private_mlp_backprop_matches_plaintext_exactly() {
+        // The headline: private backpropagation *through ReLU* is bit-exact.
+        let ds = make_dataset(6, 4, 2, 3);
+        let mut pmlp = Mlp::random(4, 4, 2, 3);
+        for _ in 0..3 {
+            for s in 0..ds.x.len() {
+                let y = ds.onehot(s);
+                pmlp.step(&ds.x[s], &y, 6, 9);
+            }
+        }
+        let init = Mlp::random(4, 4, 2, 3);
+        let (emlp, comm) = private_train_mlp(&ds, &init, 3, 6, 9, NetworkProfile::INSTANT);
+        assert_eq!(emlp.w1, pmlp.w1, "W1 must match after private backprop");
+        assert_eq!(emlp.w2, pmlp.w2, "W2 must match after private backprop");
+        assert_eq!(emlp.b1, pmlp.b1);
+        assert_eq!(emlp.b2, pmlp.b2);
+        assert!(comm.messages > 0);
     }
 }

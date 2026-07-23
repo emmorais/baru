@@ -875,9 +875,31 @@ this side — the paper's no-bootstrap *FHE* contribution is the *inference*
 deployment, and this module completes the private-ML lifecycle around it,
 showing the same UC-gadget library composes a full SGD trainer. Correctness
 is exact; *accuracy* is a property of the (synthetic, separable) data,
-reported separately. This is the linear case (which converges provably); a
-deep MLP's backward pass reuses the same gadgets (ReLU′ = `lt`, already
-here) and is future work.
+reported separately.
+
+**Backpropagation *through ReLU* (`--hidden H`).** The linear case above
+converges provably; adding a hidden layer makes it a real (non-convex)
+network whose backward pass differentiates a nonlinearity — and it stays
+inside the gadget library, because `ReLU′(z) = (z > 0)` is exactly the mask
+`gadgets::relu` already computes (reused from the forward pass for the
+backward). The whole loop — `z1=W1·x+b1; a1=ReLU(z1); z2=W2·a1+b2` forward,
+`δ2=z2−y; ∂W2=δ2⊗a1; δ1=(W2ᵀδ2)⊙step(z1); ∂W1=δ1⊗x` backward, arith-shift
+updates — runs under the real protocol and the trained model matches the
+plaintext integer reference **bit-for-bit**:
+
+```sh
+./target/release/baru bench-train --hidden 8 --epochs 16 --lr-shift 6 --lr2-shift 9
+# 6 -> 8 (ReLU) -> 3 | loss 64366 -> 39013 (39%), acc 50%
+# encrypted model (backprop through ReLU) == plaintext: EXACT (bit-for-bit)
+```
+
+Two honest notes: the two layers need **different learning rates**
+(`∂W1 = W2ᵀδ2 ⊙ step ⊗ x` is smaller than `∂W2 = δ2 ⊗ a1` by the scale of
+`W2`, so one rate freezes one layer or destabilizes the other), and
+unregularized *integer* SGD **diverges past a stable regime** — an ML
+tuning matter (gradient clipping / regularization), entirely orthogonal to
+the crypto claim, which is that **private backprop through a nonlinearity
+is exact**. Deeper nets and softmax loss remain future work.
 
 ### A real CNN through the hybrid pipeline (`baru bench-cnn`)
 

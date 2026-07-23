@@ -187,6 +187,7 @@ model of §5?"
 | E6 | `gadgets` CNN composition test | full LeNet-shaped classifier (conv/pool/dense/argmax) composed from the gadget library, bit-exact, class-only reveal |
 | E7 | `bench-cnn` | that CNN through the *real hybrid pipeline* (FHE ct×ct conv + MPC relu/pool/argmax), 0 bootstraps, bit-exact, per-phase cost under a WAN model |
 | E8 | `bench-train` | private *training* (SGD, MSE loss to sidestep softmax) under the real ABY3 protocol, bit-exact vs plaintext integer-SGD, loss ↓ + 100% train acc, then private inference — the full encrypted-data→train→infer lifecycle from the gadget library |
+| E8b | `bench-train --hidden H` | private *backpropagation through ReLU* (`ReLU′ = step = lt`, reused from the forward mask): a 1-hidden-layer MLP trained under the real protocol, model bit-exact vs plaintext; honest ML caveats (per-layer LR; integer-SGD divergence past a stable regime) are separate from the exact-backprop crypto claim |
 
 ## 8. Security model — state honestly, do not overclaim
 
