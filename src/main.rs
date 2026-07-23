@@ -33,6 +33,9 @@ fn main() -> Result<(), Box<dyn Error>> {
     if args.first().map(String::as_str) == Some("quantize") {
         return baru::ml::run_cli(&args[1..]).map_err(|e| e.into());
     }
+    if args.first().map(String::as_str) == Some("bench-ckks-compare") {
+        return baru::bench::ckks_compare::run_cli(&args[1..]).map_err(|e| e.into());
+    }
 
     let participants: Vec<Participant> = (0..3).map(Participant::new).collect();
 

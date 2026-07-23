@@ -190,10 +190,13 @@ pub trait FheBackend {
 ///   - Values are `f64` reals, not two's-complement integers.  Fixed-point
 ///     Baru values cross this boundary as their true value (`v / 2^16`).
 ///   - Only ring operations exist: add / sub / mul (+ plaintext variants).
-///     Comparisons, bit operations, shifts, mux and division are impossible
-///     on approximate ciphertexts; circuits must be compiled with
-///     `CircuitCompiler::new_real` so no such gate is emitted for supported
-///     programs.
+///     Comparisons, bit operations, shifts, mux and division have no *exact*
+///     equivalent on approximate ciphertexts, so this trait doesn't declare
+///     them; circuits must be compiled with `CircuitCompiler::new_real` so no
+///     such gate is emitted for supported programs. An *approximate*
+///     comparison/ReLU is possible — see `crate::fhe::ckks_compare`, which
+///     evaluates a polynomial approximation of `sign(x)` in a separate,
+///     much deeper (and much slower) CKKS context than this shallow one.
 ///   - Results are approximate — decrypt returns a real close to, not equal
 ///     to, the true value.
 ///   - Ciphertexts are SIMD vectors of slots.  The scalar circuit path uses

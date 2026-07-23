@@ -478,6 +478,84 @@ Two complementary harnesses, both under `src/bench/`:
 
 ---
 
+## CKKS comparisons: approximate, not impossible (`src/fhe/ckks_compare.rs`)
+
+`RealFheBackend`'s doc comment says comparisons are "impossible" on CKKS's
+approximate ciphertexts — true for *exact* comparison, but the CKKS/HEAAN
+literature has an established answer for *approximate* comparison, and since
+other research groups build private-inference systems on exactly this
+technique, treating it as out of scope here would leave CKKS's real
+performance profile unmeasured rather than characterized. So: don't compare —
+approximate `sign(x)` with a polynomial, then comparison/ReLU/max fall out
+arithmetically (`relu(x) ≈ x·(sign(x)+1)/2`).
+
+**The polynomial.** `f(x) = x·(3 − x²)/2` — the classical Newton–Schulz
+iteration for the scalar sign function (a numerical-analysis technique
+predating homomorphic encryption), and, not coincidentally, the exact "f"
+polynomial family Cheon, Kim, Kim and Song introduced for *homomorphic*
+comparison in [Numerical Method for Comparison on Homomorphically Encrypted
+Numbers](https://eprint.iacr.org/2019/417) (Asiacrypt 2019). `f` has fixed
+points at `-1, 0, 1`; `0` is repelling and `±1` are superattracting, so
+iterating pushes `x ∈ (-√3, √3)` towards `sign(x)` — slowly near 0, then
+quadratically fast. The follow-up work — [Efficient Homomorphic Comparison
+Methods with Optimal
+Complexity](https://eprint.iacr.org/2019/417) (Asiacrypt 2020) and [Minimax
+Approximation of Sign Function by Composite Polynomial for Homomorphic
+Comparison](https://eprint.iacr.org/2020/834) — composes `f` with a second
+polynomial family `g` (fast near ±1) via dynamic programming for
+asymptotically optimal depth. `src/fhe/ckks_compare.rs` implements only the
+foundational `f`-iteration, not that optimal composite — correct and
+independently verified (see below), but costlier in depth for a given
+precision than the state of the art. Implementing the `f`+`g` composite is
+future work.
+
+**Why this needs its own CKKS context.** `CkksBackend` (the existing,
+shallow path used for `matvec`/`dot`) deliberately never calls SEAL's
+`rescale_to_next` — it keeps every ciphertext at the top modulus level and
+tracks scale via a `depth` counter, which is exactly right for its depth-≤2
+linear workloads but means each multiplication *compounds* the required
+modulus budget instead of resetting it, so it cannot survive the several
+sequential multiplications a sign-approximation iteration needs.
+`CkksCompareBackend` is an independent context that does what real CKKS
+deployments do to support depth: a genuine `rescale_to_next` after every
+multiplication, so depth cost is linear in the number of primes (levels),
+not exponential — at the cost of a much bigger ring dimension (to fit enough
+primes) and correspondingly much slower arithmetic. It picks the smallest
+ring dimension (8192 / 16384 / 32768) that fits the requested level count
+using `CoefficientModulusFactory::max_bit_count` — SEAL's own
+HomomorphicEncryption.org-standard security table, looked up at run time,
+not a guessed constant.
+
+**Measured, not assumed** (`baru bench-ckks-compare`, this machine, one
+scalar `relu_approx` per row, bound=5.0):
+
+```sh
+./target/release/baru bench-ckks-compare --iterations 1,2,3
+```
+
+| iterations | levels | ring degree | keygen | relu (per op) | ciphertext | error vs. exact ReLU | error vs. plain approx |
+|---|---|---|---|---|---|---|---|
+| 1 | 6  | 16384 | 5.3s  | 1.7s  | 1.8 MB | 0.39  | 3.4×10⁻⁸ |
+| 2 | 9  | 32768 | 18.9s | 8.7s  | 5.2 MB | 0.19  | 2.3×10⁻⁸ |
+| 3 | 12 | 32768 | 30.0s | 17.2s | 6.8 MB | 0.17  | 1.9×10⁻⁸ |
+
+Two separate error columns on purpose: "vs. plain approx" (the same Newton
+iteration run in plain `f64`, `sign_approx_plain`/`relu_approx_plain`) stays
+at ~2×10⁻⁸ across the board — proof that real SEAL ciphertext noise is
+*not* the dominant error source, the polynomial's own approximation error
+is. And that error is large at these iteration counts specifically because
+the sample points include inputs close to the bound's boundary (the
+documented slow-near-zero regime) — the `f`-only simplification's known
+weakness relative to the optimal `f`+`g` composite. For comparison, MPC's
+`relu(4)` (real replicated-secret-sharing, `bench-nn`) costs **~10ms per
+element** end to end. This is the "totally different performance profile"
+CKKS has for nonlinearities made concrete: three to four orders of magnitude
+slower per comparison than MPC, before even reaching useful precision, and
+that cost is paid in a separate, deeper, ring-dimension-inflated context
+that the cheap linear/matvec CKKS path never has to touch.
+
+---
+
 ## Precompiled gadgets (`src/precompile/`)
 
 The benchmark above found a real bottleneck: naive MPC has no batching, so
@@ -594,6 +672,11 @@ src/
     mpc_matvec.rs   — MpcMatVec gadget: NaiveMatVec, BatchedMatVec
   ml/
     mod.rs          — NetworkSpec/QuantizedNetwork, `baru quantize` CLI
+  fhe/
+    ckks_backend.rs — shallow (depth <= 2) CKKS: matvec/dot, no comparisons
+    ckks_compare.rs — deep CKKS: polynomial-approximation sign/relu/compare
+  bench/
+    ckks_compare.rs — `baru bench-ckks-compare`: measures the above
 tests/
   features.rs       — unit/integration tests for the interpreter + MPC
   tcp_integration.rs — spawns 3 tcp_party processes over TCP

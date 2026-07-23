@@ -12,8 +12,10 @@
 //!   dot(n)          inner product of two length-n private vectors
 //!   matvec(in,out)  a dense/linear layer's weight matrix times an input
 //!   relu(n)         elementwise ReLU (the expensive nonlinearity: needs a
-//!                   comparison in MPC, and is *impossible* to express
-//!                   directly on CKKS's approximate ciphertexts)
+//!                   comparison in MPC; has no *exact* equivalent on CKKS's
+//!                   approximate ciphertexts, but see `bench-ckks-compare`
+//!                   / `crate::fhe::ckks_compare` for a measured, approximate
+//!                   construction in a separate, much deeper CKKS context)
 //!   layer(in,out)   matvec + bias-add + relu — one full dense layer
 //!
 //! Backends:
@@ -32,8 +34,9 @@
 //!               whole vector in one SIMD ciphertext via `encrypt_vec` +
 //!               `dot_plain`) — the batched/circuit contrast is itself one of
 //!               the most important communication-size findings this harness
-//!               surfaces.  ReLU is not attempted (impossible on approximate
-//!               ciphertexts; `RealFheBackend` has no comparison/mux).
+//!               surfaces.  ReLU is not attempted here (this shallow, depth-≤2
+//!               context has no comparison/mux — see `bench-ckks-compare` for
+//!               the separate, much-deeper context that has an approximate one).
 //!
 //! FHE weights are plaintext (`mul_plain`/`add_plain`): the common
 //! "public model, private input" deployment (matching `examples/mnist.rs`),

@@ -829,5 +829,6 @@ mod tests {
     }
 }
 
+pub mod ckks_compare;
 pub mod comm;
 pub mod nn;

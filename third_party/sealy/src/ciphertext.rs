@@ -119,6 +119,22 @@ impl Ciphertext {
 
 		result
 	}
+
+	// Baru patch: CKKS scale accessor, exported by the SEAL C API but never
+	// wrapped upstream (needed to encode a plaintext at a ciphertext's exact
+	// current scale after a real `rescale_to_next`, which perturbs the scale
+	// away from a round power of two — see `fhe::ckks_compare`).
+
+	/// The CKKS encoding scale this ciphertext currently carries. Meaningless
+	/// for BFV/BGV ciphertexts.
+	pub fn scale(&self) -> f64 {
+		let mut scale: f64 = 0.0;
+
+		try_seal!(unsafe { bindgen::Ciphertext_Scale(self.get_handle(), &mut scale) })
+			.expect("Fatal error in Ciphertext::scale().");
+
+		scale
+	}
 }
 
 impl Debug for Ciphertext {
