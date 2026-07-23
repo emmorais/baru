@@ -22,3 +22,7 @@ pub mod mpc_market;
 pub mod messaging;
 
 pub mod rest;
+
+pub mod precompile;
+
+pub mod ml;

@@ -138,19 +138,38 @@ impl Workload {
     }
 }
 
-/// The default size sweep: small enough that a full run (including TFHE, if
-/// requested) finishes in a reasonable time.  MNIST-scale (784) is available
-/// via `--mnist-scale` for a deliberately larger, slower, realistic data
-/// point, matching `examples/mnist.rs`'s input dimension.
+// ─── The standard suite ────────────────────────────────────────────────────────
+//
+// A fixed, named set of sizes/shapes — deliberately NOT ad hoc per-run
+// choices — so results stay comparable across commits, backends, and
+// precompiles over time (this is what makes `--json` output meaningful to
+// diff months apart, and what a precompile competition ranks entries
+// against). Changing these numbers changes what "the standard benchmark"
+// means; treat that as a deliberate, reviewed decision, not a drive-by edit.
+//
+//   "quick"        — `default_vector_sizes`/`default_matvec_shapes`: small
+//                    enough that a full run (even including TFHE) finishes
+//                    in a reasonable time. The default.
+//   "mnist-linear" — `MNIST_SCALE_VECTOR`/`MNIST_SCALE_MATVEC`: a real
+//                    application shape (784 = examples/mnist.rs's flattened
+//                    28x28 input, 10 = digit classes), opted into via
+//                    `--mnist-scale` since it's slow, especially for TFHE.
+
+/// The "quick" standard suite's vector sizes (`dot`, `relu`).
 pub fn default_vector_sizes() -> Vec<usize> {
     vec![4, 16, 64, 256]
 }
 
+/// The "quick" standard suite's matrix shapes (`matvec`, `layer`).
 pub fn default_matvec_shapes() -> Vec<(usize, usize)> {
     vec![(8, 8), (64, 32), (128, 64)]
 }
 
+/// The "mnist-linear" standard application's vector size — `examples/
+/// mnist.rs`'s flattened 28x28 image, the realistic large-scale data point.
 pub const MNIST_SCALE_VECTOR: usize = 784;
+/// The "mnist-linear" standard application's matrix shape — 784 pixels in,
+/// 10 digit classes out.
 pub const MNIST_SCALE_MATVEC: (usize, usize) = (784, 10);
 
 // ─── Plaintext reference (ground truth for correctness checks) ───────────────
@@ -243,6 +262,7 @@ type MpcTransport = CountingTransport<LatencyTransport<InprocHandle>>;
 /// One party's full evaluation of `workload`, run inside its own thread.
 /// Party 0 owns all private data (who owns it doesn't affect cost — the
 /// protocol is symmetric); other parties pass placeholder values.
+#[allow(clippy::too_many_arguments)]
 fn mpc_party_run(
     me: usize,
     transport: MpcTransport,
@@ -250,6 +270,7 @@ fn mpc_party_run(
     x: Vec<i64>,
     w: Vec<Vec<i64>>,
     bias: Vec<i64>,
+    precompile_id: Option<&'static str>,
 ) -> (Vec<i64>, Vec<Phase>) {
     const OWNER: usize = 0;
     let mut be = TransportBackend::new(me, transport);
@@ -289,18 +310,11 @@ fn mpc_party_run(
                 let ws: Vec<Vec<ShareRef>> = w.iter().map(|row| share_vec(&mut be, row)).collect();
                 (xs, ws)
             });
-            t.phase("compute", || {
-                ws.iter()
-                    .map(|row| {
-                        let mut acc = be.mul(&row[0], &xs[0]);
-                        for j in 1..row.len() {
-                            let term = be.mul(&row[j], &xs[j]);
-                            acc = be.add(&acc, &term);
-                        }
-                        acc
-                    })
-                    .collect()
-            })
+            let registry = crate::precompile::mpc_matvec::registry();
+            let precompile = precompile_id
+                .and_then(|id| registry.get(id))
+                .unwrap_or_else(|| registry.champion());
+            t.phase("compute", || precompile.matvec(&mut be, &ws, &xs))
         }
         Workload::Relu(_) => {
             let xs = t.phase("share", || share_vec(&mut be, &x));
@@ -321,16 +335,17 @@ fn mpc_party_run(
                 let bs = share_vec(&mut be, &bias);
                 (xs, ws, bs)
             });
+            let registry = crate::precompile::mpc_matvec::registry();
+            let precompile = precompile_id
+                .and_then(|id| registry.get(id))
+                .unwrap_or_else(|| registry.champion());
             t.phase("compute", || {
-                ws.iter()
+                let pre_activation = precompile.matvec(&mut be, &ws, &xs);
+                pre_activation
+                    .iter()
                     .zip(bs.iter())
-                    .map(|(row, b)| {
-                        let mut acc = be.mul(&row[0], &xs[0]);
-                        for j in 1..row.len() {
-                            let term = be.mul(&row[j], &xs[j]);
-                            acc = be.add(&acc, &term);
-                        }
-                        acc = be.add(&acc, b);
+                    .map(|(acc, b)| {
+                        let acc = be.add(acc, b);
                         let zero = be.sub(&acc, &acc);
                         let mask = be.lt(&zero, &acc);
                         be.mul(&acc, &mask)
@@ -350,7 +365,20 @@ fn mpc_party_run(
     (revealed, t.phases)
 }
 
+/// Run the MPC path with the registry's champion precompile (the normal,
+/// default-recommended path).
 pub fn run_mpc(workload: Workload, profile: NetworkProfile) -> NnReport {
+    run_mpc_as(workload, profile, None)
+}
+
+/// Run the MPC path forcing a *specific* precompile id (or the champion, if
+/// `None`) — the basis of the precompile competition/leaderboard mode: run
+/// every registered entry through the identical measurement and compare.
+pub fn run_mpc_as(
+    workload: Workload,
+    profile: NetworkProfile,
+    precompile_id: Option<&'static str>,
+) -> NnReport {
     let (in_dim, out_dim) = match workload {
         Workload::Dot(n) => (n, 1),
         Workload::MatVec { in_dim, out_dim } => (in_dim, out_dim),
@@ -374,7 +402,7 @@ pub fn run_mpc(workload: Workload, profile: NetworkProfile) -> NnReport {
         let w = w.clone();
         let bias = bias.clone();
         joins.push(std::thread::spawn(move || {
-            mpc_party_run(me, counted, workload, x, w, bias)
+            mpc_party_run(me, counted, workload, x, w, bias, precompile_id)
         }));
     }
 
@@ -413,21 +441,36 @@ pub fn run_mpc(workload: Workload, profile: NetworkProfile) -> NnReport {
     };
     let ok = result == expected;
 
+    let precompile_note = if matches!(workload, Workload::MatVec { .. } | Workload::Layer { .. }) {
+        let registry = crate::precompile::mpc_matvec::registry();
+        let used = precompile_id
+            .and_then(|id| registry.get(id).map(|_| id))
+            .unwrap_or(registry.champion_meta().id);
+        Some(format!("matvec precompile={used}"))
+    } else {
+        None
+    };
+
     // Party 0's phases and comm stats are representative (the protocol is
     // symmetric across parties; wall time is bounded by the slowest thread,
     // captured separately as total_micros over the whole join).
+    let mut notes = vec![
+        "3 parties, private input AND private weights".into(),
+        format!("nbits={NBITS}"),
+    ];
+    notes.extend(precompile_note);
     NnReport {
         workload: workload.label(),
-        backend: "mpc".into(),
+        backend: match precompile_id {
+            Some(id) => format!("mpc[{id}]"),
+            None => "mpc".into(),
+        },
         phases: per_party[0].1.clone(),
         total_micros: (total_secs * 1e6) as u128,
         throughput_ops_per_sec: throughput(workload.op_count(), total_secs),
         comm: Some(comm_handles[0].stats()),
         ok: Some(ok),
-        notes: vec![
-            "3 parties, private input AND private weights".into(),
-            format!("nbits={NBITS}"),
-        ],
+        notes,
         error: None,
     }
 }
@@ -850,6 +893,10 @@ options:
   --rtt-ms N          simulated one-way network latency injected into the MPC
                       transport, in milliseconds (default: 0 = in-process speed)
   --bandwidth-mbps N  simulated bandwidth cap for the same MPC transport
+  --competition       for matvec/layer, run EVERY registered MPC precompile
+                      (not just the champion) side by side — a leaderboard
+                      of competing gadget implementations (see
+                      `crate::precompile`), instead of one 'mpc' row.
   --json              emit JSON instead of tables
 ";
 
@@ -860,6 +907,7 @@ pub fn run_cli(args: &[String]) -> Result<(), String> {
     let mut rtt_ms: u64 = 0;
     let mut bandwidth_mbps: Option<f64> = None;
     let mut json = false;
+    let mut competition = false;
 
     let mut i = 0;
     while i < args.len() {
@@ -870,6 +918,7 @@ pub fn run_cli(args: &[String]) -> Result<(), String> {
             }
             "--json" => json = true,
             "--mnist-scale" => mnist_scale = true,
+            "--competition" => competition = true,
             "--backends" => {
                 i += 1;
                 let list = args.get(i).ok_or("--backends needs a value")?;
@@ -942,8 +991,19 @@ pub fn run_cli(args: &[String]) -> Result<(), String> {
             println!("\n── {}", w.label());
             let _ = std::io::stdout().flush();
         }
+        let is_matvec_shaped = matches!(w, Workload::MatVec { .. } | Workload::Layer { .. });
         for &b in &backends {
-            for r in run_one(*w, b, profile) {
+            let reports = if competition && b == NnBackend::Mpc && is_matvec_shaped {
+                // Leaderboard: every registered precompile, same workload,
+                // same measurement — not just the champion.
+                crate::precompile::mpc_matvec::registry()
+                    .entries()
+                    .map(|(meta, _)| run_mpc_as(*w, profile, Some(meta.id)))
+                    .collect()
+            } else {
+                run_one(*w, b, profile)
+            };
+            for r in reports {
                 if !json {
                     print_report(&r);
                     let _ = std::io::stdout().flush();

@@ -1479,14 +1479,7 @@ impl Participant {
             }
             match (&args[0], &args[1]) {
                 (Types::List(rows), Types::List(v)) => {
-                    let out: Vec<Types> = rows
-                        .iter()
-                        .map(|row| match row {
-                            Types::List(r) => vec_dot(&matvec_backend, r, v),
-                            _ => panic!("matvec: matrix rows must be lists"),
-                        })
-                        .collect();
-                    Types::List(out)
+                    Types::List(matvec_impl(&matvec_backend, rows, v))
                 }
                 _ => panic!("matvec expects a list of lists and a list"),
             }
@@ -1494,6 +1487,116 @@ impl Participant {
         self.store.borrow_mut().insert(
             "matvec".to_string(),
             Rc::new(RefCell::new(Types::NativeFunc(matvec_fn))),
+        );
+
+        // nn-load-model builtin: (nn-load-model "path.json") -> list of
+        // layers, each a 3-element list (weights bias activation) with
+        // weights/bias as nested Fixed lists — see `crate::ml`.
+        let nn_load_model_fn = Arc::new(move |args: Vec<Types>| -> Types {
+            if args.len() != 1 {
+                panic!("nn-load-model expects 1 arg: (nn-load-model path)");
+            }
+            let path = match &args[0] {
+                Types::Str(s) => s.clone(),
+                _ => panic!("nn-load-model expects a string path"),
+            };
+            let net = crate::ml::QuantizedNetwork::load_json(&path)
+                .unwrap_or_else(|e| panic!("nn-load-model: {e}"));
+            if net.scale_bits != 16 {
+                panic!(
+                    "nn-load-model: model was quantized at {} scale bits, but Baru's \
+                     Types::Fixed is always Q16.16 — re-run `baru quantize` with \
+                     --scale-bits 16",
+                    net.scale_bits
+                );
+            }
+            let layers: Vec<Types> = net
+                .layers
+                .iter()
+                .map(|layer| {
+                    let weights = Types::List(
+                        layer
+                            .weights
+                            .iter()
+                            .map(|row| Types::List(row.iter().map(|&w| Types::Fixed(w)).collect()))
+                            .collect(),
+                    );
+                    let bias =
+                        Types::List(layer.bias.iter().map(|&b| Types::Fixed(b)).collect());
+                    let activation = Types::Str(
+                        match layer.activation {
+                            crate::ml::Activation::Relu => "relu",
+                            crate::ml::Activation::Identity => "identity",
+                        }
+                        .to_string(),
+                    );
+                    Types::List(vec![weights, bias, activation])
+                })
+                .collect();
+            Types::List(layers)
+        });
+        self.store.borrow_mut().insert(
+            "nn-load-model".to_string(),
+            Rc::new(RefCell::new(Types::NativeFunc(nn_load_model_fn))),
+        );
+
+        // nn-forward builtin: (nn-forward layers input) -> output vector.
+        // Runs a full multi-layer forward pass (matvec + bias-add +
+        // activation per layer, chained) over whatever `nn-load-model`
+        // produced. Works for public (Num/Fixed) and private (Share) input
+        // alike, since matvec_impl/vec_add/vec_relu all dispatch per-element
+        // on the actual runtime type — a private input against a public
+        // model, or an all-private evaluation, both fall out of the same
+        // code path with no separate "private mode" to opt into.
+        let nn_forward_backend = backend.clone();
+        let nn_forward_fn = Arc::new(move |args: Vec<Types>| -> Types {
+            if args.len() != 2 {
+                panic!("nn-forward expects 2 args: (nn-forward layers input)");
+            }
+            let (layers, mut cur) = match (&args[0], &args[1]) {
+                (Types::List(layers), Types::List(input)) => (layers.clone(), input.clone()),
+                _ => panic!("nn-forward expects (list-of-layers input-list)"),
+            };
+            for layer in &layers {
+                let parts = match layer {
+                    Types::List(parts) if parts.len() == 3 => parts,
+                    _ => panic!(
+                        "nn-forward: each layer must be a 3-element list \
+                         (weights bias activation), as produced by nn-load-model"
+                    ),
+                };
+                let weights = match &parts[0] {
+                    Types::List(w) => w,
+                    _ => panic!("nn-forward: layer weights must be a list"),
+                };
+                let bias = match &parts[1] {
+                    Types::List(b) => b,
+                    _ => panic!("nn-forward: layer bias must be a list"),
+                };
+                let activation = match &parts[2] {
+                    Types::Str(s) => s.as_str(),
+                    _ => panic!("nn-forward: layer activation must be a string"),
+                };
+                let pre = matvec_impl(&nn_forward_backend, weights, &cur);
+                let biased: Vec<Types> = pre
+                    .iter()
+                    .zip(bias.iter())
+                    .map(|(p, b)| vec_add(&nn_forward_backend, p, b))
+                    .collect();
+                cur = match activation {
+                    "relu" => biased
+                        .iter()
+                        .map(|t| vec_relu(&nn_forward_backend, t))
+                        .collect(),
+                    "identity" => biased,
+                    other => panic!("nn-forward: unknown activation '{other}'"),
+                };
+            }
+            Types::List(cur)
+        });
+        self.store.borrow_mut().insert(
+            "nn-forward".to_string(),
+            Rc::new(RefCell::new(Types::NativeFunc(nn_forward_fn))),
         );
 
         // a2b builtin
@@ -2916,6 +3019,74 @@ fn vec_add(backend: &Arc<Mutex<Box<dyn Backend>>>, a: &Types, b: &Types) -> Type
             Types::Share(share_addsub_typed(&mut **be, a, b, false))
         }
         _ => panic!("vector builtins: cannot add {:?} and {:?}", a, b),
+    }
+}
+
+/// Shared matvec dispatch, used by both the `matvec` builtin and
+/// `nn-forward` (one row of a network layer at a time). When every weight
+/// and input element is a live Share, dispatch to the registered MatVec
+/// precompile (see `crate::precompile::mpc_matvec`) instead of the naive
+/// per-element loop below — a hand-optimized "gadget" substituted in
+/// transparently. Any Num/Fixed mix, or a public-weights/private-input
+/// combination (the precompile only accepts bare `ShareRef`s on both
+/// sides), falls through to the per-row `vec_dot` loop unchanged.
+fn matvec_impl(backend: &Arc<Mutex<Box<dyn Backend>>>, rows: &[Types], v: &[Types]) -> Vec<Types> {
+    let all_shares = |vs: &[Types]| vs.iter().all(|t| matches!(t, Types::Share(_)));
+    let rows_are_share_lists = rows
+        .iter()
+        .all(|row| matches!(row, Types::List(r) if all_shares(r)));
+    if rows_are_share_lists && all_shares(v) && !rows.is_empty() {
+        let x_refs: Vec<ShareRef> = v
+            .iter()
+            .map(|t| match t {
+                Types::Share(sr) => sr.clone(),
+                _ => unreachable!(),
+            })
+            .collect();
+        let w_refs: Vec<Vec<ShareRef>> = rows
+            .iter()
+            .map(|row| match row {
+                Types::List(r) => r
+                    .iter()
+                    .map(|t| match t {
+                        Types::Share(sr) => sr.clone(),
+                        _ => unreachable!(),
+                    })
+                    .collect(),
+                _ => unreachable!(),
+            })
+            .collect();
+        let mut be = backend.lock().unwrap_or_else(|e| e.into_inner());
+        let out = crate::precompile::mpc_matvec::registry()
+            .champion()
+            .matvec(&mut **be, &w_refs, &x_refs);
+        return out.into_iter().map(Types::Share).collect();
+    }
+    rows.iter()
+        .map(|row| match row {
+            Types::List(r) => vec_dot(backend, r, v),
+            _ => panic!("matvec: matrix rows must be lists"),
+        })
+        .collect()
+}
+
+/// Elementwise ReLU for `nn-forward`. Num/Fixed clamp locally; Share follows
+/// the mux-via-mul pattern from `bench::nn`'s Layer workload: `mask = (0 <
+/// x)`, then `x * mask` — no fixed-point rescale needed since `mask` is a
+/// plain 0/1 bit, not Q16.16-scaled.
+fn vec_relu(backend: &Arc<Mutex<Box<dyn Backend>>>, x: &Types) -> Types {
+    match x {
+        Types::Num(n) => Types::Num((*n).max(0)),
+        Types::Fixed(f) => Types::Fixed((*f).max(0)),
+        Types::Share(sr) => {
+            let mut be = backend.lock().unwrap_or_else(|e| e.into_inner());
+            let zero = be.sub(sr, sr);
+            let mask = be.lt(&zero, sr);
+            let mut r = be.mul(sr, &mask);
+            r.fixed = sr.fixed;
+            Types::Share(r)
+        }
+        _ => panic!("nn-forward: relu expects Num, Fixed, or Share elements"),
     }
 }
 

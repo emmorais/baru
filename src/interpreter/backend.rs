@@ -29,6 +29,21 @@ pub trait Backend: Send + Sync {
     fn sub(&mut self, a: &ShareRef, b: &ShareRef) -> ShareRef;
     fn mul(&mut self, a: &ShareRef, b: &ShareRef) -> ShareRef;
 
+    /// Multiply `pairs.len()` independent share pairs, sharing communication
+    /// across all of them where the backend supports it.
+    ///
+    /// Default implementation: `pairs.len()` separate [`Backend::mul`] calls
+    /// — always correct, for every backend, at the cost of `pairs.len()`
+    /// communication rounds (see the benchmark finding in `src/bench/nn.rs`:
+    /// MPC throughput is flat regardless of shape because nothing batches
+    /// today). `TransportBackend` overrides this with a genuinely batched
+    /// wire protocol (`aby3_protocol::mul_batch_party`) that collapses the
+    /// whole call to one round; this is the primitive precompiled "gadget"
+    /// implementations are expected to prefer over a naive per-element loop.
+    fn mul_batch(&mut self, pairs: &[(ShareRef, ShareRef)]) -> Vec<ShareRef> {
+        pairs.iter().map(|(a, b)| self.mul(a, b)).collect()
+    }
+
     /// Secret/secret division and modulo: `(a / b, a % b)`, both shared.
     ///
     /// Default implementation: a restoring binary long-division circuit,

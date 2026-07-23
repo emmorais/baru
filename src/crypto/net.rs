@@ -74,6 +74,25 @@ pub enum MpcMsg {
         op_id: u64,
         value: u128,
     },
+
+    /// Beaver triples for `count` independent multiplications, dealt in one
+    /// message instead of `3*count` separate `TripleComponent` sends.  Each
+    /// multiplication `i` (0-indexed) occupies 6 consecutive entries in
+    /// `components`: `[x.left, x.right, y.left, y.right, z.left, z.right]`,
+    /// mirroring the single-triple layout at `base_triple_id + 3*i`.
+    TripleBatch {
+        base_triple_id: u64,
+        components: Vec<u128>,
+    },
+    /// Masked-open D and E values for `count` independent multiplications
+    /// sharing one communication round, instead of `2*count` separate
+    /// broadcasts — the wire-level fix for MPC's lack of multiplication
+    /// batching (see `crypto::aby3_protocol::mul_batch_party`).
+    TaggedDEBatch {
+        base_op_id: u64,
+        d_values: Vec<u128>,
+        e_values: Vec<u128>,
+    },
 }
 
 /// Serialize a message using bincode.

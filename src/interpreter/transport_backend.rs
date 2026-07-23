@@ -101,6 +101,34 @@ impl<T: Transport + 'static> Backend for TransportBackend<T> {
         self.store(id, ps, a.nbits.max(b.nbits), a.owner)
     }
 
+    /// Real batched multiplication: one communication round for the whole
+    /// batch (`aby3_protocol::mul_batch_party`), instead of one round per
+    /// pair via the trait's default loop-over-`mul` implementation.
+    fn mul_batch(&mut self, pairs: &[(ShareRef, ShareRef)]) -> Vec<ShareRef> {
+        if pairs.is_empty() {
+            return Vec::new();
+        }
+        let base_op_id = self.alloc_id();
+        let party_pairs: Vec<_> = pairs
+            .iter()
+            .map(|(a, b)| (self.get_cloned(a), self.get_cloned(b)))
+            .collect();
+        let results = crate::crypto::aby3_protocol::mul_batch_party(
+            &party_pairs,
+            base_op_id,
+            self.me,
+            &self.mailbox,
+        );
+        pairs
+            .iter()
+            .zip(results)
+            .map(|((a, b), ps)| {
+                let id = self.alloc_id();
+                self.store(id, ps, a.nbits.max(b.nbits), a.owner)
+            })
+            .collect()
+    }
+
     // divmod: previously attempted here via bitlen-normalization, which needs
     // `shift_left(b, diff)` for a *secret* `diff = bitlen(a)-bitlen(b)` —
     // `shift_left` only takes a public `usize` amount, so that approach was a

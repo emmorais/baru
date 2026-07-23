@@ -455,20 +455,116 @@ Two complementary harnesses, both under `src/bench/`:
   ./target/release/baru bench-nn --json > results.json      # for tracking across commits
   ```
 
-  **What it already shows** (default sizes, this machine): MPC throughput is
-  *flat* at roughly 220–380 multiply-accumulates/sec regardless of shape —
+  **The standard suite.** Sizes/shapes are a fixed, named set (see
+  `src/bench/nn.rs`'s "the standard suite" section) — not ad hoc per-run
+  choices — so `--json` results stay comparable across commits and
+  precompiles over time. "quick" is the small default sweep; "mnist-linear"
+  (`--mnist-scale`) is `examples/mnist.rs`'s real 784-pixel/10-class shape.
+
+  **What it already shows** (this machine): MPC throughput on the naive path
+  is *flat* at roughly 220–380 multiply-accumulates/sec regardless of shape —
   cost and message count both scale exactly linearly with element count (no
-  batching of Beaver triples or wire messages across independent
-  multiplications), so `matvec(128×64)` — one modest dense layer — already
-  costs ~26s and ~115k messages. CKKS shows the opposite shape: its
-  "circuit" form (one ciphertext per input scalar) has encrypt cost growing
-  linearly with vector size (26s to encrypt 256 scalars), while its
-  "batched" SIMD form (`encrypt_vec` + `dot_plain`, one ciphertext for the
-  whole vector) holds encrypt/eval time roughly *constant* regardless of
-  size — the sharpest illustration in this codebase of FHE's O(1)-message,
-  large-payload communication profile versus MPC's O(n)-message,
-  small-payload one. These numbers are exactly what the framework exists to
-  keep re-measuring as the MPC/FHE backends are optimized.
+  batching of Beaver triples or wire messages), so `matvec(128×64)` — one
+  modest dense layer — cost ~25s and ~115k messages *before* the batched
+  precompile below existed. CKKS shows the opposite shape: its "circuit" form
+  (one ciphertext per input scalar) has encrypt cost growing linearly with
+  vector size (26s to encrypt 256 scalars), while its "batched" SIMD form
+  (`encrypt_vec` + `dot_plain`, one ciphertext for the whole vector) holds
+  encrypt/eval time roughly *constant* regardless of size. TFHE — the only
+  FHE backend here that can do real encrypted comparisons/ReLU, unlike CKKS —
+  is dramatically the slowest: dot-product throughput holds flat at ~0.3
+  ops/sec (≈3.3s per encrypted multiply-accumulate) from n=16 up, so
+  `dot(256)` took 812.7s. Three backends, three cost shapes, same workload.
+
+---
+
+## Precompiled gadgets (`src/precompile/`)
+
+The benchmark above found a real bottleneck: naive MPC has no batching, so
+cost scales linearly with element count. **Precompiles** are the fix, and a
+pattern for future ones: a named Rust trait per (operation, backend family)
+— a **Gadget** — that multiple implementations can satisfy, a
+[`Registry`](src/precompile/mod.rs) that tracks them plus which one is the
+current **champion** (dispatch target, set by a maintainer — see the module
+doc for why this is deliberately a reviewed decision, not an automated
+market), and a Baru builtin (`matvec`, in `Participant::register_builtins`)
+that calls the champion directly against the live backend instead of a Baru
+program re-deriving the same loop.
+
+The first gadget, `mpc_matvec::MpcMatVec`, ships two implementations:
+`NaiveMatVec` (the original per-element loop) and `BatchedMatVec`, which
+flattens the *entire* matrix's multiplications into one
+[`Backend::mul_batch`](src/interpreter/backend.rs) call — a real batched
+Beaver-triple wire protocol (`aby3_protocol::mul_batch_party`, new
+`MpcMsg::TripleBatch`/`TaggedDEBatch` messages) collapsing dealing and D/E
+opening from O(n) rounds to one, regardless of shape. `Backend::mul_batch`
+has a default (loop over `mul`) so every other backend keeps working
+unmodified; only `TransportBackend` overrides it with the real batched path.
+
+Compare registered precompiles yourself — every entry, same measurement,
+side by side:
+
+```sh
+./target/release/baru bench-nn --workload matvec --backends mpc --competition
+```
+
+| shape | naive | batched | speedup | messages (naive → batched) |
+|---|---|---|---|---|
+| matvec(8×8) | 178.8ms | 16.4ms | 10.9× | 944 → 308 |
+| matvec(64×32) | 5772.2ms | 56.8ms | 101.6× | 28,992 → 8,516 |
+| matvec(128×64) | 25.3s | 127.2ms | **199×** | 115,328 → 33,412 |
+
+Both agree with the plaintext reference at every shape (`bench/nn.rs`'s and
+`precompile/mpc_matvec.rs`'s tests hold this invariant permanently — a
+Precompile that disagrees with plaintext is a bug, full stop, independent of
+how fast it is). `matvec-batched` is the registry's champion today.
+
+---
+
+## Model import & quantization (`src/ml/`)
+
+Every neural-net example in this repo so far (`examples/data/mnist_data.rs`)
+hand-quantized its weights once and pasted the resulting integers into a
+Rust literal array — not reproducible, and with no record of how much
+accuracy that quantization cost. `src/ml/` replaces that with a small,
+reusable pipeline: train a model in whatever framework you like, export its
+weights/biases to a plain JSON [`NetworkSpec`](src/ml/mod.rs), then:
+
+```sh
+# quantize to Q16.16 fixed-point and measure the accuracy loss on real samples
+./target/release/baru quantize --in model.json --out model.quant.json \
+    --scale-bits 16 --validate samples.json
+```
+
+`--validate` is intentionally not optional-and-silent: if you skip it, the
+CLI prints a warning rather than quietly implying the model is fine. The
+report ([`QuantizationReport`](src/ml/mod.rs)) gives max/mean absolute error
+and max relative error by comparing the float and quantized forward passes
+on the same inputs — "a bit of precision lost, but good enough for
+inference" is a number you check, not an assumption. `--scale-bits` defaults
+to 16 (required to actually load the model into Baru — see below) but can be
+set lower to study the accuracy/footprint trade-off in isolation.
+
+The quantized JSON loads straight into Baru as ordinary Lisp data:
+
+```lisp
+(let ((layers (nn-load-model "model.quant.json"))
+      (input (list (int->fixed 3) (int->fixed 1))))
+  (nn-forward layers input))
+```
+
+`nn-load-model` returns a plain list of `(weights bias activation)` triples
+— inspectable from Baru like any other value, not an opaque handle.
+`nn-forward` runs the full multi-layer forward pass (matvec + bias-add +
+activation, chained layer to layer), reusing the same `matvec` precompile
+dispatch, `vec_add`, and a new mux-based `vec_relu` — and it works
+identically whether `input` is public (`Num`/`Fixed`) or a private `Share`
+vector (or a private input against a *public* model, the common
+private-inference shape): each helper already dispatches per-element on the
+runtime type, so there is no separate "private mode" to opt into. Only
+`relu` and `identity` activations are supported today — richer
+nonlinearities need a polynomial approximation to stay oblivious, which is
+future work, not solved here.
 
 ---
 
@@ -493,6 +589,11 @@ src/
     scheduler.rs    — broadcast round simulator with corruption injection
   bin/
     tcp_party.rs    — multi-party binary (inproc demo + TCP mode)
+  precompile/
+    mod.rs          — Gadget/Precompile/Registry, `baru bench-nn --competition`
+    mpc_matvec.rs   — MpcMatVec gadget: NaiveMatVec, BatchedMatVec
+  ml/
+    mod.rs          — NetworkSpec/QuantizedNetwork, `baru quantize` CLI
 tests/
   features.rs       — unit/integration tests for the interpreter + MPC
   tcp_integration.rs — spawns 3 tcp_party processes over TCP

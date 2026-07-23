@@ -159,6 +159,22 @@ fn test_matvec_builtin_shares() {
     assert_eq!(eval_shared(src), 8);
 }
 
+#[test]
+fn test_matvec_builtin_fully_private_dispatches_to_precompile() {
+    // Both the weight matrix AND the input vector are shares — the fully
+    // private case, which `matvec`'s builtin now dispatches to the
+    // registered MatVec precompile (`crate::precompile::mpc_matvec`,
+    // currently the batched champion) instead of the naive per-element
+    // loop. Correctness must be identical to the plain-weight case above.
+    // [[2 -3] [1 2]] · [4 4] = [-4 12]; vsum = 8.
+    let src = "(let ((w00 (share 2 32)) (w01 (share -3 32))
+                     (w10 (share 1 32)) (w11 (share 2 32))
+                     (x (share 4 32)) (y (share 4 32)))
+                 (reconstruct
+                   (vsum (matvec (list (list w00 w01) (list w10 w11)) (list x y)))))";
+    assert_eq!(eval_shared(src), 8);
+}
+
 // ---------------------------------------------------------------------------
 // Q16.16 fixed-point shares
 // (fixed×fixed share products need headroom before the >>16 rescale — use

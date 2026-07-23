@@ -30,6 +30,9 @@ fn main() -> Result<(), Box<dyn Error>> {
     if args.first().map(String::as_str) == Some("bench-nn") {
         return baru::bench::nn::run_cli(&args[1..]).map_err(|e| e.into());
     }
+    if args.first().map(String::as_str) == Some("quantize") {
+        return baru::ml::run_cli(&args[1..]).map_err(|e| e.into());
+    }
 
     let participants: Vec<Participant> = (0..3).map(Participant::new).collect();
 

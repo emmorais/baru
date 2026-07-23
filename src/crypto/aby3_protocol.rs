@@ -338,6 +338,207 @@ pub fn mul_party<T: Transport>(
     add_party(&t, &de_pub)
 }
 
+/// Deal Beaver triples for `count` independent multiplications at once,
+/// starting at `base_triple_id` (each occupying 3 consecutive ids — the same
+/// per-triple convention as [`deal_triple`] — so batched and single
+/// multiplications can freely interleave).  Sends one [`MpcMsg::TripleBatch`]
+/// per peer instead of `3*count` separate [`MpcMsg::TripleComponent`]s.
+///
+/// Each of the `count` triples is freshly and independently random — only the
+/// *network I/O* is batched, not the randomness — so this is exactly as
+/// secure as `count` separate `deal_triple` calls.
+pub fn deal_triple_batch<T: Transport>(
+    base_triple_id: u64,
+    count: usize,
+    me: PartyId,
+    mbx: &Mailbox<T>,
+) -> Vec<(PartyShare, PartyShare, PartyShare)> {
+    let mut mine = Vec::with_capacity(count);
+    let mut per_peer: Vec<Vec<u128>> = (0..N).map(|_| Vec::with_capacity(count * 6)).collect();
+
+    for _ in 0..count {
+        let (x_sh, y_sh, z_sh) = gen_beaver_triple();
+        let x_parts = party_pairs(&x_sh);
+        let y_parts = party_pairs(&y_sh);
+        let z_parts = party_pairs(&z_sh);
+        for (i, peer_buf) in per_peer.iter_mut().enumerate() {
+            if i == me {
+                continue;
+            }
+            peer_buf.push(x_parts[i].left);
+            peer_buf.push(x_parts[i].right);
+            peer_buf.push(y_parts[i].left);
+            peer_buf.push(y_parts[i].right);
+            peer_buf.push(z_parts[i].left);
+            peer_buf.push(z_parts[i].right);
+        }
+        mine.push((
+            x_parts[me].clone(),
+            y_parts[me].clone(),
+            z_parts[me].clone(),
+        ));
+    }
+
+    for (i, components) in per_peer.into_iter().enumerate() {
+        if i == me {
+            continue;
+        }
+        mbx.send(
+            i,
+            serialize_msg(&MpcMsg::TripleBatch {
+                base_triple_id,
+                components,
+            }),
+        );
+    }
+    mine
+}
+
+/// Receive a batch of triples dealt by [`deal_triple_batch`].
+pub fn receive_triple_batch<T: Transport>(
+    base_triple_id: u64,
+    count: usize,
+    mbx: &Mailbox<T>,
+) -> Vec<(PartyShare, PartyShare, PartyShare)> {
+    let Some((_from, m)) = mbx.recv_matching(
+        TIMEOUT_MS,
+        |m| matches!(m, MpcMsg::TripleBatch { base_triple_id: id, .. } if *id == base_triple_id),
+    ) else {
+        panic!("receive_triple_batch: timeout for base_triple_id={base_triple_id}");
+    };
+    let MpcMsg::TripleBatch { components, .. } = m else {
+        unreachable!("recv_matching predicate guarantees TripleBatch");
+    };
+    assert_eq!(
+        components.len(),
+        count * 6,
+        "receive_triple_batch: expected {} components for count={count}, got {}",
+        count * 6,
+        components.len()
+    );
+    (0..count)
+        .map(|i| {
+            let b = i * 6;
+            (
+                PartyShare {
+                    left: components[b],
+                    right: components[b + 1],
+                },
+                PartyShare {
+                    left: components[b + 2],
+                    right: components[b + 3],
+                },
+                PartyShare {
+                    left: components[b + 4],
+                    right: components[b + 5],
+                },
+            )
+        })
+        .collect()
+}
+
+/// Batched ABY3 multiplication: `pairs.len()` independent multiplications
+/// sharing **one** communication round (Beaver-triple dealing + D/E opening),
+/// instead of `pairs.len()` separate rounds for that many [`mul_party`]
+/// calls.  This is the wire-level fix for MPC's lack of multiplication
+/// batching — the same per-element math as `mul_party`, just with the
+/// network I/O collapsed from O(n) messages to O(1).
+///
+/// `base_op_id` must not be reused until this call returns (mirroring
+/// `mul_party`'s `op_id`/`op_id+1` convention, generalized to
+/// `base_op_id+1 ..= base_op_id + 3*pairs.len()` for the triple range).
+pub fn mul_batch_party<T: Transport>(
+    pairs: &[(PartyShare, PartyShare)],
+    base_op_id: u64,
+    me: PartyId,
+    mbx: &Mailbox<T>,
+) -> Vec<PartyShare> {
+    let count = pairs.len();
+    if count == 0 {
+        return Vec::new();
+    }
+    let base_triple_id = base_op_id + 1;
+
+    let triples = if me == 0 {
+        deal_triple_batch(base_triple_id, count, me, mbx)
+    } else {
+        receive_triple_batch(base_triple_id, count, mbx)
+    };
+
+    let d_values: Vec<u128> = pairs
+        .iter()
+        .zip(&triples)
+        .map(|((a, _b), (x, _y, _z))| a.left.wrapping_sub(x.left))
+        .collect();
+    let e_values: Vec<u128> = pairs
+        .iter()
+        .zip(&triples)
+        .map(|((_a, b), (_x, y, _z))| b.left.wrapping_sub(y.left))
+        .collect();
+
+    mbx.broadcast(serialize_msg(&MpcMsg::TaggedDEBatch {
+        base_op_id,
+        d_values: d_values.clone(),
+        e_values: e_values.clone(),
+    }));
+
+    let mut d_shares: Vec<[u128; N]> = vec![[0u128; N]; count];
+    let mut e_shares: Vec<[u128; N]> = vec![[0u128; N]; count];
+    for i in 0..count {
+        d_shares[i][me] = d_values[i];
+        e_shares[i][me] = e_values[i];
+    }
+    let mut got = [false; N];
+    got[me] = true;
+    let mut remaining = N - 1;
+
+    while remaining > 0 {
+        let Some((from, m)) = mbx.recv_matching(
+            TIMEOUT_MS,
+            |m| matches!(m, MpcMsg::TaggedDEBatch { base_op_id: oid, .. } if *oid == base_op_id),
+        ) else {
+            panic!("mul_batch_party: timeout collecting D/E batch for base_op_id={base_op_id}");
+        };
+        if got[from] {
+            continue;
+        }
+        let MpcMsg::TaggedDEBatch {
+            d_values: dv,
+            e_values: ev,
+            ..
+        } = m
+        else {
+            unreachable!("recv_matching predicate guarantees TaggedDEBatch");
+        };
+        assert_eq!(dv.len(), count, "mul_batch_party: d_values length mismatch");
+        assert_eq!(ev.len(), count, "mul_batch_party: e_values length mismatch");
+        for i in 0..count {
+            d_shares[i][from] = dv[i];
+            e_shares[i][from] = ev[i];
+        }
+        got[from] = true;
+        remaining -= 1;
+    }
+
+    (0..count)
+        .map(|i| {
+            let d: Fr = d_shares[i]
+                .iter()
+                .fold(0u128, |acc, &v| acc.wrapping_add(v));
+            let e: Fr = e_shares[i]
+                .iter()
+                .fold(0u128, |acc, &v| acc.wrapping_add(v));
+            let (x, y, z) = &triples[i];
+            let de_pub = share_public(d.wrapping_mul(e), me);
+            let dy = scalar_mul_party(y, d);
+            let ex = scalar_mul_party(x, e);
+            let t = add_party(z, &dy);
+            let t = add_party(&t, &ex);
+            add_party(&t, &de_pub)
+        })
+        .collect()
+}
+
 /// Arithmetic-to-bit decomposition.
 pub fn a2b_party<T: Transport>(
     a: &PartyShare,
@@ -450,4 +651,141 @@ fn party_pairs(s: &Share3) -> Vec<PartyShare> {
             right: s.0,
         },
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::crypto::net::InprocHandle;
+
+    /// Run `f` (given `(me, mailbox)`) concurrently across 3 in-process
+    /// parties and collect their results in party-index order.
+    fn run_parties<R: Send + 'static>(
+        f: impl Fn(PartyId, Mailbox<InprocHandle>) -> R + Send + Sync + Clone + 'static,
+    ) -> Vec<R> {
+        let handles = InprocHandle::create(3);
+        let joins: Vec<_> = handles
+            .into_iter()
+            .enumerate()
+            .map(|(me, h)| {
+                let f = f.clone();
+                std::thread::spawn(move || f(me, Mailbox::new(h)))
+            })
+            .collect();
+        joins.into_iter().map(|j| j.join().unwrap()).collect()
+    }
+
+    /// Secret-share `values[i]` (owned by party 0) for i in 0..values.len(),
+    /// returning this party's `PartyShare` for each.
+    fn share_all<T: Transport>(values: &[i64], me: PartyId, mbx: &Mailbox<T>) -> Vec<PartyShare> {
+        values
+            .iter()
+            .enumerate()
+            .map(|(i, &v)| {
+                let fr = if me == 0 { v as u128 } else { 0 };
+                share_input(fr, i as u64 * 10, 0, me, mbx)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn mul_batch_matches_sequential_mul_party() {
+        let a_vals = [3i64, -5, 7, 0, 12];
+        let b_vals = [4i64, 6, -2, 9, 11];
+        let expected: Vec<i64> = a_vals.iter().zip(&b_vals).map(|(a, b)| a * b).collect();
+
+        let results = run_parties(move |me, mbx| {
+            let a_shares = share_all(&a_vals, me, &mbx);
+            let b_shares = share_all(&b_vals, me, &mbx);
+            let pairs: Vec<_> = a_shares.into_iter().zip(b_shares).collect();
+
+            let out = mul_batch_party(&pairs, 1000, me, &mbx);
+
+            // Reveal every product to party 0.
+            out.into_iter()
+                .enumerate()
+                .map(|(i, ps)| reveal(&ps, 2000 + i as u64, Some(0), me, &mbx))
+                .collect::<Vec<Fr>>()
+        });
+
+        // Only party 0 (the reveal target) has the real sums; the others'
+        // `reveal` calls return 0 by design (see `reveal`'s doc).
+        let got: Vec<i64> = results[0].iter().map(|&v| v as i128 as i64).collect();
+        assert_eq!(got, expected);
+    }
+
+    #[test]
+    fn mul_batch_matches_sequential_mul_party_for_single_pair() {
+        // count=1 must behave identically to a plain `mul_party` call.
+        let results = run_parties(|me, mbx| {
+            let a = share_input(if me == 0 { 6 } else { 0 }, 0, 0, me, &mbx);
+            let b = share_input(if me == 0 { 7 } else { 0 }, 1, 0, me, &mbx);
+            let batched = mul_batch_party(&[(a.clone(), b.clone())], 100, me, &mbx)
+                .into_iter()
+                .next()
+                .unwrap();
+            reveal(&batched, 200, Some(0), me, &mbx) as i128 as i64
+        });
+        assert_eq!(results[0], 42);
+    }
+
+    #[test]
+    fn mul_batch_uses_one_round_instead_of_n() {
+        use crate::bench::comm::CountingTransport;
+
+        let n = 8usize;
+        let a_vals: Vec<i64> = (0..n as i64).collect();
+        let b_vals: Vec<i64> = (0..n as i64).map(|i| i + 1).collect();
+
+        let handles = InprocHandle::create(3);
+        let joins: Vec<_> = handles
+            .into_iter()
+            .enumerate()
+            .map(|(me, h)| {
+                let a_vals = a_vals.clone();
+                let b_vals = b_vals.clone();
+                std::thread::spawn(move || {
+                    let counted = CountingTransport::new(h, 3);
+                    let handle = counted.handle();
+                    let mbx = Mailbox::new(counted);
+
+                    let a_shares = share_all(&a_vals, me, &mbx);
+                    let b_shares = share_all(&b_vals, me, &mbx);
+                    let pairs: Vec<_> = a_shares.into_iter().zip(b_shares).collect();
+
+                    let batched_stats_before = handle.stats();
+                    let _ = mul_batch_party(&pairs, 1000, me, &mbx);
+                    let batched_stats = handle.stats().saturating_sub(&batched_stats_before);
+
+                    // Sequential baseline: n separate mul_party calls on fresh shares.
+                    let a2 = share_all(&a_vals, me, &mbx);
+                    let b2 = share_all(&b_vals, me, &mbx);
+                    let seq_before = handle.stats();
+                    for (i, (a, b)) in a2.iter().zip(&b2).enumerate() {
+                        let _ = mul_party(a, b, 5000 + i as u64 * 10, me, &mbx);
+                    }
+                    let seq_stats = handle.stats().saturating_sub(&seq_before);
+
+                    (batched_stats, seq_stats)
+                })
+            })
+            .collect();
+        let results: Vec<_> = joins.into_iter().map(|j| j.join().unwrap()).collect();
+
+        let (batched, seq) = results[0];
+        assert!(
+            batched.messages < seq.messages,
+            "batched ({}) should use far fewer messages than sequential ({}) for n={n}",
+            batched.messages,
+            seq.messages
+        );
+        // Sequential does n independent rounds -> message count scales with n;
+        // batched does it in one round -> message count is O(1) in n.
+        assert!(
+            seq.messages >= batched.messages * (n as u64) / 2,
+            "expected roughly n-fold more messages sequentially: batched={} seq={} n={n}",
+            batched.messages,
+            seq.messages
+        );
+    }
 }
