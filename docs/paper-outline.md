@@ -185,6 +185,7 @@ model of §5?"
 | E4 | `bench-hybrid-nn --rtt-ms … --bandwidth-mbps …` | WAN cost, single-layer crossover vs pure MPC |
 | E5 | `demo-private-mnist` | end-to-end, encrypted model + image, only the class bit revealed |
 | E6 | `gadgets` CNN composition test | full LeNet-shaped classifier (conv/pool/dense/argmax) composed from the gadget library, bit-exact, class-only reveal |
+| E7 | `bench-cnn` | that CNN through the *real hybrid pipeline* (FHE ct×ct conv + MPC relu/pool/argmax), 0 bootstraps, bit-exact, per-phase cost under a WAN model |
 
 ## 8. Security model — state honestly, do not overclaim
 

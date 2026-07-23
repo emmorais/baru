@@ -94,10 +94,21 @@ pub fn share_input<T: Transport>(
 
 /// Share a public constant locally (no communication).  Party 0 gets the
 /// value in its left component; others get 0 so that reconstruction = value.
+///
+/// The replicated layout must be consistent: party `i` holds
+/// `(s_i, s_{(i+1) mod 3})` for the additive sharing `s = (value, 0, 0)`.
+/// Party 2's *right* component is therefore `s_0 = value`, not 0 — an
+/// earlier version zeroed every right component, which reconstructs fine
+/// (reveal sums only the lefts) but corrupts any *multiplication* of the
+/// public value, since the multiplication protocol relies on the replicated
+/// pairing. (Latent until a public nonzero constant was fed into a
+/// product — e.g. `crate::gadgets` argmax indices / ReLU `keep` mask.)
 pub fn share_public(value: Fr, me: PartyId) -> PartyShare {
-    let left = if me == 0 { value } else { 0 };
-    let right = 0;
-    PartyShare { left, right }
+    let s = |i: usize| if i == 0 { value } else { 0 };
+    PartyShare {
+        left: s(me),
+        right: s((me + 1) % 3),
+    }
 }
 
 /// Add two party shares locally (no communication required).

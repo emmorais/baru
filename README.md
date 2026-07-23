@@ -841,6 +841,49 @@ from one `a2b`, keeping fixed-point magnitude bounded at any depth), and
 **per-layer independent MPC sessions** whose only carried state is the
 scheme-switch ciphertext — i.e. the interactive bootstrap made concrete.
 
+### A real CNN through the hybrid pipeline (`baru bench-cnn`)
+
+The gadget library composes into a full convolutional classifier that runs
+end-to-end through the actual hybrid pipeline — FHE ct×ct linear layers, MPC
+nonlinearities, **zero FHE bootstraps** — verified **bit-exact** against the
+plaintext reference:
+
+```
+1×D×D image → conv(2, 3×3) → ReLU∘rescale → maxpool(2×2) → dense(→10) → argmax → class
+```
+
+Both the image *and* the weights are encrypted. The convolution runs as a
+single (chunked) packed matvec against an im2col/Toeplitz matrix — so it
+reuses the *same* proven SI-NTRU matvec + scheme-switch machinery as
+`bench-deep-nn`; only the nonlinearities differ (ReLU fused with the
+fixed-point rescale; max-pool and argmax are the `crate::gadgets`). Measured
+(D=8, this machine):
+
+| network | class | bootstraps | total | fhe | mpc | MPC wire |
+|---|---|---|---|---|---|---|
+| rtt = 0 | exact ✓ | **0** | 1.27 s | 344 ms | 880 ms | 2,040 msgs / 71 KB |
+| rtt = 20 ms | exact ✓ | **0** | 8.40 s | 410 ms | 7.95 s | 2,040 msgs / 71 KB |
+
+The cost lives where the theory predicts: the MPC nonlinearities (ReLU +
+max-pool + argmax, all comparison-heavy) dominate, and under WAN latency
+their round count is what stacks — exactly the profile the hybrid is built
+around (comparisons are cheap in MPC and ruinous in FHE). **Correctness is
+exact; accuracy** on a real dataset is the orthogonal ML step (trained
+weights via `crate::ml`, which `demo-private-mnist` already exercises on a
+real linear model). Coefficient packing bounds this to small D; CIFAR-scale
+needs SIMD-slot conv packing (Gazelle-style) — the noted next
+crypto-engineering step, independent of the no-bootstrap result.
+
+> Building this surfaced two real transport-only bugs the earlier
+> benchmarks couldn't reach (they only ever compared secrets against zero):
+> `aby3_protocol::share_public` produced an inconsistent replicated share
+> (party 2's wraparound component was zeroed — invisible to `reveal`, wrong
+> under multiplication), and `b2a` returned a share carrying the bit-width
+> of its input bits (`1`) rather than the recomposed value's, so a
+> downstream comparison decomposed a single bit. Both are fixed, with
+> regression tests. That the *composition* (CNN) caught bugs the *unit*
+> paths didn't is itself the argument for the UC-gadget approach.
+
 ### Composable gadget library: arbitrary private CNNs, secure by construction (`src/gadgets/`)
 
 The depth result above is about *chaining* — and the point of chaining is
@@ -1021,6 +1064,8 @@ src/
                        mpc / tfhe / ckks / hybrid-tfhe / hybrid-ckks / hybrid-ntru
     deep_nn.rs      — `baru bench-deep-nn`: deep (L-layer) private inference,
                        ZERO FHE bootstraps, cost linear in depth
+    cnn.rs          — `baru bench-cnn`: full conv classifier (conv/relu/
+                       maxpool/dense/argmax) through the hybrid, 0 bootstraps
   demo/
     mod.rs          — `baru demo-private-mnist`: encrypted image × encrypted
                        model → MPC threshold → only the class bit revealed

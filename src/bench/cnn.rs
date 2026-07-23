@@ -1,0 +1,563 @@
+//! `baru bench-cnn` — a full convolutional classifier through the hybrid
+//! pipeline: FHE ciphertext×ciphertext linear layers, MPC nonlinearities
+//! (ReLU, max-pool, argmax), **zero FHE bootstraps**, verified bit-exact
+//! against the plaintext reference, with a real cost measurement.
+//!
+//! Architecture (a compact LeNet-shaped classifier):
+//!   input 1×D×D  →  conv(OC, 3×3, s1)  →  ReLU∘rescale  →  maxpool(2×2, s2)
+//!               →  flatten  →  dense(→ NCLASSES)  →  argmax  →  class bit
+//!
+//! Both the image and the weights are encrypted (ct×ct linear layers). The
+//! convolution is evaluated as a single (chunked) packed matvec against an
+//! im2col/Toeplitz weight matrix — so it runs through the *same* proven
+//! SI-NTRU matvec + scheme-switch machinery as `bench-deep-nn`; only the
+//! nonlinearities differ (ReLU is fused with the fixed-point rescale;
+//! max-pool and argmax are the `crate::gadgets` building blocks). Every
+//! layer's FHE ciphertext is depth-1 fresh, so no bootstrapping occurs at
+//! any point — the same invariant `bench-deep-nn` demonstrates for MLPs,
+//! now for a CNN.
+//!
+//! # Scope / honesty
+//!
+//! - **Correctness is exact** (encrypted class == plaintext class). This is
+//!   the crypto claim. **Accuracy** on a real dataset is an *orthogonal*
+//!   axis that needs trained weights; the `crate::ml` quantization pipeline
+//!   is the ingestion path, and `demo-private-mnist` already runs a real
+//!   trained (linear) model. The weights here are controlled-magnitude
+//!   synthetic values (a cost/correctness microbenchmark, standard for this
+//!   line of work), not a trained classifier.
+//! - Coefficient packing bounds the flattened input to ≲ the ring
+//!   dimension, so this runs *small* CNNs (D ≤ ~12). CIFAR-scale needs
+//!   SIMD-slot conv packing with rotations (Gazelle-style) — a different
+//!   FHE instantiation; the no-bootstrap construction is scheme-agnostic
+//!   and transfers. See `docs/paper-outline.md` §9.
+
+use std::time::Instant;
+
+use rand::rngs::StdRng;
+use rand::{Rng, SeedableRng};
+use serde::Serialize;
+
+use crate::bench::comm::{CommStats, NetworkProfile};
+use crate::bench::hybrid_nn::{run_parties, sleep_link, MpcTransport};
+use crate::crypto::types::Fr;
+use crate::fhe::si_ntru::{NtruCt, SiNtru, SiNtruAdapter, SiNtruParams};
+use crate::gadgets::{argmax, maxpool2d, Chw};
+use crate::hybrid::FheAdapter;
+use crate::interpreter::backend::{Backend, ShareRef};
+use crate::interpreter::transport_backend::TransportBackend;
+
+const OC: usize = 2; // conv output channels
+const K: usize = 3; // conv kernel size
+const POOL: usize = 2; // max-pool window / stride
+const NCLASSES: usize = 10;
+
+fn residue(v: i64, nbits: usize) -> u128 {
+    (v as i128).rem_euclid(1i128 << nbits) as u128
+}
+
+// ─── The CNN weights + exact plaintext reference (fused fixed-point) ──────────
+
+pub struct CnnModel {
+    pub d: usize,        // input side length (1 channel)
+    pub kernels: Vec<Vec<i64>>, // [OC][K*K]
+    pub cbias: Vec<i64>, // [OC]
+    pub dense_w: Vec<Vec<i64>>, // [NCLASSES][flat]
+    pub dense_b: Vec<i64>, // [NCLASSES]
+    pub shift: u32,
+    pub nbits: usize,
+    pub conv_shape: Chw, // OC × (D-2) × (D-2)
+    pub pool_shape: Chw, // OC × ((D-2)/2) × ((D-2)/2)
+}
+
+impl CnnModel {
+    pub fn random(d: usize, seed: u64) -> (Self, Vec<i64>) {
+        assert!((d - (K - 1)).is_multiple_of(POOL), "conv output side must be even for pooling");
+        let oh = d - (K - 1);
+        let ph = oh / POOL;
+        let flat = OC * ph * ph;
+        let shift = 6;
+        // SI-NTRU's proven depth-1 noise budget sits at log2_t = 20 (the
+        // `DEFAULT` params); all intermediates here fit in ~2^14, so 20 is
+        // ample and stays well inside the budget for the packed 2048-degree
+        // product. (Raising it shrinks Δ/2 and overflows the noise — the
+        // first symptom is a garbage matvec.)
+        let nbits = 20;
+
+        let mut rng = StdRng::seed_from_u64(seed);
+        let kernels = (0..OC)
+            .map(|_| (0..K * K).map(|_| rng.gen_range(-4i64..=4)).collect())
+            .collect();
+        let cbias = (0..OC).map(|_| rng.gen_range(-16i64..=16)).collect();
+        let dense_w = (0..NCLASSES)
+            .map(|_| (0..flat).map(|_| rng.gen_range(-4i64..=4)).collect())
+            .collect();
+        let dense_b = (0..NCLASSES).map(|_| rng.gen_range(-16i64..=16)).collect();
+        let input: Vec<i64> = (0..d * d).map(|_| rng.gen_range(0i64..64)).collect();
+
+        (
+            CnnModel {
+                d,
+                kernels,
+                cbias,
+                dense_w,
+                dense_b,
+                shift,
+                nbits,
+                conv_shape: Chw { c: OC, h: oh, w: oh },
+                pool_shape: Chw { c: OC, h: ph, w: ph },
+            },
+            input,
+        )
+    }
+
+    fn conv_dot(&self, input: &[i64], oc: usize, oy: usize, ox: usize) -> i64 {
+        let mut acc = 0i64;
+        for ky in 0..K {
+            for kx in 0..K {
+                acc += self.kernels[oc][ky * K + kx] * input[(oy + ky) * self.d + (ox + kx)];
+            }
+        }
+        acc
+    }
+
+    /// Exact plaintext forward pass mirroring the hybrid's fused semantics.
+    /// Returns `(class, max_abs_intermediate)`.
+    pub fn forward(&self, input: &[i64]) -> (usize, i64) {
+        let oh = self.conv_shape.h;
+        let mut max_abs = input.iter().map(|v| v.abs()).max().unwrap_or(0);
+        // conv → fused ReLU∘rescale
+        let mut conv_act = vec![0i64; OC * oh * oh];
+        for oc in 0..OC {
+            for oy in 0..oh {
+                for ox in 0..oh {
+                    let dot = self.conv_dot(input, oc, oy, ox);
+                    let v = dot + (self.cbias[oc] << self.shift);
+                    max_abs = max_abs.max(v.abs());
+                    let a = if v >= 0 { v >> self.shift } else { 0 };
+                    conv_act[(oc * oh + oy) * oh + ox] = a;
+                }
+            }
+        }
+        // max-pool
+        let (pooled, _) = crate::gadgets::maxpool2d_ref(&conv_act, self.conv_shape, POOL, POOL);
+        // dense → logits
+        let logits: Vec<i64> = self
+            .dense_w
+            .iter()
+            .zip(&self.dense_b)
+            .map(|(row, &b)| {
+                let v = row.iter().zip(&pooled).map(|(&w, &x)| w * x).sum::<i64>() + b;
+                max_abs = max_abs.max(v.abs());
+                v
+            })
+            .collect();
+        (crate::gadgets::argmax_ref(&logits), max_abs)
+    }
+
+    /// Build the im2col/Toeplitz weight matrix `[OC·oh·oh][D·D]` so the
+    /// convolution is one packed matvec against the flattened input.
+    fn conv_toeplitz(&self) -> Vec<Vec<i64>> {
+        let oh = self.conv_shape.h;
+        let n_in = self.d * self.d;
+        let mut rows = Vec::with_capacity(OC * oh * oh);
+        for oc in 0..OC {
+            for oy in 0..oh {
+                for ox in 0..oh {
+                    let mut row = vec![0i64; n_in];
+                    for ky in 0..K {
+                        for kx in 0..K {
+                            row[(oy + ky) * self.d + (ox + kx)] = self.kernels[oc][ky * K + kx];
+                        }
+                    }
+                    rows.push(row);
+                }
+            }
+        }
+        rows
+    }
+}
+
+// ─── Hybrid FHE matvec + scheme-switch to opened shares ───────────────────────
+
+/// One packed ct×ct matvec of `weights` (row-major, each length `in_dim`)
+/// against `c_input`, chunked to respect the ring packing bound, followed
+/// by a mask-and-open switch. Returns per-output opened residues and the
+/// three per-output masks (so the MPC side can reconstruct the raw share).
+#[allow(clippy::type_complexity)]
+fn hybrid_matvec_open(
+    s: &SiNtru,
+    ck: &[u8],
+    c_input: &NtruCt,
+    weights: &[Vec<i64>],
+    in_dim: usize,
+    profile: NetworkProfile,
+    rng: &mut impl Rng,
+) -> (Vec<u64>, Vec<[u64; 3]>) {
+    let n = s.params.n;
+    let t_mask = s.params.t() - 1;
+    let adapter = SiNtruAdapter(s);
+    let rows_per_chunk = (n / in_dim).saturating_sub(1).max(1);
+
+    let mut opened = Vec::with_capacity(weights.len());
+    let mut masks = Vec::with_capacity(weights.len());
+    for chunk in weights.chunks(rows_per_chunk) {
+        let cw = s.encrypt_poly(ck, &s.pack_weights(chunk));
+        let prod = s.mul(c_input, &cw);
+        let chunk_masks: Vec<Vec<u64>> = (0..3)
+            .map(|_| (0..n).map(|_| rng.gen::<u64>() & t_mask).collect())
+            .collect();
+        let mut conv_bytes = 0usize;
+        let mut masked = prod;
+        for m in &chunk_masks {
+            let enc = s.encrypt_poly(ck, m);
+            conv_bytes += adapter.ct_bytes(&enc);
+            masked = s.add(&masked, &enc);
+        }
+        let y = s.decrypt_poly(ck, &masked);
+        sleep_link(&profile, conv_bytes + chunk.len() * 8, 2);
+        for r in 0..chunk.len() {
+            let pos = s.matvec_output_position(in_dim, r);
+            opened.push(y[pos]);
+            masks.push([chunk_masks[0][pos], chunk_masks[1][pos], chunk_masks[2][pos]]);
+        }
+    }
+    (opened, masks)
+}
+
+/// Reconstruct this party's share of the raw matvec output `j` from the
+/// opened value and the per-party masks (party 0 also holds `y`).
+fn import_raw(
+    be: &mut TransportBackend<MpcTransport>,
+    me: usize,
+    opened: &[u64],
+    masks: &[[u64; 3]],
+    j: usize,
+    nbits: usize,
+) -> ShareRef {
+    let my_comp: Fr = if me == 0 {
+        (opened[j] as u128).wrapping_sub(masks[j][0] as u128)
+    } else {
+        0u128.wrapping_sub(masks[j][me] as u128)
+    };
+    let mut raw: Option<ShareRef> = None;
+    for owner in 0..3 {
+        let v = if me == owner { my_comp } else { 0 };
+        let sh = be.share_secret(v, nbits, owner);
+        raw = Some(match raw {
+            None => sh,
+            Some(a) => be.add(&a, &sh),
+        });
+    }
+    raw.unwrap()
+}
+
+/// Fused ReLU∘rescale on a share: `ReLU(v ≫ s)` from one `a2b` (correct
+/// because the logical shift is kept only on the non-negative branch).
+fn fused_relu_rescale(
+    be: &mut TransportBackend<MpcTransport>,
+    v: &ShareRef,
+    shift: u32,
+    nbits: usize,
+) -> ShareRef {
+    let bits = be.a2b(v, nbits);
+    // b2a inherits the bit-shares' width (1); the recomposed value spans the
+    // full range, so restore its width — otherwise a downstream comparison
+    // (`lt` → `a2b(·, nbits)`) would decompose only 1 bit and compare
+    // garbage. (Invisible when the ReLU output is only revealed/exported, as
+    // in `bench-deep-nn`; load-bearing once it feeds max-pool.)
+    let mut shifted = be.b2a(&bits[shift as usize..]);
+    shifted.nbits = nbits;
+    let sign = bits[nbits - 1].clone();
+    let one = be.share_public(1, 1);
+    let keep = be.sub(&one, &sign);
+    let mut act = be.mul(&shifted, &keep);
+    act.nbits = nbits;
+    act
+}
+
+// ─── The full hybrid CNN forward pass ─────────────────────────────────────────
+
+pub struct CnnRun {
+    pub class: usize,
+    pub expected: usize,
+    pub correct: bool,
+    pub total_ms: f64,
+    pub fhe_ms: f64,
+    pub mpc_ms: f64,
+    pub comm: CommStats,
+    pub bootstraps: u64,
+}
+
+pub fn run_cnn_hybrid(model: &CnnModel, input: &[i64], profile: NetworkProfile) -> CnnRun {
+    let (expected, max_abs) = model.forward(input);
+    assert!(
+        (max_abs as i128) < (1i128 << (model.nbits - 1)),
+        "cnn: intermediate magnitude {max_abs} overflows nbits={}",
+        model.nbits
+    );
+    let nbits = model.nbits;
+    let s = SiNtru::new(SiNtruParams { n: 2048, log2_q: 120, log2_t: nbits as u32 });
+    let n_in = model.d * model.d;
+    assert!((n_in + 1) <= s.params.n, "input too large for coefficient packing");
+    let t_mask = s.params.t() - 1;
+    let adapter = SiNtruAdapter(&s);
+
+    let start = Instant::now();
+    let (mut fhe_ms, mut mpc_ms) = (0.0, 0.0);
+    let mut comm = CommStats::default();
+    let mut rng = rand::thread_rng();
+
+    let (ck, _sk) = s.keygen();
+    let c_input = s.encrypt_poly(&ck, &s.pack_input(input));
+
+    // ── Conv (FHE ct×ct matvec via Toeplitz) → open ──
+    let t0 = Instant::now();
+    let toeplitz = model.conv_toeplitz();
+    let (conv_open, conv_masks) =
+        hybrid_matvec_open(&s, &ck, &c_input, &toeplitz, n_in, profile, &mut rng);
+    fhe_ms += t0.elapsed().as_secs_f64() * 1000.0;
+
+    // ── MPC: +cbias≪s, fused ReLU∘rescale, max-pool → export pooled acts ──
+    let t0 = Instant::now();
+    let cbias = model.cbias.clone();
+    let conv_shape = model.conv_shape;
+    let shift = model.shift;
+    let (per_party_pool, conv_comm) = run_parties(profile, |me| {
+        let conv_open = conv_open.clone();
+        let conv_masks = conv_masks.clone();
+        let cbias = cbias.clone();
+        move |be: &mut TransportBackend<MpcTransport>| {
+            let oh = conv_shape.h;
+            // per conv output (channel-major) → fused ReLU∘rescale
+            let relu: Vec<ShareRef> = (0..OC * oh * oh)
+                .map(|j| {
+                    let raw = import_raw(be, me, &conv_open, &conv_masks, j, nbits);
+                    let oc = j / (oh * oh);
+                    let bconst = residue(cbias[oc] << shift, nbits);
+                    let bsh = be.share_public(bconst, nbits);
+                    let v = be.add(&raw, &bsh);
+                    fused_relu_rescale(be, &v, shift, nbits)
+                })
+                .collect();
+            // max-pool (gadget) over the ReLU'd feature maps
+            let (pooled, _) = maxpool2d(be, &relu, conv_shape, POOL, POOL);
+            pooled.iter().map(|p| be.my_additive_component(p)).collect::<Vec<Fr>>()
+        }
+    });
+    comm = CommStats { messages: comm.messages + conv_comm.messages, bytes: comm.bytes + conv_comm.bytes };
+    mpc_ms += t0.elapsed().as_secs_f64() * 1000.0;
+
+    // ── Switch back → packed FHE dense input ──
+    let t0 = Instant::now();
+    let flat = model.pool_shape.c * model.pool_shape.h * model.pool_shape.w;
+    let mut c_dense_in: Option<NtruCt> = None;
+    let mut bytes = 0usize;
+    for comps in per_party_pool.iter() {
+        let m: Vec<u64> = comps.iter().map(|&c| (c as u64) & t_mask).collect();
+        let enc = s.encrypt_poly(&ck, &m);
+        bytes += adapter.ct_bytes(&enc);
+        c_dense_in = Some(match c_dense_in {
+            None => enc,
+            Some(acc) => s.add(&acc, &enc),
+        });
+    }
+    sleep_link(&profile, bytes, 1);
+    let c_dense_in = c_dense_in.expect("three parties");
+
+    // ── Dense (FHE ct×ct matvec) → open ──
+    let (dense_open, dense_masks) =
+        hybrid_matvec_open(&s, &ck, &c_dense_in, &model.dense_w, flat, profile, &mut rng);
+    fhe_ms += t0.elapsed().as_secs_f64() * 1000.0;
+
+    // ── MPC: +dense bias, argmax → reveal class only ──
+    let t0 = Instant::now();
+    let dense_b = model.dense_b.clone();
+    let (classes, argmax_comm) = run_parties(profile, |me| {
+        let dense_open = dense_open.clone();
+        let dense_masks = dense_masks.clone();
+        let dense_b = dense_b.clone();
+        move |be: &mut TransportBackend<MpcTransport>| {
+            let logits: Vec<ShareRef> = (0..NCLASSES)
+                .map(|j| {
+                    let raw = import_raw(be, me, &dense_open, &dense_masks, j, nbits);
+                    let bsh = be.share_public(residue(dense_b[j], nbits), nbits);
+                    be.add(&raw, &bsh)
+                })
+                .collect();
+            let idx = argmax(be, &logits, nbits);
+            (be.reveal(&idx, None) as u64 & (t_mask)) as usize
+        }
+    });
+    comm = CommStats { messages: comm.messages + argmax_comm.messages, bytes: comm.bytes + argmax_comm.bytes };
+    mpc_ms += t0.elapsed().as_secs_f64() * 1000.0;
+    let class = classes[0];
+
+    CnnRun {
+        correct: class == expected,
+        class,
+        expected,
+        total_ms: start.elapsed().as_secs_f64() * 1000.0,
+        fhe_ms,
+        mpc_ms,
+        comm,
+        bootstraps: 0,
+    }
+}
+
+// ─── CLI ──────────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CnnPoint {
+    pub d: usize,
+    pub class: usize,
+    pub correct: bool,
+    pub total_ms: f64,
+    pub fhe_ms: f64,
+    pub mpc_ms: f64,
+    pub messages: u64,
+    pub bytes: u64,
+    pub bootstraps: u64,
+}
+
+const USAGE: &str = "usage: baru bench-cnn [options]
+
+A compact convolutional classifier (conv → ReLU → maxpool → dense → argmax)
+through the hybrid pipeline: FHE ct×ct linear layers, MPC nonlinearities,
+ZERO FHE bootstraps, verified bit-exact against the plaintext reference.
+Correctness is exact; ACCURACY needs trained weights (orthogonal — see the
+module docs). Small D only (coefficient packing); CIFAR-scale needs
+SIMD-slot conv packing.
+
+options:
+  --img D              input side length D (1 channel, D×D; default 8; D even)
+  --rtt-ms N           round-trip latency (default 0)
+  --bandwidth-mbps X   link bandwidth in Mbit/s (default: unlimited)
+  --seed N             RNG seed (default 1)
+  --json               emit JSON
+";
+
+pub fn run_cli(args: &[String]) -> Result<(), String> {
+    let mut d = 8usize;
+    let mut rtt_ms = 0u64;
+    let mut bandwidth_mbps: Option<f64> = None;
+    let mut seed = 1u64;
+    let mut json = false;
+
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--help" | "-h" => {
+                println!("{USAGE}");
+                return Ok(());
+            }
+            "--json" => json = true,
+            "--img" => {
+                i += 1;
+                d = args.get(i).ok_or("--img needs a value")?.parse().map_err(|_| "bad img".to_string())?;
+            }
+            "--rtt-ms" => {
+                i += 1;
+                rtt_ms = args.get(i).ok_or("--rtt-ms needs a value")?.parse().map_err(|_| "bad rtt-ms".to_string())?;
+            }
+            "--bandwidth-mbps" => {
+                i += 1;
+                bandwidth_mbps = Some(args.get(i).ok_or("--bandwidth-mbps needs a value")?.parse().map_err(|_| "bad bandwidth".to_string())?);
+            }
+            "--seed" => {
+                i += 1;
+                seed = args.get(i).ok_or("--seed needs a value")?.parse().map_err(|_| "bad seed".to_string())?;
+            }
+            other => return Err(format!("unknown option '{other}'\n{USAGE}")),
+        }
+        i += 1;
+    }
+
+    let mut profile = NetworkProfile::fixed_latency(std::time::Duration::from_micros(rtt_ms * 500));
+    if let Some(mbps) = bandwidth_mbps {
+        profile = profile.with_bandwidth(mbps * 1e6 / 8.0);
+    }
+
+    let (model, input) = CnnModel::random(d, seed);
+    let r = run_cnn_hybrid(&model, &input, profile);
+
+    if json {
+        let p = CnnPoint {
+            d,
+            class: r.class,
+            correct: r.correct,
+            total_ms: r.total_ms,
+            fhe_ms: r.fhe_ms,
+            mpc_ms: r.mpc_ms,
+            messages: r.comm.messages,
+            bytes: r.comm.bytes,
+            bootstraps: r.bootstraps,
+        };
+        println!("{}", serde_json::to_string_pretty(&p).map_err(|e| e.to_string())?);
+        return Ok(());
+    }
+
+    println!("Private CNN classifier — hybrid SI-NTRU × ABY3, ZERO FHE bootstraps");
+    println!(
+        "architecture: 1×{d}×{d} → conv({OC},{K}×{K}) → ReLU → maxpool({POOL}×{POOL}) \
+         → dense(→{NCLASSES}) → argmax"
+    );
+    println!("image AND weights encrypted; only the class index is revealed");
+    println!(
+        "network: rtt={rtt_ms}ms, bandwidth={}\n",
+        bandwidth_mbps.map(|b| format!("{b}Mbps")).unwrap_or_else(|| "unlimited".into())
+    );
+    println!("  predicted class : {}  ({})", r.class, if r.correct { "exact vs plaintext" } else { "WRONG" });
+    println!("  FHE bootstraps  : {}", r.bootstraps);
+    println!("  time            : total {:.0}ms  (fhe {:.0}ms, mpc {:.0}ms)", r.total_ms, r.fhe_ms, r.mpc_ms);
+    println!("  MPC wire traffic: {} messages, {} bytes", r.comm.messages, r.comm.bytes);
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    #[ignore] // uses the real 3-party transport
+    fn max2_and_lt_on_transport() {
+        use crate::gadgets::max2;
+        let (out, _) = run_parties(NetworkProfile::INSTANT, |me| {
+            move |be: &mut TransportBackend<MpcTransport>| {
+                let a = be.share_secret(if me == 0 { 9 } else { 0 }, 20, 0);
+                let b = be.share_secret(if me == 0 { 6 } else { 0 }, 20, 0);
+                let lt = be.lt(&a, &b); // expect 0 (9 < 6 is false)
+                let m = max2(be, &a, &b); // expect 9
+                (be.reveal(&lt, None) as i64, be.reveal(&m, None) as i64)
+            }
+        });
+        assert_eq!(out[0], (0, 9), "lt(9,6) should be 0 and max2(9,6) should be 9");
+    }
+
+    #[test]
+    fn plaintext_cnn_is_bounded_and_deterministic() {
+        let (model, input) = CnnModel::random(8, 3);
+        let (class, max_abs) = model.forward(&input);
+        assert!(class < NCLASSES);
+        assert!((max_abs as i128) < (1i128 << (model.nbits - 1)));
+        let (m2, i2) = CnnModel::random(8, 3);
+        assert_eq!(input, i2);
+        assert_eq!(model.forward(&i2).0, m2.forward(&input).0);
+    }
+
+    #[test]
+    #[ignore] // n=2048 schoolbook ring — slow in debug, fast in release
+    fn hybrid_cnn_classifies_exactly() {
+        for (d, seed) in [(8usize, 1u64), (8, 2), (10, 5)] {
+            let (model, input) = CnnModel::random(d, seed);
+            let r = run_cnn_hybrid(&model, &input, NetworkProfile::INSTANT);
+            assert!(
+                r.correct,
+                "d={d} seed={seed}: encrypted class {} != plaintext {}",
+                r.class, r.expected
+            );
+            assert_eq!(r.bootstraps, 0);
+            assert!(r.comm.messages > 0, "must use the real MPC protocol");
+        }
+    }
+}
