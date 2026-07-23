@@ -26,3 +26,5 @@ pub mod rest;
 pub mod precompile;
 
 pub mod ml;
+
+pub mod hybrid;

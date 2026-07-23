@@ -212,4 +212,23 @@ impl Backend for Aby3Backend {
         self.shares.clear();
         self.next_id = 1;
     }
+
+    // ── Scheme switching (see `crate::hybrid`) ───────────────────────────────
+    // The in-process simulator holds all three parties' components directly,
+    // so export/import are trivial projections to/from `Share3`.
+
+    fn export_additive(&mut self, a: &ShareRef) -> Vec<Fr> {
+        let s = self.get_cloned(a);
+        vec![s.0, s.1, s.2]
+    }
+
+    fn import_additive(&mut self, components: &[Fr], nbits: usize) -> ShareRef {
+        // Fold any component count into three slots (wrapping addition
+        // preserves the sum, which is all that defines the sharing).
+        let mut c = [0u128; 3];
+        for (i, v) in components.iter().enumerate() {
+            c[i % 3] = c[i % 3].wrapping_add(*v);
+        }
+        self.store(Share3(c[0], c[1], c[2]), nbits, 0)
+    }
 }

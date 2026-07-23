@@ -145,4 +145,33 @@ pub trait Backend: Send + Sync {
     fn bitlen(&mut self, a: &ShareRef) -> ShareRef;
     fn shift_right(&mut self, a: &ShareRef, n: usize) -> ShareRef;
     fn shift_left(&mut self, a: &ShareRef, n: usize) -> ShareRef;
+
+    // ── Scheme switching (MPC <-> FHE, see `crate::hybrid`) ─────────────────
+    //
+    // These two methods are the MPC half of the generic conversion interface:
+    // any backend that can expose its raw *additive* share components (values
+    // whose wrapping sum is the secret mod 2^nbits) composes with any FHE
+    // backend that implements `crate::hybrid::FheAdapter`.  They are optional
+    // (defaults panic) because not every backend can honour them: a garbled-
+    // circuit backend has no additive components at all, and a per-party
+    // transport backend would need a protocol round to agree which replicated
+    // component each party contributes (future work — see `crate::hybrid`'s
+    // module docs).
+
+    /// The additive components of `a`: a vector whose wrapping sum
+    /// reconstructs the secret modulo `2^a.nbits`.  For the in-process ABY3
+    /// simulator this is simply the three `Share3` components.
+    fn export_additive(&mut self, a: &ShareRef) -> Vec<Fr> {
+        let _ = a;
+        panic!("export_additive: this MPC backend does not support share export (see crate::hybrid)")
+    }
+
+    /// Install raw additive components (wrapping sum ≡ secret mod `2^nbits`)
+    /// as a live share.  Inverse of [`Backend::export_additive`]; accepts any
+    /// component count (a backend with fixed arity folds extras together —
+    /// the sum is what matters).
+    fn import_additive(&mut self, components: &[Fr], nbits: usize) -> ShareRef {
+        let _ = (components, nbits);
+        panic!("import_additive: this MPC backend does not support share import (see crate::hybrid)")
+    }
 }

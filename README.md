@@ -556,6 +556,76 @@ that the cheap linear/matvec CKKS path never has to touch.
 
 ---
 
+## Scheme switching: MPC ↔ FHE conversions (`src/hybrid/`)
+
+The two sections above measure a sharp asymmetry: MPC does comparisons/ReLU
+in ~10 ms but pays communication for every multiplication; CKKS does a whole
+linear layer in one SIMD ciphertext op but pays *seconds* per approximate
+comparison. Scheme switching turns that asymmetry from a limitation into a
+design space: convert values **between MPC shares and FHE ciphertexts,
+mid-computation, without ever exposing them**, and run each phase on
+whichever cryptosystem is cheapest there — Lego-style. This is the
+architecture of Gazelle (Juvekar et al., USENIX Security 2018) and its
+successors; the cross-scheme idea in general is
+[CHIMERA](https://eprint.iacr.org/2018/758), and the trust model is
+threshold FHE ([Asharov et al., EUROCRYPT 2012](https://eprint.iacr.org/2011/613)).
+
+Both directions are one short protocol each (`src/hybrid/mod.rs`):
+
+- **MPC → FHE** (`shares_to_fhe`): each party encrypts its *own additive
+  share component* under the FHE public key; the evaluator homomorphically
+  sums them. The sum of components *is* the secret, so the result is an
+  encryption of it — and nobody ever reconstructed it. Needs only
+  homomorphic addition (no relin/galois keys), so it works on every backend
+  in this repo: mock, TFHE, CKKS real + mock.
+- **FHE → MPC** (`fhe_to_shares`): mask-and-open. Each party contributes an
+  encrypted uniform mask; only the *masked* value (uniformly random,
+  reveals nothing) is ever decrypted, and the masks turn it into additive
+  shares. This is exactly the data flow of a threshold decryption; the
+  in-process implementation stands in a single client key for the
+  distributed key operation (same trust boundary as the existing
+  trusted-triple-dealer limitation — documented, not hidden).
+- **Re-encryption instead of bootstrapping** (`mpc_reencrypt`): compose the
+  two. FHE → shares → fresh FHE ciphertext resets encryption noise — and,
+  for levelled CKKS, restores the full depth budget — for the price of one
+  interactive round instead of a bootstrapping circuit.
+  `tests/hybrid.rs::test_real_ckks_share_conversion_resets_depth` proves it
+  on real SEAL: multiply a ciphertext (depth 1), re-encrypt, depth is 0
+  again and the value is intact.
+
+**Generic by construction**: conversions are written against two small
+capability traits, so new FHE backends compose with new MPC backends
+without touching the module — `hybrid::FheAdapter` on the FHE side
+(`IntFhe` blankets every integer `FheBackend`; `RealFhe` adapts any
+`RealFheBackend`), and `Backend::export_additive`/`import_additive` on the
+MPC side (implemented for the ABY3 simulator; a per-party transport backend
+needs one protocol round to split its replicated components — future work).
+
+From Baru itself, the switch is two builtins:
+
+```lisp
+; a secret computed under MPC crosses into FHE without being revealed
+(let ((keys (fhe-keygen)) (x (share 6 32)) (y (share -7 32)))
+  (fhe-dec keys (share->fhe keys (* x y))))          ; => -42
+
+; a value under FHE needs a ReLU (FHE's weak spot): switch to MPC for it
+(let ((keys (fhe-keygen)))
+  (let ((z (fhe->share keys (fhe-enc keys -4) 32)))
+    (reconstruct (* z (> z 0)))))                    ; => 0
+```
+
+The Gazelle-style pipeline — **FHE linear layer → switch → MPC ReLU →
+switch back** — runs end to end in
+`src/hybrid/mod.rs::gazelle_style_pipeline_fhe_linear_then_mpc_relu`, and
+the real-backend conversions are validated against TFHE and SEAL-CKKS in
+`tests/hybrid.rs` (ignored by default; run with `--ignored --release`).
+One documented caveat: a converted ciphertext holds the value's *residue
+class* mod `2^nbits` (share-sum carries may sit above it), so `+`/`−`/`×`
+keep working but FHE-side comparisons on converted values would see the
+carry — convert back to MPC for those, which is the point.
+
+---
+
 ## Precompiled gadgets (`src/precompile/`)
 
 The benchmark above found a real bottleneck: naive MPC has no batching, so
@@ -677,6 +747,9 @@ src/
     ckks_compare.rs — deep CKKS: polynomial-approximation sign/relu/compare
   bench/
     ckks_compare.rs — `baru bench-ckks-compare`: measures the above
+  hybrid/
+    mod.rs          — MPC <-> FHE scheme switching (share->fhe, fhe->share,
+                       mpc_reencrypt as a bootstrapping alternative)
 tests/
   features.rs       — unit/integration tests for the interpreter + MPC
   tcp_integration.rs — spawns 3 tcp_party processes over TCP

@@ -155,6 +155,7 @@ pub fn evaluate_job<B: FheBackend>(
         backend_id: backend.backend_id().to_string(),
         bytes,
         fixed: job.circuit.output_fixed,
+        nbits: None,
     };
     let receipt = WorkReceipt {
         request: job.request_hash(),

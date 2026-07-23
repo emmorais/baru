@@ -2067,6 +2067,7 @@ impl Participant {
                         backend_id: be.backend_id().to_string(),
                         bytes: be.serialize_ct(&ct),
                         fixed: is_fixed,
+                        nbits: None,
                     };
                     Types::FheCiphertext(handle)
                 }
@@ -2089,6 +2090,7 @@ impl Participant {
                             backend_id: be.backend_id().to_string(),
                             bytes: be.serialize_ct(&ct),
                             fixed,
+                            nbits: None,
                         })
                     }
                     if kp.backend_id == "seal-ckks" {
@@ -2114,6 +2116,7 @@ impl Participant {
                         backend_id: be.backend_id().to_string(),
                         bytes: be.serialize_ct(&ct),
                         fixed: is_fixed,
+                        nbits: None,
                     };
                     Types::FheCiphertext(handle)
                 }
@@ -2139,6 +2142,22 @@ impl Participant {
                 Types::FheCiphertext(h) => h.clone(),
                 _ => panic!("fhe-dec: second arg must be a FheCiphertext"),
             };
+            // Scheme-switched ciphertexts (share->fhe) carry the share's bit
+            // width: the plaintext is a residue class mod 2^nbits (possibly
+            // with share-sum carries above it), so reduce and sign-extend to
+            // recover the signed value the share represented.
+            let reduce_signed = |raw: i64, nbits: usize| -> i64 {
+                if nbits >= 64 {
+                    return raw;
+                }
+                let m = 1u128 << nbits;
+                let v = (raw as u64 as u128) % m;
+                if v >= m / 2 {
+                    (v as i128 - m as i128) as i64
+                } else {
+                    v as i64
+                }
+            };
             use crate::fhe::FheBackend;
             let plain = match kp.backend_id.as_str() {
                 "seal-ckks" | "ckks-mock" => {
@@ -2154,6 +2173,16 @@ impl Participant {
                         let ct = be.deserialize_ct(&handle.bytes);
                         be.decrypt(&kp.client_key_bytes, &ct)
                     };
+                    if let Some(nb) = handle.nbits {
+                        // Converted share: v is the (carried) raw residue,
+                        // already in the scaled domain if fixed.
+                        let raw = reduce_signed(v.round() as i64, nb);
+                        return if handle.fixed {
+                            Types::Fixed(raw)
+                        } else {
+                            Types::Num(raw)
+                        };
+                    }
                     return if handle.fixed {
                         Types::Fixed((v * 65536.0).round() as i64)
                     } else {
@@ -2170,6 +2199,10 @@ impl Participant {
                     let ct = be.deserialize_ct(&handle.bytes);
                     be.decrypt(&kp.client_key_bytes, &ct) as i64
                 }
+            };
+            let plain = match handle.nbits {
+                Some(nb) => reduce_signed(plain, nb),
+                None => plain,
             };
             if handle.fixed {
                 Types::Fixed(plain)
@@ -2369,6 +2402,7 @@ impl Participant {
                             backend_id: be.backend_id().to_string(),
                             bytes: be.serialize_ct(&result_ct),
                             fixed: circuit.output_fixed,
+                            nbits: None,
                         })
                     }
                     if kp.backend_id == "seal-ckks" {
@@ -2400,6 +2434,7 @@ impl Participant {
                         backend_id: be.backend_id().to_string(),
                         bytes: be.serialize_ct(&result_ct),
                         fixed: circuit.output_fixed,
+                        nbits: None,
                     };
                     Types::FheCiphertext(handle)
                 }
@@ -2416,6 +2451,7 @@ impl Participant {
                         backend_id: be.backend_id().to_string(),
                         bytes: be.serialize_ct(&result_ct),
                         fixed: circuit.output_fixed,
+                        nbits: None,
                     };
                     Types::FheCiphertext(handle)
                 }
@@ -2424,6 +2460,141 @@ impl Participant {
         self.store.borrow_mut().insert(
             "fhe-eval".to_string(),
             Rc::new(RefCell::new(Types::NativeFunc(fhe_eval_fn))),
+        );
+
+        // ── Scheme switching: MPC shares <-> FHE ciphertexts ─────────────────
+        //
+        // (share->fhe keys share)
+        //   → converts a live MPC share into an FHE ciphertext of the same
+        //     value: each party encrypts its additive component, the sum is
+        //     taken homomorphically.  The value is never reconstructed.
+        //
+        // (fhe->share keys ciphertext nbits)
+        //   → converts an FHE ciphertext into a live MPC share via
+        //     mask-and-open (only a uniformly-masked value is ever decrypted).
+        //
+        // See `crate::hybrid` for the protocol, trust model, and literature
+        // (Gazelle / CHIMERA / threshold FHE).
+
+        let share_to_fhe_backend = backend.clone();
+        let share_to_fhe_fn = Arc::new(move |args: Vec<Types>| -> Types {
+            if args.len() != 2 {
+                panic!("share->fhe expects 2 args: (share->fhe keys share)");
+            }
+            let keys_json = match &args[0] {
+                Types::Str(s) => s.clone(),
+                _ => panic!("share->fhe: first arg must be a key-pair JSON string"),
+            };
+            let kp: crate::fhe::backend::FheKeyPair = serde_json::from_str(&keys_json)
+                .unwrap_or_else(|e| panic!("share->fhe: invalid key JSON: {}", e));
+            let sref = match &args[1] {
+                Types::Share(s) => s.clone(),
+                _ => panic!("share->fhe: second arg must be a shared value"),
+            };
+            let mut be = share_to_fhe_backend
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            use crate::fhe::{FheBackend, RealFheBackend};
+            use crate::hybrid::{mpc_share_to_fhe, FheAdapter, IntFhe, RealFhe};
+            fn pack<A: FheAdapter>(
+                a: &A,
+                ct: &A::Ct,
+                ser: impl Fn(&A::Ct) -> Vec<u8>,
+                sref: &crate::interpreter::backend::ShareRef,
+            ) -> Types {
+                Types::FheCiphertext(crate::fhe::backend::FheCiphertextHandle {
+                    backend_id: a.backend_id().to_string(),
+                    bytes: ser(ct),
+                    fixed: sref.fixed,
+                    nbits: Some(sref.nbits),
+                })
+            }
+            match kp.backend_id.as_str() {
+                "tfhe-rs-v1.6" => {
+                    crate::fhe::TfheBackend::install_server_key(&kp.server_key_bytes);
+                    let f = crate::fhe::TfheBackend::new();
+                    let a = IntFhe(&f);
+                    let ct = mpc_share_to_fhe(&mut **be, &sref, &a, &kp.client_key_bytes);
+                    pack(&a, &ct, |c| f.serialize_ct(c), &sref)
+                }
+                "seal-ckks" => {
+                    let f = crate::fhe::CkksBackend::new();
+                    let a = RealFhe(&f);
+                    let ct = mpc_share_to_fhe(&mut **be, &sref, &a, &kp.client_key_bytes);
+                    pack(&a, &ct, |c| f.serialize_ct(c), &sref)
+                }
+                "ckks-mock" => {
+                    let f = crate::fhe::MockCkksBackend;
+                    let a = RealFhe(&f);
+                    let ct = mpc_share_to_fhe(&mut **be, &sref, &a, &kp.client_key_bytes);
+                    pack(&a, &ct, |c| f.serialize_ct(c), &sref)
+                }
+                _ => {
+                    let f = crate::fhe::MockFheBackend;
+                    let a = IntFhe(&f);
+                    let ct = mpc_share_to_fhe(&mut **be, &sref, &a, &kp.client_key_bytes);
+                    pack(&a, &ct, |c| f.serialize_ct(c), &sref)
+                }
+            }
+        });
+        self.store.borrow_mut().insert(
+            "share->fhe".to_string(),
+            Rc::new(RefCell::new(Types::NativeFunc(share_to_fhe_fn))),
+        );
+
+        let fhe_to_share_backend = backend.clone();
+        let fhe_to_share_fn = Arc::new(move |args: Vec<Types>| -> Types {
+            if args.len() != 3 {
+                panic!("fhe->share expects 3 args: (fhe->share keys ciphertext nbits)");
+            }
+            let keys_json = match &args[0] {
+                Types::Str(s) => s.clone(),
+                _ => panic!("fhe->share: first arg must be a key-pair JSON string"),
+            };
+            let kp: crate::fhe::backend::FheKeyPair = serde_json::from_str(&keys_json)
+                .unwrap_or_else(|e| panic!("fhe->share: invalid key JSON: {}", e));
+            let handle = match &args[1] {
+                Types::FheCiphertext(h) => h.clone(),
+                _ => panic!("fhe->share: second arg must be a FheCiphertext"),
+            };
+            let nbits = match &args[2] {
+                Types::Num(n) => *n as usize,
+                _ => panic!("fhe->share: third arg must be a bit width (number)"),
+            };
+            let mut be = fhe_to_share_backend
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            use crate::fhe::{FheBackend, RealFheBackend};
+            use crate::hybrid::{fhe_to_mpc_share, IntFhe, RealFhe};
+            let mut sref = match kp.backend_id.as_str() {
+                "tfhe-rs-v1.6" => {
+                    crate::fhe::TfheBackend::install_server_key(&kp.server_key_bytes);
+                    let f = crate::fhe::TfheBackend::new();
+                    let ct = f.deserialize_ct(&handle.bytes);
+                    fhe_to_mpc_share(&IntFhe(&f), &kp.client_key_bytes, &ct, &mut **be, nbits)
+                }
+                "seal-ckks" => {
+                    let f = crate::fhe::CkksBackend::new();
+                    let ct = f.deserialize_ct(&handle.bytes);
+                    fhe_to_mpc_share(&RealFhe(&f), &kp.client_key_bytes, &ct, &mut **be, nbits)
+                }
+                "ckks-mock" => {
+                    let f = crate::fhe::MockCkksBackend;
+                    let ct = f.deserialize_ct(&handle.bytes);
+                    fhe_to_mpc_share(&RealFhe(&f), &kp.client_key_bytes, &ct, &mut **be, nbits)
+                }
+                _ => {
+                    let f = crate::fhe::MockFheBackend;
+                    let ct = f.deserialize_ct(&handle.bytes);
+                    fhe_to_mpc_share(&IntFhe(&f), &kp.client_key_bytes, &ct, &mut **be, nbits)
+                }
+            };
+            sref.fixed = handle.fixed;
+            Types::Share(sref)
+        });
+        self.store.borrow_mut().insert(
+            "fhe->share".to_string(),
+            Rc::new(RefCell::new(Types::NativeFunc(fhe_to_share_fn))),
         );
     }
 

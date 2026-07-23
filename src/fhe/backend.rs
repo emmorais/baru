@@ -71,6 +71,12 @@ pub struct FheCiphertextHandle {
     /// returns Types::Fixed for such handles.
     #[serde(default)]
     pub fixed: bool,
+    /// Set when this ciphertext came from an MPC share via scheme switching
+    /// (`share->fhe`, see `crate::hybrid`): the share's bit width. The
+    /// plaintext is then a *residue class* mod `2^nbits` (possibly carrying
+    /// `+ k·2^nbits`), and `fhe-dec` reduces and sign-extends accordingly.
+    #[serde(default)]
+    pub nbits: Option<usize>,
 }
 
 // ─── Backend trait ────────────────────────────────────────────────────────────
