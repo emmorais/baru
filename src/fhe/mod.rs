@@ -54,6 +54,7 @@ pub mod ckks_compare;
 pub mod lifecycle;
 pub mod market;
 pub mod mock_backend;
+pub mod si_ntru;
 pub mod tfhe_backend;
 
 pub use backend::{FheBackend, FheCircuit, RealFheBackend};

@@ -831,4 +831,5 @@ mod tests {
 
 pub mod ckks_compare;
 pub mod comm;
+pub mod hybrid_nn;
 pub mod nn;

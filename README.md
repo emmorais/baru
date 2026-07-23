@@ -624,6 +624,114 @@ class* mod `2^nbits` (share-sum carries may sit above it), so `+`/`−`/`×`
 keep working but FHE-side comparisons on converted values would see the
 carry — convert back to MPC for those, which is the point.
 
+### SI-NTRU: no-bootstrapping FHE for inner products (`src/fhe/si_ntru.rs`)
+
+A Rust port of the scale-invariant NTRU-based (LTV-family) scheme from
+[Inversed-Tech's `hom-ham`](https://github.com/Inversed-Tech/hom-ham)
+(`si-ntru/`, the `Mult` + `DecryptMul` path): `f = t·f′+1`, `h = t·g·f⁻¹`,
+`c = e₁ + h·e₂ + Δ·m`, multiplication = exact integer product rescaled by
+`t/q` — and **no relinearization, no bootstrapping, no evaluation keys at
+all**: a product ciphertext simply decrypts under **f²** (and depth-k under
+higher powers of f — `decrypt` applies the ciphertext's tracked key power).
+For depth-1 workloads (= inner products) the expensive machinery of FHE is
+deleted rather than optimized. Two further tricks from the reference make
+matvecs almost free:
+
+- **Reversed packing**: input in coefficients `0..d` of one message
+  polynomial, every weight row *reversed* at stride `d` in another — the
+  **whole matvec is ONE ciphertext×ciphertext multiplication**, row `r`'s
+  inner product landing in coefficient `r·d + d−1` (cross-term-free while
+  `(rows+1)·d ≤ n`; asserted). Weights and input are both *encrypted* —
+  fully private linear algebra.
+- **Poly-level scheme switch**: one masked decryption (under f²) converts
+  the *entire* output vector to ABY3 shares simultaneously.
+
+Port parameters vs the reference: `q = 2^120` instead of a 101-bit prime
+(mod-q arithmetic becomes native wrapping u128, `t | q` exactly so mod-t
+plaintext arithmetic is native and share-sum carries vanish, the rescale is
+a shift), `t = 2^20`, `n = 2048` (as the reference); the scale-invariant
+product is computed on centered representatives with exact 256-bit
+intermediates. Depth 2 at `t = 2^20` **fails** (the `f⁴`·roundoff term
+`≈ n³t⁴ ≈ 2^113` exceeds `Δ/2 = 2^99` — measured, then documented) and
+works with `t` re-balanced to `2^8` — the "parameters adapted accordingly"
+trade-off, exposed by a passing test rather than asserted.
+
+**Security caveat, stated plainly**: LTV/YASHE-family NTRU at these
+parameter shapes (large q vs n — both this port's `2^120` and the
+reference's `2^101` at n = 2048) is in the **overstretched NTRU regime**,
+subject to subfield/dense-sublattice attacks (Albrecht–Bai–Ducas 2016,
+Kirchner–Fouque 2017; Ducas–van Woerden's fatigue point is near
+`q ≈ n^2.484`). That is why the YASHE line was abandoned for production
+FHE. This backend is a research/benchmarking artifact for the depth-1
+no-bootstrapping design point — not production key material.
+
+### Measured: one private dense layer, five ways (`baru bench-hybrid-nn`)
+
+The same layer — `matvec(8×2) + bias + ReLU`, inputs spanning both signs —
+computed end-to-end under five strategies and verified against the
+plaintext reference (this machine, release build):
+
+```sh
+./target/release/baru bench-hybrid-nn        # --in/--out/--strategies to vary
+```
+
+| strategy | total | linear | ReLU | correct? |
+|---|---|---|---|---|
+| **mpc** (pure ABY3, weights *also* private) | **6.7 ms** | 5.8 ms | 0.7 ms | ✓ exact |
+| **hybrid-ntru** (SI-NTRU linear → ABY3 ReLU, weights *also* encrypted) | **179 ms** | 33 ms (one ct×ct mult) | 1.1 ms (+80 ms switching) | ✓ exact |
+| **hybrid-ckks** (CKKS linear → ABY3 ReLU) | 8.3 s | 2.5 s | 1.1 ms (+1.4 s switching) | ✓ exact |
+| **tfhe** (pure TFHE, PBS ReLU) | 69.6 s | 66.7 s | 1.9 s | ✓ exact |
+| **hybrid-tfhe** (TFHE linear → ABY3 ReLU) | 73.7 s | 66.9 s | 0.9 ms (+5.6 s switching) | ✓ exact |
+| **ckks** (pure deep CKKS, polynomial ReLU) | 72.6 s | 9.5 s | 17.0 s | ✗ off by 282 vs exact¹ |
+
+And at `layer(64×8)` the gap *widens*: hybrid-ntru **351 ms** vs
+hybrid-ckks **20.3 s** — **58×** — because both of NTRU's expensive steps
+are flat in the output size (the whole matvec stays ONE multiplication via
+packing, ~32 ms; the whole output vector crosses to MPC in ONE masked
+decryption, ~35 ms), while CKKS pays per row (`dot_plain` ×8 → 9.9 s) and
+per scalar in conversion (3.4 s). At that shape hybrid-ntru sits within 3×
+of pure MPC — while keeping FHE's send-and-evaluate deployment shape and
+encrypting the weights (which the CKKS/TFHE rows do not).
+
+¹ The pure-CKKS output matches its own plain-`f64` Newton-approximation
+reference (the crypto is correct) but deviates 282 from the exact ReLU on
+the negative pre-activation (−818 at bound 5820, ratio 0.14 — squarely in
+the documented slow-near-zero regime at 2 iterations). More iterations
+shrink it, at more levels/keygen/time.
+
+What the table says:
+
+- **Depth-1 FHE + MPC ReLU is the winning hybrid, and SI-NTRU is its
+  cheapest depth-1 engine.** 46× faster than hybrid-CKKS at 8×2 (58× at
+  64×8): no evaluation keys to generate (keygen 36 ms vs CKKS's 4.2 s),
+  one multiplication for the whole matvec instead of one rotation-tree per
+  row, one masked decryption for the whole output vector — because the
+  scheme never needs to *continue* computing on the product, decrypting
+  under f² replaces relinearization outright, and the MPC side absorbs
+  everything nonlinear. (Subject to the overstretched-regime security
+  caveat above — this is a research design point, not a production
+  deployment.)
+- **Scheme switching rescues CKKS entirely.** Pure CKKS needs a
+  degree-32768, 10-level context (37 s keygen) and still gives an
+  *approximate* ReLU costing 8.5 s/element. Hybrid-CKKS keeps the cheap
+  shallow SIMD context (whole input = one ciphertext, `dot_plain`), does
+  the ReLU **exactly** under MPC in ~0.5 ms/element, and finishes 8.7×
+  faster with zero error. Per-element ReLU: MPC is ~25,000× faster than
+  CKKS's polynomial and ~2,700× faster than TFHE's PBS.
+- **Switching is not free, and doesn't always pay: hybrid-TFHE's honest
+  result.** TFHE's bottleneck is the *linear* phase (66.9 s — scheme
+  switching can't fix what stays in-scheme), and the conversion round-trip
+  (~2.8 s/element: masks must themselves be TFHE-encrypted and added)
+  costs *more* than TFHE's native 0.95 s/element PBS ReLU. Hybrid-TFHE
+  earns its keep only when the switched-out section replaces *many*
+  expensive FHE ops (deep nonlinear blocks — maxpool, argmax, whole
+  MPC-side subnetworks), not a single comparison.
+- **Pure MPC remains 1,000× ahead of everything FHE** when interactivity
+  is acceptable — with *stronger* privacy in this table (its weights are
+  shared too; the FHE rows use public weights). FHE's value is the
+  non-interactive/outsourced setting, and there, hybrid-CKKS is the
+  configuration to beat.
+
 ---
 
 ## Precompiled gadgets (`src/precompile/`)
@@ -745,11 +853,16 @@ src/
   fhe/
     ckks_backend.rs — shallow (depth <= 2) CKKS: matvec/dot, no comparisons
     ckks_compare.rs — deep CKKS: polynomial-approximation sign/relu/compare
+    si_ntru.rs      — scale-invariant NTRU (LTV): decrypt-under-f^k instead
+                       of relinearization; packed one-mult matvecs
   bench/
     ckks_compare.rs — `baru bench-ckks-compare`: measures the above
   hybrid/
     mod.rs          — MPC <-> FHE scheme switching (share->fhe, fhe->share,
                        mpc_reencrypt as a bootstrapping alternative)
+  bench/
+    hybrid_nn.rs    — `baru bench-hybrid-nn`: one private dense layer under
+                       mpc / tfhe / ckks / hybrid-tfhe / hybrid-ckks
 tests/
   features.rs       — unit/integration tests for the interpreter + MPC
   tcp_integration.rs — spawns 3 tcp_party processes over TCP
