@@ -48,6 +48,9 @@ fn main() -> Result<(), Box<dyn Error>> {
     if args.first().map(String::as_str) == Some("bench-cnn") {
         return baru::bench::cnn::run_cli(&args[1..]).map_err(|e| e.into());
     }
+    if args.first().map(String::as_str) == Some("bench-train") {
+        return baru::bench::train::run_cli(&args[1..]).map_err(|e| e.into());
+    }
 
     let participants: Vec<Participant> = (0..3).map(Participant::new).collect();
 

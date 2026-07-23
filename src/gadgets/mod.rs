@@ -122,6 +122,32 @@ pub fn argmax_ref(xs: &[i64]) -> usize {
     best
 }
 
+/// Arithmetic shift-right of a **signed** share by a public `k` bits
+/// (division by `2^k`, rounding toward −∞). Needed by SGD weight updates
+/// (`W -= grad ≫ lr`), where the gradient is signed — unlike the fused
+/// ReLU-rescale, whose logical shift is only valid on the non-negative
+/// branch. Decomposes once (`a2b`), keeps bits `k..`, and sign-extends the
+/// top `k` positions with the sign bit.
+pub fn arith_shr(be: &mut dyn Backend, x: &ShareRef, k: usize, nbits: usize) -> ShareRef {
+    if k == 0 {
+        return x.clone();
+    }
+    let bits = be.a2b(x, nbits);
+    let sign = bits[nbits - 1].clone();
+    let out_bits: Vec<ShareRef> = (0..nbits)
+        .map(|j| if j + k < nbits { bits[j + k].clone() } else { sign.clone() })
+        .collect();
+    let mut r = be.b2a(&out_bits);
+    // b2a inherits the bit-shares' width (1); restore the value's width so
+    // downstream ops (comparisons) decompose the full number.
+    r.nbits = nbits;
+    r
+}
+
+pub fn arith_shr_ref(x: i64, k: usize) -> i64 {
+    x >> k
+}
+
 // ─── Linear building blocks ────────────────────────────────────────────────────
 //
 // These express the *linear* layers (fully-connected, convolution) directly
@@ -373,6 +399,28 @@ mod tests {
             let got = to_signed(be.reveal(&idx, None)) as usize;
             assert_eq!(got, argmax_ref(xs), "argmax {xs:?}");
         }
+    }
+
+    #[test]
+    fn arith_shr_matches_reference_signed() {
+        for &(x, k) in &[(8i64, 1usize), (-8, 1), (7, 2), (-7, 2), (-1, 3), (100, 4), (-100, 4), (0, 5)] {
+            let mut be = Aby3Backend::new();
+            let s = be.share_secret(residue(x), NBITS, 0);
+            let r = arith_shr(&mut be, &s, k, NBITS);
+            assert_eq!(to_signed(be.reveal(&r, None)), arith_shr_ref(x, k), "arith_shr({x},{k})");
+        }
+    }
+
+    #[test]
+    fn arith_shr_result_is_usable_in_a_comparison() {
+        // The b2a-nbits fix: the shifted value must be comparable afterwards
+        // (regression for the CNN maxpool bug).
+        let mut be = Aby3Backend::new();
+        let a = be.share_secret(residue(40), NBITS, 0);
+        let b = be.share_secret(residue(9), NBITS, 0);
+        let sa = arith_shr(&mut be, &a, 2, NBITS); // 10
+        let m = max2(&mut be, &sa, &b); // max(10, 9) = 10
+        assert_eq!(to_signed(be.reveal(&m, None)), 10);
     }
 
     #[test]

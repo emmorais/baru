@@ -841,6 +841,44 @@ from one `a2b`, keeping fixed-point magnitude bounded at any depth), and
 **per-layer independent MPC sessions** whose only carried state is the
 scheme-switch ciphertext — i.e. the interactive bootstrap made concrete.
 
+### Private *training*, not just inference (`baru bench-train`)
+
+The whole stack so far assumes a model already exists. This closes the loop:
+a least-squares classifier is **trained by SGD entirely under the real
+3-party ABY3 protocol** — the training data stays secret-shared, and every
+forward pass, gradient, and weight update is an oblivious computation
+composed from `crate::gadgets` — then the trained model does private
+inference on a held-out example. "Encrypted data in → train → encrypted
+inference," end to end.
+
+The one design choice that makes this tractable: **MSE loss instead of
+softmax.** Softmax-cross-entropy's gradient needs `exp`/`log`/division (the
+transcendental wall again); regressing to one-hot targets with squared
+error gives a gradient that is purely `sub`/`mul`/shift — no nonlinearity in
+the loss at all (`forward z=W·x+b; δ=z−y; ∂W=δ⊗x; W-=∂W≫lr`, the shift being
+the new `gadgets::arith_shr` signed arithmetic shift). Every step is exact
+integer fixed-point, so the encrypted run matches a plaintext integer-SGD
+reference **bit-for-bit**. Measured (`bench-train`, 12 samples, 6 binary
+features, 3 classes, 20 epochs, lr = 2⁻⁴, real protocol):
+
+```
+loss (MSE): 65536 → 7172   (89% reduction, monotone)
+train accuracy: 100%
+encrypted model == plaintext model: EXACT (bit-for-bit)
+held-out example: classified correctly (only the class index revealed)
+FHE bootstraps: 0     MPC wire: 105,162 msgs / 3.8 MB
+```
+
+Honest framing: training is naturally an MPC computation (as in SecureML /
+ABY3's own training experiments), so "0 bootstraps" is trivially true on
+this side — the paper's no-bootstrap *FHE* contribution is the *inference*
+deployment, and this module completes the private-ML lifecycle around it,
+showing the same UC-gadget library composes a full SGD trainer. Correctness
+is exact; *accuracy* is a property of the (synthetic, separable) data,
+reported separately. This is the linear case (which converges provably); a
+deep MLP's backward pass reuses the same gadgets (ReLU′ = `lt`, already
+here) and is future work.
+
 ### A real CNN through the hybrid pipeline (`baru bench-cnn`)
 
 The gadget library composes into a full convolutional classifier that runs
@@ -1066,6 +1104,8 @@ src/
                        ZERO FHE bootstraps, cost linear in depth
     cnn.rs          — `baru bench-cnn`: full conv classifier (conv/relu/
                        maxpool/dense/argmax) through the hybrid, 0 bootstraps
+    train.rs        — `baru bench-train`: private SGD training (MSE loss),
+                       gadget-composed, bit-exact, then private inference
   demo/
     mod.rs          — `baru demo-private-mnist`: encrypted image × encrypted
                        model → MPC threshold → only the class bit revealed

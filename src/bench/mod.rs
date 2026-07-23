@@ -835,3 +835,4 @@ pub mod deep_nn;
 pub mod comm;
 pub mod hybrid_nn;
 pub mod nn;
+pub mod train;
