@@ -1,5 +1,5 @@
 //! `baru bench-hybrid-nn` — one private dense layer (matvec + bias + ReLU),
-//! computed end-to-end under five strategies, timed per phase and verified
+//! computed end-to-end under six strategies, timed per phase and verified
 //! against the plaintext reference:
 //!
 //!   mpc          everything under ABY3 shares (weights shared too — the
@@ -19,36 +19,57 @@
 //!                output vector switched to MPC in ONE masked decryption
 //!                → ABY3 ReLU → share->fhe (see `fhe::si_ntru`)
 //!
-//! The hybrids are the Gazelle pattern made concrete with `crate::hybrid`'s
-//! conversions: run the linear phase where it's cheap (FHE, batched), and
-//! the comparison where *it* is cheap (MPC, ~ms), never exposing the value.
+//! # The MPC is the real protocol, not a simulator
+//!
+//! Every MPC phase here — the pure-MPC strategy, the hybrids' ReLU, and
+//! both directions of the scheme switch — runs the genuine replicated
+//! 3-party ABY3 **wire protocol** (`TransportBackend` over `InprocHandle`,
+//! three party threads exchanging real serialized messages), NOT the
+//! in-process `Aby3Backend` simulator (whose algorithms differ from the
+//! distributed protocol — e.g. its `Share3` multiplication reconstructs
+//! and reshares locally, which costs nothing and reveals everything).
+//! A [`NetworkProfile`] (`--rtt-ms`, `--bandwidth-mbps`) injects one-way
+//! latency + a bytes/bandwidth term into every protocol message, so the
+//! *same computation as the real protocol* is measured under whatever
+//! network you posit — parties in one rack (0 ms) or on different
+//! continents (100 ms+) — without deploying anything. Round-trip counts,
+//! not per-op CPU, then dominate MPC cost, which is exactly the effect an
+//! in-process simulator hides.
+//!
+//! The FHE side runs single-threaded (it IS single-party — that's FHE's
+//! deployment model), but its WAN legs are charged too: a `link-io` phase
+//! models uploading input ciphertexts / downloading results (1 RTT +
+//! bytes/bandwidth), and each scheme switch pays its real round trips
+//! (mask ciphertexts to the evaluator + opened value back = 1 RTT for
+//! FHE→MPC; component ciphertexts in = ½ RTT for MPC→FHE) with the real
+//! serialized ciphertext sizes.
 //!
 //! Scope notes, stated so the numbers are read fairly:
-//! - FHE paths use public weights (`mul_plain`/`dot_plain` — the standard
-//!   "public model, private input" deployment); the MPC path shares its
-//!   weights (fully private). This *disadvantages* MPC in the comparison
-//!   and it still wins the ReLU phase — the asymmetry is real, not an
-//!   artifact of scope.
+//! - FHE paths use public weights (`mul_plain`/`dot_plain`) EXCEPT
+//!   hybrid-ntru, which encrypts them; the MPC path shares its weights
+//!   (fully private).
 //! - `ckks` is *approximate*: its `ok` column checks agreement with the
-//!   plain-f64 Newton-iteration reference at the same iteration count
-//!   (`relu_approx_plain`), and the deviation from the *exact* ReLU is
-//!   reported separately — at practical iteration counts and realistic
-//!   pre-activation bounds that deviation is large (the documented
-//!   slow-near-zero regime), which is itself one of the findings.
-//! - Conversions here are in-process simulations of the mask-and-open /
-//!   encrypt-shares protocols (see `crate::hybrid` for the trust model).
+//!   plain-f64 Newton reference at the same iteration count; deviation
+//!   from the exact ReLU is reported separately.
+//! - Conversions simulate the mask-and-open protocol's data flow with a
+//!   single decryption key standing in for threshold decryption (see
+//!   `crate::hybrid` for the trust model).
 
 use std::time::Instant;
 
+use rand::Rng;
 use serde::Serialize;
 
+use crate::bench::comm::{CommStats, CountingTransport, LatencyTransport, NetworkProfile};
 use crate::bench::Phase;
+use crate::crypto::net::InprocHandle;
+use crate::crypto::types::Fr;
 use crate::fhe::ckks_compare::{relu_approx_plain, CkksCompareBackend};
-use crate::fhe::si_ntru::{ntru_poly_to_mpc_shares, SiNtru, SiNtruAdapter, SiNtruParams};
+use crate::fhe::si_ntru::{NtruCt, SiNtru, SiNtruAdapter, SiNtruParams};
 use crate::fhe::{CkksBackend, FheBackend, MockFheBackend, RealFheBackend, TfheBackend};
-use crate::hybrid::{fhe_to_mpc_share, mpc_share_to_fhe, FheAdapter, IntFhe, RealFhe};
-use crate::interpreter::aby3_backend::Aby3Backend;
+use crate::hybrid::{shares_to_fhe, FheAdapter, IntFhe, RealFhe};
 use crate::interpreter::backend::{Backend, ShareRef};
+use crate::interpreter::transport_backend::TransportBackend;
 
 const NBITS: usize = 32;
 
@@ -99,14 +120,19 @@ pub fn make_layer(in_dim: usize, out_dim: usize) -> LayerData {
     }
 }
 
-fn residue(v: i64) -> u128 {
-    (v as i128).rem_euclid(1i128 << NBITS) as u128
+fn residue(v: i64, nbits: usize) -> u128 {
+    (v as i128).rem_euclid(1i128 << nbits) as u128
 }
 
-/// Low-32-bit two's-complement decode (shares/converted ciphertexts carry
-/// residues mod 2^32, possibly with share-sum carries above).
-fn to_signed(v: u64) -> i64 {
-    (v as u32) as i32 as i64
+/// Two's-complement decode of the low `nbits` bits.
+fn to_signed_n(v: u64, nbits: usize) -> i64 {
+    let m = 1u64 << nbits;
+    let v = v & (m - 1);
+    if v >= m / 2 {
+        (v as i64) - (m as i64)
+    } else {
+        v as i64
+    }
 }
 
 // ─── Reporting ────────────────────────────────────────────────────────────────
@@ -123,6 +149,9 @@ pub struct StrategyReport {
     /// Worst |output − exact ReLU| — nonzero only for the approximate
     /// `ckks` strategy (its polynomial ReLU error, quantified).
     pub max_abs_error_vs_exact: i64,
+    /// Real wire traffic of the MPC segment (party-0 perspective), when
+    /// the strategy has one.
+    pub comm: Option<CommStats>,
     pub notes: Vec<String>,
 }
 
@@ -152,10 +181,58 @@ impl Timer {
     }
 }
 
-// ─── Shared MPC pieces ────────────────────────────────────────────────────────
+// ─── The real-protocol MPC session harness ────────────────────────────────────
 
-/// Mux-style ReLU on shares (`bench-nn`'s Layer pattern).
-fn mpc_relu(be: &mut Aby3Backend, z: &ShareRef) -> ShareRef {
+pub type MpcTransport = CountingTransport<LatencyTransport<InprocHandle>>;
+
+/// Run one closure per party, SPMD, on 3 threads over the real wire
+/// protocol with `profile`'s latency/bandwidth on every message. Returns
+/// per-party results (index = party id) and party-0's wire statistics.
+pub fn run_parties<R, F>(profile: NetworkProfile, mk: impl Fn(usize) -> F) -> (Vec<R>, CommStats)
+where
+    R: Send + 'static,
+    F: FnOnce(&mut TransportBackend<MpcTransport>) -> R + Send + 'static,
+{
+    let handles = InprocHandle::create(3);
+    let mut joins = Vec::with_capacity(3);
+    let mut comm = None;
+    for (me, h) in handles.into_iter().enumerate() {
+        let lat = LatencyTransport::new(h, profile);
+        let counted = CountingTransport::new(lat, 3);
+        if me == 0 {
+            comm = Some(counted.handle());
+        }
+        let f = mk(me);
+        joins.push(std::thread::spawn(move || {
+            let mut be = TransportBackend::new(me, counted);
+            f(&mut be)
+        }));
+    }
+    let results: Vec<R> = joins
+        .into_iter()
+        .map(|j| j.join().expect("MPC party thread panicked"))
+        .collect();
+    (results, comm.unwrap().stats())
+}
+
+/// Model one leg of evaluator↔parties WAN traffic that does NOT go through
+/// the party-to-party transport (FHE ciphertext upload/download and the
+/// scheme-switch round trips): `half_rtts` one-way latencies plus the
+/// bytes/bandwidth term, slept for real so it lands in phase timings.
+pub fn sleep_link(profile: &NetworkProfile, bytes: usize, half_rtts: u32) {
+    let bw = profile
+        .bandwidth_bytes_per_sec
+        .map(|bw| std::time::Duration::from_secs_f64(bytes as f64 / bw))
+        .unwrap_or(std::time::Duration::ZERO);
+    let d = profile.one_way_latency * half_rtts + bw;
+    if !d.is_zero() {
+        std::thread::sleep(d);
+    }
+}
+
+/// Mux-style ReLU on shares (`bench-nn`'s Layer pattern), over whatever
+/// backend — for this benchmark, always the real transport.
+pub fn mpc_relu(be: &mut dyn Backend, z: &ShareRef) -> ShareRef {
     let zero = be.sub(z, z);
     let mask = be.lt(&zero, z);
     be.mul(z, &mask)
@@ -163,66 +240,168 @@ fn mpc_relu(be: &mut Aby3Backend, z: &ShareRef) -> ShareRef {
 
 // ─── Strategies ───────────────────────────────────────────────────────────────
 
-fn run_mpc_only(data: &LayerData) -> StrategyReport {
-    let mut t = Timer::new();
-    let mut be = Aby3Backend::new();
+fn run_mpc_only(data: &LayerData, profile: NetworkProfile) -> StrategyReport {
+    let start = Instant::now();
+    let x = data.x.clone();
+    let w = data.w.clone();
+    let bias = data.bias.clone();
 
-    let (xs, ws, bs) = t.phase("share", || {
-        let xs: Vec<ShareRef> = data
-            .x
-            .iter()
-            .map(|&v| be.share_secret(residue(v), NBITS, 0))
-            .collect();
-        let ws: Vec<Vec<ShareRef>> = data
-            .w
-            .iter()
-            .map(|row| {
-                row.iter()
-                    .map(|&v| be.share_secret(residue(v), NBITS, 0))
-                    .collect()
-            })
-            .collect();
-        let bs: Vec<ShareRef> = data
-            .bias
-            .iter()
-            .map(|&v| be.share_secret(residue(v), NBITS, 0))
-            .collect();
-        (xs, ws, bs)
+    let (mut per_party, comm) = run_parties(profile, |me| {
+        let x = x.clone();
+        let w = w.clone();
+        let bias = bias.clone();
+        move |be: &mut TransportBackend<MpcTransport>| {
+            let mut t = Timer::new();
+            let share_one = |be: &mut TransportBackend<MpcTransport>, v: i64| -> ShareRef {
+                let fr = if me == 0 { residue(v, NBITS) } else { 0 };
+                be.share_secret(fr, NBITS, 0)
+            };
+            let (xs, ws, bs) = t.phase("share", || {
+                let xs: Vec<ShareRef> = x.iter().map(|&v| share_one(be, v)).collect();
+                let ws: Vec<Vec<ShareRef>> = w
+                    .iter()
+                    .map(|row| row.iter().map(|&v| share_one(be, v)).collect())
+                    .collect();
+                let bs: Vec<ShareRef> = bias.iter().map(|&v| share_one(be, v)).collect();
+                (xs, ws, bs)
+            });
+            let pre = t.phase("linear", || {
+                // Champion precompile (batched Beaver triples — the best
+                // known MPC matvec in this repo), on the real wire.
+                let registry = crate::precompile::mpc_matvec::registry();
+                let mv = registry.champion().matvec(be, &ws, &xs);
+                mv.iter()
+                    .zip(&bs)
+                    .map(|(o, b)| be.add(o, b))
+                    .collect::<Vec<_>>()
+            });
+            let relu = t.phase("relu", || {
+                pre.iter().map(|z| mpc_relu(be, z)).collect::<Vec<_>>()
+            });
+            let out = t.phase("reveal", || {
+                relu.iter()
+                    .map(|s| to_signed_n(be.reveal(s, None) as u64, NBITS))
+                    .collect::<Vec<i64>>()
+            });
+            (out, t.phases)
+        }
     });
 
-    let pre = t.phase("linear", || {
-        ws.iter()
-            .zip(&bs)
-            .map(|(row, b)| {
-                let mut acc = be.mul(&row[0], &xs[0]);
-                for (wi, xi) in row[1..].iter().zip(&xs[1..]) {
-                    let p = be.mul(wi, xi);
-                    acc = be.add(&acc, &p);
-                }
-                be.add(&acc, b)
-            })
-            .collect::<Vec<_>>()
-    });
-
-    let relu = t.phase("relu", || {
-        pre.iter().map(|z| mpc_relu(&mut be, z)).collect::<Vec<_>>()
-    });
-
-    let output = t.phase("reveal", || {
-        relu.iter()
-            .map(|s| to_signed(be.reveal(s, None) as u64))
-            .collect::<Vec<i64>>()
-    });
-
+    let (output, phases) = per_party.swap_remove(0);
     StrategyReport {
         strategy: "mpc".into(),
-        total_ms: t.total_ms(),
-        phases: t.phases,
+        phases,
+        total_ms: start.elapsed().as_secs_f64() * 1000.0,
         ok: output == data.expected,
         max_abs_error_vs_exact: max_err(&output, &data.expected),
         output,
-        notes: vec!["ABY3, weights AND input private (shared)".into()],
+        comm: Some(comm),
+        notes: vec![
+            "real ABY3 wire protocol (3 threads), weights AND input private".into(),
+            "matvec via champion precompile (batched)".into(),
+        ],
     }
+}
+
+/// The hybrids' MPC segment, generic over the FHE side: mask-and-open the
+/// pre-activation ciphertexts (1 RTT + mask-ciphertext bytes), run
+/// import + ReLU + per-party component export on the real 3-party wire
+/// protocol, re-encrypt the components (½ RTT + bytes). Returns the output
+/// ciphertexts and the MPC segment's wire stats.
+fn hybrid_mpc_relu<A: FheAdapter>(
+    t: &mut Timer,
+    fhe: &A,
+    ck: &[u8],
+    pre: &[A::Ct],
+    nbits: usize,
+    profile: NetworkProfile,
+) -> (Vec<A::Ct>, CommStats) {
+    let k = pre.len();
+    let vmask: u64 = if nbits >= 64 {
+        u64::MAX
+    } else {
+        (1u64 << nbits) - 1
+    };
+
+    let mut rng = rand::thread_rng();
+    let masks: Vec<Vec<u64>> = (0..3)
+        .map(|_| (0..k).map(|_| rng.gen::<u64>() & vmask).collect())
+        .collect();
+
+    let opened: Vec<u64> = t.phase("to-mpc", || {
+        let mut conv_bytes = 0usize;
+        let y: Vec<u64> = pre
+            .iter()
+            .enumerate()
+            .map(|(j, ct)| {
+                let mut masked = ct.clone();
+                for m in &masks {
+                    let enc = fhe.encrypt(ck, m[j]);
+                    conv_bytes += fhe.ct_bytes(&enc);
+                    masked = fhe.add(&masked, &enc);
+                }
+                fhe.decrypt(ck, &masked) & vmask
+            })
+            .collect();
+        // Parties send Enc(rᵢ) to the evaluator; the opened y comes back:
+        // one full round trip.
+        sleep_link(&profile, conv_bytes + k * 8, 2);
+        y
+    });
+
+    let (per_party, comm) = t.phase("mpc-relu", || {
+        run_parties(profile, |me| {
+            let my_masks = masks[me].clone();
+            let opened = opened.clone();
+            move |be: &mut TransportBackend<MpcTransport>| {
+                // Import: each party shares ITS component (y−r₀ for party
+                // 0, −rᵢ otherwise) via the real input-sharing protocol,
+                // then the three shares are added locally.
+                let shares: Vec<ShareRef> = (0..opened.len())
+                    .map(|j| {
+                        let my_comp: Fr = if me == 0 {
+                            (opened[j] as u128).wrapping_sub(my_masks[j] as u128)
+                        } else {
+                            0u128.wrapping_sub(my_masks[j] as u128)
+                        };
+                        let mut acc: Option<ShareRef> = None;
+                        for owner in 0..3 {
+                            let v = if me == owner { my_comp } else { 0 };
+                            let s = be.share_secret(v, nbits, owner);
+                            acc = Some(match acc {
+                                None => s,
+                                Some(a) => be.add(&a, &s),
+                            });
+                        }
+                        acc.unwrap()
+                    })
+                    .collect();
+                let relu: Vec<ShareRef> =
+                    shares.iter().map(|z| mpc_relu(be, z)).collect();
+                // Export: this party's canonical additive component —
+                // local, zero communication.
+                relu.iter()
+                    .map(|s| be.my_additive_component(s))
+                    .collect::<Vec<Fr>>()
+            }
+        })
+    });
+
+    let out = t.phase("to-fhe", || {
+        let mut bytes = 0usize;
+        let cts: Vec<A::Ct> = (0..k)
+            .map(|j| {
+                let comps: Vec<Fr> = (0..3).map(|p| per_party[p][j]).collect();
+                let ct = shares_to_fhe(fhe, ck, &comps, nbits);
+                bytes += 3 * fhe.ct_bytes(&ct);
+                ct
+            })
+            .collect();
+        // Parties send Enc(component) to the evaluator: half a round trip.
+        sleep_link(&profile, bytes, 1);
+        cts
+    });
+    (out, comm)
 }
 
 /// Shared TFHE linear phase: encrypt input, mul_plain/add per row, add bias.
@@ -231,12 +410,17 @@ fn tfhe_linear(
     f: &TfheBackend,
     ck: &[u8],
     data: &LayerData,
+    profile: &NetworkProfile,
 ) -> Vec<<TfheBackend as FheBackend>::Ct> {
     let cts = t.phase("encrypt", || {
         data.x
             .iter()
             .map(|&v| f.encrypt(ck, v as u64))
             .collect::<Vec<_>>()
+    });
+    t.phase("link-io", || {
+        let ct_size = f.serialize_ct(&cts[0]).len();
+        sleep_link(profile, ct_size * cts.len(), 2);
     });
     t.phase("linear", || {
         data.w
@@ -253,7 +437,7 @@ fn tfhe_linear(
     })
 }
 
-fn run_tfhe_only(data: &LayerData) -> StrategyReport {
+fn run_tfhe_only(data: &LayerData, profile: NetworkProfile) -> StrategyReport {
     let mut t = Timer::new();
     let f = TfheBackend::new();
     let ck = t.phase("keygen", || {
@@ -262,7 +446,7 @@ fn run_tfhe_only(data: &LayerData) -> StrategyReport {
         ck
     });
 
-    let pre = tfhe_linear(&mut t, &f, &ck, data);
+    let pre = tfhe_linear(&mut t, &f, &ck, data, &profile);
 
     let relu = t.phase("relu", || {
         pre.iter()
@@ -287,11 +471,12 @@ fn run_tfhe_only(data: &LayerData) -> StrategyReport {
         ok: output == data.expected,
         max_abs_error_vs_exact: max_err(&output, &data.expected),
         output,
+        comm: None,
         notes: vec!["public weights; exact PBS ReLU".into()],
     }
 }
 
-fn run_hybrid_tfhe(data: &LayerData) -> StrategyReport {
+fn run_hybrid_tfhe(data: &LayerData, profile: NetworkProfile) -> StrategyReport {
     let mut t = Timer::new();
     let f = TfheBackend::new();
     let ck = t.phase("keygen", || {
@@ -300,30 +485,13 @@ fn run_hybrid_tfhe(data: &LayerData) -> StrategyReport {
         ck
     });
 
-    let pre = tfhe_linear(&mut t, &f, &ck, data);
-
-    let mut be = Aby3Backend::new();
+    let pre = tfhe_linear(&mut t, &f, &ck, data, &profile);
     let adapter = IntFhe(&f);
-    let shares = t.phase("to-mpc", || {
-        pre.iter()
-            .map(|ct| fhe_to_mpc_share(&adapter, &ck, ct, &mut be, NBITS))
-            .collect::<Vec<_>>()
-    });
-    let relu = t.phase("relu", || {
-        shares
-            .iter()
-            .map(|s| mpc_relu(&mut be, s))
-            .collect::<Vec<_>>()
-    });
-    let back = t.phase("to-fhe", || {
-        relu.iter()
-            .map(|s| mpc_share_to_fhe(&mut be, s, &adapter, &ck))
-            .collect::<Vec<_>>()
-    });
+    let (back, comm) = hybrid_mpc_relu(&mut t, &adapter, &ck, &pre, NBITS, profile);
 
     let output = t.phase("decrypt", || {
         back.iter()
-            .map(|ct| to_signed(adapter.decrypt(&ck, ct)))
+            .map(|ct| to_signed_n(adapter.decrypt(&ck, ct), NBITS))
             .collect::<Vec<i64>>()
     });
 
@@ -334,11 +502,12 @@ fn run_hybrid_tfhe(data: &LayerData) -> StrategyReport {
         ok: output == data.expected,
         max_abs_error_vs_exact: max_err(&output, &data.expected),
         output,
-        notes: vec!["TFHE linear + ABY3 ReLU via scheme switch".into()],
+        comm: Some(comm),
+        notes: vec!["TFHE linear + real-protocol ABY3 ReLU via scheme switch".into()],
     }
 }
 
-fn run_ckks_only(data: &LayerData, iterations: u32) -> StrategyReport {
+fn run_ckks_only(data: &LayerData, iterations: u32, profile: NetworkProfile) -> StrategyReport {
     let mut t = Timer::new();
     // The whole layer must live in the deep context: linear costs 1 level
     // (one mul_plain), then the polynomial ReLU needs its full budget.
@@ -361,6 +530,11 @@ fn run_ckks_only(data: &LayerData, iterations: u32) -> StrategyReport {
             .iter()
             .map(|&v| be.encrypt(&ck, v as f64))
             .collect::<Vec<_>>()
+    });
+
+    t.phase("link-io", || {
+        let ct_size = be.serialize_ct(&cts[0]).len();
+        sleep_link(&profile, ct_size * cts.len(), 2);
     });
 
     let pre = t.phase("linear", || {
@@ -401,10 +575,6 @@ fn run_ckks_only(data: &LayerData, iterations: u32) -> StrategyReport {
             .collect::<Vec<i64>>()
     });
 
-    // "Working as expected" for an approximate scheme = matches the plain
-    // f64 Newton reference at the same iteration count (±1 for CKKS noise
-    // and rounding); the gap to the exact ReLU is the polynomial's own,
-    // separately-reported approximation error.
     let approx_reference: Vec<i64> = data
         .pre
         .iter()
@@ -422,6 +592,7 @@ fn run_ckks_only(data: &LayerData, iterations: u32) -> StrategyReport {
         ok,
         max_abs_error_vs_exact: max_err(&output, &data.expected),
         output,
+        comm: None,
         notes: vec![
             format!("deep context: degree={degree}, {levels} levels"),
             format!("Newton-sign ReLU: {iterations} iterations, bound={bound:.0}"),
@@ -430,7 +601,7 @@ fn run_ckks_only(data: &LayerData, iterations: u32) -> StrategyReport {
     }
 }
 
-fn run_hybrid_ckks(data: &LayerData) -> StrategyReport {
+fn run_hybrid_ckks(data: &LayerData, profile: NetworkProfile) -> StrategyReport {
     let mut t = Timer::new();
     let (ck, be) = t.phase("keygen", || {
         let client = CkksBackend::new();
@@ -442,6 +613,11 @@ fn run_hybrid_ckks(data: &LayerData) -> StrategyReport {
     let x_ct = t.phase("encrypt", || {
         let x_f: Vec<f64> = data.x.iter().map(|&v| v as f64).collect();
         be.encrypt_vec(&ck, &x_f)
+    });
+
+    t.phase("link-io", || {
+        let ct_size = be.serialize_ct(&x_ct).len();
+        sleep_link(&profile, ct_size, 2);
     });
 
     let pre = t.phase("linear", || {
@@ -456,28 +632,12 @@ fn run_hybrid_ckks(data: &LayerData) -> StrategyReport {
             .collect::<Vec<_>>()
     });
 
-    let mut mpc = Aby3Backend::new();
     let adapter = RealFhe(&be);
-    let shares = t.phase("to-mpc", || {
-        pre.iter()
-            .map(|ct| fhe_to_mpc_share(&adapter, &ck, ct, &mut mpc, NBITS))
-            .collect::<Vec<_>>()
-    });
-    let relu = t.phase("relu", || {
-        shares
-            .iter()
-            .map(|s| mpc_relu(&mut mpc, s))
-            .collect::<Vec<_>>()
-    });
-    let back = t.phase("to-fhe", || {
-        relu.iter()
-            .map(|s| mpc_share_to_fhe(&mut mpc, s, &adapter, &ck))
-            .collect::<Vec<_>>()
-    });
+    let (back, comm) = hybrid_mpc_relu(&mut t, &adapter, &ck, &pre, NBITS, profile);
 
     let output = t.phase("decrypt", || {
         back.iter()
-            .map(|ct| to_signed(adapter.decrypt(&ck, ct)))
+            .map(|ct| to_signed_n(adapter.decrypt(&ck, ct), NBITS))
             .collect::<Vec<i64>>()
     });
 
@@ -488,17 +648,39 @@ fn run_hybrid_ckks(data: &LayerData) -> StrategyReport {
         ok: output == data.expected,
         max_abs_error_vs_exact: max_err(&output, &data.expected),
         output,
+        comm: Some(comm),
         notes: vec![
             "shallow SIMD context; whole input = 1 ciphertext (dot_plain)".into(),
-            "exact ABY3 ReLU via scheme switch — no deep context needed".into(),
+            "exact real-protocol ABY3 ReLU via scheme switch — no deep context needed".into(),
         ],
     }
 }
 
-fn run_hybrid_ntru(data: &LayerData) -> StrategyReport {
+fn run_hybrid_ntru(data: &LayerData, profile: NetworkProfile) -> StrategyReport {
     let mut t = Timer::new();
-    let s = SiNtru::new(SiNtruParams::DEFAULT);
+    let in_dim = data.x.len();
+    let out_dim = data.w.len();
+
+    // Plaintext modulus sized to the activation range (a real deployment
+    // calibrates this on sample data — `ml::QuantizationReport`'s job);
+    // the noise analysis in `fhe::si_ntru` allows log2_t up to ~31.
+    let max_abs_pre = data.pre.iter().map(|v| v.abs()).max().unwrap_or(1).max(1) as u64;
+    let log2_t = (66 - max_abs_pre.leading_zeros()).max(20); // value bits + sign + headroom
+    assert!(log2_t <= 31, "activation range exceeds SI-NTRU's depth-1 noise budget");
+    let s = SiNtru::new(SiNtruParams {
+        n: 2048,
+        log2_q: 120,
+        log2_t,
+    });
     let nbits = s.params.log2_t as usize;
+    let t_mask = s.params.t() - 1;
+
+    // Rows per weight ciphertext under the packing bound (rows+1)·in ≤ n;
+    // larger matrices split into chunks, each chunk one ct×ct mult against
+    // the SAME encrypted input.
+    assert!(2 * in_dim <= s.params.n, "in_dim exceeds the ring dimension");
+    let rows_per_chunk = (s.params.n / in_dim).saturating_sub(1).min(out_dim.max(1));
+    let chunks: Vec<&[Vec<i64>]> = data.w.chunks(rows_per_chunk).collect();
 
     let ck = t.phase("keygen", || {
         let (ck, _sk) = s.keygen();
@@ -506,56 +688,148 @@ fn run_hybrid_ntru(data: &LayerData) -> StrategyReport {
     });
 
     // Both the input AND the weight matrix are encrypted (fully private
-    // linear phase, like the MPC strategy — stronger than the public-weight
-    // CKKS/TFHE rows).
-    let (cx, cw) = t.phase("encrypt", || {
+    // linear phase, like the MPC strategy).
+    let (cx, cws) = t.phase("encrypt", || {
         let cx = s.encrypt_poly(&ck, &s.pack_input(&data.x));
-        let cw = s.encrypt_poly(&ck, &s.pack_weights(&data.w));
-        (cx, cw)
-    });
-
-    // The ENTIRE matvec: one ciphertext×ciphertext scale-invariant
-    // multiplication (row r's inner product lands at coefficient
-    // r·in_dim + in_dim − 1; decrypts under f² — no relinearization).
-    // Bias folds in as a plaintext Δ·b addition at each output position.
-    let in_dim = data.x.len();
-    let pre = t.phase("linear", || {
-        let mut prod = s.mul(&cx, &cw);
-        for (r, &b) in data.bias.iter().enumerate() {
-            let pos = s.matvec_output_position(in_dim, r);
-            let residue = (b as i128).rem_euclid(1i128 << nbits) as u64;
-            prod = s.add_plain_at(&prod, pos, residue);
-        }
-        prod
-    });
-
-    // ONE polynomial-level mask-and-open converts every output coefficient
-    // to MPC shares simultaneously.
-    let positions: Vec<usize> = (0..data.w.len())
-        .map(|r| s.matvec_output_position(in_dim, r))
-        .collect();
-    let mut be = Aby3Backend::new();
-    let shares = t.phase("to-mpc", || {
-        ntru_poly_to_mpc_shares(&s, &ck, &pre, &positions, 3, &mut be)
-    });
-
-    let relu = t.phase("relu", || {
-        shares
+        let cws: Vec<NtruCt> = chunks
             .iter()
-            .map(|z| mpc_relu(&mut be, z))
-            .collect::<Vec<_>>()
+            .map(|chunk| s.encrypt_poly(&ck, &s.pack_weights(chunk)))
+            .collect();
+        (cx, cws)
     });
 
     let adapter = SiNtruAdapter(&s);
+    t.phase("link-io", || {
+        let bytes =
+            adapter.ct_bytes(&cx) + cws.iter().map(|c| adapter.ct_bytes(c)).sum::<usize>();
+        sleep_link(&profile, bytes, 2);
+    });
+
+    // The matvec: one ct×ct scale-invariant multiplication PER CHUNK (all
+    // against the one encrypted input), plus plaintext Δ·b bias additions.
+    let mut bias_iter = data.bias.iter();
+    let pre_chunks: Vec<NtruCt> = t.phase("linear", || {
+        chunks
+            .iter()
+            .zip(&cws)
+            .map(|(chunk, cw)| {
+                let mut prod = s.mul(&cx, cw);
+                for r in 0..chunk.len() {
+                    let b = *bias_iter.next().expect("bias per row");
+                    let pos = s.matvec_output_position(in_dim, r);
+                    prod = s.add_plain_at(&prod, pos, residue(b, nbits) as u64);
+                }
+                prod
+            })
+            .collect()
+    });
+
+    // Poly-level mask-and-open per chunk: one masked decryption converts
+    // every output coefficient of that chunk. Masks are full uniform-mod-t
+    // polynomials.
+    let mut rng = rand::thread_rng();
+    let masks: Vec<Vec<Vec<u64>>> = pre_chunks
+        .iter()
+        .map(|_| {
+            (0..3)
+                .map(|_| (0..s.params.n).map(|_| rng.gen::<u64>() & t_mask).collect())
+                .collect()
+        })
+        .collect();
+
+    let opened: Vec<Vec<u64>> = t.phase("to-mpc", || {
+        let mut conv_bytes = 0usize;
+        let y: Vec<Vec<u64>> = pre_chunks
+            .iter()
+            .zip(&masks)
+            .map(|(pre, chunk_masks)| {
+                let mut masked = pre.clone();
+                for m in chunk_masks {
+                    let enc = s.encrypt_poly(&ck, m);
+                    conv_bytes += adapter.ct_bytes(&enc);
+                    masked = s.add(&masked, &enc);
+                }
+                s.decrypt_poly(&ck, &masked)
+            })
+            .collect();
+        sleep_link(
+            &profile,
+            conv_bytes + y.iter().map(|v| v.len() * 8).sum::<usize>(),
+            2,
+        );
+        y
+    });
+
+    // Flatten (chunk, local row) -> per-output mask/opened values.
+    let mut flat_masks: Vec<[u64; 3]> = Vec::with_capacity(out_dim);
+    let mut flat_opened: Vec<u64> = Vec::with_capacity(out_dim);
+    for (ci, chunk) in chunks.iter().enumerate() {
+        for r in 0..chunk.len() {
+            let pos = s.matvec_output_position(in_dim, r);
+            flat_masks.push([masks[ci][0][pos], masks[ci][1][pos], masks[ci][2][pos]]);
+            flat_opened.push(opened[ci][pos]);
+        }
+    }
+
+    let (per_party, comm) = t.phase("mpc-relu", || {
+        run_parties(profile, |me| {
+            let my_masks: Vec<u64> = flat_masks.iter().map(|m| m[me]).collect();
+            let y = flat_opened.clone();
+            move |be: &mut TransportBackend<MpcTransport>| {
+                let shares: Vec<ShareRef> = (0..y.len())
+                    .map(|j| {
+                        let my_comp: Fr = if me == 0 {
+                            (y[j] as u128).wrapping_sub(my_masks[j] as u128)
+                        } else {
+                            0u128.wrapping_sub(my_masks[j] as u128)
+                        };
+                        let mut acc: Option<ShareRef> = None;
+                        for owner in 0..3 {
+                            let v = if me == owner { my_comp } else { 0 };
+                            let sref = be.share_secret(v, nbits, owner);
+                            acc = Some(match acc {
+                                None => sref,
+                                Some(a) => be.add(&a, &sref),
+                            });
+                        }
+                        acc.unwrap()
+                    })
+                    .collect();
+                let relu: Vec<ShareRef> =
+                    shares.iter().map(|z| mpc_relu(be, z)).collect();
+                relu.iter()
+                    .map(|sref| be.my_additive_component(sref))
+                    .collect::<Vec<Fr>>()
+            }
+        })
+    });
+
+    // Return switch, packed: each party puts ALL its output components
+    // into ONE message polynomial (component j at coefficient j), encrypts
+    // once, and the homomorphic sum is a single ciphertext holding the
+    // whole ReLU'd output vector — 3 ciphertexts on the wire regardless of
+    // out_dim, instead of 3 per output scalar (which dominated conversion
+    // bytes at large shapes: 48 × 33 KB at layer(1024×16)).
     let back = t.phase("to-fhe", || {
-        relu.iter()
-            .map(|z| mpc_share_to_fhe(&mut be, z, &adapter, &ck))
-            .collect::<Vec<_>>()
+        let mut sum: Option<NtruCt> = None;
+        let mut bytes = 0usize;
+        for comps in per_party.iter() {
+            let m: Vec<u64> = comps.iter().map(|&c| (c as u64) & t_mask).collect();
+            let enc = s.encrypt_poly(&ck, &m);
+            bytes += adapter.ct_bytes(&enc);
+            sum = Some(match sum {
+                None => enc,
+                Some(acc) => s.add(&acc, &enc),
+            });
+        }
+        sleep_link(&profile, bytes, 1);
+        sum.expect("three parties")
     });
 
     let output = t.phase("decrypt", || {
-        back.iter()
-            .map(|ct| s.to_signed(adapter.decrypt(&ck, ct) & (s.params.t() - 1)))
+        let coeffs = s.decrypt_poly(&ck, &back);
+        (0..out_dim)
+            .map(|j| s.to_signed(coeffs[j] & t_mask))
             .collect::<Vec<i64>>()
     });
 
@@ -566,22 +840,27 @@ fn run_hybrid_ntru(data: &LayerData) -> StrategyReport {
         ok: output == data.expected,
         max_abs_error_vs_exact: max_err(&output, &data.expected),
         output,
+        comm: Some(comm),
         notes: vec![
             format!(
-                "SI-NTRU (LTV): n={}, q=2^{}, t=2^{} — see module docs for the \
+                "SI-NTRU (LTV): n={}, q=2^{}, t=2^{} (adaptive) — see module docs for the \
                  overstretched-regime security caveat",
                 s.params.n, s.params.log2_q, s.params.log2_t
             ),
-            "weights AND input encrypted; whole matvec = ONE ct×ct mult, decrypted under f²"
-                .into(),
-            "whole output vector switched to MPC in ONE masked decryption".into(),
+            format!(
+                "weights AND input encrypted; matvec = {} ct×ct mult(s) ({} rows/chunk), \
+                 f² decrypt",
+                chunks.len(),
+                rows_per_chunk
+            ),
+            "whole output switched to MPC in one masked decryption per chunk".into(),
         ],
     }
 }
 
-/// Harness-validation strategy: same pipeline as the hybrids, but on the
-/// plaintext mock FHE backend — instant, exercises every conversion.
-fn run_hybrid_mock(data: &LayerData) -> StrategyReport {
+/// Harness-validation strategy: the full hybrid pipeline (including the
+/// real-protocol MPC segment) on the plaintext mock FHE backend.
+fn run_hybrid_mock(data: &LayerData, profile: NetworkProfile) -> StrategyReport {
     let mut t = Timer::new();
     let f = MockFheBackend;
     let (ck, _) = f.keygen();
@@ -604,27 +883,11 @@ fn run_hybrid_mock(data: &LayerData) -> StrategyReport {
             })
             .collect::<Vec<_>>()
     });
-    let mut be = Aby3Backend::new();
     let adapter = IntFhe(&f);
-    let shares = t.phase("to-mpc", || {
-        pre.iter()
-            .map(|ct| fhe_to_mpc_share(&adapter, &ck, ct, &mut be, NBITS))
-            .collect::<Vec<_>>()
-    });
-    let relu = t.phase("relu", || {
-        shares
-            .iter()
-            .map(|s| mpc_relu(&mut be, s))
-            .collect::<Vec<_>>()
-    });
-    let back = t.phase("to-fhe", || {
-        relu.iter()
-            .map(|s| mpc_share_to_fhe(&mut be, s, &adapter, &ck))
-            .collect::<Vec<_>>()
-    });
+    let (back, comm) = hybrid_mpc_relu(&mut t, &adapter, &ck, &pre, NBITS, profile);
     let output = t.phase("decrypt", || {
         back.iter()
-            .map(|ct| to_signed(adapter.decrypt(&ck, ct)))
+            .map(|ct| to_signed_n(adapter.decrypt(&ck, ct), NBITS))
             .collect::<Vec<i64>>()
     });
     StrategyReport {
@@ -634,6 +897,7 @@ fn run_hybrid_mock(data: &LayerData) -> StrategyReport {
         ok: output == data.expected,
         max_abs_error_vs_exact: max_err(&output, &data.expected),
         output,
+        comm: Some(comm),
         notes: vec!["plaintext mock FHE — harness validation only".into()],
     }
 }
@@ -677,31 +941,40 @@ impl Strategy {
     }
 }
 
-pub fn run_strategy(s: Strategy, data: &LayerData, relu_iterations: u32) -> StrategyReport {
+pub fn run_strategy(
+    s: Strategy,
+    data: &LayerData,
+    relu_iterations: u32,
+    profile: NetworkProfile,
+) -> StrategyReport {
     match s {
-        Strategy::Mpc => run_mpc_only(data),
-        Strategy::Tfhe => run_tfhe_only(data),
-        Strategy::Ckks => run_ckks_only(data, relu_iterations),
-        Strategy::HybridTfhe => run_hybrid_tfhe(data),
-        Strategy::HybridCkks => run_hybrid_ckks(data),
-        Strategy::HybridNtru => run_hybrid_ntru(data),
-        Strategy::HybridMock => run_hybrid_mock(data),
+        Strategy::Mpc => run_mpc_only(data, profile),
+        Strategy::Tfhe => run_tfhe_only(data, profile),
+        Strategy::Ckks => run_ckks_only(data, relu_iterations, profile),
+        Strategy::HybridTfhe => run_hybrid_tfhe(data, profile),
+        Strategy::HybridCkks => run_hybrid_ckks(data, profile),
+        Strategy::HybridNtru => run_hybrid_ntru(data, profile),
+        Strategy::HybridMock => run_hybrid_mock(data, profile),
     }
 }
 
 const USAGE: &str = "usage: baru bench-hybrid-nn [options]
 
 One private dense layer (matvec + bias + ReLU) computed end-to-end under
-five strategies — pure ABY3 MPC, pure TFHE, pure CKKS (deep context,
-polynomial ReLU), and the two Gazelle-style hybrids that switch to MPC
-shares for the ReLU — each timed per phase and verified against the
-plaintext reference.
+six strategies — pure ABY3 MPC (real wire protocol, 3 party threads), pure
+TFHE, pure CKKS (deep context, polynomial ReLU), and the Gazelle-style
+hybrids (TFHE/CKKS/SI-NTRU linear, then a scheme switch to real-protocol
+ABY3 for the ReLU) — each timed per phase and verified against the
+plaintext reference. A network model injects latency/bandwidth into every
+MPC protocol message AND the FHE upload/download + conversion round trips.
 
 options:
   --in N               input dimension (default 8)
   --out M              output dimension (default 2)
-  --strategies LIST    comma-separated subset (default: all five real ones)
+  --strategies LIST    comma-separated subset (default: all except mock)
   --relu-iterations K  Newton iterations for the ckks strategy (default 2)
+  --rtt-ms N           round-trip latency between any two machines (default 0)
+  --bandwidth-mbps X   link bandwidth in Mbit/s (default: unlimited)
   --json               emit reports as JSON
 ";
 
@@ -720,6 +993,8 @@ pub fn run_cli(args: &[String]) -> Result<(), String> {
     let mut in_dim = 8usize;
     let mut out_dim = 2usize;
     let mut relu_iterations = 2u32;
+    let mut rtt_ms: u64 = 0;
+    let mut bandwidth_mbps: Option<f64> = None;
     let mut json = false;
     let mut strategies = vec![
         Strategy::Mpc,
@@ -762,6 +1037,23 @@ pub fn run_cli(args: &[String]) -> Result<(), String> {
                     .parse()
                     .map_err(|_| "--relu-iterations needs a non-negative integer".to_string())?;
             }
+            "--rtt-ms" => {
+                i += 1;
+                rtt_ms = args
+                    .get(i)
+                    .ok_or("--rtt-ms needs a value")?
+                    .parse()
+                    .map_err(|_| "--rtt-ms needs a non-negative integer".to_string())?;
+            }
+            "--bandwidth-mbps" => {
+                i += 1;
+                let v: f64 = args
+                    .get(i)
+                    .ok_or("--bandwidth-mbps needs a value")?
+                    .parse()
+                    .map_err(|_| "--bandwidth-mbps needs a number".to_string())?;
+                bandwidth_mbps = Some(v);
+            }
             "--strategies" => {
                 i += 1;
                 let list = args.get(i).ok_or("--strategies needs a value")?;
@@ -773,6 +1065,12 @@ pub fn run_cli(args: &[String]) -> Result<(), String> {
             other => return Err(format!("unknown option '{other}'\n{USAGE}")),
         }
         i += 1;
+    }
+
+    let mut profile =
+        NetworkProfile::fixed_latency(std::time::Duration::from_micros(rtt_ms * 500));
+    if let Some(mbps) = bandwidth_mbps {
+        profile = profile.with_bandwidth(mbps * 1e6 / 8.0);
     }
 
     if strategies.contains(&Strategy::Tfhe) || strategies.contains(&Strategy::HybridTfhe) {
@@ -790,24 +1088,35 @@ pub fn run_cli(args: &[String]) -> Result<(), String> {
 
     let data = make_layer(in_dim, out_dim);
     if !json {
-        println!("layer({in_dim}x{out_dim})  reference output: {:?}", data.expected);
-        println!("                 (pre-activation:   {:?})\n", data.pre);
+        println!(
+            "layer({in_dim}x{out_dim})  rtt={rtt_ms}ms  bandwidth={}  reference: {:?}",
+            bandwidth_mbps
+                .map(|b| format!("{b}Mbps"))
+                .unwrap_or_else(|| "unlimited".into()),
+            data.expected
+        );
+        println!("                 (pre-activation: {:?})\n", data.pre);
     }
 
     let mut reports = Vec::new();
     for &s in &strategies {
-        let r = run_strategy(s, &data, relu_iterations);
+        let r = run_strategy(s, &data, relu_iterations, profile);
         if !json {
             let phases: Vec<String> = r
                 .phases
                 .iter()
                 .map(|p| format!("{}={}", p.name, fmt_ms(p.micros)))
                 .collect();
+            let comm = r
+                .comm
+                .map(|c| format!("  comm[msgs={} bytes={}]", c.messages, c.bytes))
+                .unwrap_or_default();
             println!(
-                "{:<12} total={:<10} {}  {}",
+                "{:<12} total={:<10} {}{}  {}",
                 r.strategy,
                 fmt_ms((r.total_ms * 1000.0) as u128),
                 if r.ok { "✓" } else { "✗" },
+                comm,
                 phases.join(" ")
             );
             println!("             output: {:?}", r.output);
@@ -839,23 +1148,56 @@ mod tests {
     use super::*;
 
     #[test]
-    fn mpc_only_matches_plaintext() {
+    fn mpc_only_matches_plaintext_on_real_protocol() {
         let data = make_layer(6, 3);
-        let r = run_mpc_only(&data);
-        assert!(r.ok, "mpc output {:?} != expected {:?}", r.output, data.expected);
+        let r = run_mpc_only(&data, NetworkProfile::INSTANT);
+        assert!(
+            r.ok,
+            "mpc output {:?} != expected {:?}",
+            r.output, data.expected
+        );
         assert_eq!(r.max_abs_error_vs_exact, 0);
+        let comm = r.comm.expect("real protocol must report wire traffic");
+        assert!(comm.messages > 0, "real protocol must send messages");
     }
 
     #[test]
-    fn hybrid_mock_pipeline_matches_plaintext() {
-        // Validates the full FHE-linear -> to-mpc -> relu -> to-fhe pipeline
-        // without real-crypto cost.
+    fn hybrid_mock_pipeline_matches_plaintext_on_real_protocol() {
+        // Validates the full FHE-linear -> mask/open -> real-protocol
+        // import+relu+export -> re-encrypt pipeline without crypto cost.
         let data = make_layer(6, 3);
-        let r = run_hybrid_mock(&data);
+        let r = run_hybrid_mock(&data, NetworkProfile::INSTANT);
         assert!(
             r.ok,
             "hybrid-mock output {:?} != expected {:?}",
             r.output, data.expected
+        );
+        assert!(r.comm.expect("has an MPC segment").messages > 0);
+    }
+
+    #[test]
+    fn latency_profile_slows_the_mpc_segment_down() {
+        // The whole point of the network model: the same computation must
+        // get measurably slower when rounds cost something.
+        let data = make_layer(4, 1);
+        let fast = run_mpc_only(&data, NetworkProfile::INSTANT);
+        let slow = run_mpc_only(
+            &data,
+            NetworkProfile::fixed_latency(std::time::Duration::from_millis(2)),
+        );
+        assert!(
+            fast.ok && slow.ok,
+            "fast: {:?} slow: {:?} expected: {:?}",
+            fast.output,
+            slow.output,
+            data.expected
+        );
+        assert!(
+            slow.total_ms > fast.total_ms + 5.0,
+            "2ms one-way latency must visibly slow a multi-round protocol: \
+             fast={:.1}ms slow={:.1}ms",
+            fast.total_ms,
+            slow.total_ms
         );
     }
 
@@ -863,7 +1205,7 @@ mod tests {
     #[ignore] // slow in debug (n=2048 schoolbook ring); fast in release
     fn hybrid_ntru_matches_plaintext() {
         let data = make_layer(8, 2);
-        let r = run_hybrid_ntru(&data);
+        let r = run_hybrid_ntru(&data, NetworkProfile::INSTANT);
         assert!(
             r.ok,
             "hybrid-ntru output {:?} != expected {:?}",
@@ -873,10 +1215,25 @@ mod tests {
     }
 
     #[test]
+    #[ignore] // slow in debug (n=2048 schoolbook ring); fast in release
+    fn hybrid_ntru_chunked_large_layer_matches_plaintext() {
+        // (out+1)*in = 21*128 > 2048 forces multi-chunk packing, and the
+        // 128-input pre-activations force the adaptive t above 2^20.
+        let data = make_layer(128, 20);
+        let r = run_hybrid_ntru(&data, NetworkProfile::INSTANT);
+        assert!(
+            r.ok,
+            "chunked hybrid-ntru output {:?} != expected {:?}",
+            r.output, data.expected
+        );
+        assert_eq!(r.max_abs_error_vs_exact, 0, "hybrid must be exact");
+    }
+
+    #[test]
     #[ignore] // slow: real SEAL keygen (~seconds)
     fn hybrid_ckks_matches_plaintext() {
         let data = make_layer(8, 2);
-        let r = run_hybrid_ckks(&data);
+        let r = run_hybrid_ckks(&data, NetworkProfile::INSTANT);
         assert!(
             r.ok,
             "hybrid-ckks output {:?} != expected {:?}",

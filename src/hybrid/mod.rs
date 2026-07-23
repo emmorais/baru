@@ -110,6 +110,9 @@ pub trait FheAdapter {
     fn decrypt(&self, client_key: &[u8], ct: &Self::Ct) -> u64;
     fn add(&self, a: &Self::Ct, b: &Self::Ct) -> Self::Ct;
     fn backend_id(&self) -> &'static str;
+    /// Serialized size of one ciphertext — what a conversion actually puts
+    /// on the wire (used by benchmark link-cost models).
+    fn ct_bytes(&self, ct: &Self::Ct) -> usize;
 }
 
 /// Adapter over any integer [`FheBackend`] (mock, TFHE, future backends).
@@ -128,6 +131,9 @@ impl<F: FheBackend> FheAdapter for IntFhe<'_, F> {
     }
     fn backend_id(&self) -> &'static str {
         self.0.backend_id()
+    }
+    fn ct_bytes(&self, ct: &F::Ct) -> usize {
+        self.0.serialize_ct(ct).len()
     }
 }
 
@@ -160,6 +166,9 @@ impl<B: RealFheBackend> FheAdapter for RealFhe<'_, B> {
     }
     fn backend_id(&self) -> &'static str {
         self.0.backend_id()
+    }
+    fn ct_bytes(&self, ct: &B::Ct) -> usize {
+        self.0.serialize_ct(ct).len()
     }
 }
 

@@ -217,6 +217,12 @@ impl Backend for Aby3Backend {
     // The in-process simulator holds all three parties' components directly,
     // so export/import are trivial projections to/from `Share3`.
 
+    fn share_public(&mut self, value: Fr, nbits: usize) -> ShareRef {
+        // Whole value in the first component; the in-process reveal sums the
+        // three components, so this reconstructs to `value`.
+        self.store(Share3(value, 0, 0), nbits, 0)
+    }
+
     fn export_additive(&mut self, a: &ShareRef) -> Vec<Fr> {
         let s = self.get_cloned(a);
         vec![s.0, s.1, s.2]

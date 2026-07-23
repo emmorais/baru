@@ -39,6 +39,12 @@ fn main() -> Result<(), Box<dyn Error>> {
     if args.first().map(String::as_str) == Some("bench-hybrid-nn") {
         return baru::bench::hybrid_nn::run_cli(&args[1..]).map_err(|e| e.into());
     }
+    if args.first().map(String::as_str) == Some("demo-private-mnist") {
+        return baru::demo::run_cli(&args[1..]).map_err(|e| e.into());
+    }
+    if args.first().map(String::as_str) == Some("bench-deep-nn") {
+        return baru::bench::deep_nn::run_cli(&args[1..]).map_err(|e| e.into());
+    }
 
     let participants: Vec<Participant> = (0..3).map(Participant::new).collect();
 

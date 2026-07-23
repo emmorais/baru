@@ -553,6 +553,10 @@ impl crate::hybrid::FheAdapter for SiNtruAdapter<'_> {
     fn backend_id(&self) -> &'static str {
         "si-ntru"
     }
+    fn ct_bytes(&self, ct: &NtruCt) -> usize {
+        // n coefficients × 16 bytes + the key-power tag.
+        ct.poly.len() * 16 + 4
+    }
 }
 
 /// Polynomial-level FHE→MPC conversion: ONE mask-and-open turns every

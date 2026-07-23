@@ -28,3 +28,7 @@ pub mod precompile;
 pub mod ml;
 
 pub mod hybrid;
+
+pub mod gadgets;
+
+pub mod demo;

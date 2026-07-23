@@ -146,6 +146,20 @@ pub trait Backend: Send + Sync {
     fn shift_right(&mut self, a: &ShareRef, n: usize) -> ShareRef;
     fn shift_left(&mut self, a: &ShareRef, n: usize) -> ShareRef;
 
+    /// Inject a value that is **public** (known identically to every party)
+    /// as a share, with no communication. Every party can do this locally
+    /// because it knows its own party id — the canonical construction
+    /// assigns the whole value to party 0's component and zero to the rest
+    /// (their wrapping sum is the value). Needed by gadgets that select on
+    /// public constants (e.g. class indices in `crate::gadgets::argmax`).
+    ///
+    /// Default panics; the real MPC backends (`Aby3Backend`,
+    /// `TransportBackend`) implement it.
+    fn share_public(&mut self, value: Fr, nbits: usize) -> ShareRef {
+        let _ = (value, nbits);
+        panic!("share_public: this MPC backend does not support public-constant injection")
+    }
+
     // ── Scheme switching (MPC <-> FHE, see `crate::hybrid`) ─────────────────
     //
     // These two methods are the MPC half of the generic conversion interface:

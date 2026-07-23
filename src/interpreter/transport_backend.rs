@@ -67,6 +67,24 @@ impl<T: Transport> TransportBackend<T> {
     fn get_cloned(&self, sr: &ShareRef) -> PartyShare {
         self.get(sr).clone()
     }
+
+    /// This party's canonical additive component of `a`: in the replicated
+    /// layout party i holds `(s_i, s_{i+1})`, so each party contributing its
+    /// `left` yields the three distinct components whose wrapping sum is the
+    /// secret — the per-party half of an MPC→FHE scheme switch
+    /// (`crate::hybrid`), with no communication at all. This is
+    /// deliberately NOT `Backend::export_additive`: that trait method's
+    /// contract is "return ALL components" (satisfiable only by an
+    /// in-process simulator); a real party can only ever produce its own.
+    pub fn my_additive_component(&self, a: &ShareRef) -> Fr {
+        self.get(a).left
+    }
+
+    fn store_public(&mut self, value: Fr, nbits: usize) -> ShareRef {
+        let id = self.alloc_id();
+        let ps = crate::crypto::aby3_protocol::share_public(value, self.me);
+        self.store(id, ps, nbits, 0)
+    }
 }
 
 impl<T: Transport + 'static> Backend for TransportBackend<T> {
@@ -262,6 +280,10 @@ impl<T: Transport + 'static> Backend for TransportBackend<T> {
     fn reset_per_expression(&mut self) {
         self.shares.clear();
         self.next_id = 1;
+    }
+
+    fn share_public(&mut self, value: Fr, nbits: usize) -> ShareRef {
+        self.store_public(value, nbits)
     }
 
     fn and(&mut self, a: &ShareRef, b: &ShareRef) -> ShareRef {

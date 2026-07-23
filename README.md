@@ -665,72 +665,225 @@ Kirchner–Fouque 2017; Ducas–van Woerden's fatigue point is near
 FHE. This backend is a research/benchmarking artifact for the depth-1
 no-bootstrapping design point — not production key material.
 
-### Measured: one private dense layer, five ways (`baru bench-hybrid-nn`)
+### Measured: one private dense layer, six ways (`baru bench-hybrid-nn`)
 
 The same layer — `matvec(8×2) + bias + ReLU`, inputs spanning both signs —
-computed end-to-end under five strategies and verified against the
-plaintext reference (this machine, release build):
+computed end-to-end under six strategies and verified against the
+plaintext reference (this machine, release build).
+
+**The MPC is the real protocol, and the network is modeled.** Every MPC
+segment — the pure strategy, the hybrids' ReLU, and both scheme-switch
+directions — runs the genuine replicated 3-party ABY3 **wire protocol**
+(`TransportBackend`, three party threads exchanging serialized messages),
+not the in-process `Aby3Backend` simulator, whose algorithms differ from
+the distributed protocol (its share multiplication reconstructs and
+reshares locally — free and insecure) and which understated the pure-MPC
+row by ~2.7× (6.7 ms simulated vs **18 ms** real-protocol). A
+`--rtt-ms`/`--bandwidth-mbps` network model injects latency into every
+protocol message *and* into the FHE upload/download and conversion round
+trips, so parties can be "moved" from one rack to different continents
+without deploying anything. (Building this exposed a real harness bug:
+the old per-message latency timers could reorder back-to-back messages,
+corrupting the protocol — the model now preserves per-connection FIFO like
+a real TCP stream, with a regression test.)
 
 ```sh
-./target/release/baru bench-hybrid-nn        # --in/--out/--strategies to vary
+./target/release/baru bench-hybrid-nn                 # rtt=0
+./target/release/baru bench-hybrid-nn --rtt-ms 20     # same computation, WAN rounds
 ```
 
-| strategy | total | linear | ReLU | correct? |
-|---|---|---|---|---|
-| **mpc** (pure ABY3, weights *also* private) | **6.7 ms** | 5.8 ms | 0.7 ms | ✓ exact |
-| **hybrid-ntru** (SI-NTRU linear → ABY3 ReLU, weights *also* encrypted) | **179 ms** | 33 ms (one ct×ct mult) | 1.1 ms (+80 ms switching) | ✓ exact |
-| **hybrid-ckks** (CKKS linear → ABY3 ReLU) | 8.3 s | 2.5 s | 1.1 ms (+1.4 s switching) | ✓ exact |
-| **tfhe** (pure TFHE, PBS ReLU) | 69.6 s | 66.7 s | 1.9 s | ✓ exact |
-| **hybrid-tfhe** (TFHE linear → ABY3 ReLU) | 73.7 s | 66.9 s | 0.9 ms (+5.6 s switching) | ✓ exact |
-| **ckks** (pure deep CKKS, polynomial ReLU) | 72.6 s | 9.5 s | 17.0 s | ✗ off by 282 vs exact¹ |
+At `rtt=0` (all parties co-located):
 
-And at `layer(64×8)` the gap *widens*: hybrid-ntru **351 ms** vs
-hybrid-ckks **20.3 s** — **58×** — because both of NTRU's expensive steps
-are flat in the output size (the whole matvec stays ONE multiplication via
-packing, ~32 ms; the whole output vector crosses to MPC in ONE masked
-decryption, ~35 ms), while CKKS pays per row (`dot_plain` ×8 → 9.9 s) and
-per scalar in conversion (3.4 s). At that shape hybrid-ntru sits within 3×
-of pure MPC — while keeping FHE's send-and-evaluate deployment shape and
-encrypting the weights (which the CKKS/TFHE rows do not).
+| strategy | total | linear | MPC segment | wire (MPC) | correct? |
+|---|---|---|---|---|---|
+| **mpc** (pure ABY3, weights *also* private) | **18 ms** | 4.4 ms | relu 10.1 ms | 136 msgs / 8.1 KB | ✓ exact |
+| **hybrid-ntru** (SI-NTRU linear → ABY3 ReLU, weights *also* encrypted) | **200 ms** | 35 ms (one ct×ct mult) | 17 ms (+80 ms switch) | 32 msgs / 1.1 KB | ✓ exact |
+| **hybrid-ckks** (CKKS linear → ABY3 ReLU) | 8.9 s | 2.6 s | 18 ms (+1.6 s switch) | 32 msgs / 1.1 KB | ✓ exact |
+| **tfhe** (pure TFHE, PBS ReLU) | 67.8 s | 64.9 s | — | — | ✓ exact |
+| **hybrid-tfhe** (TFHE linear → ABY3 ReLU) | 74.5 s | 67.5 s | 20 ms (+5.8 s switch) | 32 msgs / 1.1 KB | ✓ exact |
+| **ckks** (pure deep CKKS, polynomial ReLU) | 75.0 s | 9.5 s | — | — | ✗ off by 282 vs exact¹ |
+
+And the latency sweep (mpc / hybrid-ntru / hybrid-ckks, layer 8×2):
+
+| network | mpc | hybrid-ntru | hybrid-ckks |
+|---|---|---|---|
+| rtt = 0 | 18 ms | 200 ms | 8.9 s |
+| rtt = 20 ms | 120 ms | 375 ms | 8.9 s |
+| rtt = 100 ms, 100 Mbps | 520 ms | 1.10 s | 9.6 s |
 
 ¹ The pure-CKKS output matches its own plain-`f64` Newton-approximation
 reference (the crypto is correct) but deviates 282 from the exact ReLU on
-the negative pre-activation (−818 at bound 5820, ratio 0.14 — squarely in
-the documented slow-near-zero regime at 2 iterations). More iterations
-shrink it, at more levels/keygen/time.
+the negative pre-activation (−818 at bound 5820 — the documented
+slow-near-zero regime at 2 iterations).
 
-What the table says:
+What the numbers say:
 
+- **Under latency, MPC cost is rounds × RTT — and ABY3's batched matvec
+  is remarkably round-cheap.** At 100 ms RTT the whole fully-private layer
+  is ~5 round trips (520 ms): the batched-Beaver matvec collapses to ~1
+  round regardless of shape, and the sequential per-element ReLU is what
+  stacks rounds. This is precisely the structure an in-process simulator
+  cannot show.
+- **The hybrids pay the same ReLU rounds plus ~1.5 conversion RTTs**, so
+  scheme switching does not beat pure MPC on *latency* at these shapes —
+  its win is elsewhere: deployment shape (client sends ciphertexts and
+  leaves; only the tiny nonlinear segment needs live parties) and wire
+  footprint. At `layer(64×8), rtt=20ms` pure MPC moved **2,452 messages /
+  200 KB** between parties (weights are shared!) vs the NTRU hybrid's
+  **128 messages / 4.4 KB** — 19× fewer messages, 46× fewer bytes —
+  because the bytes-heavy linear phase lives in FHE where it crosses the
+  wire once as ciphertext.
 - **Depth-1 FHE + MPC ReLU is the winning hybrid, and SI-NTRU is its
-  cheapest depth-1 engine.** 46× faster than hybrid-CKKS at 8×2 (58× at
-  64×8): no evaluation keys to generate (keygen 36 ms vs CKKS's 4.2 s),
-  one multiplication for the whole matvec instead of one rotation-tree per
-  row, one masked decryption for the whole output vector — because the
-  scheme never needs to *continue* computing on the product, decrypting
-  under f² replaces relinearization outright, and the MPC side absorbs
-  everything nonlinear. (Subject to the overstretched-regime security
-  caveat above — this is a research design point, not a production
-  deployment.)
-- **Scheme switching rescues CKKS entirely.** Pure CKKS needs a
-  degree-32768, 10-level context (37 s keygen) and still gives an
-  *approximate* ReLU costing 8.5 s/element. Hybrid-CKKS keeps the cheap
-  shallow SIMD context (whole input = one ciphertext, `dot_plain`), does
-  the ReLU **exactly** under MPC in ~0.5 ms/element, and finishes 8.7×
-  faster with zero error. Per-element ReLU: MPC is ~25,000× faster than
-  CKKS's polynomial and ~2,700× faster than TFHE's PBS.
-- **Switching is not free, and doesn't always pay: hybrid-TFHE's honest
-  result.** TFHE's bottleneck is the *linear* phase (66.9 s — scheme
-  switching can't fix what stays in-scheme), and the conversion round-trip
-  (~2.8 s/element: masks must themselves be TFHE-encrypted and added)
-  costs *more* than TFHE's native 0.95 s/element PBS ReLU. Hybrid-TFHE
-  earns its keep only when the switched-out section replaces *many*
-  expensive FHE ops (deep nonlinear blocks — maxpool, argmax, whole
-  MPC-side subnetworks), not a single comparison.
-- **Pure MPC remains 1,000× ahead of everything FHE** when interactivity
-  is acceptable — with *stronger* privacy in this table (its weights are
-  shared too; the FHE rows use public weights). FHE's value is the
-  non-interactive/outsourced setting, and there, hybrid-CKKS is the
-  configuration to beat.
+  cheapest depth-1 engine** at every network profile (~9–44× faster than
+  hybrid-CKKS): no evaluation keys (keygen 36 ms vs CKKS's 4.2 s), one
+  multiplication for the whole matvec, one masked decryption for the whole
+  output switch — decrypting under f² replaces relinearization outright.
+  (Subject to the overstretched-regime security caveat above.)
+
+### When does the hybrid beat pure MPC? Large params, few ReLUs, thin pipes
+
+The hypothesis: small layers can't justify the hybrid (its scheme-switch
+floor dominates), but a *large* linear layer with *few* ReLUs should flip
+the comparison, because pure MPC's wire cost grows with the parameter
+count (every weight is secret-shared, every multiplication moves
+Beaver-triple traffic — measured: **~400 B/parameter**) while the hybrid's
+MPC segment stays tiny and its FHE bytes grow ~2.5× slower. Measured
+(hybrid-ntru extended with chunked packing — one ct×ct mult per
+`n/in − 1` weight rows against the same encrypted input — an adaptive
+plaintext modulus sized to the activation range, and a packed return
+switch: each party encrypts ALL its output components in one polynomial,
+so the MPC→FHE leg is 3 ciphertexts flat):
+
+| shape (params) | network | mpc | hybrid-ntru | winner |
+|---|---|---|---|---|
+| 8×2 (16) | 20 ms / 10 Mbps | **121 ms** | 431 ms | mpc |
+| 512×4 (2 K) | 20 ms / 10 Mbps | **815 ms** | 1.24 s | mpc |
+| 1024×4 (4 K) | 20 ms / 10 Mbps | 1.41 s | **1.30 s** | hybrid |
+| 1024×8 (8 K) | 20 ms / 10 Mbps | 2.71 s | **2.35 s** | hybrid |
+| 1024×16 (16 K) | 20 ms / 10 Mbps | 5.31 s | **4.43 s** | hybrid (and growing) |
+| 1024×16 (16 K) | 20 ms / 50 Mbps | **1.68 s** | 2.82 s | mpc |
+
+Wire traffic at 1024×16: pure MPC moved **69,924 messages / 6.2 MB**
+between parties; the hybrid's MPC segment moved **256 messages / 8.7 KB**
+(the rest crosses once as ciphertexts). So the crossover is real and sits
+where predicted — parameters ≳ 4 K with few outputs — but it is
+**bandwidth-gated**: at 50 Mbps the same 16 K-parameter layer flips back
+to MPC, because 6.2 MB simply stops hurting. (Finding this required
+fixing the harness's bandwidth model to serialize bulk transfers
+cumulatively, like a real pipe — the old per-message model undercharged
+exactly the byte-heavy phases this experiment is about, and there is a
+regression test pinning the corrected behavior.) The hybrid's remaining
+floor is its ReLU segment (~2× pure MPC's relu rounds, since the share
+import adds a round per component) — which is why the regime is "few
+ReLUs" specifically: the linear phase is where the hybrid wins, and the
+nonlinearity is where it still pays MPC prices plus conversion round
+trips.
+- **Scheme switching still rescues CKKS entirely** (exact ReLU in
+  milliseconds vs an approximate one costing 8.5 s/element in a
+  degree-32768 context), and **hybrid-TFHE's honest negative result
+  stands**: TFHE's linear phase (67.5 s) dominates and the conversion
+  costs more than its native PBS ReLU — switching pays only when it
+  replaces *many* FHE ops, not one comparison.
+
+---
+
+## The headline: deep private inference with ZERO bootstrapping (`baru bench-deep-nn`)
+
+This is the result the whole stack was built toward, and the basis of the
+paper outline in [`docs/paper-outline.md`](docs/paper-outline.md).
+
+**The claim.** In the hybrid pipeline, the scheme switch that computes each
+ReLU *also refreshes the ciphertext*: the switch-back re-encrypts from
+scratch ([`shares_to_fhe`](src/hybrid/mod.rs) → `key_pow = 1`, fresh noise),
+so **the FHE noise budget resets at every layer boundary**. The MPC round
+trip *is* an interactive functional bootstrap. Therefore a network of
+**arbitrary depth** runs with **zero FHE bootstraps**, cost **linear in
+depth**, using an FHE engine (SI-NTRU) that supports only a *single*
+multiplication. A leveled-FHE competitor (CKKS/BGV) must bootstrap every
+few layers or exhaust its modulus chain; we never bootstrap.
+
+**Measured** (this machine, deep fully-connected ReLU net, width 16,
+weights *and* activations encrypted, real ABY3 protocol, exact integer
+fixed-point):
+
+```sh
+./target/release/baru bench-deep-nn --depths 2,4,8,16,32 --width 16
+```
+
+| depth | exact? | total | fhe | switch | mpc | msgs | bytes | our bootstraps | CKKS-competitor bootstraps |
+|---|---|---|---|---|---|---|---|---|---|
+| 2  | ✓ | 0.55 s | 80 ms | 119 ms | 298 ms | 768 | 24 KB | **0** | 0 |
+| 4  | ✓ | 1.09 s | 153 ms | 232 ms | 653 ms | 1,536 | 49 KB | **0** | 1 |
+| 8  | ✓ | 2.31 s | 304 ms | 471 ms | 1.49 s | 3,072 | 98 KB | **0** | 3 |
+| 16 | ✓ | 4.40 s | 598 ms | 986 ms | 2.76 s | 6,144 | 197 KB | **0** | 7 |
+| 32 | ✓ | 8.76 s | 1.18 s | 2.07 s | 5.46 s | 12,288 | 393 KB | **0** | 15 |
+
+Every row is **bit-exact** against the plaintext integer network (if noise
+accumulated, deep outputs would diverge — they don't, which is the
+empirical proof of the noise-reset invariant). Total time, messages, and
+bytes are all **perfectly linear in depth** (2→32 is 16×; total 0.55→8.76 s
+is 16.0×). Our bootstrap count is a flat **0**; the competitor's grows
+∝ depth.
+
+The competitor column is not fabricated: it uses *our own measured*
+per-ReLU level cost from `bench-ckks-compare`
+(`CkksCompareBackend::levels_for_relu` = 9 levels at 2 iterations, + 1 for
+the linear map = 10 levels/layer), with a stated conservative 20
+levels-recovered-per-bootstrap assumption — `⌈(10·L − 20)/20⌉` → 0, 1, 3,
+7, 15. The *shape* (∝ depth vs flat 0) is the point, and each CKKS
+bootstrap costs seconds in a degree-32768 context (see the CKKS section
+above). Everything is `--json`-emittable and reproducible; nothing is
+hand-entered.
+
+Two design choices make deep chains work (both documented in
+`src/bench/deep_nn.rs`): a **fused ReLU∘rescale** (`a' = ReLU((W·a + β≪s)≫s)`
+from one `a2b`, keeping fixed-point magnitude bounded at any depth), and
+**per-layer independent MPC sessions** whose only carried state is the
+scheme-switch ciphertext — i.e. the interactive bootstrap made concrete.
+
+### Composable gadget library: arbitrary private CNNs, secure by construction (`src/gadgets/`)
+
+The depth result above is about *chaining* — and the point of chaining is
+composition. `src/gadgets/` is a small library of MPC building blocks, each
+a pure function of the oblivious primitives (`add`/`sub`/`mul`/`lt`/
+`share_public`): `relu`, `max2`/`max_reduce`/`maxpool2d`, `argmax`,
+`dense`, `conv2d`. Every one ships with a plaintext reference and is tested
+for **bit-exact** equality, not approximation.
+
+Why this matters for the paper (see [`docs/paper-outline.md`](docs/paper-outline.md)
+§5b): Baru is effectively an **Arithmetic Black Box** — it manipulates
+secrets only through opaque handles and a fixed primitive set, never
+inspecting the representation. So if each primitive UC-realizes its ideal
+operation, each gadget does too (UC composition), and **any network
+composed from these gadgets is secure and correct by construction** — no
+per-architecture proof. The research question becomes "which architecture is
+*fastest*," not "is this one secure."
+
+As evidence the composition is semantically exact, not just type-correct,
+the library includes an end-to-end LeNet-shaped classifier —
+`conv → relu → maxpool → flatten → dense → relu → dense → argmax` — that
+runs entirely through the gadgets, matches its plaintext reference
+bit-for-bit, and reveals **only the class index** (`argmax` is the escape
+from the transformer softmax wall: a CNN *classifier* needs argmax over
+logits, never `exp`/division). Adding channels, conv blocks, or residual
+connections needs no new security argument. Convolution here is the
+correctness/composition form (direct MACs / im2col-matvec); the efficient
+FHE conv *packing* for CIFAR-scale speed is the noted remaining
+crypto-engineering step.
+
+### Flagship demo: private MNIST, encrypted model *and* image (`baru demo-private-mnist`)
+
+The audience-facing version. A handwritten digit (real MNIST sample) and a
+trained discriminator are **both encrypted**; the 784-pixel dot product is
+**one** SI-NTRU ciphertext×ciphertext multiplication (decrypted under f² —
+no bootstrapping, no evaluation keys); the class decision is a real 3-party
+ABY3 threshold comparison that reveals **only the final bit**. Nobody —
+not the evaluator, not the MPC parties, not even the client — ever sees the
+score, only the predicted digit. (This is the leak the reference `hom-ham`
+iris pipeline has — `DecryptMul` reveals the raw distance — closed by
+thresholding under MPC.) Encrypting the *model* is a strictly stronger
+privacy setting than Gazelle/Delphi/Cheetah, whose server holds the model
+in plaintext.
 
 ---
 
@@ -860,9 +1013,20 @@ src/
   hybrid/
     mod.rs          — MPC <-> FHE scheme switching (share->fhe, fhe->share,
                        mpc_reencrypt as a bootstrapping alternative)
+  gadgets/
+    mod.rs          — composable MPC gadget library: relu, max/maxpool2d,
+                       argmax, dense, conv2d (UC-composable building blocks)
   bench/
     hybrid_nn.rs    — `baru bench-hybrid-nn`: one private dense layer under
-                       mpc / tfhe / ckks / hybrid-tfhe / hybrid-ckks
+                       mpc / tfhe / ckks / hybrid-tfhe / hybrid-ckks / hybrid-ntru
+    deep_nn.rs      — `baru bench-deep-nn`: deep (L-layer) private inference,
+                       ZERO FHE bootstraps, cost linear in depth
+  demo/
+    mod.rs          — `baru demo-private-mnist`: encrypted image × encrypted
+                       model → MPC threshold → only the class bit revealed
+docs/
+  paper-outline.md  — publication framing: claims, proof sketch, security
+                       model, related work, experiments, limitations
 tests/
   features.rs       — unit/integration tests for the interpreter + MPC
   tcp_integration.rs — spawns 3 tcp_party processes over TCP
