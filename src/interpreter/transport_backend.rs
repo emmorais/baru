@@ -48,6 +48,15 @@ impl<T: Transport> TransportBackend<T> {
         id
     }
 
+    /// Reserve `n` consecutive operation ids, returning the base. Sub-protocols
+    /// that run several communication rounds derive their ids from this block
+    /// so they cannot collide with other operations.
+    fn alloc_block(&mut self, n: u64) -> u64 {
+        let id = self.next_id;
+        self.next_id += n;
+        id
+    }
+
     fn store(&mut self, id: u64, ps: PartyShare, nbits: usize, owner: usize) -> ShareRef {
         self.shares.insert(id, ps);
         ShareRef {
@@ -241,7 +250,9 @@ impl<T: Transport + 'static> Backend for TransportBackend<T> {
 
     fn a2b(&mut self, a: &ShareRef, nbits: usize) -> Vec<ShareRef> {
         let pa = self.get_cloned(a);
-        let op_id = self.alloc_id();
+        // Reserve a block: the bit decomposition runs ~9 batched
+        // multiplication rounds internally, each consuming two ids.
+        let op_id = self.alloc_block(crate::crypto::aby3_protocol::A2B_ID_BLOCK);
         let bit_shares =
             crate::crypto::aby3_protocol::a2b_party(&pa, nbits, op_id, self.me, &self.mailbox);
         bit_shares

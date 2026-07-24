@@ -3,6 +3,15 @@
 //! (ReLU, max-pool, argmax), **zero FHE bootstraps**, verified bit-exact
 //! against the plaintext reference, with a real cost measurement.
 //!
+//! The FHE side is **BFV at RLWE-secure parameters** (n=4096, q=2^100, at or
+//! below the ~109-bit ceiling for n=4096 at the 128-bit security level).
+//! This benchmark previously ran on SI-NTRU, which our own analysis shows is
+//! *not* secure at the parameters this construction needs — not even at
+//! depth 1, where the fatigue point sits around 2^59 (adjusted) against a
+//! required q ≳ 2^84. See the security note in `crate::fhe::si_ntru`. BFV
+//! supports the identical no-relinearization trick (multiply, then decrypt
+//! the degree-2 result under s^2), so the construction transfers unchanged.
+//!
 //! Architecture (a compact LeNet-shaped classifier):
 //!   input 1×D×D  →  conv(OC, 3×3, s1)  →  ReLU∘rescale  →  maxpool(2×2, s2)
 //!               →  flatten  →  dense(→ NCLASSES)  →  argmax  →  class bit
@@ -30,9 +39,10 @@
 //!   synthetic values (a cost/correctness microbenchmark, standard for this
 //!   line of work), not a trained classifier.
 //! - Conv packing needs `2·in_c·H·W ≲ n`, so a full 28×28 MNIST image runs
-//!   comfortably at `n = 2048`. Multi-channel CIFAR (3×32×32) exceeds that
-//!   and needs the channels split across ciphertexts (or a larger ring) —
-//!   a packing question, not a limit of the no-bootstrap construction.
+//!   comfortably at `n = 4096` (it needs degree 841). Multi-channel CIFAR
+//!   (3×32×32) needs 5185 and so must split channels across ciphertexts (or
+//!   move to n=8192) — a packing question, not a limit of the no-bootstrap
+//!   construction.
 //! - With conv packing the FHE cost is nearly **flat in D** (it is `OC`
 //!   multiplications regardless), so the bottleneck moves decisively to the
 //!   MPC nonlinearities: at D=28 the ~1352 ReLUs and the max-pool
@@ -49,9 +59,8 @@ use crate::bench::comm::{CommStats, NetworkProfile};
 use crate::bench::hybrid_nn::{run_parties, sleep_link, MpcTransport};
 use crate::crypto::types::Fr;
 use crate::fhe::conv_pack::{self, ConvShape};
-use crate::fhe::si_ntru::{NtruCt, SiNtru, SiNtruAdapter, SiNtruParams};
+use crate::fhe::bfv::{Bfv, BfvCt, BfvParams};
 use crate::gadgets::{argmax, maxpool2d, Chw};
-use crate::hybrid::FheAdapter;
 use crate::interpreter::backend::{Backend, ShareRef};
 use crate::interpreter::transport_backend::TransportBackend;
 
@@ -85,12 +94,6 @@ impl CnnModel {
         let ph = oh / POOL;
         let flat = OC * ph * ph;
         let shift = 6;
-        // SI-NTRU's proven depth-1 noise budget sits at log2_t = 20 (the
-        // `DEFAULT` params); all intermediates here fit in ~2^14, so 20 is
-        // ample and stays well inside the budget for the packed 2048-degree
-        // product. (Raising it shrinks Δ/2 and overflows the noise — the
-        // first symptom is a garbage matvec.)
-        let nbits = 20;
 
         let mut rng = StdRng::seed_from_u64(seed);
         let kernels = (0..OC)
@@ -103,20 +106,32 @@ impl CnnModel {
         let dense_b = (0..NCLASSES).map(|_| rng.gen_range(-16i64..=16)).collect();
         let input: Vec<i64> = (0..d * d).map(|_| rng.gen_range(0i64..64)).collect();
 
-        (
-            CnnModel {
-                d,
-                kernels,
-                cbias,
-                dense_w,
-                dense_b,
-                shift,
-                nbits,
-                conv_shape: Chw { c: OC, h: oh, w: oh },
-                pool_shape: Chw { c: OC, h: ph, w: ph },
-            },
-            input,
-        )
+        let mut model = CnnModel {
+            d,
+            kernels,
+            cbias,
+            dense_w,
+            dense_b,
+            shift,
+            nbits: 20, // provisional; calibrated below
+            conv_shape: Chw { c: OC, h: oh, w: oh },
+            pool_shape: Chw { c: OC, h: ph, w: ph },
+        };
+        // Size the plaintext modulus `t = 2^nbits` from the **measured**
+        // activation range rather than a hardcoded width. `forward` is pure
+        // integer arithmetic and does not read `nbits`, so calibrating from
+        // it is sound. A fixed `t` is a real correctness hazard: too small
+        // and a dot product silently wraps the modulus, giving wrong (not
+        // merely noisy) results — the same bug that bit `bench-hybrid-nn` at
+        // in_dim=784.
+        let (_, max_abs) = model.forward(&input);
+        let needed = (64 - (max_abs.max(1) as u64).leading_zeros() as usize) + 2;
+        assert!(
+            needed <= 30,
+            "cnn: activations need 2^{needed}, past the depth-1 noise budget              (log2_t ≤ 30 at n=4096, q=2^100); lower `shift` or the weight range"
+        );
+        model.nbits = needed.max(20);
+        (model, input)
     }
 
     fn conv_dot(&self, input: &[i64], oc: usize, oy: usize, ox: usize) -> i64 {
@@ -173,9 +188,9 @@ impl CnnModel {
 /// three per-output masks (so the MPC side can reconstruct the raw share).
 #[allow(clippy::type_complexity)]
 fn hybrid_matvec_open(
-    s: &SiNtru,
+    s: &Bfv,
     ck: &[u8],
-    c_input: &NtruCt,
+    c_input: &BfvCt,
     weights: &[Vec<i64>],
     in_dim: usize,
     profile: NetworkProfile,
@@ -183,14 +198,15 @@ fn hybrid_matvec_open(
 ) -> (Vec<u64>, Vec<[u64; 3]>) {
     let n = s.params.n;
     let t_mask = s.params.t() - 1;
-    let adapter = SiNtruAdapter(s);
     let rows_per_chunk = (n / in_dim).saturating_sub(1).max(1);
+    // The input's forward NTT is computed once and reused across chunks.
+    let cxt = s.transform(c_input);
 
     let mut opened = Vec::with_capacity(weights.len());
     let mut masks = Vec::with_capacity(weights.len());
     for chunk in weights.chunks(rows_per_chunk) {
         let cw = s.encrypt_poly(ck, &s.pack_weights(chunk));
-        let prod = s.mul(c_input, &cw);
+        let prod = s.mul_pre(&cxt, &cw);
         let chunk_masks: Vec<Vec<u64>> = (0..3)
             .map(|_| (0..n).map(|_| rng.gen::<u64>() & t_mask).collect())
             .collect();
@@ -198,7 +214,7 @@ fn hybrid_matvec_open(
         let mut masked = prod;
         for m in &chunk_masks {
             let enc = s.encrypt_poly(ck, m);
-            conv_bytes += adapter.ct_bytes(&enc);
+            conv_bytes += s.ct_bytes(&enc);
             masked = s.add(&masked, &enc);
         }
         let y = s.decrypt_poly(ck, &masked);
@@ -218,16 +234,15 @@ fn hybrid_matvec_open(
 /// the same layout the MPC stage and the plaintext reference use.
 #[allow(clippy::type_complexity)]
 fn hybrid_conv_open(
-    s: &SiNtru,
+    s: &Bfv,
     ck: &[u8],
-    c_input: &NtruCt,
+    c_input: &BfvCt,
     model: &CnnModel,
     profile: NetworkProfile,
     rng: &mut impl Rng,
 ) -> (Vec<u64>, Vec<[u64; 3]>) {
     let n = s.params.n;
     let t_mask = s.params.t() - 1;
-    let adapter = SiNtruAdapter(s);
     let shape = ConvShape { in_c: 1, h: model.d, w: model.d, kh: K, kw: K };
     assert!(
         shape.required_degree() < n,
@@ -237,11 +252,14 @@ fn hybrid_conv_open(
     let (oh, ow) = (shape.out_h(), shape.out_w());
     let mut opened = Vec::with_capacity(OC * oh * ow);
     let mut masks = Vec::with_capacity(OC * oh * ow);
+    // Every output channel multiplies against the *same* encrypted image, so
+    // its forward NTT is computed once and reused (`mul_pre`).
+    let cxt = s.transform(c_input);
 
     for oc in 0..OC {
         let kpoly = conv_pack::pack_kernel(&model.kernels[oc], shape, n, t_mask);
         let cw = s.encrypt_poly(ck, &kpoly);
-        let prod = s.mul(c_input, &cw);
+        let prod = s.mul_pre(&cxt, &cw);
 
         // Fresh masks per output channel (reuse across channels would leak
         // the difference of their pre-activations).
@@ -252,7 +270,7 @@ fn hybrid_conv_open(
         let mut masked = prod;
         for m in &chan_masks {
             let enc = s.encrypt_poly(ck, m);
-            conv_bytes += adapter.ct_bytes(&enc);
+            conv_bytes += s.ct_bytes(&enc);
             masked = s.add(&masked, &enc);
         }
         let y = s.decrypt_poly(ck, &masked);
@@ -334,6 +352,12 @@ pub struct CnnRun {
     pub conv_mults: usize,
     /// What an im2col/Toeplitz matvec of the same convolution would cost.
     pub conv_mults_toeplitz: usize,
+    /// FHE ring dimension and modulus actually used — recorded so the
+    /// security claim is testable rather than only asserted in prose.
+    pub ring_n: usize,
+    pub log2_q: u32,
+    /// Plaintext modulus width, calibrated from the measured activations.
+    pub log2_t: u32,
 }
 
 pub fn run_cnn_hybrid(model: &CnnModel, input: &[i64], profile: NetworkProfile) -> CnnRun {
@@ -344,11 +368,14 @@ pub fn run_cnn_hybrid(model: &CnnModel, input: &[i64], profile: NetworkProfile) 
         model.nbits
     );
     let nbits = model.nbits;
-    let s = SiNtru::new(SiNtruParams { n: 2048, log2_q: 120, log2_t: nbits as u32 });
+    // RLWE-secure parameters: n=4096, q=2^100 is at/below the 128-bit bound
+    // of ~109 for n=4096 (HomomorphicEncryption.org). Unlike SI-NTRU there
+    // is no fatigue point to worry about — see `fhe::si_ntru`'s security note
+    // for why the NTRU instantiation could not be rescued even at depth 1.
+    let s = Bfv::new(BfvParams { n: 4096, log2_q: 100, log2_t: nbits as u32 });
     let n_in = model.d * model.d;
     assert!((n_in + 1) <= s.params.n, "input too large for coefficient packing");
     let t_mask = s.params.t() - 1;
-    let adapter = SiNtruAdapter(&s);
 
     let start = Instant::now();
     let (mut fhe_ms, mut mpc_ms) = (0.0, 0.0);
@@ -401,12 +428,12 @@ pub fn run_cnn_hybrid(model: &CnnModel, input: &[i64], profile: NetworkProfile) 
     // ── Switch back → packed FHE dense input ──
     let t0 = Instant::now();
     let flat = model.pool_shape.c * model.pool_shape.h * model.pool_shape.w;
-    let mut c_dense_in: Option<NtruCt> = None;
+    let mut c_dense_in: Option<BfvCt> = None;
     let mut bytes = 0usize;
     for comps in per_party_pool.iter() {
         let m: Vec<u64> = comps.iter().map(|&c| (c as u64) & t_mask).collect();
         let enc = s.encrypt_poly(&ck, &m);
-        bytes += adapter.ct_bytes(&enc);
+        bytes += s.ct_bytes(&enc);
         c_dense_in = Some(match c_dense_in {
             None => enc,
             Some(acc) => s.add(&acc, &enc),
@@ -452,11 +479,14 @@ pub fn run_cnn_hybrid(model: &CnnModel, input: &[i64], profile: NetworkProfile) 
         mpc_ms,
         comm,
         bootstraps: 0,
+        ring_n: s.params.n,
+        log2_q: s.params.log2_q,
+        log2_t: s.params.log2_t,
         conv_mults: OC,
         conv_mults_toeplitz: conv_pack::toeplitz_multiplications(
             ConvShape { in_c: 1, h: model.d, w: model.d, kh: K, kw: K },
             OC,
-            SiNtruParams::DEFAULT.n,
+            BfvParams::DEFAULT.n,
         ),
     }
 }
@@ -476,13 +506,17 @@ pub struct CnnPoint {
     pub bootstraps: u64,
     pub conv_mults: usize,
     pub conv_mults_toeplitz: usize,
+    pub ring_n: usize,
+    pub log2_q: u32,
+    pub log2_t: u32,
 }
 
 const USAGE: &str = "usage: baru bench-cnn [options]
 
 A compact convolutional classifier (conv → ReLU → maxpool → dense → argmax)
-through the hybrid pipeline: FHE ct×ct linear layers, MPC nonlinearities,
-ZERO FHE bootstraps, verified bit-exact against the plaintext reference.
+through the hybrid pipeline: BFV ct×ct linear layers at RLWE-secure
+parameters (n=4096, q=2^100), MPC nonlinearities, ZERO FHE bootstraps,
+verified bit-exact against the plaintext reference.
 Correctness is exact; ACCURACY needs trained weights (orthogonal — see the
 module docs). The convolution uses Cheetah-style coefficient packing, so it
 costs one ct×ct multiply per output channel regardless of D — a full 28×28
@@ -554,12 +588,15 @@ pub fn run_cli(args: &[String]) -> Result<(), String> {
             bootstraps: r.bootstraps,
             conv_mults: r.conv_mults,
             conv_mults_toeplitz: r.conv_mults_toeplitz,
+            ring_n: r.ring_n,
+            log2_q: r.log2_q,
+            log2_t: r.log2_t,
         };
         println!("{}", serde_json::to_string_pretty(&p).map_err(|e| e.to_string())?);
         return Ok(());
     }
 
-    println!("Private CNN classifier — hybrid SI-NTRU × ABY3, ZERO FHE bootstraps");
+    println!("Private CNN classifier — hybrid BFV × ABY3, ZERO FHE bootstraps");
     println!(
         "architecture: 1×{d}×{d} → conv({OC},{K}×{K}) → ReLU → maxpool({POOL}×{POOL}) \
          → dense(→{NCLASSES}) → argmax"
@@ -570,6 +607,10 @@ pub fn run_cli(args: &[String]) -> Result<(), String> {
         bandwidth_mbps.map(|b| format!("{b}Mbps")).unwrap_or_else(|| "unlimited".into())
     );
     println!("  predicted class : {}  ({})", r.class, if r.correct { "exact vs plaintext" } else { "WRONG" });
+    println!(
+        "  FHE parameters  : BFV n={}, q=2^{}, t=2^{} (RLWE-secure, 128-bit)",
+        r.ring_n, r.log2_q, r.log2_t
+    );
     println!("  FHE bootstraps  : {}", r.bootstraps);
     println!(
         "  conv ct×ct mults: {} (packed)  vs {} (im2col/Toeplitz) — {:.0}× fewer",
@@ -614,7 +655,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // n=2048 schoolbook ring — slow in debug, fast in release
+    #[ignore] // n=4096 secure ring — slow in debug, fast in release
     fn hybrid_cnn_classifies_exactly() {
         for (d, seed) in [(8usize, 1u64), (8, 2), (10, 5)] {
             let (model, input) = CnnModel::random(d, seed);
@@ -646,6 +687,22 @@ mod tests {
             "expected a large win over Toeplitz, got {} vs {}",
             r.conv_mults_toeplitz, r.conv_mults
         );
+    }
+
+    /// The security claim, as a test rather than prose: the benchmark must
+    /// run on RLWE-secure parameters. `n = 4096` admits `log q ≤ 109` at the
+    /// 128-bit level (HomomorphicEncryption.org), and the plaintext modulus
+    /// must stay inside the depth-1 noise budget. Guards against a silent
+    /// regression to SI-NTRU, which is *not* secure here at any depth.
+    #[test]
+    #[ignore]
+    fn uses_rlwe_secure_parameters() {
+        let (model, input) = CnnModel::random(8, 21);
+        let r = run_cnn_hybrid(&model, &input, NetworkProfile::INSTANT);
+        assert_eq!(r.ring_n, 4096, "ring dimension");
+        assert!(r.log2_q <= 109, "q=2^{} exceeds the 128-bit bound for n=4096", r.log2_q);
+        assert!(r.log2_t <= 30, "t=2^{} past the depth-1 noise budget", r.log2_t);
+        assert!(r.correct && r.bootstraps == 0);
     }
 
     /// The FHE cost of the convolution is flat in D — it is `OC`

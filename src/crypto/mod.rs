@@ -18,7 +18,7 @@ pub use net::*;
 #[allow(unused_imports)]
 pub use party::*;
 pub use protocol::{
-    a2b_party, add_party, deal_triple, mul_party, receive_triple, reveal, scalar_mul_party,
+    a2b_party, add_party, mul_party, reveal, scalar_mul_party,
     share_input, share_public, sub_party, PartyShare,
 };
 pub use scheduler::*;

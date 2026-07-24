@@ -56,43 +56,54 @@ pub enum MpcMsg {
         value: u128,
     },
 
-    /// Beaver triple: send party i its two components (left, right) for one
-    /// triple identified by `triple_id`.
-    TripleComponent {
-        triple_id: u64,
-        left: u128,
-        right: u128,
+
+    /// One-time PRF key handshake. Party `i` samples `k_i` and sends it to
+    /// party `i+1`, so each adjacent pair ends up sharing a key that the
+    /// third party does not know. Those keys generate the zero-sum
+    /// correlated randomness ABY3 multiplication needs, with no dealer and
+    /// no per-multiplication communication.
+    PrfKey {
+        key: [u8; 32],
     },
 
-    /// Masked-open D value tagged with an operation id.
-    TaggedD {
-        op_id: u64,
-        value: u128,
-    },
-    /// Masked-open E value tagged with an operation id.
-    TaggedE {
-        op_id: u64,
-        value: u128,
-    },
-
-    /// Beaver triples for `count` independent multiplications, dealt in one
-    /// message instead of `3*count` separate `TripleComponent` sends.  Each
-    /// multiplication `i` (0-indexed) occupies 6 consecutive entries in
-    /// `components`: `[x.left, x.right, y.left, y.right, z.left, z.right]`,
-    /// mirroring the single-triple layout at `base_triple_id + 3*i`.
-    TripleBatch {
-        base_triple_id: u64,
-        components: Vec<u128>,
-    },
-    /// Masked-open D and E values for `count` independent multiplications
-    /// sharing one communication round, instead of `2*count` separate
-    /// broadcasts — the wire-level fix for MPC's lack of multiplication
-    /// batching (see `crypto::aby3_protocol::mul_batch_party`).
-    TaggedDEBatch {
+    /// Resharing values for a batch of ABY3 multiplications: party `i` sends
+    /// its `z_i` components to party `i−1`. One ring element per party per
+    /// multiplication — replacing `TripleBatch` (6 elements dealt per
+    /// multiplication) plus `TaggedDEBatch` (2 opened).
+    TaggedZBatch {
         base_op_id: u64,
-        d_values: Vec<u128>,
-        e_values: Vec<u128>,
+        values: Vec<u128>,
     },
+}
+
+/// A party's two pairwise PRF keys: `mine` is shared with the next party,
+/// `prev` with the previous one.
+#[derive(Clone, Copy, Debug)]
+pub struct PrfKeys {
+    pub mine: [u8; 32],
+    pub prev: [u8; 32],
+}
+
+impl PrfKeys {
+    /// Zero-sum correlated randomness for operation `ctr`:
+    /// `αᵢ = F(kᵢ, ctr) − F(kᵢ₋₁, ctr)`. Summed over the three parties each
+    /// PRF output appears once positively and once negatively, so
+    /// `α₀+α₁+α₂ = 0` — while no single party can predict any other's α.
+    pub fn alpha(&self, ctr: u64) -> u128 {
+        prf(&self.mine, ctr).wrapping_sub(prf(&self.prev, ctr))
+    }
+}
+
+/// Keyed PRF: the low 16 bytes of `SHA-256(key ‖ ctr)`.
+fn prf(key: &[u8; 32], ctr: u64) -> u128 {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(key);
+    h.update(ctr.to_le_bytes());
+    let d = h.finalize();
+    let mut b = [0u8; 16];
+    b.copy_from_slice(&d[..16]);
+    u128::from_le_bytes(b)
 }
 
 /// Serialize a message using bincode.
@@ -221,6 +232,9 @@ pub fn recv_forever<T: Transport>(t: &T) -> (PartyId, Message) {
 /// the protocols become order-independent and no timing hacks are required.
 pub struct Mailbox<T: Transport> {
     transport: T,
+    /// Pairwise PRF keys, established lazily on first use (see
+    /// `prf_keys`). `Mutex` for interior mutability behind `&self`.
+    prf: Mutex<Option<PrfKeys>>,
     // `Mutex` (rather than `RefCell`) so `Mailbox`/`TransportBackend` stay
     // `Send + Sync` as the `Backend` trait requires; a party drives its mailbox
     // single-threaded, so the lock is uncontended.
@@ -232,8 +246,35 @@ impl<T: Transport> Mailbox<T> {
     pub fn new(transport: T) -> Self {
         Mailbox {
             transport,
+            prf: Mutex::new(None),
             buf: Mutex::new(VecDeque::new()),
         }
+    }
+
+    /// This party's pairwise PRF keys, performing the one-time handshake on
+    /// first call. `mine` is shared with party `me+1`, `prev` with `me−1`;
+    /// no party holds all three, which is what makes the derived randomness
+    /// sum to zero without revealing it.
+    pub fn prf_keys(&self, me: PartyId) -> PrfKeys {
+        {
+            let held = self.prf.lock().expect("prf key lock poisoned");
+            if let Some(k) = *held {
+                return k;
+            }
+        }
+        let mut mine = [0u8; 32];
+        rand::Rng::fill(&mut rand::thread_rng(), &mut mine);
+        self.send((me + 1) % 3, serialize_msg(&MpcMsg::PrfKey { key: mine }));
+        let (_, msg) = self
+            .recv_matching(30_000, |m| matches!(m, MpcMsg::PrfKey { .. }))
+            .expect("prf key handshake timed out");
+        let prev = match msg {
+            MpcMsg::PrfKey { key } => key,
+            _ => unreachable!("predicate guarantees PrfKey"),
+        };
+        let keys = PrfKeys { mine, prev };
+        *self.prf.lock().expect("prf key lock poisoned") = Some(keys);
+        keys
     }
 
     /// This participant's id.

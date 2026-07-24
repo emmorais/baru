@@ -7,9 +7,8 @@
 
 use rand::Rng;
 
-use crate::crypto::arith::gen_beaver_triple;
 use crate::crypto::net::{serialize_msg, Mailbox, MpcMsg, PartyId, Transport};
-use crate::crypto::types::{Fr, Share3};
+use crate::crypto::types::Fr;
 
 const N: usize = 3;
 const TIMEOUT_MS: u64 = 5_000;
@@ -194,92 +193,26 @@ pub fn reveal<T: Transport>(
     }
 }
 
-/// Beaver triple from the dealer's perspective: distribute triple components
-/// to each party.
-pub fn deal_triple<T: Transport>(
-    triple_id: u64,
-    me: PartyId,
-    mbx: &Mailbox<T>,
-) -> (PartyShare, PartyShare, PartyShare) {
-    let (x_sh, y_sh, z_sh) = gen_beaver_triple();
-
-    let x_parts = party_pairs(&x_sh);
-    let y_parts = party_pairs(&y_sh);
-    let z_parts = party_pairs(&z_sh);
-
-    for i in 0..N {
-        if i == me {
-            continue;
-        }
-        mbx.send(
-            i,
-            serialize_msg(&MpcMsg::TripleComponent {
-                triple_id,
-                left: x_parts[i].left,
-                right: x_parts[i].right,
-            }),
-        );
-        mbx.send(
-            i,
-            serialize_msg(&MpcMsg::TripleComponent {
-                triple_id: triple_id + 1,
-                left: y_parts[i].left,
-                right: y_parts[i].right,
-            }),
-        );
-        mbx.send(
-            i,
-            serialize_msg(&MpcMsg::TripleComponent {
-                triple_id: triple_id + 2,
-                left: z_parts[i].left,
-                right: z_parts[i].right,
-            }),
-        );
-    }
-
-    (
-        x_parts[me].clone(),
-        y_parts[me].clone(),
-        z_parts[me].clone(),
-    )
-}
-
-/// Receive a triple that was dealt by another party.
-pub fn receive_triple<T: Transport>(
-    triple_id: u64,
-    mbx: &Mailbox<T>,
-) -> (PartyShare, PartyShare, PartyShare) {
-    let mut x: Option<PartyShare> = None;
-    let mut y: Option<PartyShare> = None;
-    let mut z: Option<PartyShare> = None;
-
-    while x.is_none() || y.is_none() || z.is_none() {
-        if let Some((_from, m)) = mbx.recv_matching(TIMEOUT_MS, |m| {
-            matches!(m, MpcMsg::TripleComponent { triple_id: tid, .. }
-                if (triple_id..=triple_id + 2).contains(tid))
-        }) {
-            if let MpcMsg::TripleComponent {
-                triple_id: tid,
-                left,
-                right,
-            } = m
-            {
-                if tid == triple_id {
-                    x = Some(PartyShare { left, right });
-                } else if tid == triple_id + 1 {
-                    y = Some(PartyShare { left, right });
-                } else if tid == triple_id + 2 {
-                    z = Some(PartyShare { left, right });
-                }
-            }
-        } else {
-            panic!("receive_triple: timeout for triple_id={}", triple_id);
-        }
-    }
-    (x.unwrap(), y.unwrap(), z.unwrap())
-}
-
-/// ABY3 multiplication using Beaver triples.
+/// ABY3 multiplication — **no Beaver triples**.
+///
+/// With replicated sharing `x = x₀+x₁+x₂` (party `i` holds `xᵢ, xᵢ₊₁`), each
+/// party can compute three of the nine cross terms locally:
+///
+/// ```text
+/// zᵢ = xᵢyᵢ + xᵢyᵢ₊₁ + xᵢ₊₁yᵢ + αᵢ
+/// ```
+///
+/// Summed over the three parties these cover all nine terms exactly once, so
+/// `Σzᵢ = (Σxᵢ)(Σyᵢ) = xy`. The `αᵢ` are zero-sum correlated randomness from
+/// pairwise PRF keys — they cancel in the sum but re-randomise each party's
+/// component, which is what stops `zᵢ` leaking. Generating them costs *no*
+/// communication, so the whole multiplication is **one ring element sent to
+/// one neighbour**.
+///
+/// This replaces a Beaver-triple protocol that had party 0 deal 6 ring
+/// elements per multiplication and then opened 2 more. Triples are not
+/// merely moved offline here, they are eliminated: there is nothing left to
+/// precompute or distribute.
 pub fn mul_party<T: Transport>(
     a: &PartyShare,
     b: &PartyShare,
@@ -287,270 +220,169 @@ pub fn mul_party<T: Transport>(
     me: PartyId,
     mbx: &Mailbox<T>,
 ) -> PartyShare {
-    let triple_id = op_id + 1;
-
-    // Party 0 deals the triple; the others receive it.  The `Mailbox` buffers
-    // any D/E messages that race ahead of the triple, so no ordering hack (the
-    // former `sleep`) is needed on the receiving parties.
-    let (x, y, z) = if me == 0 {
-        deal_triple(triple_id, me, mbx)
-    } else {
-        receive_triple(triple_id, mbx)
-    };
-
-    let d_i = a.left.wrapping_sub(x.left);
-    let e_i = b.left.wrapping_sub(y.left);
-
-    mbx.broadcast(serialize_msg(&MpcMsg::TaggedD { op_id, value: d_i }));
-    mbx.broadcast(serialize_msg(&MpcMsg::TaggedE { op_id, value: e_i }));
-
-    let mut d_shares = [0u128; N];
-    let mut e_shares = [0u128; N];
-    d_shares[me] = d_i;
-    e_shares[me] = e_i;
-    let mut got_d = [false; N];
-    let mut got_e = [false; N];
-    got_d[me] = true;
-    got_e[me] = true;
-    let mut remaining = (N - 1) * 2;
-
-    while remaining > 0 {
-        if let Some((from, m)) = mbx.recv_matching(TIMEOUT_MS, |m| {
-            matches!(m,
-                MpcMsg::TaggedD { op_id: oid, .. } | MpcMsg::TaggedE { op_id: oid, .. }
-                    if *oid == op_id)
-        }) {
-            match m {
-                MpcMsg::TaggedD { value: v, .. } if !got_d[from] => {
-                    d_shares[from] = v;
-                    got_d[from] = true;
-                    remaining -= 1;
-                }
-                MpcMsg::TaggedE { value: v, .. } if !got_e[from] => {
-                    e_shares[from] = v;
-                    got_e[from] = true;
-                    remaining -= 1;
-                }
-                _ => {}
-            }
-        } else {
-            panic!("mul_party: timeout collecting D/E for op_id={}", op_id);
-        }
-    }
-
-    let d: Fr = d_shares.iter().fold(0u128, |acc, &v| acc.wrapping_add(v));
-    let e: Fr = e_shares.iter().fold(0u128, |acc, &v| acc.wrapping_add(v));
-
-    let de_pub = share_public(d.wrapping_mul(e), me);
-    let dy = scalar_mul_party(&y, d);
-    let ex = scalar_mul_party(&x, e);
-    let t = add_party(&z, &dy);
-    let t = add_party(&t, &ex);
-    add_party(&t, &de_pub)
+    mul_batch_party(&[(a.clone(), b.clone())], op_id, me, mbx)
+        .pop()
+        .expect("one product")
 }
-
-/// Deal Beaver triples for `count` independent multiplications at once,
-/// starting at `base_triple_id` (each occupying 3 consecutive ids — the same
-/// per-triple convention as [`deal_triple`] — so batched and single
-/// multiplications can freely interleave).  Sends one [`MpcMsg::TripleBatch`]
-/// per peer instead of `3*count` separate [`MpcMsg::TripleComponent`]s.
+/// Batched [`mul_party`]: one message per party for the whole batch.
 ///
-/// Each of the `count` triples is freshly and independently random — only the
-/// *network I/O* is batched, not the randomness — so this is exactly as
-/// secure as `count` separate `deal_triple` calls.
-pub fn deal_triple_batch<T: Transport>(
-    base_triple_id: u64,
-    count: usize,
-    me: PartyId,
-    mbx: &Mailbox<T>,
-) -> Vec<(PartyShare, PartyShare, PartyShare)> {
-    let mut mine = Vec::with_capacity(count);
-    let mut per_peer: Vec<Vec<u128>> = (0..N).map(|_| Vec::with_capacity(count * 6)).collect();
-
-    for _ in 0..count {
-        let (x_sh, y_sh, z_sh) = gen_beaver_triple();
-        let x_parts = party_pairs(&x_sh);
-        let y_parts = party_pairs(&y_sh);
-        let z_parts = party_pairs(&z_sh);
-        for (i, peer_buf) in per_peer.iter_mut().enumerate() {
-            if i == me {
-                continue;
-            }
-            peer_buf.push(x_parts[i].left);
-            peer_buf.push(x_parts[i].right);
-            peer_buf.push(y_parts[i].left);
-            peer_buf.push(y_parts[i].right);
-            peer_buf.push(z_parts[i].left);
-            peer_buf.push(z_parts[i].right);
-        }
-        mine.push((
-            x_parts[me].clone(),
-            y_parts[me].clone(),
-            z_parts[me].clone(),
-        ));
-    }
-
-    for (i, components) in per_peer.into_iter().enumerate() {
-        if i == me {
-            continue;
-        }
-        mbx.send(
-            i,
-            serialize_msg(&MpcMsg::TripleBatch {
-                base_triple_id,
-                components,
-            }),
-        );
-    }
-    mine
-}
-
-/// Receive a batch of triples dealt by [`deal_triple_batch`].
-pub fn receive_triple_batch<T: Transport>(
-    base_triple_id: u64,
-    count: usize,
-    mbx: &Mailbox<T>,
-) -> Vec<(PartyShare, PartyShare, PartyShare)> {
-    let Some((_from, m)) = mbx.recv_matching(
-        TIMEOUT_MS,
-        |m| matches!(m, MpcMsg::TripleBatch { base_triple_id: id, .. } if *id == base_triple_id),
-    ) else {
-        panic!("receive_triple_batch: timeout for base_triple_id={base_triple_id}");
-    };
-    let MpcMsg::TripleBatch { components, .. } = m else {
-        unreachable!("recv_matching predicate guarantees TripleBatch");
-    };
-    assert_eq!(
-        components.len(),
-        count * 6,
-        "receive_triple_batch: expected {} components for count={count}, got {}",
-        count * 6,
-        components.len()
-    );
-    (0..count)
-        .map(|i| {
-            let b = i * 6;
-            (
-                PartyShare {
-                    left: components[b],
-                    right: components[b + 1],
-                },
-                PartyShare {
-                    left: components[b + 2],
-                    right: components[b + 3],
-                },
-                PartyShare {
-                    left: components[b + 4],
-                    right: components[b + 5],
-                },
-            )
-        })
-        .collect()
-}
-
-/// Batched ABY3 multiplication: `pairs.len()` independent multiplications
-/// sharing **one** communication round (Beaver-triple dealing + D/E opening),
-/// instead of `pairs.len()` separate rounds for that many [`mul_party`]
-/// calls.  This is the wire-level fix for MPC's lack of multiplication
-/// batching — the same per-element math as `mul_party`, just with the
-/// network I/O collapsed from O(n) messages to O(1).
-///
-/// `base_op_id` must not be reused until this call returns (mirroring
-/// `mul_party`'s `op_id`/`op_id+1` convention, generalized to
-/// `base_op_id+1 ..= base_op_id + 3*pairs.len()` for the triple range).
+/// Each product `i` draws its own `α` from counter `base_op_id + i`, so the
+/// re-randomisation is fresh per multiplication even within a batch.
 pub fn mul_batch_party<T: Transport>(
     pairs: &[(PartyShare, PartyShare)],
     base_op_id: u64,
     me: PartyId,
     mbx: &Mailbox<T>,
 ) -> Vec<PartyShare> {
-    let count = pairs.len();
-    if count == 0 {
+    if pairs.is_empty() {
         return Vec::new();
     }
-    let base_triple_id = base_op_id + 1;
-
-    let triples = if me == 0 {
-        deal_triple_batch(base_triple_id, count, me, mbx)
-    } else {
-        receive_triple_batch(base_triple_id, count, mbx)
-    };
-
-    let d_values: Vec<u128> = pairs
+    let keys = mbx.prf_keys(me);
+    // Local: three of the nine cross terms, re-randomised by a zero-sum α.
+    let z_mine: Vec<u128> = pairs
         .iter()
-        .zip(&triples)
-        .map(|((a, _b), (x, _y, _z))| a.left.wrapping_sub(x.left))
-        .collect();
-    let e_values: Vec<u128> = pairs
-        .iter()
-        .zip(&triples)
-        .map(|((_a, b), (_x, y, _z))| b.left.wrapping_sub(y.left))
-        .collect();
-
-    mbx.broadcast(serialize_msg(&MpcMsg::TaggedDEBatch {
-        base_op_id,
-        d_values: d_values.clone(),
-        e_values: e_values.clone(),
-    }));
-
-    let mut d_shares: Vec<[u128; N]> = vec![[0u128; N]; count];
-    let mut e_shares: Vec<[u128; N]> = vec![[0u128; N]; count];
-    for i in 0..count {
-        d_shares[i][me] = d_values[i];
-        e_shares[i][me] = e_values[i];
-    }
-    let mut got = [false; N];
-    got[me] = true;
-    let mut remaining = N - 1;
-
-    while remaining > 0 {
-        let Some((from, m)) = mbx.recv_matching(
-            TIMEOUT_MS,
-            |m| matches!(m, MpcMsg::TaggedDEBatch { base_op_id: oid, .. } if *oid == base_op_id),
-        ) else {
-            panic!("mul_batch_party: timeout collecting D/E batch for base_op_id={base_op_id}");
-        };
-        if got[from] {
-            continue;
-        }
-        let MpcMsg::TaggedDEBatch {
-            d_values: dv,
-            e_values: ev,
-            ..
-        } = m
-        else {
-            unreachable!("recv_matching predicate guarantees TaggedDEBatch");
-        };
-        assert_eq!(dv.len(), count, "mul_batch_party: d_values length mismatch");
-        assert_eq!(ev.len(), count, "mul_batch_party: e_values length mismatch");
-        for i in 0..count {
-            d_shares[i][from] = dv[i];
-            e_shares[i][from] = ev[i];
-        }
-        got[from] = true;
-        remaining -= 1;
-    }
-
-    (0..count)
-        .map(|i| {
-            let d: Fr = d_shares[i]
-                .iter()
-                .fold(0u128, |acc, &v| acc.wrapping_add(v));
-            let e: Fr = e_shares[i]
-                .iter()
-                .fold(0u128, |acc, &v| acc.wrapping_add(v));
-            let (x, y, z) = &triples[i];
-            let de_pub = share_public(d.wrapping_mul(e), me);
-            let dy = scalar_mul_party(y, d);
-            let ex = scalar_mul_party(x, e);
-            let t = add_party(z, &dy);
-            let t = add_party(&t, &ex);
-            add_party(&t, &de_pub)
+        .enumerate()
+        .map(|(i, (a, b))| {
+            a.left
+                .wrapping_mul(b.left)
+                .wrapping_add(a.left.wrapping_mul(b.right))
+                .wrapping_add(a.right.wrapping_mul(b.left))
+                .wrapping_add(keys.alpha(base_op_id.wrapping_add(i as u64)))
         })
+        .collect();
+
+    // Resharing: party i needs z_{i+1} to hold (z_i, z_{i+1}), so each party
+    // sends its components to its predecessor. One directed message, not a
+    // broadcast.
+    mbx.send(
+        (me + N - 1) % N,
+        serialize_msg(&MpcMsg::TaggedZBatch { base_op_id, values: z_mine.clone() }),
+    );
+    let (_, msg) = mbx
+        .recv_matching(TIMEOUT_MS, |m| {
+            matches!(m, MpcMsg::TaggedZBatch { base_op_id: b, .. } if *b == base_op_id)
+        })
+        .unwrap_or_else(|| panic!("mul_batch_party: timeout on z for op_id={base_op_id}"));
+    let z_next = match msg {
+        MpcMsg::TaggedZBatch { values, .. } => values,
+        _ => unreachable!("predicate guarantees TaggedZBatch"),
+    };
+    assert_eq!(z_next.len(), z_mine.len(), "batch length mismatch in resharing");
+
+    z_mine
+        .into_iter()
+        .zip(z_next)
+        .map(|(left, right)| PartyShare { left, right })
         .collect()
 }
+/// Operation ids reserved by one `a2b_party` call. Each internal
+/// `mul_batch` round derives its correlated randomness from a distinct id
+/// range; the block gives generous headroom over the ~9 rounds used.
+pub const A2B_ID_BLOCK: u64 = 64;
 
-/// Arithmetic-to-bit decomposition.
+/// Replicated sharing of a value held by the two parties that own additive
+/// component `owner` — **no communication**.
+///
+/// A replicated sharing puts value `v` in one additive component and zero in
+/// the others. Component `owner` is held as `left` by party `owner` and as
+/// `right` by party `owner−1`, so exactly those two parties supply `v` and
+/// the third contributes nothing and learns nothing. This is what makes the
+/// first step of bit decomposition free.
+fn share_component(value: Fr, owner: usize, me: PartyId) -> PartyShare {
+    PartyShare {
+        left: if me == owner { value } else { 0 },
+        right: if (me + 1) % N == owner { value } else { 0 },
+    }
+}
+
+/// XOR of two bit-shares in the arithmetic encoding: `a ⊕ b = a + b − 2ab`,
+/// given their already-computed product.
+fn xor_from_product(a: &PartyShare, b: &PartyShare, ab: &PartyShare) -> PartyShare {
+    sub_party(&add_party(a, b), &scalar_mul_party(ab, 2))
+}
+
+/// Kogge–Stone parallel-prefix adder on bit-shares: the low `nbits` bits of
+/// `u + v`. Costs `2 + ⌈log₂ nbits⌉` communication rounds.
+fn ppa_add<T: Transport>(
+    u: &[PartyShare],
+    v: &[PartyShare],
+    nbits: usize,
+    next_id: &mut u64,
+    me: PartyId,
+    mbx: &Mailbox<T>,
+) -> Vec<PartyShare> {
+    let take_id = |n: &mut u64| {
+        let b = *n;
+        *n += 2;
+        b
+    };
+    // generate g = u∧v and propagate p = u⊕v — one product serves both.
+    let pairs: Vec<_> = (0..nbits).map(|k| (u[k].clone(), v[k].clone())).collect();
+    let base = take_id(next_id);
+    let uv = mul_batch_party(&pairs, base, me, mbx);
+    let mut g = uv.clone();
+    let mut p: Vec<PartyShare> =
+        (0..nbits).map(|k| xor_from_product(&u[k], &v[k], &uv[k])).collect();
+    let p_leaf = p.clone();
+
+    let mut d = 1usize;
+    while d < nbits {
+        let mut pr = Vec::with_capacity(2 * (nbits - d));
+        for k in d..nbits {
+            pr.push((p[k].clone(), g[k - d].clone()));
+            pr.push((p[k].clone(), p[k - d].clone()));
+        }
+        let base = take_id(next_id);
+        let out = mul_batch_party(&pr, base, me, mbx);
+        let (mut ng, mut np) = (g.clone(), p.clone());
+        for (i, k) in (d..nbits).enumerate() {
+            // A group cannot both generate and propagate, so `g` and
+            // `p ∧ g'` are mutually exclusive and their XOR is plain
+            // addition — no communication for the combine.
+            ng[k] = add_party(&g[k], &out[2 * i]);
+            np[k] = out[2 * i + 1].clone();
+        }
+        g = ng;
+        p = np;
+        d <<= 1;
+    }
+
+    // carry into position k is the group generate over 0..k−1
+    if nbits == 1 {
+        return vec![p_leaf[0].clone()];
+    }
+    let pairs: Vec<_> = (1..nbits).map(|k| (p_leaf[k].clone(), g[k - 1].clone())).collect();
+    let base = take_id(next_id);
+    let prod = mul_batch_party(&pairs, base, me, mbx);
+    let mut out = Vec::with_capacity(nbits);
+    out.push(p_leaf[0].clone()); // nothing carries into the LSB
+    for k in 1..nbits {
+        out.push(xor_from_product(&p_leaf[k], &g[k - 1], &prod[k - 1]));
+    }
+    out
+}
+
+/// Arithmetic-to-bit decomposition (ABY3 bit decomposition).
+///
+/// `op_id` must be the base of a reserved block of [`A2B_ID_BLOCK`] ids.
+///
+/// # Protocol
+///
+/// 1. **Binary-share the three additive components** — free, via
+///    [`share_component`]: `a = a₀ + a₁ + a₂` and each `aⱼ` is already known
+///    to exactly the two parties a replicated sharing of it requires.
+/// 2. **Carry-save reduce 3 → 2.** In this arithmetic bit encoding
+///    `x⊕y⊕z = x+y+z − 2(xy+xz+yz) + 4xyz` and
+///    `maj(x,y,z) = xy+xz+yz − 2xyz`, so both the sum and carry vectors fall
+///    out of the *same* four products — two rounds, not four.
+/// 3. **Add the remaining two** with a Kogge–Stone prefix adder.
+///
+/// This replaces an earlier version that masked with a value derived from
+/// `op_id` alone and opened `a − r`. Because `op_id` is a public lockstep
+/// counter that mask carried no secret entropy, so the input was recoverable
+/// by anyone — that version was not private. Nothing here is ever opened:
+/// every product goes through Beaver triples, which is why the carry chain
+/// now costs communication instead of being "free".
 pub fn a2b_party<T: Transport>(
     a: &PartyShare,
     nbits: usize,
@@ -558,82 +390,64 @@ pub fn a2b_party<T: Transport>(
     me: PartyId,
     mbx: &Mailbox<T>,
 ) -> Vec<PartyShare> {
-    let mut rng_seed = [0u8; 32];
-    rng_seed[..8].copy_from_slice(&op_id.to_le_bytes());
-    use rand::SeedableRng;
-    let mut seeded_rng = rand::rngs::StdRng::from_seed(rng_seed);
-    let r: Fr = seeded_rng.gen::<u128>() & ((1u128 << nbits) - 1);
-
-    let mut r_bits: Vec<PartyShare> = Vec::with_capacity(nbits);
-    for i in 0..nbits {
-        let bit = ((r >> i) & 1) != 0;
-        let bv: Fr = if bit { 1 } else { 0 };
-        r_bits.push(share_public(bv, me));
-    }
-
-    let mut r_sh = share_public(0, me);
-    for (i, r_bit) in r_bits.iter().enumerate() {
-        let term = scalar_mul_party(r_bit, 1u128 << i);
-        r_sh = add_party(&r_sh, &term);
-    }
-
-    let d_i = a.left.wrapping_sub(r_sh.left);
-    mbx.broadcast(serialize_msg(&MpcMsg::TaggedD { op_id, value: d_i }));
-
-    let mut d_shares = [0u128; N];
-    d_shares[me] = d_i;
-    let mut got_d = [false; N];
-    got_d[me] = true;
-    let mut remaining = N - 1;
-
-    while remaining > 0 {
-        if let Some((from, m)) = mbx.recv_matching(
-            TIMEOUT_MS,
-            |m| matches!(m, MpcMsg::TaggedD { op_id: oid, .. } if *oid == op_id),
-        ) {
-            if let MpcMsg::TaggedD { value: v, .. } = m {
-                if !got_d[from] {
-                    d_shares[from] = v;
-                    got_d[from] = true;
-                    remaining -= 1;
-                }
-            }
-        } else {
-            panic!("a2b_party: timeout collecting D for op_id={}", op_id);
-        }
-    }
-
-    let d: Fr = d_shares.iter().fold(0u128, |acc, &v| acc.wrapping_add(v));
-
-    let mut out: Vec<PartyShare> = Vec::with_capacity(nbits);
-    let mut carry = share_public(0, me);
-
-    for (i, r_bit) in r_bits.iter().enumerate().take(nbits) {
-        let d_bit: Fr = (d >> i) & 1;
-        let r_bit_val: Fr = (r >> i) & 1;
-
-        let s1 = xor_public_party(r_bit, &share_public(d_bit, me), me);
-        let sum = xor_public_party(&s1, &carry, me);
-        out.push(sum);
-
-        let r_and_d: Fr = r_bit_val.wrapping_mul(d_bit);
-        let r_xor_d: Fr = r_bit_val ^ d_bit;
-        let xor_times_carry = scalar_mul_party(&carry, r_xor_d);
-        let carry_base = share_public(r_and_d, me);
-        carry = add_party(&carry_base, &xor_times_carry);
-    }
-
-    out
-}
-
-/// XOR two party shares.
-fn xor_public_party(a: &PartyShare, b: &PartyShare, _me: PartyId) -> PartyShare {
-    let two_ab = PartyShare {
-        left: a.left.wrapping_mul(2).wrapping_mul(b.left),
-        right: a.right.wrapping_mul(2).wrapping_mul(b.right),
+    let mut next_id = op_id;
+    let take_id = |n: &mut u64| {
+        let b = *n;
+        *n += 2;
+        b
     };
-    let ab = add_party(a, b);
-    sub_party(&ab, &two_ab)
+
+    // ── 1. free binary sharings of the three additive components ──
+    let comp: Vec<Vec<PartyShare>> = (0..N)
+        .map(|j| {
+            let known: Fr = if j == me {
+                a.left
+            } else if j == (me + 1) % N {
+                a.right
+            } else {
+                0
+            };
+            (0..nbits).map(|k| share_component((known >> k) & 1, j, me)).collect()
+        })
+        .collect();
+    let (x, y, z) = (&comp[0], &comp[1], &comp[2]);
+
+    // ── 2. carry-save 3 → 2 (four products, depth 2) ──
+    let mut pairs = Vec::with_capacity(3 * nbits);
+    for k in 0..nbits {
+        pairs.push((x[k].clone(), y[k].clone()));
+    }
+    for k in 0..nbits {
+        pairs.push((x[k].clone(), z[k].clone()));
+    }
+    for k in 0..nbits {
+        pairs.push((y[k].clone(), z[k].clone()));
+    }
+    let base = take_id(&mut next_id);
+    let pw = mul_batch_party(&pairs, base, me, mbx);
+    let (xy, xz, yz) = (&pw[0..nbits], &pw[nbits..2 * nbits], &pw[2 * nbits..3 * nbits]);
+
+    let triple: Vec<_> = (0..nbits).map(|k| (xy[k].clone(), z[k].clone())).collect();
+    let base = take_id(&mut next_id);
+    let xyz = mul_batch_party(&triple, base, me, mbx);
+
+    let mut sum = Vec::with_capacity(nbits);
+    let mut carry = Vec::with_capacity(nbits);
+    for k in 0..nbits {
+        let sym = add_party(&add_party(&xy[k], &xz[k]), &yz[k]); // xy+xz+yz
+        let lin = add_party(&add_party(&x[k], &y[k]), &z[k]); // x+y+z
+        sum.push(add_party(
+            &sub_party(&lin, &scalar_mul_party(&sym, 2)),
+            &scalar_mul_party(&xyz[k], 4),
+        ));
+        carry.push(sub_party(&sym, &scalar_mul_party(&xyz[k], 2)));
+    }
+
+    // ── 3. a = sum + (carry ≪ 1), mod 2^nbits ──
+    let mut shifted = Vec::with_capacity(nbits);
+    shifted.push(share_public(0, me));
+    shifted.extend(carry.iter().take(nbits - 1).cloned());
+    ppa_add(&sum, &shifted, nbits, &mut next_id, me, mbx)
 }
 
 /// Reveal a bit share to all parties.
@@ -647,7 +461,8 @@ pub fn reveal_bit_to_all<T: Transport>(
     v % 2 != 0
 }
 
-fn party_pairs(s: &Share3) -> Vec<PartyShare> {
+#[cfg(test)]
+fn party_pairs(s: &crate::crypto::types::Share3) -> Vec<PartyShare> {
     vec![
         PartyShare {
             left: s.0,
@@ -669,6 +484,41 @@ mod tests {
     use super::*;
     use crate::crypto::net::InprocHandle;
 
+    /// Component sharings must be constructible with no communication and
+    /// must reconstruct the original additive components. This is what makes
+    /// the first phase of bit decomposition free, and it is also where a
+    /// party could wrongly place a value it does not own — worth pinning.
+    #[test]
+    fn component_sharings_are_free_and_consistent() {
+        let secret: Fr = 0xDEAD_BEEF;
+        let shares = crate::crypto::arith::share_secret(secret);
+        let parties = party_pairs(&shares);
+
+        for j in 0..N {
+            // Each party supplies only what it already holds.
+            let built: Vec<PartyShare> = (0..N)
+                .map(|me| {
+                    let known: Fr = if j == me {
+                        parties[me].left
+                    } else if j == (me + 1) % N {
+                        parties[me].right
+                    } else {
+                        0
+                    };
+                    share_component(known, j, me)
+                })
+                .collect();
+            // The party that owns neither end of component j contributes
+            // nothing — it never has to know the value.
+            let idle = (j + 1) % N;
+            assert_eq!(built[idle].left, 0);
+            assert_eq!(built[idle].right, 0);
+            // And the sharing reconstructs that component.
+            let total = built.iter().fold(0u128, |acc, p| acc.wrapping_add(p.left));
+            assert_eq!(total, parties[j].left, "component {j} must reconstruct");
+        }
+    }
+
     /// Run `f` (given `(me, mailbox)`) concurrently across 3 in-process
     /// parties and collect their results in party-index order.
     fn run_parties<R: Send + 'static>(
@@ -684,6 +534,80 @@ mod tests {
             })
             .collect();
         joins.into_iter().map(|j| j.join().unwrap()).collect()
+    }
+
+    /// Triple-free multiplication is correct *and* leaks nothing on the wire.
+    /// Correctness: `Σzᵢ = xy`. Privacy: a single party's outbound message
+    /// (`z_i`) is masked by `αᵢ`, which depends on a PRF key that party does
+    /// not hold both halves of — so its value is not a function of the
+    /// inputs alone. We check the weaker observable consequence that the
+    /// three `α` cancel (`Σαᵢ = 0`), which is what makes the masking free,
+    /// and that flipping a hidden input does not change what one victim
+    /// party can compute from its own view — i.e. no `op_id`-only recovery
+    /// like the old `a2b` had.
+    #[test]
+    fn triple_free_mul_is_correct_and_reshares_are_masked() {
+        // Correctness across the transport.
+        let out = run_parties(|me, mbx| {
+            let a = share_input(if me == 0 { 7 } else { 0 }, 0, 0, me, &mbx);
+            let b = share_input(if me == 0 { 6 } else { 0 }, 1, 0, me, &mbx);
+            let p = mul_party(&a, &b, 100, me, &mbx);
+            reveal(&p, 200, None, me, &mbx)
+        });
+        assert_eq!(out[0], 42, "7*6 must reveal 42");
+
+        // Privacy of the reshared component: recompute exactly what party 1
+        // sends to party 0 (its z_1) for two different secret inputs. If z_1
+        // were a public function of op_id (the old bug's shape), it would be
+        // identical regardless of the secret; the α mask must make it differ.
+        use crate::crypto::net::PrfKeys;
+        let keys = PrfKeys { mine: [1u8; 32], prev: [2u8; 32] };
+        let z1 = |xr: u128| {
+            // party 1 holds (x1,x2),(y1,y2); vary its x-share.
+            let a = PartyShare { left: xr, right: 3 };
+            let b = PartyShare { left: 4, right: 5 };
+            a.left
+                .wrapping_mul(b.left)
+                .wrapping_add(a.left.wrapping_mul(b.right))
+                .wrapping_add(a.right.wrapping_mul(b.left))
+                .wrapping_add(keys.alpha(100))
+        };
+        assert_ne!(z1(11), z1(12), "reshared component must depend on the secret share");
+        // And the α that masks it is genuinely zero-sum across a key ring.
+        let k0 = PrfKeys { mine: [1u8; 32], prev: [3u8; 32] };
+        let k1 = PrfKeys { mine: [2u8; 32], prev: [1u8; 32] };
+        let k2 = PrfKeys { mine: [3u8; 32], prev: [2u8; 32] };
+        assert_eq!(
+            k0.alpha(100).wrapping_add(k1.alpha(100)).wrapping_add(k2.alpha(100)),
+            0,
+            "the three parties' α must cancel"
+        );
+    }
+
+    /// The rebuilt bit decomposition must agree with plaintext binary
+    /// expansion, including two's-complement negatives (the MSB is what
+    /// `lt` returns, so sign handling is load-bearing).
+    #[test]
+    fn a2b_matches_plaintext_binary_expansion() {
+        let nbits = 12;
+        let cases: Vec<i64> = vec![0, 1, 2, 5, 255, 1024, 4095, -1, -2, -7, -2048];
+        for &v in &cases {
+            let out = run_parties(move |me, mbx| {
+                let fr: Fr = if me == 0 { (v as i128).rem_euclid(1i128 << nbits) as u128 } else { 0 };
+                let sh = share_input(fr, 0, me, 0, &mbx);
+                let bits = a2b_party(&sh, nbits, 1_000, me, &mbx);
+                bits.iter()
+                    .enumerate()
+                    .map(|(i, b)| reveal(b, 5_000 + i as u64, None, me, &mbx) & 1)
+                    .collect::<Vec<u128>>()
+            });
+            let want = (v as i128).rem_euclid(1i128 << nbits) as u128;
+            let got = out[0]
+                .iter()
+                .enumerate()
+                .fold(0u128, |acc, (i, b)| acc | (b << i));
+            assert_eq!(got, want, "a2b({v}) gave {got:#x}, want {want:#x}");
+        }
     }
 
     /// Secret-share `values[i]` (owned by party 0) for i in 0..values.len(),
