@@ -59,7 +59,7 @@
 //!   is exact until a final mask), the `t/q` rescale an arithmetic shift,
 //!   and `f⁻¹` a 3-step Hensel lift — no big-integer division anywhere.
 //! - The scale-invariant multiplication is done on *centered*
-//!   representatives with exact 256-bit intermediates ([`I256`]) — the
+//!   representatives with exact 256-bit intermediates (`crate::fhe::ntt`) — the
 //!   textbook-correct YASHE'-style product.
 //!
 //! Noise budget at these parameters (ternary errors): fresh noise
@@ -75,18 +75,43 @@
 //! this scheme family exposes explicitly instead of hiding behind
 //! bootstrapping.
 //!
-//! # Security status — read this
+//! # Security status — read this (depth-1 does NOT rescue it)
 //!
 //! LTV/YASHE-family NTRU at *these* parameter shapes (large q relative to
-//! n) sits in the **overstretched NTRU regime** and is subject to
-//! subfield/dense-sublattice lattice attacks (Albrecht–Bai–Ducas,
-//! CRYPTO 2016; Kirchner–Fouque 2017; Ducas–van Woerden's "NTRU fatigue"
-//! puts the onset near q ≈ n^2.484, far below both this port's 2^120 and
-//! the reference's 2^101 at n = 2048). That is *why* the YASHE line was
-//! abandoned for production FHE. This backend exists for what Baru uses it
-//! for: research/benchmarking of the depth-1 no-bootstrapping design point
-//! and its scheme-switching pipeline — not production key material. Same
-//! honesty rule as the trusted-dealer caveat in the MPC stack.
+//! n) sits in the **overstretched NTRU regime**, subject to
+//! subfield/dense-sublattice attacks (Albrecht–Bai–Ducas, CRYPTO 2016;
+//! Kirchner–Fouque 2017; Ducas–van Woerden "NTRU Fatigue", EUROCRYPT 2021).
+//!
+//! One might hope that because Baru only ever uses **depth 1** (a single
+//! multiplication, no bootstrapping), the parameters stay small enough to
+//! be safe. They do not, and it is worth spelling out why, since the point
+//! is subtle:
+//!
+//! - Fatigue point (ternary secret) at n = 2048: q ≈ n^2.484 · c ≈ 2^19.
+//!   The large LTV secret f = t·f'+1 (‖f‖ ~ t·√n) raises the *effective*
+//!   fatigue point, generously by ~t² = 2^40, to ≈ 2^59.
+//! - But depth 1 with a *usable* plaintext modulus (t ≈ 2^20, needed to
+//!   hold NN inner-product results) already forces q ≳ 2^84 by the noise
+//!   budget above (Δ/2 = q/2^21 must exceed the ~2^63 post-multiply noise).
+//! - 2^84 is still ~25 bits above the adjusted fatigue point (2^59), and
+//!   this port's 2^120 is ~60 above. Closing the gap by raising n needs
+//!   n ≈ 2^35 (impractical); lowering q below fatigue is incompatible with
+//!   one multiply at t ≈ 2^20. The two constraints cannot both hold at any
+//!   practical ring dimension.
+//!
+//! (This is a back-of-envelope estimate, not a full run of the DvW
+//! estimator, and the large-f structure merits a careful treatment — but
+//! the margin is far too wide for the conclusion to flip.)
+//!
+//! **Therefore this backend is a fast *reference/benchmark* only, not a
+//! secure instantiation.** The construction itself (depth-1 ct×ct inner
+//! product, no relinearization, decrypt under the squared key, then switch
+//! to MPC) is scheme-agnostic and is instantiated **securely** by the
+//! RLWE schemes (BGV/BFV/CKKS), which have no NTRU lattice and hence no
+//! fatigue point at these q — see `crate::fhe::ckks_backend` and the
+//! paper outline §8. SI-NTRU is kept because it is genuinely the cheapest
+//! arithmetic, useful for isolating the *packing/switching* costs from the
+//! FHE scheme's cost.
 
 use rand::Rng;
 
@@ -137,81 +162,9 @@ impl SiNtruParams {
     }
 }
 
-// ─── Exact 256-bit signed accumulator (for the scale-invariant rescale) ──────
+// The exact 256-bit accumulator now lives in `crate::fhe::ntt` (shared with
+// the NTT-based exact product that replaced the O(n²) schoolbook loop).
 
-/// Two's-complement 256-bit integer: just enough surface for the exact
-/// centered product Σ ±aᵢbⱼ (|coef| ≤ n·(q/2)² ≤ 2^249 at defaults) and the
-/// rounded arithmetic right-shift that implements the t/q rescale.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct I256 {
-    hi: u128,
-    lo: u128,
-}
-
-impl I256 {
-    const ZERO: I256 = I256 { hi: 0, lo: 0 };
-
-    fn wrapping_add(self, o: I256) -> I256 {
-        let (lo, carry) = self.lo.overflowing_add(o.lo);
-        I256 {
-            hi: self.hi.wrapping_add(o.hi).wrapping_add(carry as u128),
-            lo,
-        }
-    }
-
-    fn wrapping_neg(self) -> I256 {
-        let (lo, borrow) = 0u128.overflowing_sub(self.lo);
-        I256 {
-            hi: 0u128.wrapping_sub(self.hi).wrapping_sub(borrow as u128),
-            lo,
-        }
-    }
-
-    /// Exact product of two signed 128-bit values.
-    fn from_mul_i128(a: i128, b: i128) -> I256 {
-        let neg = (a < 0) != (b < 0);
-        let ua = a.unsigned_abs();
-        let ub = b.unsigned_abs();
-        // 128×128 → 256 unsigned via 64-bit limbs.
-        let (a1, a0) = (ua >> 64, ua & 0xFFFF_FFFF_FFFF_FFFF);
-        let (b1, b0) = (ub >> 64, ub & 0xFFFF_FFFF_FFFF_FFFF);
-        let p00 = a0 * b0;
-        let p01 = a0 * b1;
-        let p10 = a1 * b0;
-        let p11 = a1 * b1;
-        let mid = (p00 >> 64) + (p01 & 0xFFFF_FFFF_FFFF_FFFF) + (p10 & 0xFFFF_FFFF_FFFF_FFFF);
-        let lo = (p00 & 0xFFFF_FFFF_FFFF_FFFF) | (mid << 64);
-        let hi = p11 + (p01 >> 64) + (p10 >> 64) + (mid >> 64);
-        let m = I256 { hi, lo };
-        if neg {
-            m.wrapping_neg()
-        } else {
-            m
-        }
-    }
-
-    /// Arithmetic shift right by `k < 128` bits, rounding to nearest
-    /// (round-half-away-from-zero matches the reference's
-    /// `(aux ± q/2)/q`).
-    fn shr_round(self, k: u32) -> I256 {
-        debug_assert!(k > 0 && k < 128);
-        let negative = (self.hi >> 127) & 1 == 1;
-        let mag = if negative { self.wrapping_neg() } else { self };
-        // mag + 2^(k-1), then logical shift right by k.
-        let rounded = mag.wrapping_add(I256 {
-            hi: 0,
-            lo: 1u128 << (k - 1),
-        });
-        let lo = (rounded.lo >> k) | (rounded.hi << (128 - k));
-        let hi = rounded.hi >> k;
-        let shifted = I256 { hi, lo };
-        if negative {
-            shifted.wrapping_neg()
-        } else {
-            shifted
-        }
-    }
-}
 
 // ─── Polynomial helpers (coefficients mod q, stored masked) ──────────────────
 
@@ -234,27 +187,15 @@ fn poly_sub(a: &[u128], b: &[u128], mask: u128) -> Poly {
 /// Negacyclic schoolbook product mod q (wrapping u128 is exact for the
 /// quotient ring since q | 2^128).
 fn poly_mul_mod(a: &[u128], b: &[u128], params: &SiNtruParams) -> Poly {
-    let n = params.n;
-    let mut out = vec![0u128; n];
-    for (i, &ai) in a.iter().enumerate() {
-        if ai == 0 {
-            continue;
-        }
-        for (j, &bj) in b.iter().enumerate() {
-            let p = ai.wrapping_mul(bj);
-            let idx = i + j;
-            if idx < n {
-                out[idx] = out[idx].wrapping_add(p);
-            } else {
-                out[idx - n] = out[idx - n].wrapping_sub(p);
-            }
-        }
-    }
+    // Exact negacyclic product via the multi-modular NTT, reduced mod q.
+    // Centering first is sound: a ≡ a_c (mod q), so the products agree mod q.
     let mask = params.q_mask();
-    for c in &mut out {
-        *c &= mask;
-    }
-    out
+    let ac: Vec<i128> = a.iter().map(|&c| center(c, params)).collect();
+    let bc: Vec<i128> = b.iter().map(|&c| center(c, params)).collect();
+    crate::fhe::ntt::exact_negacyclic_product(&ac, &bc, params.n)
+        .into_iter()
+        .map(|c| c.lo & mask)
+        .collect()
 }
 
 fn center(c: u128, params: &SiNtruParams) -> i128 {
@@ -272,21 +213,9 @@ fn poly_mul_rescale(a: &[u128], b: &[u128], params: &SiNtruParams) -> Poly {
     let n = params.n;
     let ac: Vec<i128> = a.iter().map(|&c| center(c, params)).collect();
     let bc: Vec<i128> = b.iter().map(|&c| center(c, params)).collect();
-    let mut acc = vec![I256::ZERO; n];
-    for (i, &ai) in ac.iter().enumerate() {
-        if ai == 0 {
-            continue;
-        }
-        for (j, &bj) in bc.iter().enumerate() {
-            let p = I256::from_mul_i128(ai, bj);
-            let idx = i + j;
-            if idx < n {
-                acc[idx] = acc[idx].wrapping_add(p);
-            } else {
-                acc[idx - n] = acc[idx - n].wrapping_add(p.wrapping_neg());
-            }
-        }
-    }
+    // Exact integer negacyclic product via multi-modular NTT (O(n log n));
+    // see `crate::fhe::ntt` for why a power-of-two q needs the CRT detour.
+    let acc = crate::fhe::ntt::exact_negacyclic_product(&ac, &bc, n);
     let mask = params.q_mask();
     let shift = params.delta_shift();
     acc.into_iter()
@@ -617,36 +546,9 @@ mod tests {
         SiNtru::new(SiNtruParams::TEST_SMALL)
     }
 
-    #[test]
-    fn i256_mul_matches_i128_for_small_values() {
-        for &(a, b) in &[
-            (3i128, 5i128),
-            (-3, 5),
-            (3, -5),
-            (-3, -5),
-            (1i128 << 100, 1i128 << 20),
-            (-(1i128 << 100), (1i128 << 20) + 7),
-        ] {
-            let p = I256::from_mul_i128(a, b);
-            let expected = a * b; // fits i128 for these cases
-            if expected >= 0 {
-                assert_eq!(p.hi, 0, "hi for {a}*{b}");
-            } else {
-                assert_eq!(p.hi, u128::MAX, "hi for {a}*{b}");
-            }
-            assert_eq!(p.lo, expected as u128);
-        }
-    }
-
-    #[test]
-    fn i256_shr_round_rounds_to_nearest() {
-        // 5 >> 1 rounds to 3 (half away from zero), −5 >> 1 to −3.
-        let five = I256 { hi: 0, lo: 5 };
-        assert_eq!(five.shr_round(1).lo, 3);
-        let neg5 = five.wrapping_neg();
-        let r = neg5.shr_round(1);
-        assert_eq!(r.lo as i128, -3);
-    }
+    // (The I256 unit tests moved with the type into `crate::fhe::ntt`,
+    // where the exact product is now differentially tested against the
+    // schoolbook reference this scheme used to run inline.)
 
     #[test]
     fn roundtrip_scalar_and_poly() {

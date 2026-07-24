@@ -65,6 +65,7 @@ use crate::bench::Phase;
 use crate::crypto::net::InprocHandle;
 use crate::crypto::types::Fr;
 use crate::fhe::ckks_compare::{relu_approx_plain, CkksCompareBackend};
+use crate::fhe::bfv::{Bfv, BfvAdapter, BfvCt, BfvParams};
 use crate::fhe::si_ntru::{NtruCt, SiNtru, SiNtruAdapter, SiNtruParams};
 use crate::fhe::{CkksBackend, FheBackend, MockFheBackend, RealFheBackend, TfheBackend};
 use crate::hybrid::{shares_to_fhe, FheAdapter, IntFhe, RealFhe};
@@ -858,6 +859,178 @@ fn run_hybrid_ntru(data: &LayerData, profile: NetworkProfile) -> StrategyReport 
     }
 }
 
+/// The **secure** hybrid: identical pipeline to `run_hybrid_ntru` but on
+/// BFV (RLWE, no fatigue point) instead of overstretched SI-NTRU. Single
+/// chunk for clarity (the n=4096 ring packs generously); one ct×ct matvec
+/// (decrypt under s², no relinearization), poly-level mask-and-open switch,
+/// real-protocol ABY3 ReLU, packed re-encryption. This is the no-bootstrap
+/// construction running end to end on a *provably-secure* FHE scheme.
+fn run_hybrid_bfv(data: &LayerData, profile: NetworkProfile) -> StrategyReport {
+    let mut t = Timer::new();
+    let in_dim = data.x.len();
+    let out_dim = data.w.len();
+    let s = Bfv::new(BfvParams::DEFAULT);
+    let nbits = s.params.log2_t as usize; // 20
+    let t_mask = s.params.t() - 1;
+    assert!(
+        (out_dim + 1) * in_dim <= s.params.n,
+        "layer too large for a single BFV chunk (add chunking to scale)"
+    );
+    let adapter = BfvAdapter(&s);
+
+    let (ck, _server) = t.phase("keygen", || s.keygen());
+
+    // Both input and weights encrypted (fully private linear phase). The
+    // *weights* are query-independent, so their encryption is offline; only
+    // the client's input encryption is on the critical path.
+    let cw = t.phase("enc-weights", || s.encrypt_poly(&ck, &s.pack_weights(&data.w)));
+    let cx = t.phase("enc-input", || s.encrypt_poly(&ck, &s.pack_input(&data.x)));
+    t.phase("link-io", || {
+        sleep_link(&profile, adapter.ct_bytes(&cx) + adapter.ct_bytes(&cw), 2);
+    });
+
+    // The whole matvec: ONE ct×ct multiply (degree-2, no relin). Bias is
+    // added on the MPC side (BFV has no add_plain_at helper here).
+    let pre = t.phase("linear", || s.mul(&cx, &cw));
+
+    // Poly-level mask-and-open switch (masks are full uniform-mod-t polys).
+    //
+    // OFFLINE/ONLINE SPLIT (Delphi-style): both the to-MPC masks r_i and the
+    // return-path randomness rho_i are *data-independent*, so their
+    // encryptions are precomputed before the query arrives. Online, to-MPC
+    // is 3 ciphertext adds + 1 decryption, and the return is 3 *plaintext*
+    // adds — no fresh encryption on the critical path at all.
+    let mut rng = rand::thread_rng();
+    let masks: Vec<Vec<u64>> = (0..3)
+        .map(|_| (0..s.params.n).map(|_| rng.gen::<u64>() & t_mask).collect())
+        .collect();
+    let rho: Vec<Vec<u64>> = (0..3)
+        .map(|_| {
+            // Random only at the output positions; zero elsewhere so the
+            // resulting ciphertext carries no junk for a following layer.
+            let mut v = vec![0u64; s.params.n];
+            for slot in v.iter_mut().take(out_dim) {
+                *slot = rng.gen::<u64>() & t_mask;
+            }
+            v
+        })
+        .collect();
+    let (enc_masks, enc_rho) = t.phase("offline-prep", || {
+        let em: Vec<BfvCt> = masks.iter().map(|m| s.encrypt_poly(&ck, m)).collect();
+        let er: Vec<BfvCt> = rho.iter().map(|r| s.encrypt_poly(&ck, r)).collect();
+        (em, er)
+    });
+
+    let opened: Vec<u64> = t.phase("to-mpc", || {
+        let mut conv_bytes = 0usize;
+        let mut masked = pre.clone();
+        for enc in &enc_masks {
+            conv_bytes += adapter.ct_bytes(enc);
+            masked = s.add(&masked, enc);
+        }
+        let y = s.decrypt_poly(&ck, &masked);
+        sleep_link(&profile, conv_bytes + y.len() * 8, 2);
+        y
+    });
+    let positions: Vec<usize> = (0..out_dim).map(|r| s.matvec_output_position(in_dim, r)).collect();
+    let flat_masks: Vec<[u64; 3]> =
+        positions.iter().map(|&p| [masks[0][p], masks[1][p], masks[2][p]]).collect();
+    let flat_opened: Vec<u64> = positions.iter().map(|&p| opened[p]).collect();
+    let bias = data.bias.clone();
+
+    let (per_party, comm) = t.phase("mpc-relu", || {
+        run_parties(profile, |me| {
+            let my_masks: Vec<u64> = flat_masks.iter().map(|m| m[me]).collect();
+            let y = flat_opened.clone();
+            let bias = bias.clone();
+            move |be: &mut TransportBackend<MpcTransport>| {
+                (0..y.len())
+                    .map(|j| {
+                        let my_comp: Fr = if me == 0 {
+                            (y[j] as u128).wrapping_sub(my_masks[j] as u128)
+                        } else {
+                            0u128.wrapping_sub(my_masks[j] as u128)
+                        };
+                        let mut acc: Option<ShareRef> = None;
+                        for owner in 0..3 {
+                            let v = if me == owner { my_comp } else { 0 };
+                            let sref = be.share_secret(v, nbits, owner);
+                            acc = Some(match acc {
+                                None => sref,
+                                Some(a) => be.add(&a, &sref),
+                            });
+                        }
+                        let raw = acc.unwrap();
+                        let b = be.share_secret(if me == 0 { residue(bias[j], nbits) } else { 0 }, nbits, 0);
+                        let z = be.add(&raw, &b);
+                        let relu = mpc_relu(be, &z);
+                        be.my_additive_component(&relu)
+                    })
+                    .collect::<Vec<Fr>>()
+            }
+        })
+    });
+
+    // Return switch via **mask-and-correct**: party i published only
+    // δ_i = c_i − ρ_i (uniform ⇒ leaks nothing); the evaluator folds it into
+    // the precomputed Enc(ρ_i) with a *plaintext* addition. Σ(ρ_i + δ_i) =
+    // Σ c_i, so this is the same interactive bootstrap — fresh, key_pow-1 —
+    // with no online encryption.
+    let back = t.phase("to-fhe", || {
+        let mut sum: Option<BfvCt> = None;
+        let mut bytes = 0usize;
+        for (i, comps) in per_party.iter().enumerate() {
+            let mut delta = vec![0u64; s.params.n];
+            for (j, &c) in comps.iter().enumerate() {
+                delta[j] = ((c as u64) & t_mask).wrapping_sub(rho[i][j]) & t_mask;
+            }
+            bytes += comps.len() * 8; // only the masked corrections go on the wire
+            let e = s.add_plain_poly(&enc_rho[i], &delta);
+            sum = Some(match sum {
+                None => e,
+                Some(acc) => s.add(&acc, &e),
+            });
+        }
+        sleep_link(&profile, bytes, 1);
+        sum.expect("three parties")
+    });
+
+    let output = t.phase("decrypt", || {
+        let coeffs = s.decrypt_poly(&ck, &back);
+        (0..out_dim).map(|j| s.to_signed(coeffs[j] & t_mask)).collect::<Vec<i64>>()
+    });
+
+    let total_ms = t.total_ms();
+    let t_phases = t.phases.clone();
+    StrategyReport {
+        strategy: "hybrid-bfv".into(),
+        total_ms,
+        phases: t.phases,
+        ok: output == data.expected,
+        max_abs_error_vs_exact: max_err(&output, &data.expected),
+        output,
+        comm: Some(comm),
+        notes: {
+            // Offline = query-independent work (keygen, weight encryption,
+            // mask/rho precomputation). Online = the latency a query
+            // actually experiences.
+            let offline: f64 = t_phases
+                .iter()
+                .filter(|p| matches!(p.name, "keygen" | "enc-weights" | "offline-prep"))
+                .map(|p| p.micros as f64 / 1000.0)
+                .sum();
+            let online = total_ms - offline;
+            vec![
+                format!("BFV (RLWE, SECURE): n={}, log q={}, one ct×ct (no relin, decrypt under s²)", s.params.n, s.params.log2_q),
+                "same no-bootstrap pipeline as hybrid-ntru, on a provably-secure scheme".into(),
+                format!(
+                    "offline/online split: {offline:.0}ms precomputed (query-independent), {online:.0}ms ONLINE — same total work, moved off the critical path"
+                ),
+            ]
+        },
+    }
+}
+
 /// Harness-validation strategy: the full hybrid pipeline (including the
 /// real-protocol MPC segment) on the plaintext mock FHE backend.
 fn run_hybrid_mock(data: &LayerData, profile: NetworkProfile) -> StrategyReport {
@@ -920,6 +1093,7 @@ pub enum Strategy {
     HybridTfhe,
     HybridCkks,
     HybridNtru,
+    HybridBfv,
     HybridMock,
 }
 
@@ -932,6 +1106,7 @@ impl Strategy {
             "hybrid-tfhe" => Ok(Strategy::HybridTfhe),
             "hybrid-ckks" => Ok(Strategy::HybridCkks),
             "hybrid-ntru" => Ok(Strategy::HybridNtru),
+            "hybrid-bfv" => Ok(Strategy::HybridBfv),
             "hybrid-mock" => Ok(Strategy::HybridMock),
             other => Err(format!(
                 "unknown strategy '{other}' (expected mpc, tfhe, ckks, hybrid-tfhe, \
@@ -954,6 +1129,7 @@ pub fn run_strategy(
         Strategy::HybridTfhe => run_hybrid_tfhe(data, profile),
         Strategy::HybridCkks => run_hybrid_ckks(data, profile),
         Strategy::HybridNtru => run_hybrid_ntru(data, profile),
+        Strategy::HybridBfv => run_hybrid_bfv(data, profile),
         Strategy::HybridMock => run_hybrid_mock(data, profile),
     }
 }
@@ -999,6 +1175,7 @@ pub fn run_cli(args: &[String]) -> Result<(), String> {
     let mut strategies = vec![
         Strategy::Mpc,
         Strategy::HybridNtru,
+        Strategy::HybridBfv,
         Strategy::HybridCkks,
         Strategy::HybridTfhe,
         Strategy::Ckks,
@@ -1212,6 +1389,21 @@ mod tests {
             r.output, data.expected
         );
         assert_eq!(r.max_abs_error_vs_exact, 0, "hybrid must be exact");
+    }
+
+    #[test]
+    #[ignore] // slow in debug (n=4096 schoolbook ring); fast in release
+    fn hybrid_bfv_secure_matches_plaintext() {
+        // The no-bootstrap construction end to end on the SECURE (RLWE) FHE
+        // scheme, real ABY3 protocol, exact vs plaintext.
+        let data = make_layer(8, 2);
+        let r = run_hybrid_bfv(&data, NetworkProfile::INSTANT);
+        assert!(
+            r.ok,
+            "hybrid-bfv output {:?} != expected {:?}",
+            r.output, data.expected
+        );
+        assert_eq!(r.max_abs_error_vs_exact, 0, "secure hybrid must be exact");
     }
 
     #[test]

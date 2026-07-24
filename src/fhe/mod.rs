@@ -48,12 +48,14 @@
 //!        but heavier per-gate computation (bootstrapping).
 
 pub mod backend;
+pub mod bfv;
 pub mod circuit_emitter;
 pub mod ckks_backend;
 pub mod ckks_compare;
 pub mod lifecycle;
 pub mod market;
 pub mod mock_backend;
+pub mod ntt;
 pub mod si_ntru;
 pub mod tfhe_backend;
 

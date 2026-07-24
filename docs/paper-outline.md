@@ -166,6 +166,10 @@ model of §5?"
   engineering necessity and keep the model in plaintext; we (a) identify
   the switch as a **bootstrapping-elimination** mechanism enabling
   unbounded depth with a depth-1 FHE engine, and (b) encrypt the weights.
+- **Offline/online preprocessing**: Delphi (USENIX Sec '20) moves
+  query-independent HE work off the critical path; we apply the same idea
+  to the *scheme switch* (mask/ρ encryptions precomputed) and combine it
+  with mask-and-correct so the return leg is a plaintext addition (E11).
 - **Scheme switching between FHE schemes**: CHIMERA, PEGASUS. *Difference*:
   they switch FHE↔FHE to pick the cheapest scheme per op; we switch FHE↔MPC
   and exploit the re-encryption as a noise refresh.
@@ -188,6 +192,10 @@ model of §5?"
 | E7 | `bench-cnn` | that CNN through the *real hybrid pipeline* (FHE ct×ct conv + MPC relu/pool/argmax), 0 bootstraps, bit-exact, per-phase cost under a WAN model |
 | E8 | `bench-train` | private *training* (SGD, MSE loss to sidestep softmax) under the real ABY3 protocol, bit-exact vs plaintext integer-SGD, loss ↓ + 100% train acc, then private inference — the full encrypted-data→train→infer lifecycle from the gadget library |
 | E8b | `bench-train --hidden H` | private *backpropagation through ReLU* (`ReLU′ = step = lt`, reused from the forward mask): a 1-hidden-layer MLP trained under the real protocol, model bit-exact vs plaintext; honest ML caveats (per-layer LR; integer-SGD divergence past a stable regime) are separate from the exact-backprop crypto claim |
+| E9 | `bench-fhe-innerprod` | head-to-head of the minimal-FHE inner product (one ct×ct multiply, **no relinearization, no bootstrapping, no eval keys**, decrypt under `s²`/`f²`) — **BFV (secure, RLWE, n=4096)** vs **SI-NTRU (fast reference, insecure)**. Both exact, both eval-key-free. Result (this machine, matvec 8×4, **both NTT-accelerated**): BFV multiply 45 ms / decrypt 37 ms / ct 131 KB vs SI-NTRU 9.0 ms / 17 ms / 33 KB — the secure scheme pays ~5× (2× ring dimension + degree-2 tensor), quantifying the cost of security. CKKS is structurally the same (RLWE, no eval keys, coefficient-packed) and measured via SEAL elsewhere. **Conclusion: BFV is the secure instantiation to build on; SI-NTRU stays a reference.** |
+| E9b | `bench-hybrid-nn --strategies hybrid-bfv` | the **full no-bootstrap pipeline end to end on the SECURE scheme**: packed ct×ct matvec (BFV, no relin, decrypt under s²) → mask-open switch → real-protocol ABY3 ReLU → packed re-encryption. Bit-exact vs plaintext. Three-way (layer 8×2, all exact): mpc 21 ms / hybrid-ntru(insecure) 187 ms / hybrid-bfv(secure) 437 ms — the construction is exact and complete on secure parameters, and the remaining gap is now dominated by the scheme-switch conversions, not the FHE multiply. |
+| E10 | `fhe::ntt` differential tests | **multi-modular NTT** for the exact negacyclic product: a power-of-two `q` admits no direct NTT, so NTT-friendly primes are used as a computational device and the exact integer product is CRT-reconstructed (Garner), preserving the rounded-shift rescale. Differentially tested against the schoolbook implementation it replaces at full ±2^99 width and n=4096. Speedups: BFV multiply 515→45 ms (11×), BFV decrypt 130→37 ms (Horner), SI-NTRU multiply 31.6→9.0 ms, end-to-end secure hybrid 1149→437 ms. |
+| E11 | `bench-hybrid-nn --strategies hybrid-bfv` (offline/online) | **offline/online split of the scheme switch**, adapting Delphi's preprocessing idea plus the standard mask-and-correct trick: to-MPC masks and return-path randomness are query-independent, so their encryptions are precomputed; online, the return leg is a *plaintext* addition (`Enc(ρ)+δ`, `δ=c−ρ` uniform ⇒ leaks nothing). Measured: to-mpc 149→37 ms, to-fhe 108→**0.4 ms**, secure-hybrid **online latency 437→160 ms** (282 ms precomputed). Honest framing: total work is unchanged — it is moved off the critical path. Output bit-exact. |
 
 ## 8. Security model — state honestly, do not overclaim
 
@@ -202,15 +210,23 @@ model of §5?"
      key (threshold FHE) so no party can decrypt alone. The data flow is
      already correct (only masked values are opened); only the key
      operation is simulated.
-  2. **SI-NTRU at the paper parameters is overstretched** (large `q` vs
-     `n`), hence not IND-CPA-secure against subfield/dense-sublattice
-     attacks (Albrecht–Bai–Ducas '16; Kirchner–Fouque '17; Ducas–van
-     Woerden fatigue). Mitigation for a real deployment: instantiate C1
-     with a standard-parameter scheme (BGV/BFV/CKKS at depth 1, or a
-     non-overstretched NTRU regime), accepting a slower multiply but the
-     same 0-bootstrap property. The paper's contribution (C1) does not
-     depend on SI-NTRU's security; SI-NTRU is a *speed* choice for the
-     benchmark.
+  2. **SI-NTRU is overstretched even at depth 1** — do not claim it secure.
+     Fatigue point (ternary) at n=2048 is q ≈ 2^19; the large LTV secret
+     f=t·f'+1 raises the effective point to ≈ 2^59; but a single multiply
+     with a usable t≈2^20 already forces q ≳ 2^84 by the noise budget, and
+     no practical n closes the gap. (Back-of-envelope; a full DvW-estimator
+     run is a to-do, but the 25–65-bit margin is decisive.) **The secure
+     instantiation is RLWE**: BGV/BFV/CKKS have no NTRU lattice / fatigue
+     point, so q=2^120 at n=2048 is standard, provably-secure territory —
+     *and the same depth-1 trick applies*: a ct×ct product is a degree-2
+     ciphertext; skip relinearization and decrypt under `s²` (exactly the
+     mask-and-open switch already does). So C1's minimal FHE (one multiply,
+     no evaluation keys) is realized securely by RLWE. SI-NTRU stays as a
+     *fast reference point* (cheapest arithmetic) for isolating
+     packing/switching cost from FHE-scheme cost — never as the security
+     foundation. **Contribution opportunity**: a head-to-head of
+     BGV/BFV/CKKS/NTRU on this minimal-FHE inner product (no relin, no
+     bootstrap) — see §7 (E9, planned).
   3. Malicious security is out of scope (semi-honest, as standard for this
      line of work).
 

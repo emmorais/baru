@@ -656,14 +656,98 @@ intermediates. Depth 2 at `t = 2^20` **fails** (the `f⁴`·roundoff term
 works with `t` re-balanced to `2^8` — the "parameters adapted accordingly"
 trade-off, exposed by a passing test rather than asserted.
 
-**Security caveat, stated plainly**: LTV/YASHE-family NTRU at these
-parameter shapes (large q vs n — both this port's `2^120` and the
-reference's `2^101` at n = 2048) is in the **overstretched NTRU regime**,
-subject to subfield/dense-sublattice attacks (Albrecht–Bai–Ducas 2016,
-Kirchner–Fouque 2017; Ducas–van Woerden's fatigue point is near
-`q ≈ n^2.484`). That is why the YASHE line was abandoned for production
-FHE. This backend is a research/benchmarking artifact for the depth-1
-no-bootstrapping design point — not production key material.
+**Security caveat, stated plainly — depth-1 does *not* make it secure.**
+LTV/YASHE-family NTRU at these shapes is **overstretched**
+(Albrecht–Bai–Ducas 2016; Kirchner–Fouque 2017; Ducas–van Woerden "NTRU
+Fatigue" 2021). One might hope the minimal (single-multiply) regime stays
+below the fatigue point — it does not: at n=2048 the fatigue point is
+q ≈ 2^19 (≈ 2^59 after accounting for the large LTV secret f=t·f'+1), but
+one multiply with a usable t≈2^20 already forces q ≳ 2^84 by the noise
+budget, and no practical ring dimension closes that gap. So **this backend
+is a fast *reference point*, not a secure instantiation.** The construction
+(depth-1 ct×ct inner product, no relinearization, decrypt under the squared
+key, then switch to MPC) is scheme-agnostic and is realized **securely** by
+the RLWE schemes (BGV/BFV/CKKS) — which have no NTRU lattice and hence no
+fatigue point at these q, and admit the *same* skip-relinearization /
+decrypt-under-s² trick. SI-NTRU is kept only because it is the cheapest
+arithmetic, useful for isolating packing/switching cost from FHE-scheme
+cost. (Full analysis: `src/fhe/si_ntru.rs` docs and `docs/paper-outline.md`
+§8.)
+
+**The secure scheme runs the whole pipeline end to end.** `src/fhe/bfv.rs`
+is the RLWE instantiation, and `bench-hybrid-nn --strategies hybrid-bfv`
+runs the *same* no-bootstrap construction (packed ct×ct matvec → mask-open
+switch → real-protocol ABY3 ReLU → packed re-encryption) on it — **exact vs
+plaintext, on secure parameters**. The three-way comparison (this machine,
+layer 8×2, all exact):
+
+| strategy | secure? | total | linear | note |
+|---|---|---|---|---|
+| **mpc** (pure ABY3) | yes | 18 ms | 4.8 ms | fully private, weights shared |
+| **hybrid-ntru** | **no** (overstretched) | 187 ms | 8.6 ms | fast reference (NTT) |
+| **hybrid-bfv** | **yes** (RLWE, n=4096) | 437 ms | 45 ms | secure, same pipeline (NTT) |
+
+### NTT-accelerated ring arithmetic (`src/fhe/ntt.rs`)
+
+The polynomial multiply was the bottleneck, so it now runs on a **NTT**
+instead of the O(n²) schoolbook loop. There's a wrinkle worth knowing:
+a textbook NTT needs a modulus with a primitive 2n-th root of unity
+(`q ≡ 1 mod 2n`, prime) — but our `q = 2^100` is a **power of two**
+deliberately, because that's what makes the `t/q` rescale a rounded shift
+and the ring arithmetic native `u128`. A direct NTT is therefore
+impossible.
+
+The fix keeps the scheme and changes only the *computation*: the schemes
+really need the **exact integer** negacyclic product, so we compute it
+modulo four ~63-bit NTT-friendly primes (O(n log n) each) and
+CRT-reconstruct it exactly (Garner), then apply the unchanged rescale.
+The BFV entry point shares forward transforms across the tensor (4 forward
++ 3 inverse NTTs per prime, not 12). Decryption switched to **Horner**
+(`c₀ + s·(c₁ + s·c₂)`), one ring multiply per key power instead of six.
+
+Correctness isn't argued, it's *tested*: the NTT product is differentially
+tested against the schoolbook implementation it replaced — at full ±2⁹⁹
+coefficient width and n=4096 — which is why the swap was safe.
+
+| operation | before | after | speedup |
+|---|---|---|---|
+| BFV multiply (n=4096) | 515 ms | **45 ms** | 11× |
+| BFV decrypt | 130 ms | **37 ms** | 3.5× |
+| SI-NTRU multiply (n=2048) | 31.6 ms | **9.0 ms** | 3.5× |
+| **hybrid-bfv end-to-end** | 1149 ms | **437 ms** | 2.6× |
+
+Both schemes are NTT-accelerated, so E9 stays apples-to-apples. The secure
+BFV multiply is ~5× SI-NTRU's, reflecting its 2× ring dimension and
+3-component tensor — the honest, isolated price of security. All outputs
+remain bit-exact.
+
+### Offline/online split for the scheme switch
+
+With the multiply cheap, the *conversions* became the bottleneck (149 ms +
+108 ms = 59% of the secure hybrid) — and they were dominated by BFV
+encryptions of masks. Two standard optimizations from the literature apply
+directly:
+
+- **Delphi-style offline/online split**: the to-MPC masks `rᵢ` are
+  *query-independent*, so their encryption is precomputed before the query
+  arrives. Online, that leg is 3 ciphertext additions + 1 decryption.
+- **Mask-and-correct on the return path**: each party precomputes
+  `Enc(ρᵢ)` offline and, online, publishes only `δᵢ = cᵢ − ρᵢ` — uniform,
+  so it leaks nothing — letting the evaluator fold it in with a *plaintext*
+  addition (`Bfv::add_plain_poly`, O(n), no ring multiply). Since
+  `Σ(ρᵢ + δᵢ) = Σcᵢ`, it is the same interactive bootstrap with **no online
+  encryption at all**.
+
+| conversion leg | before | after (online) |
+|---|---|---|
+| FHE → MPC (`to-mpc`) | 149 ms | **37 ms** |
+| MPC → FHE (`to-fhe`) | 108 ms | **0.4 ms** |
+| **secure hybrid, online latency** | 437 ms | **160 ms** |
+
+Stated honestly: this does **not** reduce total work (the same six
+encryptions happen — 282 ms of them now precomputed); it moves
+query-independent work *off the critical path*, which is precisely what the
+offline/online split buys. Output remains bit-exact.
 
 ### Measured: one private dense layer, six ways (`baru bench-hybrid-nn`)
 
@@ -1110,7 +1194,10 @@ src/
     ckks_backend.rs — shallow (depth <= 2) CKKS: matvec/dot, no comparisons
     ckks_compare.rs — deep CKKS: polynomial-approximation sign/relu/compare
     si_ntru.rs      — scale-invariant NTRU (LTV): decrypt-under-f^k instead
-                       of relinearization; packed one-mult matvecs
+                       of relinearization; packed one-mult matvecs (INSECURE
+                       reference — overstretched; see its docs)
+    bfv.rs          — BFV: the SECURE RLWE instantiation of the same one-mult
+                       inner product (no relin, decrypt under s²); n=4096
   bench/
     ckks_compare.rs — `baru bench-ckks-compare`: measures the above
   hybrid/
@@ -1126,6 +1213,8 @@ src/
                        ZERO FHE bootstraps, cost linear in depth
     cnn.rs          — `baru bench-cnn`: full conv classifier (conv/relu/
                        maxpool/dense/argmax) through the hybrid, 0 bootstraps
+    fhe_innerprod.rs— `baru bench-fhe-innerprod`: BFV (secure) vs SI-NTRU
+                       (reference) on the minimal-FHE inner product
     train.rs        — `baru bench-train`: private SGD training (MSE loss),
                        gadget-composed, bit-exact, then private inference
   demo/

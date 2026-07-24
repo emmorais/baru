@@ -832,6 +832,7 @@ mod tests {
 pub mod ckks_compare;
 pub mod cnn;
 pub mod deep_nn;
+pub mod fhe_innerprod;
 pub mod comm;
 pub mod hybrid_nn;
 pub mod nn;
