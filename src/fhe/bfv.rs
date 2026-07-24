@@ -155,6 +155,13 @@ impl BfvCt {
     }
 }
 
+/// A fresh ciphertext held in the NTT domain, ready to be multiplied
+/// against many others without re-transforming.
+pub struct BfvCtNtt {
+    t0: ntt::Transformed,
+    t1: ntt::Transformed,
+}
+
 pub struct Bfv {
     pub params: BfvParams,
 }
@@ -288,13 +295,29 @@ impl Bfv {
     /// result is CRT-reconstructed before the (unchanged) rounded-shift
     /// rescale.
     pub fn mul(&self, a: &BfvCt, b: &BfvCt) -> BfvCt {
-        assert_eq!(a.c.len(), 2, "minimal mul: fresh (degree-1) operands only");
+        self.mul_pre(&self.transform(a), b)
+    }
+
+    /// Pre-transform a fresh ciphertext for reuse across several multiplies
+    /// (e.g. the input of a chunked matvec against many weight chunks).
+    pub fn transform(&self, ct: &BfvCt) -> BfvCtNtt {
+        assert_eq!(ct.c.len(), 2, "minimal mul: fresh (degree-1) operands only");
+        let p = &self.params;
+        let cen = |v: &[u128]| -> Vec<i128> { v.iter().map(|&c| center(c, p)).collect() };
+        BfvCtNtt {
+            t0: ntt::forward_transform(&cen(&ct.c[0]), p.n),
+            t1: ntt::forward_transform(&cen(&ct.c[1]), p.n),
+        }
+    }
+
+    /// Multiply a **pre-transformed** ciphertext by a fresh one, saving the
+    /// first operand's forward NTTs on every call after the transform.
+    pub fn mul_pre(&self, a: &BfvCtNtt, b: &BfvCt) -> BfvCt {
         assert_eq!(b.c.len(), 2);
         let p = &self.params;
         let cen = |v: &[u128]| -> Vec<i128> { v.iter().map(|&c| center(c, p)).collect() };
-        let (a0, a1) = (cen(&a.c[0]), cen(&a.c[1]));
         let (b0, b1) = (cen(&b.c[0]), cen(&b.c[1]));
-        let (t0, t1, t2) = ntt::exact_bfv_tensor(&a0, &a1, &b0, &b1, p.n);
+        let (t0, t1, t2) = ntt::exact_bfv_tensor_pre(&a.t0, &a.t1, &b0, &b1, p.n);
         BfvCt {
             c: vec![rescale(t0, p), rescale(t1, p), rescale(t2, p)],
         }

@@ -869,13 +869,34 @@ fn run_hybrid_bfv(data: &LayerData, profile: NetworkProfile) -> StrategyReport {
     let mut t = Timer::new();
     let in_dim = data.x.len();
     let out_dim = data.w.len();
-    let s = Bfv::new(BfvParams::DEFAULT);
-    let nbits = s.params.log2_t as usize; // 20
-    let t_mask = s.params.t() - 1;
+    // Plaintext modulus sized to the *actual* activation range: a d-term dot
+    // product of ~50-magnitude values reaches ~2^21 at d=784, which would
+    // silently wrap a fixed t=2^20. (A real deployment calibrates this from
+    // sample data — that is `ml::QuantizationReport`'s job.) q stays 2^100,
+    // so security is unchanged; only the noise budget Δ/2 = q/2t shrinks,
+    // which the cap below keeps comfortable for depth 1.
+    let max_abs_pre = data.pre.iter().map(|v| v.abs()).max().unwrap_or(1).max(1) as u64;
+    let log2_t = (66 - max_abs_pre.leading_zeros()).max(20);
     assert!(
-        (out_dim + 1) * in_dim <= s.params.n,
-        "layer too large for a single BFV chunk (add chunking to scale)"
+        log2_t <= 30,
+        "activation range needs t=2^{log2_t}, beyond BFV's depth-1 noise budget at q=2^100"
     );
+    let s = Bfv::new(BfvParams { n: 4096, log2_q: 100, log2_t });
+    let nbits = s.params.log2_t as usize;
+    let t_mask = s.params.t() - 1;
+    // Chunking lifts the single-ciphertext ceiling: the packing bound
+    // (rows+1)·in ≤ n caps rows per ciphertext, so wider layers split into
+    // ⌈out/rows_per_chunk⌉ weight ciphertexts, each multiplied against the
+    // SAME encrypted input. That count, ⌈out·in/n⌉, is the fundamental limit
+    // of coefficient packing for a dense layer: a degree-n product yields at
+    // most n/in *separable* outputs, since distinct rows need disjoint
+    // weight windows. (Gazelle's SIMD packing achieves the same MAC
+    // throughput but needs rotations + Galois keys — which would forfeit
+    // this construction's no-evaluation-keys property. Our layout is the
+    // rotation-free, Cheetah-style one.)
+    assert!(2 * in_dim <= s.params.n, "in_dim exceeds the ring dimension");
+    let rows_per_chunk = (s.params.n / in_dim).saturating_sub(1).min(out_dim.max(1));
+    let chunks: Vec<&[Vec<i64>]> = data.w.chunks(rows_per_chunk).collect();
     let adapter = BfvAdapter(&s);
 
     let (ck, _server) = t.phase("keygen", || s.keygen());
@@ -883,15 +904,27 @@ fn run_hybrid_bfv(data: &LayerData, profile: NetworkProfile) -> StrategyReport {
     // Both input and weights encrypted (fully private linear phase). The
     // *weights* are query-independent, so their encryption is offline; only
     // the client's input encryption is on the critical path.
-    let cw = t.phase("enc-weights", || s.encrypt_poly(&ck, &s.pack_weights(&data.w)));
+    let cws = t.phase("enc-weights", || {
+        chunks
+            .iter()
+            .map(|chunk| s.encrypt_poly(&ck, &s.pack_weights(chunk)))
+            .collect::<Vec<BfvCt>>()
+    });
     let cx = t.phase("enc-input", || s.encrypt_poly(&ck, &s.pack_input(&data.x)));
     t.phase("link-io", || {
-        sleep_link(&profile, adapter.ct_bytes(&cx) + adapter.ct_bytes(&cw), 2);
+        let bytes =
+            adapter.ct_bytes(&cx) + cws.iter().map(|c| adapter.ct_bytes(c)).sum::<usize>();
+        sleep_link(&profile, bytes, 2);
     });
 
-    // The whole matvec: ONE ct×ct multiply (degree-2, no relin). Bias is
-    // added on the MPC side (BFV has no add_plain_at helper here).
-    let pre = t.phase("linear", || s.mul(&cx, &cw));
+    // The matvec: one ct×ct multiply per weight chunk (degree-2, no relin),
+    // all against the same input — whose forward NTT is computed once and
+    // reused, saving 2 of 4 forward transforms per prime per chunk. Bias is
+    // added on the MPC side.
+    let pre_chunks: Vec<BfvCt> = t.phase("linear", || {
+        let cxt = s.transform(&cx);
+        cws.iter().map(|cw| s.mul_pre(&cxt, cw)).collect()
+    });
 
     // Poly-level mask-and-open switch (masks are full uniform-mod-t polys).
     //
@@ -901,8 +934,16 @@ fn run_hybrid_bfv(data: &LayerData, profile: NetworkProfile) -> StrategyReport {
     // is 3 ciphertext adds + 1 decryption, and the return is 3 *plaintext*
     // adds — no fresh encryption on the critical path at all.
     let mut rng = rand::thread_rng();
-    let masks: Vec<Vec<u64>> = (0..3)
-        .map(|_| (0..s.params.n).map(|_| rng.gen::<u64>() & t_mask).collect())
+    // FRESH masks per chunk. Reusing one mask set across chunks would be a
+    // leak: every chunk opens the same coefficient positions, so two chunks
+    // masked identically would reveal their difference (pre_i − pre_j) to
+    // whoever sees both openings.
+    let masks: Vec<Vec<Vec<u64>>> = (0..chunks.len())
+        .map(|_| {
+            (0..3)
+                .map(|_| (0..s.params.n).map(|_| rng.gen::<u64>() & t_mask).collect())
+                .collect()
+        })
         .collect();
     let rho: Vec<Vec<u64>> = (0..3)
         .map(|_| {
@@ -916,26 +957,44 @@ fn run_hybrid_bfv(data: &LayerData, profile: NetworkProfile) -> StrategyReport {
         })
         .collect();
     let (enc_masks, enc_rho) = t.phase("offline-prep", || {
-        let em: Vec<BfvCt> = masks.iter().map(|m| s.encrypt_poly(&ck, m)).collect();
+        let em: Vec<Vec<BfvCt>> = masks
+            .iter()
+            .map(|chunk_masks| {
+                chunk_masks.iter().map(|m| s.encrypt_poly(&ck, m)).collect()
+            })
+            .collect();
         let er: Vec<BfvCt> = rho.iter().map(|r| s.encrypt_poly(&ck, r)).collect();
         (em, er)
     });
 
-    let opened: Vec<u64> = t.phase("to-mpc", || {
+    let opened: Vec<Vec<u64>> = t.phase("to-mpc", || {
         let mut conv_bytes = 0usize;
-        let mut masked = pre.clone();
-        for enc in &enc_masks {
-            conv_bytes += adapter.ct_bytes(enc);
-            masked = s.add(&masked, enc);
-        }
-        let y = s.decrypt_poly(&ck, &masked);
-        sleep_link(&profile, conv_bytes + y.len() * 8, 2);
+        let y: Vec<Vec<u64>> = pre_chunks
+            .iter()
+            .enumerate()
+            .map(|(ci, pre)| {
+                let mut masked = pre.clone();
+                for enc in &enc_masks[ci] {
+                    conv_bytes += adapter.ct_bytes(enc);
+                    masked = s.add(&masked, enc);
+                }
+                s.decrypt_poly(&ck, &masked)
+            })
+            .collect();
+        sleep_link(&profile, conv_bytes + y.iter().map(|v| v.len() * 8).sum::<usize>(), 2);
         y
     });
-    let positions: Vec<usize> = (0..out_dim).map(|r| s.matvec_output_position(in_dim, r)).collect();
-    let flat_masks: Vec<[u64; 3]> =
-        positions.iter().map(|&p| [masks[0][p], masks[1][p], masks[2][p]]).collect();
-    let flat_opened: Vec<u64> = positions.iter().map(|&p| opened[p]).collect();
+    // Flatten (chunk, local row) -> per-output opened value and its chunk's
+    // own masks.
+    let mut flat_masks: Vec<[u64; 3]> = Vec::with_capacity(out_dim);
+    let mut flat_opened: Vec<u64> = Vec::with_capacity(out_dim);
+    for (ci, chunk) in chunks.iter().enumerate() {
+        for r in 0..chunk.len() {
+            let pos = s.matvec_output_position(in_dim, r);
+            flat_masks.push([masks[ci][0][pos], masks[ci][1][pos], masks[ci][2][pos]]);
+            flat_opened.push(opened[ci][pos]);
+        }
+    }
     let bias = data.bias.clone();
 
     let (per_party, comm) = t.phase("mpc-relu", || {
@@ -1389,6 +1448,17 @@ mod tests {
             r.output, data.expected
         );
         assert_eq!(r.max_abs_error_vs_exact, 0, "hybrid must be exact");
+    }
+
+    #[test]
+    #[ignore] // slow in debug; fast in release
+    fn hybrid_bfv_chunked_lifts_the_size_ceiling() {
+        // (out+1)·in = 33·256 = 8448 > n = 4096, so this REQUIRES chunking
+        // (it would have hit the old single-chunk assertion).
+        let data = make_layer(256, 32);
+        let r = run_hybrid_bfv(&data, NetworkProfile::INSTANT);
+        assert!(r.ok, "chunked hybrid-bfv output {:?} != {:?}", r.output, data.expected);
+        assert_eq!(r.max_abs_error_vs_exact, 0);
     }
 
     #[test]

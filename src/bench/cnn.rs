@@ -8,14 +8,17 @@
 //!               →  flatten  →  dense(→ NCLASSES)  →  argmax  →  class bit
 //!
 //! Both the image and the weights are encrypted (ct×ct linear layers). The
-//! convolution is evaluated as a single (chunked) packed matvec against an
-//! im2col/Toeplitz weight matrix — so it runs through the *same* proven
-//! SI-NTRU matvec + scheme-switch machinery as `bench-deep-nn`; only the
-//! nonlinearities differ (ReLU is fused with the fixed-point rescale;
-//! max-pool and argmax are the `crate::gadgets` building blocks). Every
-//! layer's FHE ciphertext is depth-1 fresh, so no bootstrapping occurs at
-//! any point — the same invariant `bench-deep-nn` demonstrates for MLPs,
-//! now for a CNN.
+//! convolution uses **Cheetah-style coefficient packing**
+//! ([`crate::fhe::conv_pack`]): the kernel is packed reversed on every axis,
+//! so one ciphertext multiplication *is* the whole sliding-window
+//! convolution for an entire output channel. That costs `OC` multiplications
+//! instead of the `⌈OC·oh·ow·D²/n⌉` an im2col/Toeplitz matvec would need —
+//! at 28×28 with `OC = 2`, **676 multiplications become 2**. The dense layer
+//! still uses the packed matvec (convolution is the case where overlapping
+//! windows are a feature; for a dense layer the `n/in_dim` separable-output
+//! limit is already tight). Every layer's FHE ciphertext is depth-1 fresh,
+//! so no bootstrapping occurs at any point — the same invariant
+//! `bench-deep-nn` demonstrates for MLPs, now for a CNN.
 //!
 //! # Scope / honesty
 //!
@@ -26,11 +29,15 @@
 //!   trained (linear) model. The weights here are controlled-magnitude
 //!   synthetic values (a cost/correctness microbenchmark, standard for this
 //!   line of work), not a trained classifier.
-//! - Coefficient packing bounds the flattened input to ≲ the ring
-//!   dimension, so this runs *small* CNNs (D ≤ ~12). CIFAR-scale needs
-//!   SIMD-slot conv packing with rotations (Gazelle-style) — a different
-//!   FHE instantiation; the no-bootstrap construction is scheme-agnostic
-//!   and transfers. See `docs/paper-outline.md` §9.
+//! - Conv packing needs `2·in_c·H·W ≲ n`, so a full 28×28 MNIST image runs
+//!   comfortably at `n = 2048`. Multi-channel CIFAR (3×32×32) exceeds that
+//!   and needs the channels split across ciphertexts (or a larger ring) —
+//!   a packing question, not a limit of the no-bootstrap construction.
+//! - With conv packing the FHE cost is nearly **flat in D** (it is `OC`
+//!   multiplications regardless), so the bottleneck moves decisively to the
+//!   MPC nonlinearities: at D=28 the ~1352 ReLUs and the max-pool
+//!   comparisons dominate. Speeding *those* up (CrypTFlow2-style comparison
+//!   and truncation protocols) is now the highest-value optimisation.
 
 use std::time::Instant;
 
@@ -41,6 +48,7 @@ use serde::Serialize;
 use crate::bench::comm::{CommStats, NetworkProfile};
 use crate::bench::hybrid_nn::{run_parties, sleep_link, MpcTransport};
 use crate::crypto::types::Fr;
+use crate::fhe::conv_pack::{self, ConvShape};
 use crate::fhe::si_ntru::{NtruCt, SiNtru, SiNtruAdapter, SiNtruParams};
 use crate::gadgets::{argmax, maxpool2d, Chw};
 use crate::hybrid::FheAdapter;
@@ -155,27 +163,6 @@ impl CnnModel {
         (crate::gadgets::argmax_ref(&logits), max_abs)
     }
 
-    /// Build the im2col/Toeplitz weight matrix `[OC·oh·oh][D·D]` so the
-    /// convolution is one packed matvec against the flattened input.
-    fn conv_toeplitz(&self) -> Vec<Vec<i64>> {
-        let oh = self.conv_shape.h;
-        let n_in = self.d * self.d;
-        let mut rows = Vec::with_capacity(OC * oh * oh);
-        for oc in 0..OC {
-            for oy in 0..oh {
-                for ox in 0..oh {
-                    let mut row = vec![0i64; n_in];
-                    for ky in 0..K {
-                        for kx in 0..K {
-                            row[(oy + ky) * self.d + (ox + kx)] = self.kernels[oc][ky * K + kx];
-                        }
-                    }
-                    rows.push(row);
-                }
-            }
-        }
-        rows
-    }
 }
 
 // ─── Hybrid FHE matvec + scheme-switch to opened shares ───────────────────────
@@ -220,6 +207,62 @@ fn hybrid_matvec_open(
             let pos = s.matvec_output_position(in_dim, r);
             opened.push(y[pos]);
             masks.push([chunk_masks[0][pos], chunk_masks[1][pos], chunk_masks[2][pos]]);
+        }
+    }
+    (opened, masks)
+}
+
+/// Convolution via [`crate::fhe::conv_pack`]: one ct×ct multiply per output
+/// channel, then a mask-and-open per channel. Returns the opened
+/// pre-activations and per-output masks flattened in `(oc, oy, ox)` order —
+/// the same layout the MPC stage and the plaintext reference use.
+#[allow(clippy::type_complexity)]
+fn hybrid_conv_open(
+    s: &SiNtru,
+    ck: &[u8],
+    c_input: &NtruCt,
+    model: &CnnModel,
+    profile: NetworkProfile,
+    rng: &mut impl Rng,
+) -> (Vec<u64>, Vec<[u64; 3]>) {
+    let n = s.params.n;
+    let t_mask = s.params.t() - 1;
+    let adapter = SiNtruAdapter(s);
+    let shape = ConvShape { in_c: 1, h: model.d, w: model.d, kh: K, kw: K };
+    assert!(
+        shape.required_degree() < n,
+        "conv packing needs degree {} < ring dimension {n}",
+        shape.required_degree()
+    );
+    let (oh, ow) = (shape.out_h(), shape.out_w());
+    let mut opened = Vec::with_capacity(OC * oh * ow);
+    let mut masks = Vec::with_capacity(OC * oh * ow);
+
+    for oc in 0..OC {
+        let kpoly = conv_pack::pack_kernel(&model.kernels[oc], shape, n, t_mask);
+        let cw = s.encrypt_poly(ck, &kpoly);
+        let prod = s.mul(c_input, &cw);
+
+        // Fresh masks per output channel (reuse across channels would leak
+        // the difference of their pre-activations).
+        let chan_masks: Vec<Vec<u64>> = (0..3)
+            .map(|_| (0..n).map(|_| rng.gen::<u64>() & t_mask).collect())
+            .collect();
+        let mut conv_bytes = 0usize;
+        let mut masked = prod;
+        for m in &chan_masks {
+            let enc = s.encrypt_poly(ck, m);
+            conv_bytes += adapter.ct_bytes(&enc);
+            masked = s.add(&masked, &enc);
+        }
+        let y = s.decrypt_poly(ck, &masked);
+        sleep_link(&profile, conv_bytes + oh * ow * 8, 2);
+        for oy in 0..oh {
+            for ox in 0..ow {
+                let pos = shape.output_position(oy, ox);
+                opened.push(y[pos]);
+                masks.push([chan_masks[0][pos], chan_masks[1][pos], chan_masks[2][pos]]);
+            }
         }
     }
     (opened, masks)
@@ -287,6 +330,10 @@ pub struct CnnRun {
     pub mpc_ms: f64,
     pub comm: CommStats,
     pub bootstraps: u64,
+    /// ct×ct multiplications the packed convolution actually performed.
+    pub conv_mults: usize,
+    /// What an im2col/Toeplitz matvec of the same convolution would cost.
+    pub conv_mults_toeplitz: usize,
 }
 
 pub fn run_cnn_hybrid(model: &CnnModel, input: &[i64], profile: NetworkProfile) -> CnnRun {
@@ -311,11 +358,14 @@ pub fn run_cnn_hybrid(model: &CnnModel, input: &[i64], profile: NetworkProfile) 
     let (ck, _sk) = s.keygen();
     let c_input = s.encrypt_poly(&ck, &s.pack_input(input));
 
-    // ── Conv (FHE ct×ct matvec via Toeplitz) → open ──
+    // ── Conv via Cheetah-style packing → open ──
+    // One ct×ct multiply per OUTPUT CHANNEL (not per output pixel): the
+    // kernel is packed reversed on every axis, so polynomial multiplication
+    // *is* the sliding-window convolution and every output pixel of that
+    // channel appears at once. See `fhe::conv_pack`.
     let t0 = Instant::now();
-    let toeplitz = model.conv_toeplitz();
     let (conv_open, conv_masks) =
-        hybrid_matvec_open(&s, &ck, &c_input, &toeplitz, n_in, profile, &mut rng);
+        hybrid_conv_open(&s, &ck, &c_input, model, profile, &mut rng);
     fhe_ms += t0.elapsed().as_secs_f64() * 1000.0;
 
     // ── MPC: +cbias≪s, fused ReLU∘rescale, max-pool → export pooled acts ──
@@ -402,6 +452,12 @@ pub fn run_cnn_hybrid(model: &CnnModel, input: &[i64], profile: NetworkProfile) 
         mpc_ms,
         comm,
         bootstraps: 0,
+        conv_mults: OC,
+        conv_mults_toeplitz: conv_pack::toeplitz_multiplications(
+            ConvShape { in_c: 1, h: model.d, w: model.d, kh: K, kw: K },
+            OC,
+            SiNtruParams::DEFAULT.n,
+        ),
     }
 }
 
@@ -418,6 +474,8 @@ pub struct CnnPoint {
     pub messages: u64,
     pub bytes: u64,
     pub bootstraps: u64,
+    pub conv_mults: usize,
+    pub conv_mults_toeplitz: usize,
 }
 
 const USAGE: &str = "usage: baru bench-cnn [options]
@@ -426,8 +484,10 @@ A compact convolutional classifier (conv → ReLU → maxpool → dense → argm
 through the hybrid pipeline: FHE ct×ct linear layers, MPC nonlinearities,
 ZERO FHE bootstraps, verified bit-exact against the plaintext reference.
 Correctness is exact; ACCURACY needs trained weights (orthogonal — see the
-module docs). Small D only (coefficient packing); CIFAR-scale needs
-SIMD-slot conv packing.
+module docs). The convolution uses Cheetah-style coefficient packing, so it
+costs one ct×ct multiply per output channel regardless of D — a full 28×28
+MNIST image runs fine. Multi-channel CIFAR needs the channels split across
+ciphertexts.
 
 options:
   --img D              input side length D (1 channel, D×D; default 8; D even)
@@ -492,6 +552,8 @@ pub fn run_cli(args: &[String]) -> Result<(), String> {
             messages: r.comm.messages,
             bytes: r.comm.bytes,
             bootstraps: r.bootstraps,
+            conv_mults: r.conv_mults,
+            conv_mults_toeplitz: r.conv_mults_toeplitz,
         };
         println!("{}", serde_json::to_string_pretty(&p).map_err(|e| e.to_string())?);
         return Ok(());
@@ -509,6 +571,12 @@ pub fn run_cli(args: &[String]) -> Result<(), String> {
     );
     println!("  predicted class : {}  ({})", r.class, if r.correct { "exact vs plaintext" } else { "WRONG" });
     println!("  FHE bootstraps  : {}", r.bootstraps);
+    println!(
+        "  conv ct×ct mults: {} (packed)  vs {} (im2col/Toeplitz) — {:.0}× fewer",
+        r.conv_mults,
+        r.conv_mults_toeplitz,
+        r.conv_mults_toeplitz as f64 / r.conv_mults as f64
+    );
     println!("  time            : total {:.0}ms  (fhe {:.0}ms, mpc {:.0}ms)", r.total_ms, r.fhe_ms, r.mpc_ms);
     println!("  MPC wire traffic: {} messages, {} bytes", r.comm.messages, r.comm.bytes);
     Ok(())
@@ -559,5 +627,43 @@ mod tests {
             assert_eq!(r.bootstraps, 0);
             assert!(r.comm.messages > 0, "must use the real MPC protocol");
         }
+    }
+
+    /// Conv packing lifts the input-size ceiling: a full 28×28 MNIST-shaped
+    /// image classifies exactly, which the im2col/Toeplitz formulation could
+    /// not do at any sane cost (it needs `conv_mults_toeplitz` multiplies,
+    /// here in the hundreds, versus `OC`).
+    #[test]
+    #[ignore] // full 28×28 through the real 3-party transport
+    fn conv_packing_classifies_a_full_mnist_sized_image() {
+        let (model, input) = CnnModel::random(28, 7);
+        let r = run_cnn_hybrid(&model, &input, NetworkProfile::INSTANT);
+        assert!(r.correct, "encrypted class {} != plaintext {}", r.class, r.expected);
+        assert_eq!(r.bootstraps, 0);
+        assert_eq!(r.conv_mults, OC, "one ct×ct multiply per output channel");
+        assert!(
+            r.conv_mults_toeplitz > 100 * r.conv_mults,
+            "expected a large win over Toeplitz, got {} vs {}",
+            r.conv_mults_toeplitz, r.conv_mults
+        );
+    }
+
+    /// The FHE cost of the convolution is flat in D — it is `OC`
+    /// multiplications either way — so growing the image must not grow the
+    /// FHE time appreciably. (The MPC side does grow: more ReLUs.)
+    #[test]
+    #[ignore]
+    fn fhe_cost_is_flat_in_image_size() {
+        let (m8, i8v) = CnnModel::random(8, 11);
+        let (m28, i28) = CnnModel::random(28, 11);
+        let small = run_cnn_hybrid(&m8, &i8v, NetworkProfile::INSTANT);
+        let big = run_cnn_hybrid(&m28, &i28, NetworkProfile::INSTANT);
+        assert!(small.correct && big.correct);
+        assert_eq!(small.conv_mults, big.conv_mults);
+        assert!(
+            big.fhe_ms < 4.0 * small.fhe_ms,
+            "FHE time should be near-flat in D: {:.0}ms at D=8 vs {:.0}ms at D=28",
+            small.fhe_ms, big.fhe_ms
+        );
     }
 }

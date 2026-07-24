@@ -50,6 +50,7 @@
 pub mod backend;
 pub mod bfv;
 pub mod circuit_emitter;
+pub mod conv_pack;
 pub mod ckks_backend;
 pub mod ckks_compare;
 pub mod lifecycle;

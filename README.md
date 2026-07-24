@@ -749,6 +749,85 @@ encryptions happen — 282 ms of them now precomputed); it moves
 query-independent work *off the critical path*, which is precisely what the
 offline/online split buys. Output remains bit-exact.
 
+### Lifting the layer-size ceiling (and why our packing is already optimal)
+
+The secure hybrid previously asserted a single weight ciphertext, capping
+layers at `(out+1)·in ≤ n = 4096`. It now **chunks**: `⌈out/(n/in − 1)⌉`
+weight ciphertexts, each multiplied against the same encrypted input, whose
+forward NTT is **computed once and reused** (`Bfv::mul_pre`) — saving 2 of
+4 forward transforms per prime per chunk.
+
+Worth stating as a finding rather than a to-do: **our reversed-coefficient
+packing is already at the fundamental limit for dense layers.** A degree-n
+product yields at most `n/in` *separable* outputs, because distinct rows
+need disjoint weight windows — so a matvec inherently costs `⌈out·in/n⌉`
+multiplications, which is exactly what chunking does. Gazelle's SIMD
+packing achieves the same MAC throughput but needs **rotations and Galois
+keys**, which would forfeit this construction's no-evaluation-keys
+property; our layout is the rotation-free, Cheetah-style one. (Convolution
+is the case where coefficient packing does strictly better — overlapping
+windows are exactly the sliding window — see the next section, where it
+turns 1352 multiplications into 2.)
+
+Measured (secure hybrid, exact at every size):
+
+| layer | multiplications | online | offline |
+|---|---|---|---|
+| 8×2 | 1 | 164 ms | 282 ms |
+| 256×32 | 3 | 656 ms | 590 ms |
+| 784×16 | 4 | 505 ms | 734 ms |
+
+Two real bugs were caught getting here, both now fixed and tested:
+- **Mask reuse across chunks leaked**: every chunk opens the same
+  coefficient positions, so sharing one mask set would reveal
+  `pre_i − pre_j` to anyone seeing two openings. Masks are now fresh per
+  chunk.
+- **Fixed `t = 2^20` silently overflowed**: a 784-term dot product of
+  ~50-magnitude values reaches ~2²¹, wrapping the plaintext modulus and
+  producing wrong (not merely noisy) results. `t` is now sized from the
+  measured activation range, with the depth-1 noise budget asserted.
+
+### Cheetah-style convolution packing: 676 multiplications become 2
+
+Convolution is exactly the case the dense-layer limit above does *not*
+apply to. Polynomial multiplication **is** convolution, so if the image is
+flattened row-major and the kernel is packed **reversed on every axis**
+(channel, row, column) at matching strides, then one ciphertext
+multiplication computes the entire sliding-window convolution for a whole
+output channel. Two properties make it exact rather than approximate:
+
+- **Channels pair off automatically.** The reversed channel offset makes
+  `c + (C−1−c′) = C−1` hold only when `c = c′`, so every input channel's
+  contribution lands on the *same* coefficient and they sum — which is
+  precisely what a multi-channel convolution wants.
+- **No row-wrap contamination.** A neighbouring row could only leak into an
+  output coefficient via a column carry (`col + b ≥ W`), which would require
+  `ox ≤ −1`. Impossible for a valid output, so the read-out positions are
+  clean. (Other coefficients *are* garbage; we never read them.)
+
+Conv output `(oy,ox)` lands at `(C−1)·HW + (oy+kh−1)·W + (ox+kw−1)`. The
+cost is `out_c` multiplications — **independent of the image size** —
+against the `⌈out_c·oh·ow·CHW/n⌉` an im2col/Toeplitz matvec needs.
+
+Measured A/B on the same classifier (`baru bench-cnn --img D`), both paths
+exact against the plaintext reference, 0 bootstraps:
+
+| D | Toeplitz mults | packed mults | FHE time (Toeplitz) | FHE time (packed) |
+|---|---|---|---|---|
+| 8 | 3 | 2 | 289 ms | 222 ms |
+| 12 | 16 | 2 | 1037 ms | 209 ms |
+| 28 | 1352 | 2 | **77497 ms** | **264 ms** |
+
+At MNIST resolution that is a **294× faster convolution** and 5.5× faster
+end to end (94.0 s → 17.1 s) — and it puts a full 28×28 image within reach,
+which the module previously documented as out of scope (`D ≤ ~12`).
+
+**The bottleneck has now moved off FHE entirely.** At D=28 the FHE work is
+264 ms of a 17.1 s run — 1.5%; the other 98.5% is the MPC side evaluating
+~1352 ReLUs plus the max-pool comparisons. Speeding *those* up
+(CrypTFlow2-style comparison and truncation protocols) is therefore the
+highest-value remaining optimization, not more FHE packing work.
+
 ### Measured: one private dense layer, six ways (`baru bench-hybrid-nn`)
 
 The same layer — `matvec(8×2) + bias + ReLU`, inputs spanning both signs —

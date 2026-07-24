@@ -435,6 +435,28 @@ pub fn exact_negacyclic_product(a: &[i128], b: &[i128], n: usize) -> Vec<I256> {
     crt_reconstruct(&residues, n)
 }
 
+/// A polynomial already in the NTT domain (per prime). Precomputing this
+/// for an operand reused across several multiplications — e.g. the *input*
+/// ciphertext of a chunked matvec, multiplied against many weight chunks —
+/// saves its forward transform on every chunk after the first.
+pub struct Transformed {
+    n: usize,
+    res: Vec<Vec<u64>>,
+}
+
+/// Forward-transform centered coefficients once, for reuse.
+pub fn forward_transform(a: &[i128], n: usize) -> Transformed {
+    let res = plans_for(n)
+        .iter()
+        .map(|plan| {
+            let mut f = reduce_mod(a, plan.p);
+            plan.forward(&mut f);
+            f
+        })
+        .collect();
+    Transformed { n, res }
+}
+
 /// The BFV multiply's three tensor components at once:
 /// `(a₀b₀, a₀b₁ + a₁b₀, a₁b₁)`, exact in ℤ.
 ///
@@ -450,15 +472,31 @@ pub fn exact_bfv_tensor(
     b1: &[i128],
     n: usize,
 ) -> (Vec<I256>, Vec<I256>, Vec<I256>) {
+    let ta0 = forward_transform(a0, n);
+    let ta1 = forward_transform(a1, n);
+    exact_bfv_tensor_pre(&ta0, &ta1, b0, b1, n)
+}
+
+/// As [`exact_bfv_tensor`], but with the first operand's transform already
+/// computed — **2 forward + 3 inverse** NTTs per prime per call instead of
+/// 4 + 3, which is the saving that makes a multi-chunk matvec cheaper.
+#[allow(clippy::type_complexity)]
+pub fn exact_bfv_tensor_pre(
+    ta0: &Transformed,
+    ta1: &Transformed,
+    b0: &[i128],
+    b1: &[i128],
+    n: usize,
+) -> (Vec<I256>, Vec<I256>, Vec<I256>) {
+    assert_eq!(ta0.n, n);
+    assert_eq!(ta1.n, n);
     let (mut r0, mut r1, mut r2) = (Vec::new(), Vec::new(), Vec::new());
-    for plan in plans_for(n) {
+    for (k, plan) in plans_for(n).iter().enumerate() {
         let p = plan.p;
-        let mut fa0 = reduce_mod(a0, p);
-        let mut fa1 = reduce_mod(a1, p);
+        let fa0 = &ta0.res[k];
+        let fa1 = &ta1.res[k];
         let mut fb0 = reduce_mod(b0, p);
         let mut fb1 = reduce_mod(b1, p);
-        plan.forward(&mut fa0);
-        plan.forward(&mut fa1);
         plan.forward(&mut fb0);
         plan.forward(&mut fb1);
         let mut d0: Vec<u64> = (0..n).map(|i| mulmod(fa0[i], fb0[i], p)).collect();
