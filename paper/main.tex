@@ -1,0 +1,670 @@
+\documentclass[11pt]{article}
+
+% ---- Packages (all standard in a full TeX Live / MiKTeX install) ----
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{lmodern}
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{mathtools}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{multirow}
+\usepackage{microtype}
+\usepackage{graphicx}
+\usepackage{xcolor}
+\usepackage{listings}
+\usepackage[hidelinks]{hyperref}
+\usepackage[capitalize,noabbrev]{cleveref}
+
+% ---- Theorem environments ----
+\theoremstyle{plain}
+\newtheorem{theorem}{Theorem}
+\newtheorem{lemma}{Lemma}
+\newtheorem{proposition}{Proposition}
+\theoremstyle{definition}
+\newtheorem{definition}{Definition}
+\newtheorem{construction}{Construction}
+\theoremstyle{remark}
+\newtheorem{remark}{Remark}
+
+% ---- Macros ----
+\newcommand{\Enc}{\mathsf{Enc}}
+\newcommand{\Dec}{\mathsf{Dec}}
+\newcommand{\Fabb}{\mathcal{F}_{\mathsf{ABB}}}
+\newcommand{\ReLU}{\mathrm{ReLU}}
+\newcommand{\Z}{\mathbb{Z}}
+\newcommand{\bt}[1]{\texttt{#1}}
+\newcommand{\toMPC}{\mathsf{fhe{\to}shares}}
+\newcommand{\toFHE}{\mathsf{shares{\to}fhe}}
+\DeclareMathOperator{\poly}{poly}
+\DeclareMathOperator{\maj}{maj}
+
+\lstset{basicstyle=\ttfamily\small,columns=fullflexible,keepspaces=true,
+        breaklines=true,frame=none,xleftmargin=1em}
+
+\title{\bfseries The Switch Is the Bootstrap:\\
+Deep Private Inference at Zero FHE Bootstraps\\
+via Scheme Switching}
+
+\author{%
+  (author names elided for review)%
+}
+\date{}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+Hybrid private-inference systems evaluate a neural network's linear layers
+under homomorphic encryption (FHE) and its nonlinearities under secure
+multi-party computation (MPC), switching representation between the two.
+Prior work treats this scheme switch as an engineering necessity. We observe
+that it is also a \emph{noise-reset mechanism}: the re-encryption that
+returns an activation from MPC shares to an FHE ciphertext produces a
+ciphertext distributed identically to a \emph{fresh}, depth-one encryption.
+Consequently a network of \emph{arbitrary depth} is evaluated with
+\textbf{zero FHE bootstraps} and cost \textbf{linear in depth}, using an FHE
+engine that supports only a \emph{single} homomorphic multiplication and
+\emph{no evaluation keys}. We make the argument precise (\Cref{thm:main}),
+instantiate the FHE side so that a full matrix--vector product with
+\emph{both} the weights and the activations encrypted is one
+ciphertext$\times$ciphertext multiplication decrypted under $s^2$ (no
+relinearization), and give a convolution packing that yields an entire
+output channel per multiplication. The MPC side is a triple-free,
+communication-batched honest-majority protocol. We implement the whole
+pipeline and validate it by \emph{bit-exact} agreement with a plaintext
+integer reference at every depth. On real MNIST test digits, a fully
+encrypted two-convolution CNN --- four encrypted linear layers, three MPC
+nonlinearities, three scheme switches, and zero bootstraps --- attains
+$98.05\%$ test accuracy, with every encrypted prediction provably equal to
+its plaintext counterpart. Unlike two-party inference services, the model
+weights are encrypted as well as the input.
+\end{abstract}
+
+\section{Introduction}\label{sec:intro}
+
+Fully homomorphic encryption~\cite{Gentry} lets a server compute on
+encrypted data, but every homomorphic multiplication grows ciphertext noise;
+after a bounded number of multiplications the ciphertext must be
+\emph{bootstrapped} --- an expensive homomorphic decryption --- to continue.
+Deep networks therefore incur bootstrapping cost that scales with depth.
+
+An orthogonal line of work evaluates the \emph{linear} layers under FHE and
+the \emph{nonlinear} layers (ReLU, max-pooling, argmax) under
+MPC~\cite{Gazelle,Delphi,Cheetah,CrypTFlow2}, because comparisons are cheap
+in MPC and expensive in FHE. Between the two representations sits a
+\emph{scheme switch}: mask the ciphertext, decrypt the mask, compute the
+nonlinearity on additive secret shares, and re-encrypt the result. These
+systems present the switch as unavoidable overhead.
+
+\paragraph{Our observation.} The return leg of the switch --- re-encrypting
+each party's share component and summing --- produces a ciphertext that is a
+sum of \emph{fresh} encryptions. A sum of fresh encryptions is itself a
+fresh encryption: it carries only fresh noise and sits at multiplicative
+depth one, indistinguishable from a first-layer input. The switch that a
+system already performs for the ReLU therefore \emph{also refreshes the FHE
+ciphertext}, and it does so for free. The per-layer FHE noise budget is a
+constant \emph{independent of network depth}, so bootstrapping is never
+needed --- not deferred, but absent. We call this ``the switch is the
+bootstrap.''
+
+This inverts a familiar tradeoff. Because the FHE engine only ever performs
+one multiplication before the next switch resets it, we may use an FHE
+scheme that is fast precisely \emph{because} it supports only depth one and
+requires \emph{no evaluation keys} (no relinearization keys, no Galois keys,
+no bootstrapping keys). A ciphertext$\times$ciphertext product is a degree-2
+ciphertext; rather than relinearizing it back to degree one, we simply
+decrypt it under $s^2$ at the next switch --- which opens a masked value
+anyway. The result is a private-inference construction whose FHE cost per
+layer is a single multiplication and whose total FHE cost is linear in depth
+with a small constant.
+
+\paragraph{Contributions.}
+\begin{enumerate}
+\item \textbf{Switch-as-bootstrap (\Cref{sec:construction}).} We formalize
+the claim that the MPC round trip refreshes the FHE ciphertext to a
+depth-one state, giving a per-layer noise bound independent of depth and
+hence unbounded-depth evaluation at zero bootstraps. The argument is
+scheme-agnostic: any additively-homomorphic FHE with a cheap depth-one
+multiply instantiates it.
+
+\item \textbf{Evaluation-key-free, both-operands-private linear layers
+(\Cref{sec:fhe}).} Instantiating the FHE side with RLWE (BFV) and
+reversed-coefficient packing, a full matrix--vector product with both the
+weight matrix \emph{and} the activation vector encrypted is a single
+ciphertext$\times$ciphertext multiplication decrypted under $s^2$, with no
+relinearization and no evaluation keys. A Cheetah-style convolution packing
+yields an entire output channel per multiplication. This strengthens the
+privacy model of prior hybrid systems, which keep the model in plaintext.
+
+\item \textbf{A triple-free, batched honest-majority MPC layer
+(\Cref{sec:mpc}).} Multiplication uses ABY3-style resharing with PRF-derived
+correlated randomness --- one ring element per party per multiplication, no
+Beaver triples, no dealer. Bit decomposition is a Kogge--Stone construction
+batched across an entire layer, so a ReLU or max-pooling layer costs a
+constant number of communication rounds regardless of width.
+
+\item \textbf{Composability (\Cref{sec:uc}).} The pipeline is an Arithmetic
+Black Box; a small gadget library (\bt{relu}, \bt{max2}, \bt{maxpool2d},
+\bt{argmax}, \bt{dense}, \bt{conv2d}) realizes standard network layers as
+pure functions of the ABB primitives, so any architecture built from them
+inherits security and correctness with no per-architecture proof.
+
+\item \textbf{An implementation validated bit-exactly
+(\Cref{sec:eval}).} We implement the entire construction and check it against
+a plaintext integer reference: the encrypted output equals the plaintext
+output \emph{bit for bit} at every measured depth. On real MNIST test
+digits, a fully encrypted two-convolution CNN reaches $98.05\%$ accuracy at
+zero bootstraps.
+\end{enumerate}
+
+\paragraph{Honesty about scope.} We separate what is proven, what is
+implemented, and what is simulated. The design is semi-honest,
+honest-majority. Two aspects of the \emph{implementation} stand in for their
+deployable form and are disclosed as limitations (\Cref{sec:security}): the
+masked decryption uses a single client key as a placeholder for threshold
+FHE, and the fast reference FHE engine (scale-invariant NTRU) is
+\emph{insecure} at the parameters this construction needs. The secure
+instantiation is RLWE, on which all headline accuracy and correctness
+numbers are measured; NTRU is retained only as a speed reference for
+isolating packing cost from FHE-scheme cost.
+
+\section{Preliminaries}\label{sec:prelim}
+
+\paragraph{Notation.} We work over the polynomial ring
+$R_q = \Z_q[X]/(X^n+1)$ with $n$ a power of two. Lowercase letters denote
+ring elements; $s$ is an RLWE secret key. For an integer $v$ and width $b$,
+$\langle v\rangle$ denotes an additive secret sharing over $\Z_{2^b}$. We
+write $x \gg s$ for a logical right shift by $s$ bits.
+
+\paragraph{RLWE encryption (BFV).}\label{par:bfv}
+We use the Brakerski/Fan--Vercauteren scheme~\cite{FV}. A plaintext is a
+polynomial with coefficients mod $t$; a ciphertext is a pair
+$(c_0,c_1)\in R_q^2$ with $c_0 + c_1 s \approx \Delta m$ for
+$\Delta=\lfloor q/t\rfloor$. Addition is componentwise. The product of two
+ciphertexts is a \emph{degree-2} ciphertext $(d_0,d_1,d_2)$ satisfying
+$d_0 + d_1 s + d_2 s^2 \approx \Delta^2 m_1 m_2 / \Delta$ after rescaling;
+usually one \emph{relinearizes} $(d_0,d_1,d_2)$ back to a pair using an
+evaluation key. We never relinearize: the next scheme switch decrypts the
+degree-2 ciphertext directly under $s^2$
+(\Cref{sec:fhe}). We take $n=4096$ and $\log_2 q = 100$, at or below the
+$128$-bit security ceiling of $\log_2 q \le 109$ for
+$n=4096$~\cite{HEStandard}.
+
+\paragraph{Replicated secret sharing (ABY3).}\label{par:rss}
+For the honest-majority three-party segment we use $2$-out-of-$3$ replicated
+sharing~\cite{ABY3}: a value $v=v_0+v_1+v_2$ over $\Z_{2^b}$ is shared so
+party $i$ holds $(v_i, v_{i+1})$. Addition and multiplication-by-constant
+are local. Multiplication is described in \Cref{sec:mpc}.
+
+\paragraph{Scheme switching.} A \emph{switch to MPC}, $\toMPC$, takes an FHE
+ciphertext of a value $x$, has the parties add fresh random masks, decrypts
+the single masked ciphertext, and produces an additive sharing
+$\langle x\rangle$; only a uniformly-masked value is ever opened. A
+\emph{switch to FHE}, $\toFHE$, has each party freshly encrypt its share
+component; the evaluator sums the ciphertexts.
+
+\section{The Switch-as-Bootstrap Construction}\label{sec:construction}
+
+\subsection{The layer template}
+
+A network is a sequence of layers $x \mapsto \sigma(L(x))$, where $L$ is an
+affine map (dense or convolution, possibly with encrypted weights) and
+$\sigma$ is a nonlinearity (ReLU, optionally followed by max-pooling). Each
+layer is evaluated as:
+\begin{enumerate}
+\item \textbf{FHE linear map.} Given a fresh ciphertext $c=\Enc(x)$, compute
+$c' = L(c)$: one homomorphic multiplication (\Cref{sec:fhe}). $c'$ is a
+degree-2 ciphertext with depth-one noise.
+\item \textbf{Switch to MPC.} $\langle y\rangle \leftarrow \toMPC(c')$,
+opening only a masked value. The ciphertext noise is now discarded.
+\item \textbf{Nonlinearity in MPC.}
+$\langle a\rangle \leftarrow \sigma(\langle y\rangle)$ (\Cref{sec:mpc}).
+\item \textbf{Switch to FHE.} $c_{\mathrm{next}} \leftarrow \toFHE(\langle
+a\rangle)$: a fresh ciphertext for the next layer.
+\end{enumerate}
+
+\subsection{Main claim}
+
+\begin{theorem}[Switch-as-bootstrap]\label{thm:main}
+Let $\Enc$ be an additively homomorphic encryption scheme whose fresh
+ciphertexts carry noise at most $\nu_0$ and admit one homomorphic
+multiplication within a decryption-correct noise budget $B$ (i.e.
+$\poly(\nu_0)\le B$). In the layer template above, the ciphertext entering
+the FHE step of \emph{every} layer is distributed identically to a fresh
+encryption: it has multiplicative depth one and noise at most $w\cdot\nu_0$,
+where $w$ is the layer's fan-in width. Consequently, for a network of any
+depth $D$, decryption correctness holds at every layer under the single
+budget $B$, and no bootstrapping is invoked.
+\end{theorem}
+
+\begin{proof}[Proof sketch]
+The claim is an invariant maintained by induction on the layer index. The
+base case is the network input, a fresh encryption by construction. For the
+inductive step, assume layer $\ell$ begins with a fresh ciphertext. Steps
+1--3 consume it and produce an additive sharing $\langle a\rangle$ living
+entirely in the MPC domain; the FHE ciphertext and its noise are discarded
+at Step 2. Step 4 forms
+$c_{\mathrm{next}} = \sum_{i} \Enc(a^{(i)})$, a sum of freshly sampled
+encryptions of the parties' share components $a^{(i)}$. By additive
+homomorphism $c_{\mathrm{next}}$ encrypts $\sum_i a^{(i)} = a$, and because
+each summand is an independent fresh encryption, $c_{\mathrm{next}}$ is
+distributed as a fresh encryption of $a$ with noise bounded by the sum of at
+most $w$ fresh noises, i.e. $w\cdot\nu_0$, at multiplicative depth one. Thus
+layer $\ell+1$ begins in the same fresh state. Since the state is fresh at
+every layer, the single-multiplication budget $B$ suffices at every layer,
+independent of $D$. Bootstrapping, the operation used only to reset
+accumulated noise, is therefore never invoked.
+\end{proof}
+
+\begin{remark}[Cost linear in depth]
+Each layer performs a constant amount of FHE work (one multiply, $O(1)$ mask
+ciphertexts), one masked decryption, and one MPC nonlinearity. Total cost is
+therefore linear in depth, with no super-linear bootstrapping term. This is
+the qualitative separation from leveled FHE, where the per-multiply cost
+grows with the remaining level budget or a bootstrap is amortized in.
+\end{remark}
+
+\begin{remark}[Why we can drop evaluation keys]
+\Cref{thm:main} needs only \emph{one} multiplication per layer and never
+composes two multiplications homomorphically. Relinearization exists to make
+a degree-2 product usable by a \emph{subsequent} homomorphic operation; here
+the subsequent operation is a decryption (the switch), which handles a
+degree-2 ciphertext natively by evaluating $d_0+d_1 s + d_2 s^2$. No
+relinearization key is needed. Coefficient packing (\Cref{sec:fhe})
+avoids slot rotations, so no Galois keys are needed either. And no
+bootstrapping key is needed by the theorem. The FHE public material is a
+single public key.
+\end{remark}
+
+\subsection{Correctness of the fixed-point values}
+
+\Cref{thm:main} concerns ciphertext \emph{noise}. Independently, the integer
+activations must not overflow the share modulus $2^b$. We use a fused
+nonlinearity
+\begin{equation}\label{eq:fused}
+a' \;=\; \ReLU\!\big((W\!\cdot\! a + (\beta \ll s)) \gg s\big),
+\end{equation}
+where the arithmetic right shift by $s$ rescales the fixed-point product so
+that activation magnitude stays roughly constant across layers. Two points
+make this exact.
+
+First, the rescale is a \emph{logical} shift, yet $W\!\cdot\!a+(\beta\ll s)$
+can be negative before the ReLU. Correctness holds because the shifted value
+is retained only on the non-negative branch of the ReLU --- where a logical
+and an arithmetic shift agree --- and zeroed on the negative branch. Hence a
+single bit decomposition of the pre-activation yields \emph{both} the sign
+bit (for the ReLU) and the shifted magnitude (for the rescale): one bit
+decomposition per layer, not two.
+
+Second, the construction is \emph{exact} integer fixed-point. The encrypted
+output equals the plaintext integer network bit for bit --- not up to an
+approximation error --- which is what our experiments verify as
+$\texttt{correct}=\texttt{true}$ (\Cref{sec:eval}). This is a much stronger
+correctness statement than the approximate equality reported by
+CKKS-based approximate inference.
+
+\section{Evaluation-Key-Free Linear Layers}\label{sec:fhe}
+
+\subsection{Both operands encrypted, no relinearization}
+
+We pack a length-$m$ vector into the coefficients of a degree-$m$ polynomial.
+To compute an inner product $\langle u, v\rangle$, we pack $u$ in natural
+order and $v$ in \emph{reversed} order; the degree-$(m-1)$ coefficient of the
+polynomial product $u(X)\cdot v(X)$ is exactly $\sum_i u_i v_i$. Both
+polynomials are ciphertexts, so a matrix--vector product is a
+ciphertext$\times$ciphertext multiplication in which \emph{both} the weights
+and the activations are encrypted. The product is a degree-2 ciphertext,
+which the next switch decrypts under $s^2$; we never relinearize.
+
+For a matrix with $\rho$ output rows and inner dimension $m$, the reversed
+layout places row $r$'s weights at coefficient offset $r\cdot m$, so a single
+degree-$n$ product yields up to $\lfloor n/m\rfloor - 1$ separable outputs; a
+layer of $\rho$ rows costs $\lceil \rho m/n\rceil$ multiplications. We show
+this is optimal for the coefficient encoding: a degree-$n$ product admits at
+most $n/m$ separable outputs because distinct rows require disjoint weight
+windows. SIMD-slot packing matches the throughput but requires rotations and
+Galois keys, forfeiting the evaluation-key-free property.
+
+\subsection{Exact negacyclic products via a multi-modular NTT}
+
+For a power-of-two modulus $q$ the ring $R_q$ has no primitive $2n$-th root
+of unity, so no direct NTT exists. We instead compute the \emph{exact}
+integer negacyclic product using several NTT-friendly primes as a
+computational device and reconstruct the integer coefficients by the Chinese
+Remainder Theorem (Garner's algorithm), then reduce mod $q$ (and apply the
+rounded-shift rescale). This is differentially tested against a schoolbook
+reference at full coefficient width and $n=4096$. It accelerates the BFV
+multiplication by roughly $11\times$ over the schoolbook implementation it
+replaces.
+
+\subsection{Convolution packing: an output channel per multiplication}
+
+Polynomial multiplication is itself a convolution, which we exploit
+directly. Flatten a $C\times H\times W$ input row-major into coefficients and
+pack a kernel \emph{reversed on every axis} (channel, row, column) at the
+input's strides. Then a single ciphertext$\times$ciphertext product places
+the valid convolution output for an entire output channel at a fixed set of
+coefficients. Two facts make it exact:
+\begin{itemize}
+\item \textbf{Channels pair off.} The reversed channel offset makes
+$c + (C{-}1{-}c') = C{-}1$ hold only when $c=c'$, so every input channel's
+contribution lands on the same output coefficient and they sum --- exactly
+what a multi-channel convolution requires.
+\item \textbf{No row-wrap contamination.} A neighbouring row could only leak
+into an output coefficient via a column carry, which would require a
+negative output column index --- impossible for a valid output. The read-out
+coefficients are therefore clean.
+\end{itemize}
+The layer costs $\mathrm{out\_c}$ multiplications, \emph{independent of image
+size}, versus $\lceil \mathrm{out\_c}\cdot o_h o_w\cdot CHW / n\rceil$ for an
+im2col/Toeplitz formulation. At $28\times28$ with a $3\times3$ kernel and two
+output channels this is $2$ multiplications instead of $1352$.
+
+\section{The MPC Layer}\label{sec:mpc}
+
+\subsection{Triple-free multiplication}
+
+With replicated sharing $x=x_0+x_1+x_2$, each party $i$ holds $(x_i,
+x_{i+1})$ and can form three of the nine cross terms of $x\cdot y$ locally:
+\begin{equation}\label{eq:reshare}
+z_i \;=\; x_i y_i + x_i y_{i+1} + x_{i+1} y_i + \alpha_i,
+\end{equation}
+where the $\alpha_i$ are zero-sum correlated randomness derived locally from
+pairwise PRF keys, $\alpha_i = F(k_i, \mathrm{ctr}) - F(k_{i-1},
+\mathrm{ctr})$. Summing over the three parties covers all nine cross terms
+exactly once, so $\sum_i z_i = (\sum_i x_i)(\sum_i y_i) = xy$; the $\alpha_i$
+cancel in the sum but re-randomize each party's share so nothing leaks. Each
+multiplication is one ring element sent to one neighbour --- no Beaver
+triples~\cite{Beaver}, no dealer, nothing precomputed beyond a one-time key
+handshake. The PRF counter is a globally distinct value per multiplication,
+so no two products ever share an $\alpha$ (which would expose their
+difference).
+
+\subsection{Batched bit decomposition}
+
+Comparisons (for ReLU, max-pooling, argmax) reduce to extracting the sign
+bit of a shared value, which requires an arithmetic-to-binary decomposition.
+We use the ABY3 decomposition: (i) binary-share the three additive
+components for free (each is already known to exactly the two parties a
+replicated sharing needs); (ii) reduce three shares to two with a carry-save
+adder, exploiting that in this encoding $x\oplus y\oplus z$ and
+$\maj(x,y,z)$ fall out of the \emph{same} four products (two rounds, not
+four); (iii) add the remaining two with a Kogge--Stone parallel-prefix
+adder~\cite{KoggeStone}, whose $(g,p)$ combine
+$G = g \oplus (p \wedge g')$ is local because a group cannot both generate
+and propagate a carry. The depth is $2 + 1 + \lceil\log_2 b\rceil + 1
+\approx 9$ rounds at $b=20$.
+
+Crucially, we \emph{batch} the decomposition across an entire layer: every
+internal multiplication round is flattened over all lanes, so decomposing a
+whole ReLU or max-pooling layer costs the same $\approx 9$ rounds as
+decomposing a single value. Without batching a $1352$-neuron ReLU layer
+would run $\approx 12{,}000$ sequential rounds; with it, $\approx 9$. This
+single change is a $6.7\times$ end-to-end speedup on the MPC segment
+(\Cref{sec:eval}).
+
+\section{Composability}\label{sec:uc}
+
+The construction manipulates secret values only through opaque handles
+(a share reference or a ciphertext handle) and a fixed set of primitive
+operations; it never inspects the representation. This is exactly the
+Arithmetic Black Box abstraction~\cite{DamgardNielsen,SPDZ}: an ideal
+functionality $\Fabb$ storing values by handle and exposing
+$\{\mathsf{add}, \mathsf{mul}, \mathsf{lt}, \mathsf{share\_public},
+\mathsf{reveal}\}$ plus an internal, invisible representation switch. The
+scheme switch of \Cref{sec:construction} is that internal operation; it is
+never observable at the ABB interface.
+
+A small gadget library realizes standard layers as pure functions of the
+ABB primitives (\Cref{tab:gadgets}). Because each gadget is a composition of
+ABB operations, if each primitive UC-realizes~\cite{Canetti} its $\Fabb$
+operation, each gadget UC-realizes the corresponding ideal gadget, and any
+network --- any sequence of gadgets --- UC-realizes the ideal inference
+functionality; the simulator for a network is the composition of the
+per-gadget simulators. We therefore do not prove ``private CNN inference''
+as a monolith: we exhibit a handful of gadgets and compose them. Swapping in
+more channels, more convolution blocks, or residual adds requires no new
+security argument, only a new sequence of gadget calls.
+
+\begin{table}[t]
+\centering
+\caption{The gadget library as compositions of ABB primitives.}
+\label{tab:gadgets}
+\begin{tabular}{@{}lll@{}}
+\toprule
+gadget & definition & primitives \\
+\midrule
+\bt{relu} & $x\cdot(0<x)$ & \bt{sub}, \bt{lt}, \bt{mul} \\
+\bt{max2} & $\mathsf{mux}(a<b,\,b,\,a)$ & \bt{lt}, \bt{sub}, \bt{mul}, \bt{add} \\
+\bt{maxpool2d} & fold of \bt{max2} over a window & (above) \\
+\bt{argmax} & scan tracking $(\text{best},\text{idx})$ & \bt{lt}, \bt{mul}, \bt{add}, \bt{share\_public} \\
+\bt{dense} / \bt{conv2d} & $\sum W\!\cdot\! x + b$ & \bt{mul}, \bt{add} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section{Security Model}\label{sec:security}
+
+\paragraph{Threat model.} Semi-honest adversary; honest-majority
+three-party MPC for the nonlinear segment; the FHE evaluator is an untrusted
+server. Only the final output (the class index) is revealed. Intermediate
+activations remain shared or encrypted, and each switch opens only a
+uniformly-masked value, which is simulatable.
+
+\paragraph{Disclosed implementation gaps.} We distinguish the design from
+its current implementation.
+\begin{enumerate}
+\item \textbf{Threshold decryption is simulated.} The masked decryption uses
+a single client key as a stand-in for threshold FHE~\cite{AsharovMHE}. The
+data flow is already correct --- only uniformly-masked values are opened ---
+so a deployable instantiation secret-shares the FHE key without changing the
+protocol logic.
+\item \textbf{The fast reference FHE engine is insecure; the secure one is
+RLWE.} We port scale-invariant NTRU~\cite{LTV,YASHE} as a speed reference
+only. It is overstretched even at depth one: the NTRU fatigue
+point~\cite{ABDucas,KirchnerFouque,DucasvanWoerden} for the parameters a
+usable plaintext modulus forces is well below the required $q$, so we do not
+claim it secure. The secure instantiation is RLWE (BFV), which has no NTRU
+lattice and no fatigue point, and supports the identical depth-one,
+no-relinearization trick. \emph{All headline accuracy and correctness numbers
+are measured on BFV.} A machine-checked regression asserts the ring
+dimension and modulus are within the standardized $128$-bit
+budget~\cite{HEStandard}.
+\item \textbf{Malicious security is out of scope}, as is standard for this
+line of work.
+\end{enumerate}
+
+\section{Evaluation}\label{sec:eval}
+
+We implement the full construction in a single Rust crate (no GPU). The
+three MPC parties run a real replicated-sharing wire protocol over serialized
+messages, with a network-cost model (round-trip time and bandwidth). Every
+benchmark verifies the encrypted result against a plaintext integer reference
+and reports \texttt{correct}; all numbers are emitted by the tool, not
+hand-entered. Wall-clock figures are single-thread on commodity hardware and
+are meant to be read as ratios, not absolutes.
+
+\subsection{Correctness and the zero-bootstrap invariant}
+
+At every measured depth and width, the encrypted class equals the plaintext
+class \emph{bit for bit}, and the bootstrap counter is exactly zero. This is
+the operational content of \Cref{thm:main}: had noise accumulated with depth,
+deep outputs would diverge from the plaintext reference; they do not. The
+same invariant holds for the fully encrypted two-convolution CNN of
+\Cref{sec:mnist}, whose four encrypted linear layers and three switches all
+report zero bootstraps.
+
+\subsection{The MPC segment: making it private, then fast}
+
+\Cref{tab:mpc} traces the MPC nonlinearity segment of the flagship CNN
+($28\times28$ input) through the sequence of protocol changes described in
+\Cref{sec:mpc}. An initial masked-open comparison was found to leak its input
+(the mask carried no secret entropy) and was replaced by the ABY3 bit
+decomposition; correctness held throughout, but the correct protocol costs
+more. Eliminating Beaver triples (PRF resharing) then cut bandwidth
+$15\times$, and batching the decomposition across each layer cut time a
+further $6.7\times$. The endpoint is \emph{private, triple-free, and batched}
+--- and $2.9\times$ faster than the original leaky baseline it started from.
+
+\begin{table}[t]
+\centering
+\caption{MPC nonlinearity segment of the $28\times28$ CNN across protocol
+revisions. Every row is bit-exact against the plaintext reference; only
+privacy and cost differ.}
+\label{tab:mpc}
+\begin{tabular}{@{}lrr@{}}
+\toprule
+protocol stage & MPC time & wire bytes \\
+\midrule
+leaky masked-open (insecure baseline) & $17.6$ s & $1.2$ MB \\
+correct bit decomposition, Beaver triples & $76.9$ s & $159.4$ MB \\
+\quad + triple-free PRF resharing & $40.8$ s & $10.4$ MB \\
+\quad + batched ReLU decomposition & $20.7$ s & $10.2$ MB \\
+\quad + batched max-pooling & $\mathbf{6.1}$ s & $10.0$ MB \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Convolution packing}
+
+Replacing the im2col/Toeplitz convolution with the reversed-axis packing of
+\Cref{sec:fhe} reduces the number of ciphertext multiplications from
+hundreds to one per output channel, independent of image size. On the
+$28\times28$ classifier the convolution's FHE time drops from $77.5$ s to
+$0.26$ s ($294\times$), and the FHE share of runtime falls to a few percent
+--- confirming that the MPC nonlinearities, not the FHE arithmetic, are the
+cost center that \Cref{sec:mpc} then addresses.
+
+\subsection{Real MNIST: a fully encrypted two-convolution CNN}\label{sec:mnist}
+
+We train the exact architecture the pipeline evaluates --- $\texttt{conv}(8,
+3\times3)\to\ReLU\to\text{pool}\to\texttt{conv}(16,3\times3)\to\ReLU\to
+\text{pool}\to\texttt{dense}(128)\to\ReLU\to\texttt{dense}(10)$ --- on the
+full $60{,}000$-image MNIST~\cite{MNIST} training set, then \emph{post-train
+quantize into the exact integer fixed-point scheme the encrypted pipeline
+runs}. The reported accuracy is thus that of the deployed integer model, not
+of a float model that would lose accuracy under quantization. This model has
+four encrypted linear layers (two convolutions, two dense), three MPC
+nonlinearities, and three scheme switches, and the second convolution is
+multi-channel and packed with the same reversed-axis layout.
+
+\begin{table}[t]
+\centering
+\caption{Full-test-set accuracy of the deployed integer model, by
+architecture. All fit the depth-one noise budget ($\text{nbits}\le 30$).}
+\label{tab:arch}
+\begin{tabular}{@{}lr@{}}
+\toprule
+architecture & MNIST test accuracy \\
+\midrule
+$\texttt{conv}(8) \to \texttt{dense}(10)$ & $94.96\%$ \\
+$\texttt{conv}(12) \to \texttt{dense}(10)$ & $95.73\%$ \\
+$\texttt{conv}(8) \to \texttt{dense}(128) \to \texttt{dense}(10)$ & $97.63\%$ \\
+$\texttt{conv}(8) \to \texttt{dense}(256)\to\texttt{dense}(128)\to\texttt{dense}(10)$ & $97.89\%$ \\
+$\texttt{conv}(8)\to\texttt{conv}(16)\to\texttt{dense}(128)\to\texttt{dense}(10)$ & $\mathbf{98.05\%}$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Because the construction makes depth free, we used it as an instrument to
+search architectures (\Cref{tab:arch}): a second convolution layer beats both
+a wider single convolution and a deeper fully-connected stack --- spatial
+depth is what MNIST rewards, and the construction supplies it at no
+cryptographic cost. The chosen two-convolution model attains $98.05\%$ on the
+$10{,}000$-image test set. The Rust integer forward pass agrees with an
+independent numpy reference digit-for-digit, and the \emph{encrypted}
+pipeline reproduces the plaintext prediction on every real digit tested, at
+zero bootstraps. Because the hybrid is bit-exact, the encrypted accuracy
+\emph{equals} the plaintext accuracy of $98.05\%$: privacy costs nothing in
+accuracy, demonstrated on real inputs rather than asserted.
+
+\subsection{Positioning against prior inference systems}
+
+\Cref{tab:sota} places the result against representative two-party inference
+systems. The residual $\sim\!1\%$ accuracy gap is model size, a training
+question the construction is indifferent to. The distinguishing axis is the
+last column: prior systems are client/server protocols in which the server
+evaluates on \emph{plaintext} weights, so the model is not hidden; here every
+linear layer is ciphertext$\times$ciphertext, so the weights are encrypted
+too, and only the class index leaves the cryptographic domain.
+
+\begin{table}[t]
+\centering
+\caption{Positioning on MNIST. The comparison axis is \emph{what is hidden},
+not accuracy.}
+\label{tab:sota}
+\begin{tabular}{@{}lll@{}}
+\toprule
+system & MNIST acc & what is hidden \\
+\midrule
+\textbf{this work} & $\mathbf{98.0\%}$ & \textbf{image \emph{and} weights} (ct$\times$ct) \\
+Gazelle~\cite{Gazelle} & ${\sim}99\%$ & image only (plaintext weights) \\
+Delphi~\cite{Delphi} & ${\sim}99\%$ & image only \\
+CrypTFlow2~\cite{CrypTFlow2} & ${\sim}99\%$ & image only \\
+MiniONN~\cite{MiniONN}/Cheetah~\cite{Cheetah} & ${\sim}99\%$ & image only \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section{Related Work}\label{sec:related}
+
+\paragraph{Hybrid linear-FHE / nonlinear-MPC inference.}
+Gazelle~\cite{Gazelle}, Delphi~\cite{Delphi}, Cheetah~\cite{Cheetah}, and
+CrypTFlow2~\cite{CrypTFlow2} pioneered evaluating linear layers under
+HE and nonlinearities under MPC. They treat the switch as engineering
+overhead and keep the model in plaintext. We identify the switch as a
+bootstrapping-elimination mechanism enabling unbounded depth with a
+depth-one FHE engine, and we encrypt the weights.
+
+\paragraph{Preprocessing.} Delphi~\cite{Delphi} moves query-independent HE
+work off the critical path. The same idea applies to the scheme switch: mask
+and return-path randomness are query-independent and can be precomputed, so
+the online return leg becomes a plaintext addition.
+
+\paragraph{Scheme switching between FHE schemes.} CHIMERA~\cite{CHIMERA} and
+PEGASUS~\cite{PEGASUS} switch FHE$\leftrightarrow$FHE to pick the cheapest
+scheme per operation. We switch FHE$\leftrightarrow$MPC and exploit the
+re-encryption as a noise refresh.
+
+\paragraph{Leveled and bootstrapped FHE.} BGV~\cite{BGV}, BFV~\cite{FV}, and
+CKKS~\cite{CKKS} evaluate bounded-depth circuits and bootstrap (following
+Gentry~\cite{Gentry}) to go deeper; TFHE~\cite{TFHE} bootstraps every gate.
+Our construction removes the bootstrap for the deep-inference workload by
+interleaving an MPC round trip that already exists for the nonlinearity.
+
+\paragraph{Overstretched NTRU.} The insecurity of NTRU at large modulus is
+established by~\cite{ABDucas,KirchnerFouque} and sharpened
+by~\cite{DucasvanWoerden}; we rely on it to justify using NTRU only as a
+non-secure reference and RLWE as the secure instantiation.
+
+\section{Limitations}\label{sec:limitations}
+
+The MPC nonlinearity and the conversions dominate cost: the construction
+wins on depth scaling, on encrypting the model, and on the thin-pipe regime,
+\emph{not} on a single small layer over a fast LAN, where pure MPC is faster.
+Softmax and layer normalization (as in transformers) need additional MPC
+subprotocols (exponentiation, reciprocal, inverse square root) that we do not
+implement; deep MLP/CNN ReLU stacks are supported. Layer width per ciphertext
+is bounded by the ring dimension through the packing constraint; wider layers
+chunk. Multi-channel inputs beyond the ring-dimension bound (e.g. CIFAR-scale
+three-channel images) require splitting channels across ciphertexts or a
+larger ring --- a packing question, not a limit of the construction.
+
+\section{Conclusion}\label{sec:conclusion}
+
+The scheme switch that hybrid private-inference systems already perform for
+each nonlinearity is, at the same time, a noise reset: it re-encrypts the
+activation to a fresh, depth-one ciphertext. Reading the switch this way
+turns bootstrapping from a per-depth cost into an absent one, and lets the
+FHE engine be a minimal, evaluation-key-free, single-multiply primitive. We
+gave the argument precisely, instantiated it with both operands encrypted,
+built a triple-free batched MPC layer, and validated the whole pipeline
+bit-exactly --- culminating in a fully encrypted two-convolution CNN at
+$98.05\%$ on real MNIST with zero FHE bootstraps.
+
+\bibliographystyle{plain}
+\bibliography{references}
+
+\end{document}

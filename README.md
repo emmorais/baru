@@ -992,30 +992,30 @@ Toeplitz-on-SI-NTRU path: 5× faster *and* actually private. FHE is now
 Everything above proves the pipeline is *exact*. This adds the orthogonal
 question a reviewer will ask: **what accuracy does it get on real data?**
 
-The model is a small but real convolutional net —
-`1×28×28 → conv(8,3×3) → ReLU → maxpool → dense(→128) → ReLU → dense(→10) → argmax`
+The model is a small but real **two-convolution** CNN —
+`1×28×28 → conv(8,3×3) → ReLU → pool → conv(16,3×3) → ReLU → pool → dense(→128) → ReLU → dense(→10) → argmax`
 — **trained** on the full 60 000-image MNIST training set (numpy SGD,
-`scratchpad/train_final.py`) and then **quantised into the very integer
+`scratchpad/train_modeA.py`) and then **quantised into the very integer
 fixed-point scheme `CnnModel::forward` runs** — so the number below is the
 accuracy of the *deployed integer model*, not a float model that would lose
-something afterward. It has **two encrypted dense layers plus an encrypted
-hidden layer**, three MPC nonlinearities and two scheme switches, and still
-**zero bootstraps** — the extra depth composes in with nothing but "switch
-again." Weights and a real test subset are embedded in
+something afterward. It has **four encrypted linear layers** (two conv, two
+dense), three MPC nonlinearities and three scheme switches, and still
+**zero bootstraps** — the second, multi-channel convolution composes in with
+nothing but "switch again." Weights and a real test subset are embedded in
 `examples/data/mnist_cnn.rs`.
 
 ```
-plaintext-integer accuracy : 298/300 = 99.33%   (in-repo test subset)
-full MNIST test set (10 000): 97.63%             (identical weights, offline)
-ENCRYPTED pipeline (8 imgs) : 8/8 match plaintext exactly, 0 bootstraps
+plaintext-integer accuracy : 296/300 = 98.67%   (in-repo test subset)
+full MNIST test set (10 000): 98.05%             (identical weights, offline)
+ENCRYPTED pipeline (4 imgs) : 4/4 match plaintext exactly, 0 bootstraps
 ```
 
 The encrypted run matters more than the accuracy: because the hybrid is
 bit-exact against `forward`, **every encrypted prediction equals the
-plaintext one** — verified here on real digits through all three encrypted
-linear layers, not asserted. So the encrypted accuracy *is* 97.63%; privacy
+plaintext one** — verified here on real digits through all four encrypted
+linear layers, not asserted. So the encrypted accuracy *is* 98.05%; privacy
 costs nothing in accuracy. The Rust integer forward was checked to agree
-with the numpy reference digit-for-digit on the embedded subset (298/300
+with the numpy reference digit-for-digit on the embedded subset (296/300
 both), so the offline 10 000-image number transfers faithfully.
 
 **Where this sits vs. the literature.** The honest framing is like-for-like
@@ -1023,15 +1023,15 @@ on *what is hidden*, since that — not accuracy — is the axis this work moves
 
 | system | model | MNIST acc | what is hidden |
 |---|---|---|---|
-| **baru** (this repo) | conv(8) + 128-hidden + dense | **97.6%** | **image *and* weights** (ct×ct) |
+| **baru** (this repo) | conv(8)+conv(16)+128-hidden+dense | **98.0%** | **image *and* weights** (ct×ct) |
 | Gazelle (2018) | larger CNN | ~99% | image only (server holds plaintext weights) |
 | Delphi (2019) | larger CNN | ~99% | image only |
 | CrypTFlow2 (2020) | larger CNN | ~99% | image only |
 | MiniONN / Cheetah | larger CNN | ~99% | image only |
 
-The residual accuracy gap is model size, and closing it is a *training*
+The residual ~1% accuracy gap is model size, and closing it is a *training*
 question the no-bootstrap construction is indifferent to (depth is free —
-this deeper model is the same pipeline switched one more time). The column
+this two-conv model is the same pipeline switched a few more times). The column
 that distinguishes this work is the last one: the systems above are
 two-party client/server protocols where **the server evaluates on plaintext
 weights** — the model is not hidden. Here the linear layers are

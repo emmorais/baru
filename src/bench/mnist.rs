@@ -10,7 +10,7 @@
 //! # What is embedded
 //!
 //! `examples/data/mnist_cnn.rs` carries weights trained by
-//! `scratchpad/train_mnist.py` (numpy SGD on the full 60 000-image MNIST
+//! `scratchpad/train_modeA.py` (numpy SGD on the full 60 000-image MNIST
 //! training set, then post-training quantisation to the exact integer
 //! fixed-point scheme [`crate::bench::cnn::CnnModel::forward`] evaluates),
 //! plus the first `N_TEST` real MNIST **test** images with their labels.
@@ -28,20 +28,22 @@
 //!   The subset run demonstrates that equality on real inputs rather than
 //!   asserting it.
 //!
-//! The architecture is a small but real convolutional net —
-//! `conv(8,3×3) → ReLU → maxpool → dense(→128) → ReLU → dense(→10)` — with
-//! **two** encrypted linear layers *plus* an encrypted hidden layer, each
-//! separated by an MPC nonlinearity and a scheme switch. That the hidden
-//! layer composes in with nothing more than "switch again, no bootstrap" is
-//! the whole thesis made concrete: depth is free. The accuracy below
-//! reflects this model; a still-larger one is a training question the
-//! construction is indifferent to.
+//! The architecture is a small but real **two-convolution** CNN —
+//! `conv(8,3×3) → ReLU → pool → conv(16,3×3) → ReLU → pool → dense(→128) →
+//! ReLU → dense(→10)` — with **four encrypted linear layers** (two conv, two
+//! dense), each separated by an MPC nonlinearity and a scheme switch. That
+//! the second convolution (multi-channel, ct×ct) composes in with nothing
+//! more than "switch again, no bootstrap" is the whole thesis made concrete:
+//! depth is free. Both the conv stack (`extra_conv`) and the FC stack
+//! (`hidden`) are arbitrary-length `Vec`s in `CnnModel`, so going deeper is
+//! data, not code. The accuracy below reflects this model; a still-larger one
+//! is a training question the construction is indifferent to.
 
 use std::time::Instant;
 
 use serde::Serialize;
 
-use crate::bench::cnn::{run_cnn_hybrid, CnnModel};
+use crate::bench::cnn::{run_cnn_hybrid, CnnModel, ConvLayer};
 use crate::bench::comm::NetworkProfile;
 
 #[path = "../../examples/data/mnist_cnn.rs"]
@@ -49,22 +51,29 @@ use crate::bench::comm::NetworkProfile;
 mod data;
 
 /// Full-test-set (all 10 000 images) integer accuracy measured offline by
-/// `train_mnist.py` on the identical weights. Stated here so the in-repo
+/// `train_modeA.py` on the identical weights. Stated here so the in-repo
 /// subset number can be read against it.
-pub const FULL_TEST_ACCURACY: f64 = 0.9763;
+pub const FULL_TEST_ACCURACY: f64 = 0.9805;
 
 fn load_model() -> (CnnModel, Vec<Vec<i64>>, Vec<u8>) {
     let images: Vec<Vec<i64>> = data::TEST_IMAGES.iter().map(|im| im.to_vec()).collect();
     let labels: Vec<u8> = data::TEST_LABELS.to_vec();
     let kernels: Vec<Vec<i64>> = data::KERNELS.iter().map(|k| k.to_vec()).collect();
-    let hidden_w: Vec<Vec<i64>> = data::HIDDEN_W.iter().map(|r| r.to_vec()).collect();
+    let extra_conv = vec![ConvLayer {
+        kernels: data::CONV2_W.iter().map(|r| r.to_vec()).collect(),
+        cbias: data::CONV2_B.to_vec(),
+        in_c: data::CONV2_IN_C,
+        in_h: data::CONV2_IN_H,
+        in_w: data::CONV2_IN_W,
+    }];
+    let hidden: Vec<(Vec<Vec<i64>>, Vec<i64>)> = data::hidden_layers();
     let dense_w: Vec<Vec<i64>> = data::DENSE_W.iter().map(|r| r.to_vec()).collect();
     let model = CnnModel::from_trained(
         28,
         kernels,
         data::CBIAS.to_vec(),
-        Some(hidden_w),
-        Some(data::HIDDEN_B.to_vec()),
+        extra_conv,
+        hidden,
         dense_w,
         data::DENSE_B.to_vec(),
         data::SHIFT,
@@ -176,9 +185,10 @@ pub fn run_cli(args: &[String]) -> Result<(), String> {
 
     println!("Private CNN on real MNIST — trained weights, real test digits, ZERO bootstraps");
     println!(
-        "architecture: 1×28×28 → conv({}, 3×3) → ReLU → maxpool(2×2) → dense(→{}) → ReLU → dense(→10) → argmax",
+        "architecture: 1×28×28 → conv({}, 3×3) → ReLU → pool → conv({}, 3×3) → ReLU → pool → dense(→{}) → ReLU → dense(→10) → argmax",
         data::OC,
-        data::HIDDEN
+        data::CONV2_W.len(),
+        data::HN
     );
     println!();
     println!(
@@ -233,7 +243,7 @@ mod tests {
     #[test]
     #[ignore] // runs the real BFV × ABY3 hybrid; slow in debug
     fn encrypted_matches_plaintext_on_real_digits() {
-        let r = run(6, NetworkProfile::INSTANT);
+        let r = run(3, NetworkProfile::INSTANT);
         assert_eq!(
             r.hybrid_matches_plaintext, r.hybrid_evaluated,
             "every encrypted prediction must equal the plaintext one"
