@@ -220,6 +220,8 @@ ABY3's bit decomposition. `a = a₀ + a₁ + a₂` as a replicated sharing, so:
 Depth is `2 + 1 + ⌈log₂ nbits⌉ + 1` ≈ 9 rounds at `nbits = 20`, versus the
 old (leaky) version's 1. Verified against plaintext binary expansion
 including two's-complement negatives, since the MSB is what `lt` returns.
+When many values are decomposed together (a whole ReLU or max-pool layer),
+`a2b_batch` runs them all in that *same* ~9 rounds — see *Batching* below.
 
 **Measured cost of correctness** (`baru bench-cnn`, results bit-exact in both
 cases — only privacy and cost differ):
@@ -243,8 +245,52 @@ The historical note, for context: with replicated sharing each party computes
 randomness derived locally from pairwise PRF keys, then sends one ring
 element to one neighbour. That is **one element per party per
 multiplication** instead of six dealt plus two opened — and it removes party
-0 as a dealer bottleneck. Replacing triple dealing with PRF-based
-multiplication is the single highest-value MPC optimization outstanding.
+0 as a dealer bottleneck.
+
+### Batching — the round count, not the multiplication count
+
+After triples were gone, the dominant cost was **round latency, not
+bandwidth**. The network's ~610k multiplications were bundled tightly within
+each `a2b`, but the `a2b` calls themselves ran one-per-element in a loop:
+1352 ReLUs, each a ~9-round decomposition, is ~12 000 sequential rounds. So
+the fix was to batch across elements, not to touch the comparison algorithm.
+
+Two backend methods do it, both with a default that just loops (so every
+non-batching backend is unaffected) and a `TransportBackend` override that
+runs the whole set in one id block:
+
+- **[`a2b_batch`](src/crypto/aby3_protocol.rs)** decomposes many shares at
+  once; every internal carry-save and prefix-adder round is flattened across
+  all lanes, so a batch of any width costs the same ~9 rounds as one value.
+- **`lt_batch`** compares many pairs at once (the MSB of each `a2b_batch`
+  lane), which lets **`maxpool2d`** reduce all its windows in lockstep —
+  `pool²−1` batched steps for the whole layer instead of one `max_reduce`
+  per window.
+
+The ReLU layer became one `a2b_batch` + one batched multiply; max-pool became
+a level-batched fold. Both are bit-exact against the per-element versions.
+
+**Measured** (`baru bench-cnn`, D=28 MPC, all rows bit-exact):
+
+| stage | MPC time | messages | wire bytes |
+|---|---|---|---|
+| leaky `a2b` (insecure baseline) | 17.6 s | 114 790 | 1.2 MB |
+| correct `a2b`, Beaver triples | 76.9 s | 114 790 | 159.4 MB |
+| + ABY3 resharing (no triples) | 40.8 s | 29 211 | 10.4 MB |
+| + batched ReLU | 20.7 s | 15 701 | 10.2 MB |
+| + batched max-pool | **6.1 s** | **5 591** | 10.0 MB |
+
+Batching alone was 40.8 → 6.1 s (6.7×) and cut messages 5.2×. The endpoint is
+the payoff: the **private, triple-free** pipeline at 6.1 s is now **2.9×
+faster than the original leaky/insecure baseline** (17.6 s) it started from —
+correctness and privacy came out ahead on speed too, once the protocol was
+the right one.
+
+While batching, one latent bug surfaced and was fixed: the α re-randomiser
+counter (`op_id + i`) could repeat across multiplication rounds once a batch
+exceeded the id spacing. Harmless for correctness (α always cancels) but a
+privacy leak (two products under the same α expose their difference); the
+counter is now a collision-free `(op_id ‖ i)` encoding (`alpha_ctr`).
 
 ### Comparisons (`>`, `<`, `>=`, `<=`, `==`)
 
@@ -941,6 +987,61 @@ BFV pipeline runs in 18.7 s against 94.0 s for the old *insecure*
 Toeplitz-on-SI-NTRU path: 5× faster *and* actually private. FHE is now
 1032 ms of 18.7 s (5.5%); the rest is MPC.
 
+### Real MNIST: a trained model, real test digits, encrypted (`baru bench-mnist`)
+
+Everything above proves the pipeline is *exact*. This adds the orthogonal
+question a reviewer will ask: **what accuracy does it get on real data?**
+
+The model is a small but real convolutional net —
+`1×28×28 → conv(8,3×3) → ReLU → maxpool → dense(→128) → ReLU → dense(→10) → argmax`
+— **trained** on the full 60 000-image MNIST training set (numpy SGD,
+`scratchpad/train_final.py`) and then **quantised into the very integer
+fixed-point scheme `CnnModel::forward` runs** — so the number below is the
+accuracy of the *deployed integer model*, not a float model that would lose
+something afterward. It has **two encrypted dense layers plus an encrypted
+hidden layer**, three MPC nonlinearities and two scheme switches, and still
+**zero bootstraps** — the extra depth composes in with nothing but "switch
+again." Weights and a real test subset are embedded in
+`examples/data/mnist_cnn.rs`.
+
+```
+plaintext-integer accuracy : 298/300 = 99.33%   (in-repo test subset)
+full MNIST test set (10 000): 97.63%             (identical weights, offline)
+ENCRYPTED pipeline (8 imgs) : 8/8 match plaintext exactly, 0 bootstraps
+```
+
+The encrypted run matters more than the accuracy: because the hybrid is
+bit-exact against `forward`, **every encrypted prediction equals the
+plaintext one** — verified here on real digits through all three encrypted
+linear layers, not asserted. So the encrypted accuracy *is* 97.63%; privacy
+costs nothing in accuracy. The Rust integer forward was checked to agree
+with the numpy reference digit-for-digit on the embedded subset (298/300
+both), so the offline 10 000-image number transfers faithfully.
+
+**Where this sits vs. the literature.** The honest framing is like-for-like
+on *what is hidden*, since that — not accuracy — is the axis this work moves.
+
+| system | model | MNIST acc | what is hidden |
+|---|---|---|---|
+| **baru** (this repo) | conv(8) + 128-hidden + dense | **97.6%** | **image *and* weights** (ct×ct) |
+| Gazelle (2018) | larger CNN | ~99% | image only (server holds plaintext weights) |
+| Delphi (2019) | larger CNN | ~99% | image only |
+| CrypTFlow2 (2020) | larger CNN | ~99% | image only |
+| MiniONN / Cheetah | larger CNN | ~99% | image only |
+
+The residual accuracy gap is model size, and closing it is a *training*
+question the no-bootstrap construction is indifferent to (depth is free —
+this deeper model is the same pipeline switched one more time). The column
+that distinguishes this work is the last one: the systems above are
+two-party client/server protocols where **the server evaluates on plaintext
+weights** — the model is not hidden. Here the linear layers are
+**ciphertext×ciphertext**, so the weights are encrypted too, and the only
+value that ever leaves the cryptographic domain is the class index. That is
+a different (stronger) privacy model, not a faster route to the same one —
+the comparison is about *what is protected*, and only secondarily about
+speed. A larger encrypted model would move the accuracy column without
+touching that distinction.
+
 ### Measured: one private dense layer, six ways (`baru bench-hybrid-nn`)
 
 The same layer — `matvec(8×2) + bias + ReLU`, inputs spanning both signs —
@@ -1185,7 +1286,7 @@ nonlinearities, **zero FHE bootstraps** — verified **bit-exact** against the
 plaintext reference:
 
 ```
-1×D×D image → conv(2, 3×3) → ReLU∘rescale → maxpool(2×2) → dense(→10) → argmax → class
+1×D×D image → conv(OC, 3×3) → ReLU∘rescale → maxpool(2×2) → dense(→10) → argmax → class
 ```
 
 Both the image *and* the weights are encrypted. The convolution runs as a

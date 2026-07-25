@@ -296,21 +296,57 @@ pub fn maxpool2d(
     let out_h = (in_shape.h - pool) / stride + 1;
     let out_w = (in_shape.w - pool) / stride + 1;
     let out_shape = Chw { c: in_shape.c, h: out_h, w: out_w };
-    let mut out = Vec::with_capacity(out_shape.len());
+
+    // Gather every window (all the same size), then reduce them in lockstep:
+    // one fold step over *all* windows at once. Each step is a single
+    // `max2_batch` (one batched comparison + one batched select), so the
+    // whole layer costs `pool²−1` batched steps instead of one `max_reduce`
+    // per window. On backends without batching this is identical work in the
+    // same order; on `TransportBackend` it collapses the round count. The
+    // left-fold order matches [`max_reduce`], so ties break the same way.
+    let mut windows: Vec<Vec<ShareRef>> = Vec::with_capacity(out_shape.len());
     for c in 0..in_shape.c {
         for oy in 0..out_h {
             for ox in 0..out_w {
-                let window: Vec<ShareRef> = (0..pool)
-                    .flat_map(|dy| (0..pool).map(move |dx| (dy, dx)))
-                    .map(|(dy, dx)| {
-                        input[in_shape.idx(c, oy * stride + dy, ox * stride + dx)].clone()
-                    })
-                    .collect();
-                out.push(max_reduce(be, &window));
+                windows.push(
+                    (0..pool)
+                        .flat_map(|dy| (0..pool).map(move |dx| (dy, dx)))
+                        .map(|(dy, dx)| {
+                            input[in_shape.idx(c, oy * stride + dy, ox * stride + dx)].clone()
+                        })
+                        .collect(),
+                );
             }
         }
     }
-    (out, out_shape)
+    let wsize = pool * pool;
+    let mut acc: Vec<ShareRef> = windows.iter().map(|w| w[0].clone()).collect();
+    for k in 1..wsize {
+        let next: Vec<ShareRef> = windows.iter().map(|w| w[k].clone()).collect();
+        acc = max2_batch(be, &acc, &next);
+    }
+    (acc, out_shape)
+}
+
+/// Elementwise `max(aᵢ, bᵢ)` over two equal-length slices, batching the
+/// comparison and the select. Semantics match [`max2`] pairwise (keeps `aᵢ`
+/// on ties).
+pub fn max2_batch(be: &mut dyn Backend, a: &[ShareRef], b: &[ShareRef]) -> Vec<ShareRef> {
+    assert_eq!(a.len(), b.len(), "max2_batch: length mismatch");
+    if a.is_empty() {
+        return Vec::new();
+    }
+    let pairs: Vec<(ShareRef, ShareRef)> =
+        a.iter().zip(b).map(|(x, y)| (x.clone(), y.clone())).collect();
+    let conds = be.lt_batch(&pairs); // condᵢ = 1 iff aᵢ < bᵢ
+    // muxᵢ(cond, b, a) = aᵢ + condᵢ·(bᵢ − aᵢ): one batched multiply.
+    let mul_pairs: Vec<(ShareRef, ShareRef)> = conds
+        .iter()
+        .zip(a.iter().zip(b))
+        .map(|(cond, (x, y))| (cond.clone(), be.sub(y, x)))
+        .collect();
+    let sels = be.mul_batch(&mul_pairs);
+    a.iter().zip(sels).map(|(x, s)| be.add(x, &s)).collect()
 }
 
 pub fn maxpool2d_ref(input: &[i64], in_shape: Chw, pool: usize, stride: usize) -> (Vec<i64>, Chw) {

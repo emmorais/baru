@@ -131,10 +131,23 @@ pub trait Backend: Send + Sync {
 
     fn eq(&mut self, a: &ShareRef, b: &ShareRef) -> ShareRef;
     fn lt(&mut self, a: &ShareRef, b: &ShareRef) -> ShareRef;
+    /// Batched `lt`: `aᵢ < bᵢ` for every pair, in the same number of rounds
+    /// as a single comparison on backends that batch (`TransportBackend`).
+    /// The default loops, so every other backend keeps working unchanged.
+    fn lt_batch(&mut self, pairs: &[(ShareRef, ShareRef)]) -> Vec<ShareRef> {
+        pairs.iter().map(|(a, b)| self.lt(a, b)).collect()
+    }
     fn le(&mut self, a: &ShareRef, b: &ShareRef) -> ShareRef;
     /// Reveal a shared value to one or all participants. `reveal_to = None` -> reveal to all.
     fn reveal(&mut self, a: &ShareRef, reveal_to: Option<usize>) -> Fr;
     fn a2b(&mut self, a: &ShareRef, nbits: usize) -> Vec<ShareRef>;
+    /// Bit-decompose several shares at once. Backends that batch their
+    /// communication (`TransportBackend`) run the whole set in the same
+    /// number of rounds as a single `a2b`; the default just loops, so every
+    /// other backend keeps working unchanged.
+    fn a2b_batch(&mut self, values: &[ShareRef], nbits: usize) -> Vec<Vec<ShareRef>> {
+        values.iter().map(|v| self.a2b(v, nbits)).collect()
+    }
     fn b2a(&mut self, bits: &[ShareRef]) -> ShareRef;
     /// Reset per-expression state (share map, ID counter) so the next expression
     /// starts with a clean slate.  Called by the REPL before each expression to

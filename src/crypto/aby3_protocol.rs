@@ -11,7 +11,14 @@ use crate::crypto::net::{serialize_msg, Mailbox, MpcMsg, PartyId, Transport};
 use crate::crypto::types::Fr;
 
 const N: usize = 3;
-const TIMEOUT_MS: u64 = 5_000;
+/// Wall-clock cap on waiting for a peer's message. This is a liveness
+/// backstop for a genuinely hung/failed party, not a performance knob: a
+/// correct run never approaches it. It is generous because `cargo test` runs
+/// many 3-party simulations concurrently, and a large batched-resharing
+/// message can sit behind CPU-starved peer threads far longer than any real
+/// deadline — a lower value made the heavy end-to-end tests flake under load
+/// while passing in isolation.
+const TIMEOUT_MS: u64 = 60_000;
 
 /// The two field elements that party `id` holds for a given shared value.
 /// In ABY3, party i holds (s_i, s_{(i+1) mod 3}).
@@ -226,8 +233,31 @@ pub fn mul_party<T: Transport>(
 }
 /// Batched [`mul_party`]: one message per party for the whole batch.
 ///
-/// Each product `i` draws its own `α` from counter `base_op_id + i`, so the
-/// re-randomisation is fresh per multiplication even within a batch.
+/// Batches wider than this cannot be given collision-free α counters under
+/// the [`alpha_ctr`] encoding. It is astronomically larger than any real
+/// batch (a full network is ~10⁵ multiplications), so the cap only guards a
+/// programming error.
+pub const MAX_BATCH: usize = 1 << 40;
+
+/// Globally-unique PRF counter for pair `i` of the multiplication batch
+/// based at `op_id`. Operation ids are handed out uniquely (the backend's
+/// `alloc_id`/`alloc_block`, and `take_id` inside the bit protocols), so
+/// giving each op_id its own disjoint `2^40`-wide slot makes every single
+/// multiplication's α distinct — even a batch of 10⁵ products cannot reach
+/// into the next op_id's slot. This is what lets one op_id cover an
+/// arbitrarily wide batch without the old `op_id + i` ranges overlapping the
+/// next round.
+fn alpha_ctr(op_id: u64, i: usize) -> u64 {
+    debug_assert!(i < MAX_BATCH, "batch exceeds the α-counter slot width");
+    (op_id << 40).wrapping_add(i as u64)
+}
+
+/// Each product draws its own `α` from a **globally distinct** counter, so
+/// no two multiplications — within this batch or across calls — are ever
+/// masked by the same randomness. Reusing an α would be harmless for
+/// correctness (it always cancels in the sum) but a privacy leak: two
+/// products sharing an α expose their difference on the wire. See
+/// [`alpha_ctr`] for how collisions are ruled out.
 pub fn mul_batch_party<T: Transport>(
     pairs: &[(PartyShare, PartyShare)],
     base_op_id: u64,
@@ -237,6 +267,7 @@ pub fn mul_batch_party<T: Transport>(
     if pairs.is_empty() {
         return Vec::new();
     }
+    assert!(pairs.len() <= MAX_BATCH, "multiplication batch too large for α counters");
     let keys = mbx.prf_keys(me);
     // Local: three of the nine cross terms, re-randomised by a zero-sum α.
     let z_mine: Vec<u128> = pairs
@@ -247,7 +278,7 @@ pub fn mul_batch_party<T: Transport>(
                 .wrapping_mul(b.left)
                 .wrapping_add(a.left.wrapping_mul(b.right))
                 .wrapping_add(a.right.wrapping_mul(b.left))
-                .wrapping_add(keys.alpha(base_op_id.wrapping_add(i as u64)))
+                .wrapping_add(keys.alpha(alpha_ctr(base_op_id, i)))
         })
         .collect();
 
@@ -450,6 +481,194 @@ pub fn a2b_party<T: Transport>(
     ppa_add(&sum, &shifted, nbits, &mut next_id, me, mbx)
 }
 
+/// Batched [`a2b_party`]: decompose `count` shared values at once.
+///
+/// Every internal multiplication round is batched **across all lanes**, so
+/// the whole batch costs the same ~9 communication rounds as a single
+/// decomposition — versus `count · 9` when the values are decomposed one at a
+/// time in a loop. This is the difference between ~10 rounds and ~12 000 for
+/// a CNN's ReLU layer, and it is where most of the MPC latency lives.
+///
+/// Returns one bit-vector (LSB first, length `nbits`) per input value.
+pub fn a2b_batch_party<T: Transport>(
+    values: &[PartyShare],
+    nbits: usize,
+    op_id: u64,
+    me: PartyId,
+    mbx: &Mailbox<T>,
+) -> Vec<Vec<PartyShare>> {
+    let count = values.len();
+    if count == 0 {
+        return Vec::new();
+    }
+    let mut next_id = op_id;
+    let take_id = |n: &mut u64| {
+        let b = *n;
+        *n += 2;
+        b
+    };
+
+    // ── 1. free binary sharings of the three additive components, per lane ──
+    // comp[lane] = (x, y, z), each an nbits vector.
+    let comp: Vec<(Vec<PartyShare>, Vec<PartyShare>, Vec<PartyShare>)> = values
+        .iter()
+        .map(|a| {
+            let per_owner: Vec<Vec<PartyShare>> = (0..N)
+                .map(|j| {
+                    let known: Fr = if j == me {
+                        a.left
+                    } else if j == (me + 1) % N {
+                        a.right
+                    } else {
+                        0
+                    };
+                    (0..nbits).map(|k| share_component((known >> k) & 1, j, me)).collect()
+                })
+                .collect();
+            let mut it = per_owner.into_iter();
+            (it.next().unwrap(), it.next().unwrap(), it.next().unwrap())
+        })
+        .collect();
+
+    // ── 2. carry-save 3 → 2, all lanes in two batched rounds ──
+    // Round A: xy, xz, yz for every lane and bit.
+    let mut pairs = Vec::with_capacity(3 * count * nbits);
+    for (x, y, z) in &comp {
+        for k in 0..nbits {
+            pairs.push((x[k].clone(), y[k].clone()));
+        }
+        for k in 0..nbits {
+            pairs.push((x[k].clone(), z[k].clone()));
+        }
+        for k in 0..nbits {
+            pairs.push((y[k].clone(), z[k].clone()));
+        }
+    }
+    let base = take_id(&mut next_id);
+    let pw = mul_batch_party(&pairs, base, me, mbx);
+
+    // Round B: xyz for every lane and bit.
+    let mut triple = Vec::with_capacity(count * nbits);
+    for (lane, (_x, _y, z)) in comp.iter().enumerate() {
+        let xy = &pw[lane * 3 * nbits..lane * 3 * nbits + nbits];
+        for k in 0..nbits {
+            triple.push((xy[k].clone(), z[k].clone()));
+        }
+    }
+    let base = take_id(&mut next_id);
+    let xyz_all = mul_batch_party(&triple, base, me, mbx);
+
+    // Per-lane sum and shifted-carry, all local.
+    let mut sums = Vec::with_capacity(count);
+    let mut shifts = Vec::with_capacity(count);
+    for (lane, (x, y, z)) in comp.iter().enumerate() {
+        let b = lane * 3 * nbits;
+        let (xy, xz, yz) = (&pw[b..b + nbits], &pw[b + nbits..b + 2 * nbits], &pw[b + 2 * nbits..b + 3 * nbits]);
+        let xyz = &xyz_all[lane * nbits..lane * nbits + nbits];
+        let mut sum = Vec::with_capacity(nbits);
+        let mut carry = Vec::with_capacity(nbits);
+        for k in 0..nbits {
+            let sym = add_party(&add_party(&xy[k], &xz[k]), &yz[k]);
+            let lin = add_party(&add_party(&x[k], &y[k]), &z[k]);
+            sum.push(add_party(
+                &sub_party(&lin, &scalar_mul_party(&sym, 2)),
+                &scalar_mul_party(&xyz[k], 4),
+            ));
+            carry.push(sub_party(&sym, &scalar_mul_party(&xyz[k], 2)));
+        }
+        let mut shifted = Vec::with_capacity(nbits);
+        shifted.push(share_public(0, me));
+        shifted.extend(carry.into_iter().take(nbits - 1));
+        sums.push(sum);
+        shifts.push(shifted);
+    }
+
+    // ── 3. one batched prefix-adder over all lanes ──
+    ppa_add_batch(&sums, &shifts, nbits, &mut next_id, me, mbx)
+}
+
+/// Batched [`ppa_add`]: `count` independent `nbits`-wide Kogge–Stone adders,
+/// every layer's products flattened into one multiplication round.
+fn ppa_add_batch<T: Transport>(
+    u: &[Vec<PartyShare>],
+    v: &[Vec<PartyShare>],
+    nbits: usize,
+    next_id: &mut u64,
+    me: PartyId,
+    mbx: &Mailbox<T>,
+) -> Vec<Vec<PartyShare>> {
+    let count = u.len();
+    let take_id = |n: &mut u64| {
+        let b = *n;
+        *n += 2;
+        b
+    };
+
+    // init g = u∧v, p = u⊕v — one product per (lane, bit).
+    let mut pairs = Vec::with_capacity(count * nbits);
+    for lane in 0..count {
+        for k in 0..nbits {
+            pairs.push((u[lane][k].clone(), v[lane][k].clone()));
+        }
+    }
+    let base = take_id(next_id);
+    let uv = mul_batch_party(&pairs, base, me, mbx);
+    let mut g: Vec<Vec<PartyShare>> =
+        (0..count).map(|l| uv[l * nbits..l * nbits + nbits].to_vec()).collect();
+    let mut p: Vec<Vec<PartyShare>> = (0..count)
+        .map(|l| (0..nbits).map(|k| xor_from_product(&u[l][k], &v[l][k], &uv[l * nbits + k])).collect())
+        .collect();
+    let p_leaf = p.clone();
+
+    let mut d = 1usize;
+    while d < nbits {
+        let mut pr = Vec::with_capacity(2 * count * (nbits - d));
+        for lane in 0..count {
+            for k in d..nbits {
+                pr.push((p[lane][k].clone(), g[lane][k - d].clone()));
+                pr.push((p[lane][k].clone(), p[lane][k - d].clone()));
+            }
+        }
+        let base = take_id(next_id);
+        let out = mul_batch_party(&pr, base, me, mbx);
+        let width = nbits - d;
+        for lane in 0..count {
+            let (mut ng, mut np) = (g[lane].clone(), p[lane].clone());
+            for (i, k) in (d..nbits).enumerate() {
+                let o = 2 * (lane * width + i);
+                ng[k] = add_party(&g[lane][k], &out[o]);
+                np[k] = out[o + 1].clone();
+            }
+            g[lane] = ng;
+            p[lane] = np;
+        }
+        d <<= 1;
+    }
+
+    if nbits == 1 {
+        return (0..count).map(|l| vec![p_leaf[l][0].clone()]).collect();
+    }
+    let mut pairs = Vec::with_capacity(count * (nbits - 1));
+    for lane in 0..count {
+        for k in 1..nbits {
+            pairs.push((p_leaf[lane][k].clone(), g[lane][k - 1].clone()));
+        }
+    }
+    let base = take_id(next_id);
+    let prod = mul_batch_party(&pairs, base, me, mbx);
+    let width = nbits - 1;
+    (0..count)
+        .map(|lane| {
+            let mut bits = Vec::with_capacity(nbits);
+            bits.push(p_leaf[lane][0].clone());
+            for (i, k) in (1..nbits).enumerate() {
+                bits.push(xor_from_product(&p_leaf[lane][k], &g[lane][k - 1], &prod[lane * width + i]));
+            }
+            bits
+        })
+        .collect()
+}
+
 /// Reveal a bit share to all parties.
 pub fn reveal_bit_to_all<T: Transport>(
     share: &PartyShare,
@@ -582,6 +801,39 @@ mod tests {
             0,
             "the three parties' α must cancel"
         );
+    }
+
+    /// Batched decomposition must reproduce plaintext binary expansion for
+    /// every lane, including two's-complement negatives — i.e. flattening the
+    /// per-lane products into shared rounds changes nothing but the round
+    /// count.
+    #[test]
+    fn a2b_batch_matches_plaintext() {
+        let nbits = 16;
+        let vals: Vec<i64> = vec![0, 3, 255, -1, 1024, -300, 4095, -2048];
+        let expected: Vec<u128> =
+            vals.iter().map(|&v| (v as i128).rem_euclid(1i128 << nbits) as u128).collect();
+        let got = run_parties(move |me, mbx| {
+            let shares: Vec<PartyShare> = vals
+                .iter()
+                .enumerate()
+                .map(|(i, &v)| {
+                    let fr: Fr = if me == 0 { (v as i128).rem_euclid(1i128 << nbits) as u128 } else { 0 };
+                    share_input(fr, i as u64, 0, me, &mbx)
+                })
+                .collect();
+            let bit_sets = a2b_batch_party(&shares, nbits, 1_000, me, &mbx);
+            bit_sets
+                .iter()
+                .enumerate()
+                .map(|(i, bits)| {
+                    bits.iter().enumerate().fold(0u128, |acc, (k, b)| {
+                        acc | ((reveal(b, 20_000 + (i * nbits + k) as u64, None, me, &mbx) & 1) << k)
+                    })
+                })
+                .collect::<Vec<u128>>()
+        });
+        assert_eq!(got[0], expected, "batched a2b must match plaintext");
     }
 
     /// The rebuilt bit decomposition must agree with plaintext binary

@@ -228,6 +228,20 @@ impl<T: Transport + 'static> Backend for TransportBackend<T> {
         bit_refs.last().cloned().expect("a2b produced no bits")
     }
 
+    fn lt_batch(&mut self, pairs: &[(ShareRef, ShareRef)]) -> Vec<ShareRef> {
+        if pairs.is_empty() {
+            return Vec::new();
+        }
+        // Each comparison is the MSB of `a − b`; batch all the decompositions
+        // into one `a2b_batch` so the whole set costs ~9 rounds, not `9·len`.
+        let nbits = pairs.iter().map(|(a, b)| a.nbits.max(b.nbits)).max().unwrap();
+        let diffs: Vec<ShareRef> = pairs.iter().map(|(a, b)| self.sub(a, b)).collect();
+        self.a2b_batch(&diffs, nbits)
+            .into_iter()
+            .map(|bits| bits.into_iter().last().expect("a2b produced no bits"))
+            .collect()
+    }
+
     fn le(&mut self, a: &ShareRef, b: &ShareRef) -> ShareRef {
         let lt = self.lt(a, b);
         let eq = self.eq(a, b);
@@ -266,6 +280,36 @@ impl<T: Transport + 'static> Backend for TransportBackend<T> {
                     owner: a.owner,
                     fixed: false,
                 }
+            })
+            .collect()
+    }
+
+    fn a2b_batch(&mut self, values: &[ShareRef], nbits: usize) -> Vec<Vec<ShareRef>> {
+        if values.is_empty() {
+            return Vec::new();
+        }
+        let party_vals: Vec<_> = values.iter().map(|v| self.get_cloned(v)).collect();
+        // One id block for the whole batch: `a2b_batch_party` runs the same
+        // ~9 rounds as a single decomposition, just wider.
+        let op_id = self.alloc_block(crate::crypto::aby3_protocol::A2B_ID_BLOCK);
+        let bit_sets = crate::crypto::aby3_protocol::a2b_batch_party(
+            &party_vals,
+            nbits,
+            op_id,
+            self.me,
+            &self.mailbox,
+        );
+        values
+            .iter()
+            .zip(bit_sets)
+            .map(|(v, bits)| {
+                bits.into_iter()
+                    .map(|ps| {
+                        let id = self.alloc_id();
+                        self.shares.insert(id, ps);
+                        ShareRef { id, nbits: 1, owner: v.owner, fixed: false }
+                    })
+                    .collect()
             })
             .collect()
     }

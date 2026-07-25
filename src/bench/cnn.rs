@@ -22,7 +22,7 @@
 //! so one ciphertext multiplication *is* the whole sliding-window
 //! convolution for an entire output channel. That costs `OC` multiplications
 //! instead of the `⌈OC·oh·ow·D²/n⌉` an im2col/Toeplitz matvec would need —
-//! at 28×28 with `OC = 2`, **676 multiplications become 2**. The dense layer
+//! at 28×28 with `OC = 8`, hundreds of Toeplitz multiplications become 8. The dense layer
 //! still uses the packed matvec (convolution is the case where overlapping
 //! windows are a feature; for a dense layer the `n/in_dim` separable-output
 //! limit is already tight). Every layer's FHE ciphertext is depth-1 fresh,
@@ -33,11 +33,12 @@
 //!
 //! - **Correctness is exact** (encrypted class == plaintext class). This is
 //!   the crypto claim. **Accuracy** on a real dataset is an *orthogonal*
-//!   axis that needs trained weights; the `crate::ml` quantization pipeline
-//!   is the ingestion path, and `demo-private-mnist` already runs a real
-//!   trained (linear) model. The weights here are controlled-magnitude
-//!   synthetic values (a cost/correctness microbenchmark, standard for this
-//!   line of work), not a trained classifier.
+//!   axis that needs trained weights. The weights *here* are
+//!   controlled-magnitude synthetic values (a cost/correctness
+//!   microbenchmark, standard for this line of work), not a trained
+//!   classifier — for the trained model on real MNIST test digits (97.6%,
+//!   run through this same hybrid, bit-exact) see `baru bench-mnist` /
+//!   `crate::bench::mnist`.
 //! - Conv packing needs `2·in_c·H·W ≲ n`, so a full 28×28 MNIST image runs
 //!   comfortably at `n = 4096` (it needs degree 841). Multi-channel CIFAR
 //!   (3×32×32) needs 5185 and so must split channels across ciphertexts (or
@@ -64,7 +65,7 @@ use crate::gadgets::{argmax, maxpool2d, Chw};
 use crate::interpreter::backend::{Backend, ShareRef};
 use crate::interpreter::transport_backend::TransportBackend;
 
-const OC: usize = 2; // conv output channels
+const OC: usize = 8; // conv output channels
 const K: usize = 3; // conv kernel size
 const POOL: usize = 2; // max-pool window / stride
 const NCLASSES: usize = 10;
@@ -79,7 +80,13 @@ pub struct CnnModel {
     pub d: usize,        // input side length (1 channel)
     pub kernels: Vec<Vec<i64>>, // [OC][K*K]
     pub cbias: Vec<i64>, // [OC]
-    pub dense_w: Vec<Vec<i64>>, // [NCLASSES][flat]
+    /// Optional hidden dense layer (`[H][flat]` weights, `[H]` bias), with a
+    /// fused ReLU∘rescale, sitting between the pooled conv features and the
+    /// output layer. `None` for the shallow model `bench-cnn` exercises;
+    /// `Some` for the trained deeper classifier in `bench-mnist`.
+    pub hidden_w: Option<Vec<Vec<i64>>>,
+    pub hidden_b: Option<Vec<i64>>,
+    pub dense_w: Vec<Vec<i64>>, // [NCLASSES][flat] or [NCLASSES][H]
     pub dense_b: Vec<i64>, // [NCLASSES]
     pub shift: u32,
     pub nbits: usize,
@@ -110,6 +117,8 @@ impl CnnModel {
             d,
             kernels,
             cbias,
+            hidden_w: None,
+            hidden_b: None,
             dense_w,
             dense_b,
             shift,
@@ -132,6 +141,52 @@ impl CnnModel {
         );
         model.nbits = needed.max(20);
         (model, input)
+    }
+
+    /// Build a model from **trained, quantised** weights (see
+    /// `examples/data/mnist_cnn.rs`). The weight tensors are already in the
+    /// integer fixed-point scheme `forward` expects; `nbits` is calibrated
+    /// from the observed activation range exactly as [`CnnModel::random`]
+    /// does, so it fits the depth-1 noise budget.
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_trained(
+        d: usize,
+        kernels: Vec<Vec<i64>>,
+        cbias: Vec<i64>,
+        hidden_w: Option<Vec<Vec<i64>>>,
+        hidden_b: Option<Vec<i64>>,
+        dense_w: Vec<Vec<i64>>,
+        dense_b: Vec<i64>,
+        shift: u32,
+        sample_inputs: &[Vec<i64>],
+    ) -> Self {
+        assert_eq!(kernels.len(), OC);
+        assert_eq!(dense_w.len(), NCLASSES);
+        assert_eq!(hidden_w.is_some(), hidden_b.is_some(), "hidden weights and bias must agree");
+        let oh = d - (K - 1);
+        let ph = oh / POOL;
+        let mut model = CnnModel {
+            d,
+            kernels,
+            cbias,
+            hidden_w,
+            hidden_b,
+            dense_w,
+            dense_b,
+            shift,
+            nbits: 20,
+            conv_shape: Chw { c: OC, h: oh, w: oh },
+            pool_shape: Chw { c: OC, h: ph, w: ph },
+        };
+        // Calibrate nbits from the worst activation seen over the samples.
+        let mut max_abs = 1i64;
+        for x in sample_inputs {
+            max_abs = max_abs.max(model.forward(x).1);
+        }
+        let needed = (64 - (max_abs.max(1) as u64).leading_zeros() as usize) + 2;
+        assert!(needed <= 30, "trained model needs 2^{needed}, past the noise budget");
+        model.nbits = needed.max(20);
+        model
     }
 
     fn conv_dot(&self, input: &[i64], oc: usize, oy: usize, ox: usize) -> i64 {
@@ -164,13 +219,30 @@ impl CnnModel {
         }
         // max-pool
         let (pooled, _) = crate::gadgets::maxpool2d_ref(&conv_act, self.conv_shape, POOL, POOL);
-        // dense → logits
+        // optional hidden dense → fused ReLU∘rescale
+        let dense_in: Vec<i64> = match (&self.hidden_w, &self.hidden_b) {
+            (Some(hw), Some(hb)) => hw
+                .iter()
+                .zip(hb)
+                .map(|(row, &b)| {
+                    let v = row.iter().zip(&pooled).map(|(&w, &x)| w * x).sum::<i64>() + b;
+                    max_abs = max_abs.max(v.abs());
+                    if v >= 0 {
+                        v >> self.shift
+                    } else {
+                        0
+                    }
+                })
+                .collect(),
+            _ => pooled,
+        };
+        // output dense → logits
         let logits: Vec<i64> = self
             .dense_w
             .iter()
             .zip(&self.dense_b)
             .map(|(row, &b)| {
-                let v = row.iter().zip(&pooled).map(|(&w, &x)| w * x).sum::<i64>() + b;
+                let v = row.iter().zip(&dense_in).map(|(&w, &x)| w * x).sum::<i64>() + b;
                 max_abs = max_abs.max(v.abs());
                 v
             })
@@ -286,6 +358,32 @@ fn hybrid_conv_open(
     (opened, masks)
 }
 
+/// Re-encrypt a layer's MPC output (three parties' additive share
+/// components of each value) as a single packed BFV ciphertext — the
+/// MPC→FHE half of the scheme switch. Communication-free per party except
+/// the one modelled link hop. Returns the ciphertext and the bytes sent.
+fn pack_shares_to_fhe(
+    s: &Bfv,
+    ck: &[u8],
+    per_party: &[Vec<Fr>],
+    t_mask: u64,
+    profile: NetworkProfile,
+) -> (BfvCt, usize) {
+    let mut c: Option<BfvCt> = None;
+    let mut bytes = 0usize;
+    for comps in per_party {
+        let m: Vec<u64> = comps.iter().map(|&v| (v as u64) & t_mask).collect();
+        let enc = s.encrypt_poly(ck, &m);
+        bytes += s.ct_bytes(&enc);
+        c = Some(match c {
+            None => enc,
+            Some(acc) => s.add(&acc, &enc),
+        });
+    }
+    sleep_link(&profile, bytes, 1);
+    (c.expect("three parties"), bytes)
+}
+
 /// Reconstruct this party's share of the raw matvec output `j` from the
 /// opened value and the per-party masks (party 0 also holds `y`).
 fn import_raw(
@@ -313,28 +411,46 @@ fn import_raw(
     raw.unwrap()
 }
 
-/// Fused ReLU∘rescale on a share: `ReLU(v ≫ s)` from one `a2b` (correct
-/// because the logical shift is kept only on the non-negative branch).
-fn fused_relu_rescale(
+/// Batched fused ReLU∘rescale: `ReLU(vⱼ ≫ s)` for every input at once.
+///
+/// The whole layer costs **one** batched `a2b` (all inputs decomposed in the
+/// same ~9 rounds) plus **one** batched multiply (the sign gate on every
+/// element together), instead of a per-element `a2b`+`mul` — collapsing a
+/// CNN's ReLU layer from `count · ~10` communication rounds to ~10.
+///
+/// Correctness is identical to the per-element version: the logical
+/// right-shift is recomposed from the high bits (`b2a`, local) and kept only
+/// on the non-negative branch (`keep = 1 − sign`).
+fn fused_relu_rescale_batch(
     be: &mut TransportBackend<MpcTransport>,
-    v: &ShareRef,
+    vs: &[ShareRef],
     shift: u32,
     nbits: usize,
-) -> ShareRef {
-    let bits = be.a2b(v, nbits);
-    // b2a inherits the bit-shares' width (1); the recomposed value spans the
-    // full range, so restore its width — otherwise a downstream comparison
-    // (`lt` → `a2b(·, nbits)`) would decompose only 1 bit and compare
-    // garbage. (Invisible when the ReLU output is only revealed/exported, as
-    // in `bench-deep-nn`; load-bearing once it feeds max-pool.)
-    let mut shifted = be.b2a(&bits[shift as usize..]);
-    shifted.nbits = nbits;
-    let sign = bits[nbits - 1].clone();
+) -> Vec<ShareRef> {
+    if vs.is_empty() {
+        return Vec::new();
+    }
+    let bit_sets = be.a2b_batch(vs, nbits);
     let one = be.share_public(1, 1);
-    let keep = be.sub(&one, &sign);
-    let mut act = be.mul(&shifted, &keep);
-    act.nbits = nbits;
-    act
+    // Local per element: recompose the shifted value and the keep bit.
+    let mut pairs = Vec::with_capacity(vs.len());
+    for bits in &bit_sets {
+        // b2a inherits the bit-shares' width (1); the recomposed value spans
+        // the full range, so restore its width — otherwise a downstream
+        // comparison (`lt` → `a2b(·, nbits)`) would decompose only 1 bit.
+        let mut shifted = be.b2a(&bits[shift as usize..]);
+        shifted.nbits = nbits;
+        let keep = be.sub(&one, &bits[nbits - 1]);
+        pairs.push((shifted, keep));
+    }
+    // One batched multiply for every element's sign gate.
+    be.mul_batch(&pairs)
+        .into_iter()
+        .map(|mut act| {
+            act.nbits = nbits;
+            act
+        })
+        .collect()
 }
 
 // ─── The full hybrid CNN forward pass ─────────────────────────────────────────
@@ -406,17 +522,19 @@ pub fn run_cnn_hybrid(model: &CnnModel, input: &[i64], profile: NetworkProfile) 
         let cbias = cbias.clone();
         move |be: &mut TransportBackend<MpcTransport>| {
             let oh = conv_shape.h;
-            // per conv output (channel-major) → fused ReLU∘rescale
-            let relu: Vec<ShareRef> = (0..OC * oh * oh)
+            // Reconstruct + bias every conv output locally (share_secret /
+            // add are communication-free), then run the whole ReLU layer as
+            // one batched a2b + one batched multiply.
+            let vs: Vec<ShareRef> = (0..OC * oh * oh)
                 .map(|j| {
                     let raw = import_raw(be, me, &conv_open, &conv_masks, j, nbits);
                     let oc = j / (oh * oh);
                     let bconst = residue(cbias[oc] << shift, nbits);
                     let bsh = be.share_public(bconst, nbits);
-                    let v = be.add(&raw, &bsh);
-                    fused_relu_rescale(be, &v, shift, nbits)
+                    be.add(&raw, &bsh)
                 })
                 .collect();
+            let relu = fused_relu_rescale_batch(be, &vs, shift, nbits);
             // max-pool (gadget) over the ReLU'd feature maps
             let (pooled, _) = maxpool2d(be, &relu, conv_shape, POOL, POOL);
             pooled.iter().map(|p| be.my_additive_component(p)).collect::<Vec<Fr>>()
@@ -428,24 +546,64 @@ pub fn run_cnn_hybrid(model: &CnnModel, input: &[i64], profile: NetworkProfile) 
     // ── Switch back → packed FHE dense input ──
     let t0 = Instant::now();
     let flat = model.pool_shape.c * model.pool_shape.h * model.pool_shape.w;
-    let mut c_dense_in: Option<BfvCt> = None;
-    let mut bytes = 0usize;
-    for comps in per_party_pool.iter() {
-        let m: Vec<u64> = comps.iter().map(|&c| (c as u64) & t_mask).collect();
-        let enc = s.encrypt_poly(&ck, &m);
-        bytes += s.ct_bytes(&enc);
-        c_dense_in = Some(match c_dense_in {
-            None => enc,
-            Some(acc) => s.add(&acc, &enc),
-        });
-    }
-    sleep_link(&profile, bytes, 1);
-    let c_dense_in = c_dense_in.expect("three parties");
-
-    // ── Dense (FHE ct×ct matvec) → open ──
-    let (dense_open, dense_masks) =
-        hybrid_matvec_open(&s, &ck, &c_dense_in, &model.dense_w, flat, profile, &mut rng);
+    let (mut c_dense_in, _) = pack_shares_to_fhe(&s, &ck, &per_party_pool, t_mask, profile);
+    let mut dense_in_dim = flat;
     fhe_ms += t0.elapsed().as_secs_f64() * 1000.0;
+
+    // ── Optional hidden dense layer: FHE matvec → open → MPC ReLU∘rescale →
+    //    switch back. Same machinery as the output dense + the conv ReLU,
+    //    composed one more time — this is the "no bootstrap, just switch
+    //    again" invariant made concrete for an extra depth level. ──
+    if let (Some(hidden_w), Some(hidden_b)) = (model.hidden_w.clone(), model.hidden_b.clone()) {
+        let th = Instant::now();
+        let (hidden_open, hidden_masks) =
+            hybrid_matvec_open(&s, &ck, &c_dense_in, &hidden_w, flat, profile, &mut rng);
+        fhe_ms += th.elapsed().as_secs_f64() * 1000.0;
+
+        let t1 = Instant::now();
+        let h = hidden_w.len();
+        let (per_party_hidden, hidden_comm) = run_parties(profile, |me| {
+            let hidden_open = hidden_open.clone();
+            let hidden_masks = hidden_masks.clone();
+            let hidden_b = hidden_b.clone();
+            move |be: &mut TransportBackend<MpcTransport>| {
+                let vs: Vec<ShareRef> = (0..h)
+                    .map(|j| {
+                        let raw = import_raw(be, me, &hidden_open, &hidden_masks, j, nbits);
+                        let bsh = be.share_public(residue(hidden_b[j], nbits), nbits);
+                        be.add(&raw, &bsh)
+                    })
+                    .collect();
+                let act = fused_relu_rescale_batch(be, &vs, shift, nbits);
+                act.iter().map(|p| be.my_additive_component(p)).collect::<Vec<Fr>>()
+            }
+        });
+        comm = CommStats {
+            messages: comm.messages + hidden_comm.messages,
+            bytes: comm.bytes + hidden_comm.bytes,
+        };
+        mpc_ms += t1.elapsed().as_secs_f64() * 1000.0;
+
+        let t2 = Instant::now();
+        let (c_hidden, _) = pack_shares_to_fhe(&s, &ck, &per_party_hidden, t_mask, profile);
+        c_dense_in = c_hidden;
+        dense_in_dim = h;
+        // fold this switch's FHE time into the shared accumulator below
+        fhe_ms += t2.elapsed().as_secs_f64() * 1000.0;
+    }
+
+    // ── Output dense (FHE ct×ct matvec) → open ──
+    let t3 = Instant::now();
+    let (dense_open, dense_masks) = hybrid_matvec_open(
+        &s,
+        &ck,
+        &c_dense_in,
+        &model.dense_w,
+        dense_in_dim,
+        profile,
+        &mut rng,
+    );
+    fhe_ms += t3.elapsed().as_secs_f64() * 1000.0;
 
     // ── MPC: +dense bias, argmax → reveal class only ──
     let t0 = Instant::now();
