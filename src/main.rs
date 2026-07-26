@@ -51,6 +51,9 @@ fn main() -> Result<(), Box<dyn Error>> {
     if args.first().map(String::as_str) == Some("bench-mnist") {
         return baru::bench::mnist::run_cli(&args[1..]).map_err(|e| e.into());
     }
+    if args.first().map(String::as_str) == Some("bench-gc-compare") {
+        return baru::bench::gc_compare::run_cli(&args[1..]).map_err(|e| e.into());
+    }
     if args.first().map(String::as_str) == Some("bench-fhe-innerprod") {
         return baru::bench::fhe_innerprod::run_cli(&args[1..]).map_err(|e| e.into());
     }

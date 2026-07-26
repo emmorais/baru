@@ -527,6 +527,56 @@ correct bit decomposition, Beaver triples & $76.9$ s & $159.4$ MB \\
 \end{tabular}
 \end{table}
 
+\subsection{Comparisons: garbled circuits vs.\ bit decomposition}\label{sec:gc}
+
+Because comparisons dominate the MPC segment, we ask whether garbled circuits
+--- constant-round --- beat the log-round bit decomposition. We built a real
+half-gates garbling engine (free-XOR~\cite{FreeXOR} offset with lsb one and
+Zahur--Rosulek--Evans half-gate AND gates~\cite{HalfGates}, two ciphertexts
+per gate) and a $\mathrm{MSB}(x+y)$ comparator, bit-exact against the
+plaintext comparison, and compared it head-to-head with the batched bit
+decomposition. Crucially, \emph{both} run through the identical transport ---
+real serialization, message passing, latency injection and byte counting ---
+so there is no measurement asymmetry.
+
+\begin{table}[t]
+\centering
+\caption{One layer of $1352$ comparisons at $20$ bits: garbled circuit vs.\
+batched bit decomposition, measured through the identical transport. Both
+bit-exact.}
+\label{tab:gc}
+\begin{tabular}{@{}lrrr@{}}
+\toprule
+network & a2b & GC & GC speedup \\
+\midrule
+structural & 9 rd, $5.9$ MB & 1 rd, $1.7$ MB & --- \\
+LAN (RTT $0.1$ ms, $10$ Gbps) & $279$ ms & $66$ ms & $4.2\times$ \\
+metro (RTT $2$ ms, $1$ Gbps) & $304$ ms & $80$ ms & $3.8\times$ \\
+WAN (RTT $20$ ms, $1$ Gbps) & $409$ ms & $84$ ms & $4.9\times$ \\
+WAN (RTT $80$ ms, $100$ Mbps) & $1156$ ms & $270$ ms & $4.3\times$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The garbled circuit wins on all three axes and at every network profile
+(\Cref{tab:gc}): $9\times$ fewer rounds, $3.5\times$ less bandwidth, and
+$3.8$--$4.9\times$ lower end-to-end latency --- not only on the WAN, as the
+round-count argument would predict, but on the LAN as well. The enabler is
+the honest-majority \emph{three-party} setting: a garbled circuit's input
+labels are delivered by the co-garbler with no oblivious
+transfer~\cite{ASTRA}, the expensive part of two-party garbling~\cite{Yao}
+and absent here. We further garble the \emph{entire} fused
+ReLU$\circ$rescale --- the pipeline's actual nonlinearity,
+$\mathrm{out} = (v \geq 0)\,?\,(v \gg s):0$ --- as one constant-round circuit
+(bit-exact against the plaintext op); measured through the transport and
+charged a B2A round to return its output to an arithmetic sharing, it beats
+the a2b fused nonlinearity by $2.7$--$3.4\times$. Since the MPC segment is
+dominated by ReLU and max-pooling comparisons, replacing the
+bit-decomposition nonlinearity with a three-party garbled one is the
+highest-value remaining MPC optimization; we report the measurement and leave
+the full integration (three-party label delivery and returning the output to
+an arithmetic sharing) as engineering.
+
 \subsection{Convolution packing}
 
 Replacing the im2col/Toeplitz convolution with the reversed-axis packing of
