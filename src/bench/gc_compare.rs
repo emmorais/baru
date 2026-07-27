@@ -449,6 +449,73 @@ fn measure_a2b_profile(n: usize, b: usize, profile: NetworkProfile) -> (f64, usi
     (elapsed, comm.bytes as usize, bits == want)
 }
 
+/// The **real** 3-party garbled-circuit comparison — `TransportBackend::
+/// lt_gc_batch` (`crate::crypto::gc_protocol`): two garblers derive an
+/// identical circuit from their shared PRF key, ship tables + input labels to
+/// the evaluator (no OT), and the boolean-shared output is resharing back to
+/// arithmetic (Y2A). Measured through the same 3-party transport as `a2b`, so
+/// the numbers are apples-to-apples — and unlike `measure_gc_transport` (a
+/// 2-party pure-GC proxy) this includes the Y2A round, the honest end-to-end
+/// cost against `a2b` (which also lands in arithmetic). Returns (ms, bytes, ok).
+fn measure_gc_real_lt(n: usize, b: usize, profile: NetworkProfile) -> (f64, usize, bool) {
+    let mut rng = rand::thread_rng();
+    let av: Vec<i64> = (0..n).map(|_| rng.gen_range(-(1 << (b - 2))..(1 << (b - 2)))).collect();
+    let bv: Vec<i64> = (0..n).map(|_| rng.gen_range(-(1 << (b - 2))..(1 << (b - 2)))).collect();
+    let want: Vec<u128> = (0..n).map(|i| (av[i] < bv[i]) as u128).collect();
+    let (results, comm) = run_parties(profile, move |me| {
+        let av = av.clone();
+        let bv = bv.clone();
+        move |be: &mut crate::interpreter::transport_backend::TransportBackend<_>| {
+            let pairs: Vec<_> = (0..n)
+                .map(|i| {
+                    let a = be.share_secret(
+                        if me == 0 { (av[i] as i128).rem_euclid(1i128 << b) as u128 } else { 0 }, b, 0);
+                    let bb = be.share_secret(
+                        if me == 0 { (bv[i] as i128).rem_euclid(1i128 << b) as u128 } else { 0 }, b, 0);
+                    (a, bb)
+                })
+                .collect();
+            let t0 = Instant::now();
+            let lt = be.lt_gc_batch(&pairs);
+            let elapsed = t0.elapsed().as_secs_f64() * 1000.0;
+            let bits: Vec<u128> = lt.iter().map(|r| be.reveal(r, None) & 1).collect();
+            (elapsed, bits)
+        }
+    });
+    let (elapsed, bits) = results.into_iter().next().unwrap();
+    (elapsed, comm.bytes as usize, bits == want)
+}
+
+/// The real 3-party garbled *fused ReLU∘rescale* — `TransportBackend::
+/// relu_gc_batch`: the whole nonlinearity in one garble round + Y2A, through
+/// the transport. Returns (ms, bytes, ok).
+fn measure_gc_real_relu(n: usize, b: usize, shift: usize, profile: NetworkProfile) -> (f64, usize, bool) {
+    let mut rng = rand::thread_rng();
+    let vals: Vec<i64> = (0..n).map(|_| rng.gen_range(-(1 << (b - 2))..(1 << (b - 2)))).collect();
+    let want: Vec<i64> = vals.iter().map(|&v| if v >= 0 { v >> shift } else { 0 }).collect();
+    let (results, comm) = run_parties(profile, move |me| {
+        let vals = vals.clone();
+        move |be: &mut crate::interpreter::transport_backend::TransportBackend<_>| {
+            let vs: Vec<_> = (0..n)
+                .map(|i| be.share_secret(
+                    if me == 0 { (vals[i] as i128).rem_euclid(1i128 << b) as u128 } else { 0 }, b, 0))
+                .collect();
+            let t0 = Instant::now();
+            let acts = be.relu_gc_batch(&vs, b, shift);
+            let elapsed = t0.elapsed().as_secs_f64() * 1000.0;
+            let out: Vec<i64> = acts.iter().map(|a| {
+                let r = be.reveal(a, None);
+                let m = (1i128 << b) - 1;
+                let v = (r as i128) & m;
+                if v >= (1i128 << (b - 1)) { (v - (1i128 << b)) as i64 } else { v as i64 }
+            }).collect();
+            (elapsed, out)
+        }
+    });
+    let (elapsed, out) = results.into_iter().next().unwrap();
+    (elapsed, comm.bytes as usize, out == want)
+}
+
 pub fn run(n: usize, b: usize) -> GcCompareReport {
     let (a_ms, a_bytes, a_ok) = measure_a2b(n, b);
     let (g_ms, g_bytes, g_ok) = measure_gc(n, b);
@@ -567,6 +634,39 @@ pub fn run_cli(args: &[String]) -> Result<(), String> {
         assert!(aok && gok, "relu correctness must hold at every profile");
         let (winner, factor) = if la < lg { ("a2b", lg / la) } else { ("GC", la / lg) };
         println!("  {:32}  {:8.1} ms  {:8.1} ms  {} {:.1}x", name, la, lg, winner, factor);
+    }
+
+    // The REAL 3-party garbled protocol (crate::crypto::gc_protocol): garble +
+    // evaluate + Y2A resharing to arithmetic, through the same 3-party
+    // transport as a2b. Unlike the pure-GC proxy above, this includes the Y2A
+    // cost — the honest end-to-end comparison (a2b also lands in arithmetic).
+    println!("\n  REAL 3-party GC protocol (garble+eval+Y2A) through the transport:");
+    println!("  {:32}  {:>11}  {:>13}  {:>10}", "network", "a2b lt", "GC lt (3pc)", "winner");
+    for (name, rtt, bw) in profiles {
+        let one_way = std::time::Duration::from_secs_f64(rtt / 2.0 / 1000.0);
+        let mut profile = NetworkProfile::fixed_latency(one_way);
+        if let Some(bps) = bw {
+            profile = profile.with_bandwidth(*bps);
+        }
+        let (la, _, aok) = measure_a2b_profile(n, b, profile);
+        let (lg, _, gok) = measure_gc_real_lt(n, b, profile);
+        assert!(aok && gok, "real-GC lt correctness must hold at every profile");
+        let (winner, factor) = if la < lg { ("a2b", lg / la) } else { ("GC", la / lg) };
+        println!("  {:32}  {:8.1} ms  {:10.1} ms  {} {:.1}x", name, la, lg, winner, factor);
+    }
+    println!("\n  REAL 3-party GC fused ReLU∘rescale ({n} ops, shift {shift}) through the transport:");
+    println!("  {:32}  {:>11}  {:>13}  {:>10}", "network", "a2b relu", "GC relu (3pc)", "winner");
+    for (name, rtt, bw) in profiles {
+        let one_way = std::time::Duration::from_secs_f64(rtt / 2.0 / 1000.0);
+        let mut profile = NetworkProfile::fixed_latency(one_way);
+        if let Some(bps) = bw {
+            profile = profile.with_bandwidth(*bps);
+        }
+        let (la, _, aok) = measure_a2b_relu_profile(n, b, shift, profile);
+        let (lg, _, gok) = measure_gc_real_relu(n, b, shift, profile);
+        assert!(aok && gok, "real-GC relu correctness must hold at every profile");
+        let (winner, factor) = if la < lg { ("a2b", lg / la) } else { ("GC", la / lg) };
+        println!("  {:32}  {:8.1} ms  {:10.1} ms  {} {:.1}x", name, la, lg, winner, factor);
     }
 
     println!(
