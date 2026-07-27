@@ -1,0 +1,652 @@
+//! The analytic cost model.
+//!
+//! Given a lowered [`Program`], its [`Schedule`], a [`ProtocolSpec`] and a
+//! [`Deployment`], predict what running the program under that protocol would
+//! cost — **without running it**.  That is what makes "which backend for *this*
+//! program?" answerable for arbitrary programs rather than only for the ones in
+//! a benchmark suite.
+//!
+//! ## How composite primitives are priced
+//!
+//! [`crate::mpcc::protocols`] only specifies the true primitives —
+//! multiplication, opening, `GF(2)` AND, and preprocessing material.  Everything
+//! else is *composed* here, in one place, from those primitives, so that adding
+//! a protocol means supplying four numbers rather than thirty:
+//!
+//! | primitive | arithmetic protocol | binary protocol |
+//! |---|---|---|
+//! | `Mul` | 1 multiplication | `k²` AND gates (schoolbook) |
+//! | `Add`/`Sub` | free | `k` AND gates (ripple-carry) |
+//! | `LtS`/`EqZ` | edaBit + `log k` AND depth | `k` AND gates |
+//! | `BitDecomp` | edaBit + a `k`-bit adder | free — already binary |
+//! | `TruncPr` | mask, open, correct | **free** — it is wire selection |
+//! | `Div` | `k` restoring-division steps | `k²` AND gates |
+//!
+//! The `TruncPr` row is the interesting one: right-shifting a secret is nearly
+//! free in a garbled circuit and genuinely expensive in an arithmetic protocol.
+//! Baru's Q16.16 fixed-point lowering emits a rescale after *every* fixed×fixed
+//! multiplication, so this single asymmetry decides the MPC-vs-GC question for
+//! most of Baru's neural-network workloads — which is exactly the kind of answer
+//! the model exists to produce.
+//!
+//! ## Accuracy
+//!
+//! Online communication and round counts follow from the protocol definitions
+//! and should be exact.  Offline volumes and the local-work constants are
+//! literature estimates (see [`crate::mpcc::protocols`]); calibrating them
+//! against measured runs is roadmap phase P1.  [`CostEstimate::notes`] carries
+//! every caveat that applied to a particular estimate.
+
+use serde::Serialize;
+
+use super::ir::{Domain, DomainKind, Op, Program, Secrecy};
+use super::protocols::{Majority, ProtocolSpec, Security};
+use super::schedule::Schedule;
+
+/// The deployment a program is being costed for.
+#[derive(Debug, Clone)]
+pub struct Deployment {
+    pub parties: usize,
+    /// The weakest adversary the deployment must tolerate.
+    pub min_security: Security,
+    /// When true, honest-majority protocols are rejected.
+    pub require_dishonest_majority: bool,
+    /// When false, the dealer model is excluded (it is not a real threat model,
+    /// only a lower bound).
+    pub allow_dealer: bool,
+    /// One-way network latency, microseconds.
+    pub latency_us: f64,
+    /// Per-party bandwidth, bytes per second.
+    pub bandwidth_bytes_per_sec: f64,
+    /// Include preprocessing in the headline time.
+    pub include_offline: bool,
+}
+
+impl Deployment {
+    /// 10 Gbit/s datacentre link, 0.1 ms round trip.
+    pub fn lan(parties: usize) -> Self {
+        Deployment {
+            parties,
+            min_security: Security::SemiHonest,
+            require_dishonest_majority: false,
+            allow_dealer: false,
+            latency_us: 50.0,
+            bandwidth_bytes_per_sec: 1.25e9,
+            include_offline: true,
+        }
+    }
+
+    /// 100 Mbit/s intercontinental link, 100 ms round trip — where round count
+    /// dominates everything else.
+    pub fn wan(parties: usize) -> Self {
+        Deployment {
+            latency_us: 50_000.0,
+            bandwidth_bytes_per_sec: 12.5e6,
+            ..Deployment::lan(parties)
+        }
+    }
+}
+
+/// What running `program` under one protocol is predicted to cost.
+#[derive(Debug, Clone, Serialize)]
+pub struct CostEstimate {
+    pub protocol: String,
+    pub implemented: bool,
+    /// Communication rounds in the online phase, including input sharing.
+    pub rounds: u64,
+    /// Bytes one party sends online.
+    pub online_bytes: u64,
+    /// Bytes one party sends during preprocessing.
+    pub offline_bytes: u64,
+    pub triples: u64,
+    pub and_triples: u64,
+    pub edabits: u64,
+    pub dabits: u64,
+    /// Boolean AND gates, for protocols that evaluate a binary circuit.
+    pub and_gates: u64,
+    /// Predicted online wall-clock, seconds.
+    pub online_secs: f64,
+    /// Predicted preprocessing wall-clock, seconds.
+    pub offline_secs: f64,
+    /// `online_secs` plus `offline_secs` when the deployment counts it.
+    pub total_secs: f64,
+    /// Which term dominates: `"latency"`, `"bandwidth"` or `"compute"`.
+    pub bottleneck: &'static str,
+    pub notes: Vec<String>,
+}
+
+/// Running totals while walking the program.
+#[derive(Default, Clone, Copy)]
+struct Acc {
+    bytes: f64,
+    triples: f64,
+    and_triples: f64,
+    edabits: f64,
+    dabits: f64,
+    and_gates: f64,
+    local_ns: f64,
+}
+
+/// Per-instruction cost in one protocol.
+#[derive(Default, Clone, Copy)]
+struct OpCost {
+    /// Internal rounds — a bit-decomposition is log-depth *inside* one
+    /// dependence level, so a schedule level costs the max over its members.
+    rounds: u32,
+    acc: Acc,
+}
+
+/// Decide whether `spec` may be used for `dep`, and why not if it may not.
+pub fn eligibility(spec: &ProtocolSpec, dep: &Deployment) -> Result<(), String> {
+    if !spec.supports_parties(dep.parties) {
+        let bound = match spec.max_parties {
+            Some(m) if m == spec.min_parties => format!("exactly {}", m),
+            Some(m) => format!("{}..={}", spec.min_parties, m),
+            None => format!("{}+", spec.min_parties),
+        };
+        return Err(format!(
+            "needs {} parties, deployment has {}",
+            bound, dep.parties
+        ));
+    }
+    if spec.security < dep.min_security {
+        return Err(format!(
+            "only {} secure, deployment requires {}",
+            spec.security, dep.min_security
+        ));
+    }
+    if spec.majority == Majority::Dealer && !dep.allow_dealer {
+        return Err("requires a trusted dealer".to_string());
+    }
+    if dep.require_dishonest_majority && spec.majority == Majority::Honest {
+        return Err("assumes an honest majority".to_string());
+    }
+    Ok(())
+}
+
+/// The domain a protocol would actually run the program in.
+fn protocol_domain(spec: &ProtocolSpec, prog: &Program) -> Domain {
+    match spec.domain {
+        DomainKind::Ring => match prog.domain {
+            Domain::Ring { k } => Domain::Ring { k },
+            _ => Domain::Ring { k: 64 },
+        },
+        // The standard SPDZ prime size; a 64-bit program run mod p has
+        // different wraparound semantics, which `notes` flags.
+        DomainKind::Field => Domain::Field { bits: 128 },
+        DomainKind::Binary => Domain::Binary,
+    }
+}
+
+fn ceil_log2(n: u32) -> u32 {
+    if n <= 1 {
+        0
+    } else {
+        32 - (n - 1).leading_zeros()
+    }
+}
+
+/// Cost of one instruction under an *arithmetic* (ring or field) protocol.
+fn arith_op_cost(
+    op: &Op,
+    lanes: f64,
+    spec: &ProtocolSpec,
+    dep: &Deployment,
+    elem_bytes: f64,
+    bit_width: u32,
+) -> OpCost {
+    let c = &spec.cost;
+    let n = dep.parties;
+    let mul_bytes = lanes * c.mul_elems.total(n) * elem_bytes * c.auth_overhead;
+    let open_bytes = lanes * c.open_elems.total(n) * elem_bytes * c.auth_overhead;
+    let and_bytes_per_lane = c.and_bits.total(n) / 8.0 * c.auth_overhead;
+    let cmp_rounds = c.open_rounds + ceil_log2(bit_width) * c.and_rounds;
+    let cmp_ands = f64::from(bit_width);
+    let local = |lanes: f64| lanes * c.local_ns_per_lane;
+
+    match op {
+        Op::Mul | Op::Mux => OpCost {
+            rounds: c.mul_rounds,
+            acc: Acc {
+                bytes: mul_bytes,
+                triples: lanes * c.triples_per_mul,
+                local_ns: local(lanes),
+                ..Acc::default()
+            },
+        },
+        Op::Open => OpCost {
+            rounds: c.open_rounds,
+            acc: Acc {
+                bytes: open_bytes,
+                local_ns: local(lanes),
+                ..Acc::default()
+            },
+        },
+        Op::And => OpCost {
+            rounds: c.and_rounds,
+            acc: Acc {
+                bytes: lanes * and_bytes_per_lane,
+                and_triples: lanes * c.triples_per_mul,
+                and_gates: lanes,
+                local_ns: local(lanes),
+                ..Acc::default()
+            },
+        },
+        // Mask with an edaBit, open, then run a k-bit binary adder to strip the
+        // mask: log-depth in AND gates.
+        Op::BitDecomp { nbits } => OpCost {
+            rounds: c.open_rounds + ceil_log2(*nbits) * c.and_rounds,
+            acc: Acc {
+                bytes: open_bytes + lanes * and_bytes_per_lane,
+                edabits: lanes * c.edabits_per_bit,
+                and_triples: lanes * c.triples_per_mul,
+                and_gates: lanes,
+                local_ns: local(lanes),
+                ..Acc::default()
+            },
+        },
+        Op::BitComp { .. } | Op::Convert => OpCost {
+            rounds: c.open_rounds,
+            acc: Acc {
+                bytes: lanes * and_bytes_per_lane,
+                dabits: lanes * c.dabits_per_bit,
+                local_ns: local(lanes),
+                ..Acc::default()
+            },
+        },
+        Op::LtS | Op::LtU | Op::EqZ => OpCost {
+            rounds: cmp_rounds,
+            acc: Acc {
+                bytes: open_bytes + lanes * cmp_ands * and_bytes_per_lane,
+                edabits: lanes * f64::from(bit_width) * c.edabits_per_bit,
+                and_triples: lanes * cmp_ands * c.triples_per_mul,
+                and_gates: lanes * cmp_ands,
+                local_ns: local(lanes * cmp_ands),
+                ..Acc::default()
+            },
+        },
+        // Probabilistic truncation: one masked opening plus a correction term.
+        // Cheap in rounds, but not free — and Baru emits one per fixed-point
+        // multiplication.
+        Op::TruncPr { .. } => OpCost {
+            rounds: c.open_rounds + c.mul_rounds,
+            acc: Acc {
+                bytes: open_bytes + mul_bytes,
+                edabits: lanes * f64::from(bit_width) * c.edabits_per_bit,
+                triples: lanes * c.triples_per_mul,
+                local_ns: local(lanes),
+                ..Acc::default()
+            },
+        },
+        // Restoring long division, exactly as `Backend::divmod` implements it:
+        // one comparison and one multiplication per quotient bit, serially.
+        Op::Div => {
+            let steps = f64::from(bit_width);
+            OpCost {
+                rounds: bit_width * (cmp_rounds + c.mul_rounds),
+                acc: Acc {
+                    bytes: steps * (open_bytes + mul_bytes + lanes * cmp_ands * and_bytes_per_lane),
+                    triples: steps * lanes * c.triples_per_mul,
+                    and_triples: steps * lanes * cmp_ands * c.triples_per_mul,
+                    and_gates: steps * lanes * cmp_ands,
+                    local_ns: local(steps * lanes * cmp_ands),
+                    ..Acc::default()
+                },
+            }
+        }
+        Op::PopCount { nbits } => OpCost {
+            rounds: c.open_rounds + ceil_log2(*nbits) * c.and_rounds,
+            acc: Acc {
+                bytes: open_bytes + lanes * f64::from(*nbits) * and_bytes_per_lane,
+                edabits: lanes * f64::from(*nbits) * c.edabits_per_bit,
+                dabits: lanes * f64::from(*nbits) * c.dabits_per_bit,
+                and_gates: lanes * f64::from(*nbits),
+                local_ns: local(lanes * f64::from(*nbits)),
+                ..Acc::default()
+            },
+        },
+        // Local: linear operations, public constants, register plumbing.
+        // Input sharing is charged once, as a batched prelude round, in
+        // `estimate` — it never appears in a schedule level.
+        _ => OpCost::default(),
+    }
+}
+
+/// Cost of one instruction under a *binary* protocol, which must evaluate the
+/// arithmetic program as a boolean circuit.  Gate counts are the textbook
+/// constructions: ripple-carry addition, schoolbook multiplication.
+fn binary_op_cost(
+    op: &Op,
+    lanes: f64,
+    spec: &ProtocolSpec,
+    dep: &Deployment,
+    bit_width: u32,
+) -> OpCost {
+    let c = &spec.cost;
+    let k = f64::from(bit_width);
+    let and_bytes = c.and_bits.total(dep.parties) / 8.0 * c.auth_overhead;
+    // AND-gate count and AND-depth of the sub-circuit for one lane.
+    let (gates, depth): (f64, u32) = match op {
+        Op::Add | Op::Sub | Op::AddC(_) => (k, ceil_log2(bit_width)),
+        Op::Mul => (k * k, 2 * ceil_log2(bit_width)),
+        Op::MulC(_) => (k * k / 2.0, 2 * ceil_log2(bit_width)),
+        Op::Mux => (k, 1),
+        Op::LtS | Op::LtU | Op::EqZ => (k, ceil_log2(bit_width)),
+        Op::And => (1.0, 1),
+        Op::Div => (k * k, bit_width * ceil_log2(bit_width)),
+        Op::PopCount { nbits } => (k * f64::from(ceil_log2(*nbits)), ceil_log2(*nbits)),
+        // Free in a binary protocol: shifts and truncations are wire
+        // relabelling, XOR is free-XOR, bit (de)composition is the identity.
+        Op::Xor
+        | Op::Not
+        | Op::Neg
+        | Op::ShlC(_)
+        | Op::TruncPr { .. }
+        | Op::BitDecomp { .. }
+        | Op::BitComp { .. }
+        | Op::Convert
+        | Op::Copy
+        | Op::LdI(_)
+        | Op::Output
+        | Op::Open
+        | Op::Input { .. } => (0.0, 0),
+    };
+    let total_gates = lanes * gates;
+    OpCost {
+        rounds: if c.constant_round {
+            0
+        } else {
+            depth * c.and_rounds
+        },
+        acc: Acc {
+            bytes: total_gates * and_bytes,
+            and_triples: total_gates * c.triples_per_mul,
+            and_gates: total_gates,
+            local_ns: total_gates * c.local_ns_per_lane,
+            ..Acc::default()
+        },
+    }
+}
+
+/// Predict the cost of running `prog` under `spec` in `dep`.
+///
+/// Returns `Err` with a human-readable reason when the protocol cannot serve
+/// the deployment at all.
+pub fn estimate(
+    prog: &Program,
+    sched: &Schedule,
+    spec: &ProtocolSpec,
+    dep: &Deployment,
+) -> Result<CostEstimate, String> {
+    eligibility(spec, dep)?;
+
+    let mut notes: Vec<String> = Vec::new();
+    let pdomain = protocol_domain(spec, prog);
+    let elem_bytes = pdomain.element_bytes();
+    // The width the lowering used for comparisons and decompositions — not the
+    // share width, which may be wider.
+    let bit_width = prog.bit_width;
+
+    if spec.domain != prog.domain.kind() {
+        match spec.domain {
+            DomainKind::Field => notes.push(format!(
+                "program is {} but {} computes {}: wraparound semantics differ, \
+                 and shares are {}-bit instead of {}-bit",
+                prog.domain,
+                spec.id,
+                pdomain,
+                pdomain.element_bits(),
+                prog.domain.element_bits()
+            )),
+            DomainKind::Binary => notes.push(format!(
+                "program is {} but {} is a binary protocol: costed as a boolean \
+                 circuit with textbook gate counts ({}-bit ripple-carry adders, \
+                 schoolbook multipliers)",
+                prog.domain, spec.id, bit_width
+            )),
+            DomainKind::Ring => notes.push(format!(
+                "program is {} but {} computes mod 2^k",
+                prog.domain, spec.id
+            )),
+        }
+    }
+
+    let is_binary_protocol = spec.domain == DomainKind::Binary;
+    let mut acc = Acc::default();
+    let mut rounds: u64 = 0;
+
+    // Input sharing, batched into a single prelude round.
+    let n_inputs = prog.inputs.len() as f64;
+    if n_inputs > 0.0 {
+        if is_binary_protocol {
+            // Oblivious transfer for the evaluator's input bits.
+            acc.bytes += n_inputs * f64::from(bit_width) * 32.0;
+        } else {
+            acc.bytes += n_inputs
+                * elem_bytes
+                * (dep.parties.saturating_sub(1)) as f64
+                * spec.cost.auth_overhead;
+            rounds += 1;
+        }
+    }
+
+    // Walk the schedule: every dependence level is one *logical* round, whose
+    // real cost is the deepest primitive it contains.
+    for round in &sched.rounds {
+        let mut level_rounds = 0u32;
+        for &idx in &round.instrs {
+            let instr = &prog.code[idx];
+            let lanes = f64::from(instr.width);
+            let cost = if is_binary_protocol {
+                binary_op_cost(&instr.op, lanes, spec, dep, bit_width)
+            } else {
+                arith_op_cost(&instr.op, lanes, spec, dep, elem_bytes, bit_width)
+            };
+            level_rounds = level_rounds.max(cost.rounds);
+            acc.bytes += cost.acc.bytes;
+            acc.triples += cost.acc.triples;
+            acc.and_triples += cost.acc.and_triples;
+            acc.edabits += cost.acc.edabits;
+            acc.dabits += cost.acc.dabits;
+            acc.and_gates += cost.acc.and_gates;
+            acc.local_ns += cost.acc.local_ns;
+        }
+        rounds += u64::from(level_rounds);
+    }
+
+    // A binary protocol still has to evaluate the *local* arithmetic
+    // instructions as gates — additions are free in a secret-sharing protocol
+    // but cost a ripple-carry adder here.  Walk them too.
+    if is_binary_protocol {
+        let mut extra_depth = 0u32;
+        for instr in &prog.code {
+            if prog.is_interactive(instr) || prog.srcs_secrecy(instr) == Secrecy::Clear {
+                continue; // already counted, or public computation with no gates
+            }
+            let cost = binary_op_cost(&instr.op, f64::from(instr.width), spec, dep, bit_width);
+            acc.bytes += cost.acc.bytes;
+            acc.and_triples += cost.acc.and_triples;
+            acc.and_gates += cost.acc.and_gates;
+            acc.local_ns += cost.acc.local_ns;
+            extra_depth = extra_depth.max(cost.rounds);
+        }
+        if spec.cost.constant_round {
+            rounds = u64::from(spec.cost.constant_rounds);
+            notes.push(format!(
+                "{} is constant-round: {} rounds regardless of circuit depth",
+                spec.id, spec.cost.constant_rounds
+            ));
+        } else {
+            rounds += u64::from(extra_depth);
+        }
+    }
+
+    let offline_bytes =
+        (acc.triples + acc.and_triples) * spec.cost.offline_elems_per_triple * elem_bytes
+            + (acc.edabits + acc.dabits) * elem_bytes;
+
+    let latency_secs = rounds as f64 * dep.latency_us / 1e6;
+    let bandwidth_secs = acc.bytes / dep.bandwidth_bytes_per_sec;
+    let compute_secs = acc.local_ns / 1e9;
+    let online_secs = latency_secs + bandwidth_secs + compute_secs;
+    let offline_secs = offline_bytes / dep.bandwidth_bytes_per_sec;
+
+    let bottleneck = if latency_secs >= bandwidth_secs && latency_secs >= compute_secs {
+        "latency"
+    } else if bandwidth_secs >= compute_secs {
+        "bandwidth"
+    } else {
+        "compute"
+    };
+
+    if spec.cost.offline_elems_per_triple > 0.0 {
+        notes.push(
+            "offline volume is a literature estimate, not a measurement (roadmap P1 calibrates it)"
+                .to_string(),
+        );
+    }
+    if spec.id == "lowgear" {
+        notes.push(
+            "LowGear trades bandwidth for CPU: its preprocessing is compute-bound, which this \
+             bandwidth-only offline term does not capture"
+                .to_string(),
+        );
+    }
+
+    Ok(CostEstimate {
+        protocol: spec.id.to_string(),
+        implemented: spec.status.is_implemented(),
+        rounds,
+        online_bytes: acc.bytes as u64,
+        offline_bytes: offline_bytes as u64,
+        triples: acc.triples as u64,
+        and_triples: acc.and_triples as u64,
+        edabits: acc.edabits as u64,
+        dabits: acc.dabits as u64,
+        and_gates: acc.and_gates as u64,
+        online_secs,
+        offline_secs,
+        total_secs: online_secs
+            + if dep.include_offline {
+                offline_secs
+            } else {
+                0.0
+            },
+        bottleneck,
+        notes,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::mpcc::lower::{lower, LowerConfig};
+    use crate::mpcc::protocols::find;
+    use crate::mpcc::schedule::schedule;
+
+    fn compile(src: &str) -> (Program, Schedule) {
+        let expr = crate::interpreter::parse(src).expect("parse");
+        let mut cc = crate::zkp::circuit_compiler::CircuitCompiler::new();
+        let circuit = cc.compile_fhe(&expr).expect("compile");
+        let prog = lower(
+            &circuit.flat_ops,
+            &circuit.output_wire,
+            &LowerConfig::default(),
+        )
+        .expect("lower");
+        let sched = schedule(&prog);
+        (prog, sched)
+    }
+
+    #[test]
+    fn eligibility_rejects_for_the_right_reasons() {
+        let mut dep = Deployment::lan(2);
+        let err = eligibility(find("aby3").unwrap(), &dep).unwrap_err();
+        assert!(err.contains("exactly 3"), "{}", err);
+
+        dep = Deployment::lan(3);
+        dep.min_security = Security::Malicious;
+        let err = eligibility(find("aby3").unwrap(), &dep).unwrap_err();
+        assert!(err.contains("semi-honest"), "{}", err);
+
+        dep = Deployment::lan(3);
+        dep.require_dishonest_majority = true;
+        let err = eligibility(find("shamir").unwrap(), &dep).unwrap_err();
+        assert!(err.contains("honest majority"), "{}", err);
+
+        assert!(eligibility(find("dealer").unwrap(), &Deployment::lan(3)).is_err());
+    }
+
+    #[test]
+    fn a_multiplication_chain_is_latency_bound_on_a_wan() {
+        let (prog, sched) = compile("(* (* (* x y) x) y)");
+        let est = estimate(&prog, &sched, find("aby3").unwrap(), &Deployment::wan(3)).unwrap();
+        assert_eq!(est.bottleneck, "latency");
+        // 1 input round + 3 serial multiplications + 1 open.
+        assert_eq!(est.rounds, 5);
+    }
+
+    #[test]
+    fn replicated_sharing_needs_no_triples_but_additive_sharing_does() {
+        let (prog, sched) = compile("(* x y)");
+        let dep = Deployment::lan(3);
+        let aby3 = estimate(&prog, &sched, find("aby3").unwrap(), &dep).unwrap();
+        let semi2k = estimate(&prog, &sched, find("semi2k").unwrap(), &dep).unwrap();
+        assert_eq!(aby3.triples, 0);
+        assert_eq!(semi2k.triples, 1);
+        assert!(semi2k.offline_bytes > aby3.offline_bytes);
+    }
+
+    #[test]
+    fn malicious_security_costs_communication() {
+        let (prog, sched) = compile("(* x y)");
+        let mut dep = Deployment::lan(3);
+        dep.min_security = Security::SemiHonest;
+        let semi = estimate(&prog, &sched, find("semi2k").unwrap(), &dep).unwrap();
+        let mal = estimate(&prog, &sched, find("spdz2k").unwrap(), &dep).unwrap();
+        assert!(
+            mal.online_bytes > semi.online_bytes,
+            "authentication should cost bytes: {} vs {}",
+            mal.online_bytes,
+            semi.online_bytes
+        );
+    }
+
+    #[test]
+    fn truncation_is_free_in_a_garbled_circuit_and_costly_in_a_ring() {
+        let (plain, s_plain) = compile("(* x y)");
+        let (shifted, s_shifted) = compile("(ash-right (* x y) 16)");
+        let dep = Deployment::lan(3);
+
+        let aby3_plain = estimate(&plain, &s_plain, find("aby3").unwrap(), &dep).unwrap();
+        let aby3_shift = estimate(&shifted, &s_shifted, find("aby3").unwrap(), &dep).unwrap();
+        assert!(
+            aby3_shift.rounds > aby3_plain.rounds,
+            "a ring protocol must pay for truncation"
+        );
+
+        let dep2 = Deployment::lan(2);
+        let yao_plain = estimate(&plain, &s_plain, find("yao").unwrap(), &dep2).unwrap();
+        let yao_shift = estimate(&shifted, &s_shifted, find("yao").unwrap(), &dep2).unwrap();
+        assert_eq!(
+            yao_plain.and_gates, yao_shift.and_gates,
+            "shifting is wire relabelling in a garbled circuit"
+        );
+        assert_eq!(yao_shift.rounds, 3, "Yao is constant-round");
+    }
+
+    #[test]
+    fn division_is_the_expensive_primitive() {
+        let (m, sm) = compile("(* x y)");
+        let (d, sd) = compile("(/ x y)");
+        let dep = Deployment::lan(3);
+        let mul = estimate(&m, &sm, find("aby3").unwrap(), &dep).unwrap();
+        let div = estimate(&d, &sd, find("aby3").unwrap(), &dep).unwrap();
+        assert!(
+            div.rounds > 20 * mul.rounds,
+            "restoring division is per-bit serial: {} vs {}",
+            div.rounds,
+            mul.rounds
+        );
+    }
+}

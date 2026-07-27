@@ -1,0 +1,52 @@
+This is BibTeX, Version 0.99d (TeX Live 2024/Homebrew)
+Capacity: max_strings=200000, hash_size=200000, hash_prime=170003
+The top-level auxiliary file: main.aux
+The style file: plain.bst
+Database file #1: references.bib
+Warning--empty booktitle in CHIMERA
+Warning--can't use both volume and number fields in CHIMERA
+Warning--empty booktitle in TFHE
+Warning--can't use both volume and number fields in TFHE
+Warning--empty booktitle in FV
+You've used 26 entries,
+            2118 wiz_defined-function locations,
+            665 strings with 8341 characters,
+and the built_in function-call counts, 11841 in all, are:
+= -- 1178
+> -- 495
+< -- 23
++ -- 196
+- -- 168
+* -- 747
+:= -- 1722
+add.period$ -- 79
+call.type$ -- 26
+change.case$ -- 161
+chr.to.int$ -- 0
+cite$ -- 31
+duplicate$ -- 527
+empty$ -- 973
+format.name$ -- 168
+if$ -- 2654
+int.to.chr$ -- 0
+int.to.str$ -- 26
+missing$ -- 25
+newline$ -- 134
+num.names$ -- 52
+pop$ -- 224
+preamble$ -- 1
+purify$ -- 135
+quote$ -- 0
+skip$ -- 456
+stack$ -- 0
+substring$ -- 842
+swap$ -- 232
+text.length$ -- 23
+text.prefix$ -- 0
+top$ -- 0
+type$ -- 104
+warning$ -- 5
+while$ -- 119
+width$ -- 28
+write$ -- 287
+(There were 5 warnings)

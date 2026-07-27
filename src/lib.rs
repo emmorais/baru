@@ -32,3 +32,10 @@ pub mod hybrid;
 pub mod gadgets;
 
 pub mod demo;
+
+/// MPC compiler: `FlatOp` → protocol-neutral bytecode → round schedule →
+/// analytic cost comparison across the protocol matrix.
+pub mod mpcc;
+
+/// Encrypted experiment store (BaruDB / blindsearch client + local fallback).
+pub mod db;

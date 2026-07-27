@@ -592,6 +592,9 @@ options:
   --input NAME=VAL  input binding for --expr (repeatable)
   --json            emit reports as JSON instead of tables
   --list            list built-in cases and exit
+  --store SPEC      persist every result: local:PATH or blindsearch:PATH
+                    (see docs/barudb-api.md; `baru db query` reads it back)
+  --tag NAME        tag stored records, e.g. --tag paper-table-3 (repeatable)
 ";
 
 pub fn run_cli(args: &[String]) -> Result<(), String> {
@@ -602,6 +605,8 @@ pub fn run_cli(args: &[String]) -> Result<(), String> {
     let mut custom_mpc_expr: Option<String> = None;
     let mut custom_inputs: Vec<(String, i64)> = Vec::new();
     let mut case_filter: Vec<String> = Vec::new();
+    let mut store_spec: Option<String> = None;
+    let mut tags: Vec<String> = Vec::new();
 
     let mut i = 0;
     while i < args.len() {
@@ -659,6 +664,14 @@ pub fn run_cli(args: &[String]) -> Result<(), String> {
                     .parse()
                     .map_err(|_| format!("--input '{}': value is not an integer", kv))?;
                 custom_inputs.push((k.to_string(), v));
+            }
+            "--store" => {
+                i += 1;
+                store_spec = Some(args.get(i).ok_or("--store needs a value")?.clone());
+            }
+            "--tag" => {
+                i += 1;
+                tags.push(args.get(i).ok_or("--tag needs a value")?.clone());
             }
             other if other.starts_with('-') => {
                 return Err(format!("unknown option '{}'\n{}", other, USAGE));
@@ -732,6 +745,64 @@ pub fn run_cli(args: &[String]) -> Result<(), String> {
             serde_json::to_string_pretty(&reports).map_err(|e| e.to_string())?
         );
     }
+    if let Some(spec) = &store_spec {
+        persist(&reports, spec, &tags, iters)?;
+    }
+    Ok(())
+}
+
+/// Write one [`crate::db::Run`] per (case, backend) into the experiment store.
+///
+/// Failed backends are recorded too, with the error in `notes`: "TFHE ran out
+/// of memory on this shape" is a result worth keeping, and silently dropping it
+/// would make the store's coverage look better than it is.
+fn persist(
+    reports: &[CaseReport],
+    spec: &str,
+    tags: &[String],
+    iters: u32,
+) -> Result<(), String> {
+    use crate::db::{Metric, Run};
+
+    let mut store = crate::db::open(spec)?;
+    let mut written = 0usize;
+    for report in reports {
+        for b in &report.backends {
+            let mut run = Run::new("bench", &report.case, &b.backend);
+            run.ok = b.ok;
+            run.tags = tags.to_vec();
+            for phase in &b.phases {
+                run.metrics.insert(
+                    format!("{}_us", phase.name),
+                    Metric::new(phase.micros as f64, "us"),
+                );
+            }
+            run.metrics
+                .insert("total_us".into(), Metric::new(b.total_micros as f64, "us"));
+            run.config.insert("expr".into(), report.expr.clone());
+            run.config.insert("iters".into(), iters.to_string());
+            for (name, value) in &report.inputs {
+                run.config.insert(format!("input.{}", name), value.to_string());
+            }
+            if let Some(r) = b.result {
+                run.config.insert("result".into(), r.to_string());
+            }
+            if let Some(base) = report.baseline {
+                run.config.insert("baseline".into(), base.to_string());
+            }
+            let mut notes = b.notes.join("; ");
+            if let Some(err) = &b.error {
+                if !notes.is_empty() {
+                    notes.push_str("; ");
+                }
+                notes.push_str(&format!("error: {}", err));
+            }
+            run.notes = notes;
+            store.put(&run)?;
+            written += 1;
+        }
+    }
+    eprintln!("stored {} records in {}", written, store.describe());
     Ok(())
 }
 
