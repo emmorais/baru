@@ -2,6 +2,7 @@
 
 pub mod aby3_protocol;
 pub mod garbled;
+pub mod gc_protocol;
 pub mod arith;
 pub mod bits;
 pub mod identity;

@@ -94,6 +94,54 @@ impl<T: Transport> TransportBackend<T> {
         let ps = crate::crypto::aby3_protocol::share_public(value, self.me);
         self.store(id, ps, nbits, 0)
     }
+
+    /// Garbled-circuit batched comparison — the **Yao leg** of ABY3
+    /// (`crate::crypto::gc_protocol`). Computes `aᵢ < bᵢ` (signed, i.e.
+    /// `MSB(aᵢ−bᵢ)`) for the whole batch in **one** garble round + one
+    /// resharing round, regardless of bit width, versus the `~log(nbits)`
+    /// rounds of the `a2b`-based [`Backend::lt_batch`]. Requires the 3-party
+    /// honest-majority roles (garblers 0/1, evaluator 2); OT-free because every
+    /// input wire is a garbler input. Returns RSS arithmetic shares of the 0/1
+    /// results, drop-in interoperable with the rest of the pipeline.
+    pub fn lt_gc_batch(&mut self, pairs: &[(ShareRef, ShareRef)]) -> Vec<ShareRef> {
+        if pairs.is_empty() {
+            return Vec::new();
+        }
+        let nbits = pairs.iter().map(|(a, b)| a.nbits.max(b.nbits)).max().unwrap();
+        let n = pairs.len();
+        let a: Vec<PartyShare> = pairs.iter().map(|(a, _)| self.get_cloned(a)).collect();
+        let b: Vec<PartyShare> = pairs.iter().map(|(_, b)| self.get_cloned(b)).collect();
+        // Reserve op_id (garble messages) + the Y2A id block, in lockstep.
+        let op_id = self.alloc_block(1 + crate::crypto::gc_protocol::gc_id_block(n, 1));
+        let out = crate::crypto::gc_protocol::gc_lt_batch(&a, &b, nbits, op_id, self.me, &self.mailbox);
+        out.into_iter()
+            .map(|ps| {
+                let id = self.alloc_id();
+                self.store(id, ps, 1, 0)
+            })
+            .collect()
+    }
+
+    /// Garbled fused ReLU∘rescale for a batch — the whole nonlinearity in one
+    /// garble round: `outᵢ = (vᵢ>=0) ? (vᵢ>>shift) : 0`. Same Yao-leg protocol
+    /// and roles as [`Self::lt_gc_batch`]; returns RSS arithmetic shares of the
+    /// activations (`nbits−shift`-bit results carried in `nbits`).
+    pub fn relu_gc_batch(&mut self, vals: &[ShareRef], nbits: usize, shift: usize) -> Vec<ShareRef> {
+        if vals.is_empty() {
+            return Vec::new();
+        }
+        let n = vals.len();
+        let width = nbits - shift;
+        let vs: Vec<PartyShare> = vals.iter().map(|v| self.get_cloned(v)).collect();
+        let op_id = self.alloc_block(1 + crate::crypto::gc_protocol::gc_id_block(n, width));
+        let out = crate::crypto::gc_protocol::gc_relu_batch(&vs, nbits, shift, op_id, self.me, &self.mailbox);
+        out.into_iter()
+            .map(|ps| {
+                let id = self.alloc_id();
+                self.store(id, ps, nbits, 0)
+            })
+            .collect()
+    }
 }
 
 impl<T: Transport + 'static> Backend for TransportBackend<T> {

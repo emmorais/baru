@@ -479,4 +479,49 @@ mod tests {
             assert_eq!(s.to_signed(out[s.matvec_output_position(x.len(), r)]), expected, "row {r}");
         }
     }
+
+    /// Measure the ACTUAL post-multiply noise budget of a depth-1 ct×ct
+    /// product — the number that gates threshold decryption with smudging
+    /// (`docs/malicious-hybrid.md` §6). Prints, does not assert a bound, since
+    /// the point is to read the measured value into the parameter analysis.
+    #[test]
+    fn measures_post_multiply_noise_budget() {
+        for (log2_t, wmag) in [(20u32, 8i64), (24, 8), (20, 64)] {
+            let p = BfvParams { n: 4096, log2_q: 100, log2_t };
+            let s = Bfv::new(p);
+            let (ck, pk) = s.keygen();
+            let t = p.t();
+            let mut rng = rand::thread_rng();
+            // One operand full-range (packed activations near t), the other a
+            // small weight window — the pipeline's worst case.
+            let m1: Vec<u64> = (0..p.n).map(|_| rng.gen::<u64>() % t).collect();
+            let m2: Vec<u64> = (0..p.n).map(|_| (rng.gen_range(-wmag..=wmag)).rem_euclid(t as i64) as u64).collect();
+            let c = s.mul(&s.encrypt_poly(&pk, &m1), &s.encrypt_poly(&pk, &m2));
+
+            // acc = Σ cᵢ·sⁱ (the pre-round decrypt inner value).
+            let sk = s.bundle(&ck).s;
+            let mask = p.q_mask();
+            let mut acc = c.c.last().unwrap().clone();
+            for ci in c.c.iter().rev().skip(1) {
+                acc = poly_mul_mod(&acc, &sk, &p);
+                acc = poly_add(&acc, ci, mask);
+            }
+            // The decrypt is correct, so its output IS the true plaintext m;
+            // the noise is acc − Δ·m (mod q, centered).
+            let m_true = s.decrypt_poly(&ck, &c);
+            let delta = 1u128 << p.delta_shift();
+            let mut max_noise: i128 = 0;
+            for (&accv, &mv) in acc.iter().zip(&m_true) {
+                let dm = delta.wrapping_mul(mv as u128) & mask;
+                let noise = center(accv.wrapping_sub(dm) & mask, &p).unsigned_abs() as i128;
+                max_noise = max_noise.max(noise);
+            }
+            let noise_bits = (max_noise as f64).log2();
+            let correctness_bound = p.log2_q as f64 - 1.0 - log2_t as f64; // log2(q/2t)
+            println!(
+                "n=4096 q=2^100 t=2^{log2_t} wmag={wmag}: |e_mult|≈2^{:.1}, correctness bound q/2t=2^{:.0}, budget left ≈ {:.1} bits",
+                noise_bits, correctness_bound, correctness_bound - noise_bits
+            );
+        }
+    }
 }

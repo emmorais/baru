@@ -74,6 +74,20 @@ pub enum MpcMsg {
         base_op_id: u64,
         values: Vec<u128>,
     },
+
+    /// One garbler's contribution in the 3-party (two-garbler) garbled-circuit
+    /// protocol (`crate::crypto::gc_protocol`). Both garblers derive an
+    /// identical circuit from their shared PRF key; garbler 0 ships the garbled
+    /// tables plus the active labels for its input wires, garbler 1 ships the
+    /// active labels for its wires, and the evaluator combines both. `op_id`
+    /// demultiplexes concurrent conversions; `garbler` (0 or 1) says which
+    /// contribution this is. No oblivious transfer: every input wire's value is
+    /// known to the garbler that sends its label.
+    GcFromGarbler {
+        op_id: u64,
+        garbler: usize,
+        payload: Vec<u8>,
+    },
 }
 
 /// A party's two pairwise PRF keys: `mine` is shared with the next party,

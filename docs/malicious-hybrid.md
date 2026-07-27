@@ -1,0 +1,280 @@
+# Malicious security for the encrypted-model honest-majority hybrid
+
+**Status: design sketch + self-pressure-test.** This is the candidate research
+contribution identified in the roadmap discussion (direction *A*): a
+maliciously-secure, honest-majority private-inference system that keeps the
+model as a *published FHE ciphertext*, where the integrity of the FHE
+operations is enforced by **replication**, not by verifiable-FHE / SNARKs.
+
+The point of writing it down is to find where it breaks *before* building it.
+Sections 5 and 6 are the honest caveats — including one claim I initially made
+and then had to retract.
+
+---
+
+## 1. Deployment scenario (why bother with FHE at all)
+
+If you already assume an honest majority of non-colluding servers, you can run
+the whole inference in pure secret-sharing (ABY3 / SWIFT) with the model
+*secret-shared* among the servers — no FHE. So FHE must earn its place. It does
+so **operationally**, not by a stronger active-security threshold:
+
+- **The model owner is offline.** The model is a *static published artifact* —
+  a set of BFV ciphertexts under a threshold key. The owner encrypts once and
+  disappears. With RSS-of-the-model the owner must interactively re-share to
+  each specific server set and re-share whenever the set changes.
+- **Servers are stateless w.r.t. the model.** They hold ciphertexts, not model
+  shares. (See the snapshot-compromise benefit in §5.)
+- **Communication.** The linear layer is one ct×ct product (§ the main paper),
+  not an interactive matmul — the WAN win.
+
+The client encrypts its input under the same threshold key. Three
+non-colluding servers run inference; nobody learns the model or the input;
+only the class index is revealed.
+
+This is a coherent, deployable niche: *a proprietary model served by a
+consortium of non-colluding clouds.* Malicious security matters because any one
+cloud could be compromised.
+
+---
+
+## 2. Threat model
+
+- **Parties.** Three servers `P0, P1, P2`, replicated 2-of-3 sharing (RSS):
+  value `v = v0 + v1 + v2`, `Pi` holds `(vi, v_{i+1})`. Each pair shares a PRF
+  key (`k01, k12, k20`) — the same keys the semi-honest multiplication already
+  uses.
+- **FHE key.** BFV secret key `s` is **replicated-shared** across the three
+  servers and threshold-decryption needs **all three** (3-of-3 for the key;
+  2-of-3 for the MPC). No proper subset can decrypt.
+- **Adversary.** Static, **malicious**, corrupts **at most one** server
+  (honest majority). Goal: security *with abort* — either the honest parties
+  output the correct class, or they abort; the adversary learns nothing either
+  way (beyond the output, on success).
+- **Boundaries.** The model owner and the client are semi-honest-with-proof:
+  they must ship *well-formed* ciphertexts (§4.4). Malicious model owner /
+  client integrity is out of scope except for that boundary check.
+
+---
+
+## 3. The one idea
+
+Every value in the pipeline is held **redundantly** (RSS ⇒ each share is known
+to two parties; the FHE key share likewise). So every operation can be
+performed by **two** parties and their results compared. With ≤1 corruption,
+at least one of the two computers is honest, so a cheat is always caught.
+
+The only obstacle is **randomness**: two honest parties re-encrypting the same
+value produce *different* ciphertexts (fresh noise), so equality-comparison
+fails. The fix is that all FHE randomness is **derandomized** from the pairwise
+PRF keys the two co-holders already share. Then the two co-holders produce a
+*bit-identical* ciphertext, and comparison works again.
+
+So the whole construction is: **classify every FHE operation as deterministic
+or randomized; verify deterministic ops by recompute-and-compare; derandomize
+randomized ops so they, too, become recompute-and-compare.**
+
+---
+
+## 4. The construction, operation by operation
+
+### 4.1 FHE linear map (ct×ct multiply) — deterministic
+
+BFV multiplication (tensor + rescale) is a deterministic function of the two
+input ciphertexts; no randomness. Both `P0` and `P1` hold the (public-to-them)
+input ciphertexts, so both compute the product and exchange a **hash** of the
+result. Disagreement ⇒ abort. A malicious computer producing a wrong ciphertext
+is caught by the honest one. Cost: 2× FHE compute + one hash.
+
+### 4.2 Switch to MPC (mask + threshold-decrypt) — randomized, derandomized
+
+To open `v` with privacy: parties add a random mask `r` (RSS-shared) and
+threshold-decrypt `c_v + Enc(r)`, revealing `v + r`; shares of `v` follow.
+
+- **Mask contribution** `r_i`: RSS-shared, so `r_i` is known to two parties.
+  They derandomize its sampling from their shared PRF key ⇒ identical ⇒
+  comparable. A wrong mask is caught by the co-holder.
+- **Partial decryption** `d_i = c1 · s_i + e_i^{smudge}`: the key share `s_i`
+  is held by two parties; the **smudging noise** `e_i^{smudge}` is derandomized
+  from their shared PRF key. Both co-holders compute the *same* `d_i` and
+  compare. A wrong partial decryption is caught.
+- The public sum `Σ d_i` yields `v + r`; each honest party checks it against
+  the two partials it can recompute.
+
+### 4.3 Switch back to FHE (re-encrypt) — randomized, derandomized
+
+Value `a` is RSS-shared after the nonlinearity. We want `c_a = Σ_i Enc(a_i)`.
+Each `a_i` is known to two parties; the encryption randomness `(u, e_1, e_2)`
+is derandomized from their shared PRF key ⇒ both produce an identical
+`Enc(a_i)` ⇒ comparable. The sum is deterministic; recompute-and-compare.
+
+### 4.4 Boundary: well-formed input ciphertexts — the *only* ZK
+
+Recompute-and-compare secures the *computation*, but it cannot vouch for
+ciphertexts that enter from outside (the published model, the client input): a
+malicious client could ship a **malformed** ciphertext (e.g. adversarial noise
+engineered to force a decryption error, or a "ciphertext" that is not an
+encryption of any bounded-noise plaintext). Both co-holders would faithfully
+compute on the same bad input and *agree*, so replication does **not** catch
+it.
+
+Therefore each externally-supplied ciphertext carries a **zero-knowledge proof
+of well-formedness**: knowledge of a bounded-noise `(m, u, e)` opening. This is
+a standard, cheap, amortizable lattice ZKPoK — *not* a SNARK over a
+computation. It is the honest price of a malicious boundary, and it is charged
+**once per input**, never per operation.
+
+> **This is the crisp contrast with single-server verifiable FHE.** There, ZK
+> must cover the *entire evaluation*. Here, ZK covers only the *inputs*;
+> replication + honest majority covers the evaluation for free.
+
+### 4.5 MPC nonlinearity — standard malicious honest-majority
+
+ReLU / max-pool / argmax on the shares use the existing malicious
+honest-majority machinery (SWIFT / Fantastic-Four-style replicate-and-compare,
+or sublinear distributed-ZK on secret-shared data — fully-linear PCPs of
+Boneh–Boyle–Corrigan-Gibbs–Ishai). No new technique; it composes with the
+above because both live in the same RSS world.
+
+### 4.6 Selective-failure defense
+
+Per-operation abort could leak: a malicious party might inject an error that
+cancels only for specific secret values, making *abort* itself input-dependent.
+Standard mitigation: do **not** compare per operation. Accumulate all
+recompute-and-compare residuals and check a **single random linear
+combination** of them at the end of the inference (à la SWIFT's batched
+verification). One check, secret-independent abort, negligible soundness error.
+
+---
+
+## 5. Security argument (sketch) and the caveat I had to retract
+
+**Integrity (≤1 malicious).** Every value has ≥2 honest-or-adversary computers
+with ≥1 honest; every operation is deterministic after derandomization; the
+batched random-linear-combination check catches any single injected error with
+overwhelming probability. External inputs are well-formed by §4.4. Hence the
+honest parties either output the correct class or abort. ∎(sketch)
+
+**Privacy (≤1 malicious).** The adversary is missing one RSS share of every
+value (so every masked-open is uniform to it) and one FHE key share (so it
+cannot decrypt). Derandomized randomness uses PRF keys the adversary lacks for
+at least one co-pair. Standard simulation. ∎(sketch)
+
+**Caveat — the "graceful degradation" claim is FALSE; do not make it.** My
+first instinct was that the FHE-encrypted model buys *model privacy under a
+dishonest majority* (2 colluding servers). It does not. Under 2-collusion:
+
+- The two colluders jointly hold all three RSS shares of every mask, so every
+  **masked-open reconstructs the intermediate activation**. The activations
+  depend on the model, so a chosen-input probe leaks model behavior and enables
+  model-extraction — the model is *not* safe under 2-collusion.
+- So the active-protocol trust threshold for **both privacy and integrity is
+  honest majority**, exactly as in pure MPC. FHE does not raise it.
+
+The one *narrow* real benefit that survives: against a **passive
+snapshot/storage-compromise** adversary that exfiltrates the state of up to two
+servers *without participating in the protocol*, the model stays confidential,
+because decrypting it needs the full 3-of-3 key that is never assembled. With
+RSS-of-the-model, two snapshots reconstruct the model. This is a genuine but
+narrow at-rest guarantee, not an active-security upgrade. State it as such.
+
+---
+
+## 6. Honest costs and open problems
+
+- **Threshold decryption needs smudging** (noise flooding to hide the key).
+  We **measured** the actual gate (`bfv::tests::measures_post_multiply_noise_budget`)
+  rather than estimate it, and the news is good — see §6a.
+- **~2× FHE compute** (two parties recompute each op). Acceptable for a
+  malicious upgrade; parallelizable across the honest pair.
+
+### 6a. The smudging gate — measured, and it passes
+
+The correctness budget for threshold decryption is
+`q/2t − |e_mult|`; smudging noise `E` must fit inside it while statistically
+hiding `|e_mult|`. By the smudging lemma, hiding `|e_mult|` at statistical
+security `λ` needs `log2 E ≥ log2|e_mult| + λ`, and correctness needs
+`log2 E < log2(q/2t)`. So the affordable statistical security is
+`λ ≤ log2(q/2t) − log2|e_mult|` — the **headroom**.
+
+We measured `|e_mult|` on the real depth-1 ct×ct product (the multi-modular
+NTT gives *exact* products, so the noise is just fresh-encryption noise blown
+up by the multiply — far smaller than a textbook worst case):
+
+| params | `|e_mult|` (measured) | `q/2t` | headroom `λ_max` |
+|---|---|---|---|
+| n=4096, q=2^100, t=2^20 | `2^38.6` | `2^79` | **≈ 40 bits** |
+| n=4096, q=2^100, t=2^24 | `2^42.5` | `2^75` | **≈ 32 bits** |
+
+Reading this into the parameter choice:
+
+- **λ = 40 statistical** (lenient): **fits at the current n=4096, q=2^100** for
+  `t ≤ 2^20`, with *no parameter change*. (`t = 2^24` is ~8 bits short.)
+- **λ = 80 statistical** (conservative): needs `log2 q ≳ 140`, hence
+  **n=8192** (its 128-bit ceiling is `log2 q ≤ 218`). Ciphertexts grow from
+  ~100 KB to ~290 KB (≈ 3×). A bounded cost, not a blocker.
+- **Rényi-divergence flooding** (sound for a bounded number of decryptions,
+  which inference is) tightens the requirement by roughly half, likely fitting
+  λ = 80 at n=4096 or comfortably at n=8192.
+- **Decrypt-to-shares** (§ below) can avoid public flooding almost entirely.
+
+**Verdict: the direction is viable.** My original pen-and-paper estimate
+(`|e_mult| ≈ 2^55`–`2^60`, "needs n=8192") was too pessimistic; the *measured*
+noise leaves 32–40 bits of headroom at current parameters. Conservative
+statistical security costs at most a doubling of `n`.
+
+**Decrypt-to-shares, the smudging-light alternative.** Public threshold
+decryption reveals `v + r` *and its noise*, which is what forces flooding. An
+alternative outputs an additive *sharing* of `v` without a public opening
+(each party derives a share via its partial decryption), so the noise is never
+revealed and the flooding requirement collapses. This is the SPDZ/Overdrive
+"distributed decryption to shares" trick; adapting it to our mask-and-open
+switch (which currently *does* open `v + r`) is the way to keep λ = 80 at
+n=4096 if the 3× ciphertext of n=8192 is unwelcome.
+- **Noise analysis under adversarial inputs.** §4.4 argues malformed inputs are
+  excluded by the boundary ZK, so honest noise bounds hold. This needs to be
+  made rigorous: the ZKPoK's noise bound must be tight enough that the
+  worst-case *accepted* input still leaves the smudging noise dominant.
+- **Derandomization vs. security of encryption.** Using PRF-derived encryption
+  randomness must be argued pseudorandom to the third party. The two co-holders
+  know it (fine — they encrypt their own share), the third does not. Needs the
+  standard PRF-security argument, and care that the *same* randomness is never
+  reused across two different plaintexts (distinct counters, as in `alpha_ctr`).
+- **The MPC malicious layer** is assumed (SWIFT-style) but not yet implemented
+  here; the current code is semi-honest. Integrating it is real work.
+
+---
+
+## 7. Novelty and positioning
+
+- **What is new:** extending the honest-majority *replicate-and-compare*
+  malicious philosophy (SWIFT, Fantastic Four) to **threshold-FHE operations**,
+  by derandomizing the randomized ones (encryption, partial decryption,
+  smudging) with the pairwise PRF keys already present. To our knowledge no
+  prior system combines a *published-ciphertext (offline-owner) model* with
+  *honest-majority MPC* and gets malicious security this way.
+- **The clean statement:** *ZK is needed only at the input boundary
+  (well-formedness), never for the computation.* Single-server verifiable FHE
+  needs ZK over the whole evaluation; honest majority replaces it with
+  replication.
+- **What is NOT new / must not be overclaimed:** the trust threshold is honest
+  majority for both privacy and integrity (no graceful degradation, §5); the
+  semi-honest hybrid, the depth-1 no-eval-key FHE, and the GC-vs-a2b finding
+  are all prior or folklore.
+
+---
+
+## 8. Next steps to de-risk before building
+
+1. ~~Concrete threshold-BFV parameters *with smudging*.~~ **Done (§6a).**
+   Measured: fits at n=4096 for λ=40; needs n=8192 (~3× ciphertext) for λ=80,
+   or decrypt-to-shares to stay at n=4096. **Gate passed — not paper-blocking.**
+2. Pin the boundary ZKPoK: which lattice proof, what noise bound, what cost per
+   input. (Now the top open item.)
+3. Write the ideal functionality `F_infer` and the simulator for the one
+   malicious party, formally, to confirm §5 holds without a hidden selective-
+   failure channel.
+4. Decide public-open + flood (n=8192) vs decrypt-to-shares (n=4096); the
+   latter changes the switch sub-protocol but keeps parameters small.
+5. Only then implement: derandomized threshold decrypt/encrypt + the batched
+   consistency check, on top of a malicious SWIFT-style MPC layer.
