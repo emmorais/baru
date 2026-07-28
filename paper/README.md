@@ -46,7 +46,7 @@ Headline correspondences:
 | §4.2 multi-modular NTT | `fhe::ntt` differential tests |
 | §5 Triple-free / batched MPC | `aby3_protocol` (`triple_free_mul_*`, `a2b_batch_*`) |
 | §5 batched scheme-switch import | `aby3_protocol::share_input_batch`, `batched_input_sharing_matches_the_scalar_protocol`, `scheme_switch_import_does_not_scale_with_layer_width` |
-| §6 Composability / gadgets | `src/gadgets/` |
+| §6 Composability / gadgets | `src/gadgets/`, `bench-abstraction` (composing costs no more than hand-batching) |
 | §7.2 MPC-segment cost table | `bench-cnn --img 28` (prints the per-phase split) |
 | §7.3 Garbled vs bit-decomposition | `bench-gc-compare`, `bench-cnn --img 28 --both`, `gc_and_a2b_nonlinearities_agree` |
 | §7.3 Tournament argmax | `gadgets::argmax`, `argmax_breaks_ties_to_first_over_every_small_input` |

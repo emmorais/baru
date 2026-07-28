@@ -69,6 +69,12 @@ fn main() -> Result<(), Box<dyn Error>> {
     if args.first().map(String::as_str) == Some("bench-medmnist") {
         return baru::bench::medmnist::run_cli(&args[1..]).map_err(|e| e.into());
     }
+    if args.first().map(String::as_str) == Some("bench-abstraction") {
+        return baru::bench::abstraction::run_cli(&args[1..]).map_err(|e| e.into());
+    }
+    if args.first().map(String::as_str) == Some("bench-circuit") {
+        return baru::bench::circuit::run_cli(&args[1..]).map_err(|e| e.into());
+    }
     if args.first().map(String::as_str) == Some("bench-gc-compare") {
         return baru::bench::gc_compare::run_cli(&args[1..]).map_err(|e| e.into());
     }

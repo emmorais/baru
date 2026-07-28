@@ -900,6 +900,8 @@ mod tests {
     }
 }
 
+pub mod abstraction;
+pub mod circuit;
 pub mod ckks_compare;
 pub mod cohort;
 pub mod cohort_eval;

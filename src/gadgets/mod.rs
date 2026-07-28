@@ -59,15 +59,30 @@ pub fn max2_ref(a: i64, b: i64) -> i64 {
     }
 }
 
-/// Maximum over a non-empty slice (left fold of [`max2`]). A max-pooling
-/// window is exactly this over the window's elements.
+/// Maximum over a non-empty slice. A max-pooling window is exactly this over
+/// the window's elements.
+///
+/// Reduces as a **tournament** over [`max2_batch`] — `⌈log₂ n⌉` batched
+/// levels — rather than the left fold of [`max2`] it used to be, whose
+/// comparisons were *dependent* (each waiting on the previous accumulator)
+/// and so could not batch. Unlike [`argmax`] the tie-breaking rule does not
+/// matter here: only the maximum *value* is returned, and that is the same
+/// whichever equal element wins.
 pub fn max_reduce(be: &mut dyn Backend, xs: &[ShareRef]) -> ShareRef {
     assert!(!xs.is_empty(), "max_reduce: empty input");
-    let mut acc = xs[0].clone();
-    for x in &xs[1..] {
-        acc = max2(be, &acc, x);
+    let mut cur: Vec<ShareRef> = xs.to_vec();
+    while cur.len() > 1 {
+        let m = cur.len() / 2;
+        let a: Vec<ShareRef> = (0..m).map(|k| cur[2 * k].clone()).collect();
+        let b: Vec<ShareRef> = (0..m).map(|k| cur[2 * k + 1].clone()).collect();
+        let mut next = max2_batch(be, &a, &b);
+        if cur.len() % 2 == 1 {
+            // Odd element carries to the next level unpaired.
+            next.push(cur[cur.len() - 1].clone());
+        }
+        cur = next;
     }
-    acc
+    cur.pop().expect("tournament leaves one element")
 }
 
 pub fn max_reduce_ref(xs: &[i64]) -> i64 {
@@ -75,16 +90,26 @@ pub fn max_reduce_ref(xs: &[i64]) -> i64 {
 }
 
 /// Elementwise ReLU: `max(x, 0)` via `x · (0 < x)` (the mux-with-zero
-/// special case — one comparison + one multiply per element, no
-/// `share_public` needed since the zero is `x − x`).
+/// special case — no `share_public` needed since the zero is `x − x`).
+///
+/// **One batched comparison and one batched multiply for the whole slice**,
+/// not one of each per element. The elements are independent, so issuing
+/// them together costs a constant number of communication rounds instead of
+/// `O(len)`. Measured on a 64-wide layer through the real transport, the
+/// per-element form sent 5x the messages and took 9x the wall-clock at
+/// RTT 20 ms for bit-identical output (`baru bench-abstraction`) — the
+/// values are the same, only the round structure differs.
 pub fn relu(be: &mut dyn Backend, xs: &[ShareRef]) -> Vec<ShareRef> {
-    xs.iter()
-        .map(|x| {
-            let zero = be.sub(x, x);
-            let pos = be.lt(&zero, x); // 1 iff x > 0
-            be.mul(x, &pos)
-        })
-        .collect()
+    if xs.is_empty() {
+        return Vec::new();
+    }
+    let zeros: Vec<ShareRef> = xs.iter().map(|x| be.sub(x, x)).collect();
+    let pairs: Vec<(ShareRef, ShareRef)> =
+        zeros.iter().zip(xs).map(|(z, x)| (z.clone(), x.clone())).collect();
+    let pos = be.lt_batch(&pairs); // 1 iff x > 0
+    let mul_pairs: Vec<(ShareRef, ShareRef)> =
+        xs.iter().zip(&pos).map(|(x, p)| (x.clone(), p.clone())).collect();
+    be.mul_batch(&mul_pairs)
 }
 
 pub fn relu_ref(xs: &[i64]) -> Vec<i64> {
@@ -212,14 +237,30 @@ pub fn dense(
     weights: &[Vec<ShareRef>],
     bias: &[ShareRef],
 ) -> Vec<ShareRef> {
+    if weights.is_empty() {
+        return Vec::new();
+    }
+    // Every product in the layer is independent of every other, so the whole
+    // weight matrix is **one** batched multiply; only the summation is
+    // sequential, and addition is local (free). The per-element form this
+    // replaced issued `out_dim x in_dim` dependent rounds — on an 8x64 layer,
+    // 14x the messages and 45x the wall-clock at RTT 20 ms for identical
+    // output (`baru bench-abstraction`).
+    let mut pairs = Vec::with_capacity(weights.len() * x.len());
+    for row in weights {
+        for (w, xi) in row.iter().zip(x) {
+            pairs.push((w.clone(), xi.clone()));
+        }
+    }
+    let prods = be.mul_batch(&pairs);
     weights
         .iter()
         .zip(bias)
-        .map(|(row, b)| {
+        .enumerate()
+        .map(|(r, (row, b))| {
             let mut acc = b.clone();
-            for (w, xi) in row.iter().zip(x) {
-                let p = be.mul(w, xi);
-                acc = be.add(&acc, &p);
+            for c in 0..row.len().min(x.len()) {
+                acc = be.add(&acc, &prods[r * x.len() + c]);
             }
             acc
         })
@@ -271,24 +312,45 @@ pub fn conv2d(
     let out_h = (in_shape.h - kh) / stride + 1;
     let out_w = (in_shape.w - kw) / stride + 1;
     let out_shape = Chw { c: out_c, h: out_h, w: out_w };
-    let mut out = Vec::with_capacity(out_shape.len());
-    for (oc, kernel) in weights.iter().enumerate() {
+    // Gather every (weight, input) product the layer needs, multiply them all
+    // in **one** batched round, then accumulate locally. The per-element form
+    // this replaced cost one communication round per multiply-accumulate,
+    // i.e. `out_c x out_h x out_w x in_c x kh x kw` dependent rounds — the
+    // same defect `dense` had, and the same fix. Windows overlap, so the same
+    // input share appears in many pairs; that is fine, `mul_batch` does not
+    // require distinct operands.
+    let per_out = in_shape.c * kh * kw;
+    let mut pairs = Vec::with_capacity(out_shape.len() * per_out);
+    for kernel in weights.iter() {
         for oy in 0..out_h {
             for ox in 0..out_w {
-                let mut acc = bias[oc].clone();
                 let mut k = 0usize;
                 for ic in 0..in_shape.c {
                     for dy in 0..kh {
                         for dx in 0..kw {
                             let iy = oy * stride + dy;
                             let ix = ox * stride + dx;
-                            let p = be.mul(&kernel[k], &input[in_shape.idx(ic, iy, ix)]);
-                            acc = be.add(&acc, &p);
+                            pairs.push((
+                                kernel[k].clone(),
+                                input[in_shape.idx(ic, iy, ix)].clone(),
+                            ));
                             k += 1;
                         }
                     }
                 }
-                let _ = oc;
+            }
+        }
+    }
+    let prods = be.mul_batch(&pairs);
+    let mut out = Vec::with_capacity(out_shape.len());
+    for oc in 0..out_c {
+        for oy in 0..out_h {
+            for ox in 0..out_w {
+                let base = ((oc * out_h + oy) * out_w + ox) * per_out;
+                let mut acc = bias[oc].clone();
+                for j in 0..per_out {
+                    acc = be.add(&acc, &prods[base + j]);
+                }
                 out.push(acc);
             }
         }

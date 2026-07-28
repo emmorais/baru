@@ -1,11 +1,49 @@
 # Private inference performance: state, method, and what to do next
 
+**Self-contained handoff. Start here if you are picking this up cold.**
+
 Working notes for the **switch-as-bootstrap** paper (`paper/main.tex`,
 outline in [`paper-outline.md`](paper-outline.md)) — *not* the cost-model
 paper, whose agenda is [`research-agenda.md`](research-agenda.md).
 
 Last measured **2026-07-28** on an Apple-silicon laptop, `--release`,
 single-threaded. Ratios transfer between machines; absolute seconds do not.
+
+---
+
+## 0. Orientation
+
+**The project.** Baru evaluates a neural network with the *image and the
+weights both encrypted*: linear layers under BFV (FHE), nonlinearities under
+3-party ABY3 (MPC), switching representation between them. The paper's claim
+is that the switch is also a **noise reset**, so a network of any depth runs
+at **zero FHE bootstraps** with a depth-1 FHE engine. Everything is verified
+**bit-exact** against a plaintext integer reference — that invariant is what
+makes it safe to optimize aggressively.
+
+**What happened on 2026-07-28.** One encrypted medical diagnosis went from
+**32.7 s to 2.90 s online (11×)** without touching the cryptography. Every
+win was round structure or work placement, and every one was invisible to the
+measurement granularity in use at the time. In order:
+
+| # | change | effect | where |
+|---|---|---|---|
+| 1 | batched the scheme-switch import | 32.7 s → 5.71 s | `aby3_protocol::share_input_batch` |
+| 2 | integrated 3-party garbled nonlinearities | → 4.94 s | `bench::cnn::Nonlin::Gc` |
+| 3 | tournament `argmax` | 2.4× on that phase at RTT 20 ms | `gadgets::argmax` |
+| 4 | preprocessed the switch masks | → **2.90 s** online + 2.03 s offline | `bench::cnn::MaskPool` |
+| 5 | batched the whole gadget library | 9–45× on the composable API | `src/gadgets/` |
+| 6 | CSE into the compile pipeline | MNIST circuit 2365 → 1764 gates | `zkp::circuit_compiler::cse` |
+
+Items 1–4 are §1–§2; item 5 is §2.1; item 6 is §2.2. **§2 is the most
+important section in this document** — it is the method that found all six,
+and the reason the earlier conclusions in the paper were wrong.
+
+**Git state.** Items 1–4 were committed by the user as `e487bb8 Optimize` and
+`0b36019 Some optimizations`. **Items 5–6 and all documentation updates were
+left uncommitted** — check `git status` before assuming anything is saved.
+New untracked files: `src/bench/abstraction.rs`, `src/bench/circuit.rs`,
+`docs/private-inference-performance.md` (this file).
 
 ---
 
@@ -83,9 +121,128 @@ Corollary that keeps biting: a **cross-stage ratio** (e.g. `bench-cohort-eval`'s
 improves. It went 1900× → 388× today. Quote the command's output, never a
 remembered number.
 
+### 2.1 The same defect lived in the composable API (fixed 2026-07-28)
+
+`bench-cnn` and `bench-medmnist` are hand-written Rust calling the backend's
+*batched* entry points. The [`gadgets`](../src/gadgets/mod.rs) library — the
+API the paper's composability section is about, and what a user actually
+writes — was round-serial almost everywhere:
+
+| gadget | was | now |
+|---|---|---|
+| `relu` | `lt` + `mul` per element | one `lt_batch` + one `mul_batch` |
+| `dense` | one `mul` **per weight** | one `mul_batch` for the matrix |
+| `conv2d` | one `mul` per multiply-accumulate | one `mul_batch` for the layer |
+| `max_reduce` | left fold of `max2` (dependent) | tournament over `max2_batch` |
+| `maxpool2d`, `argmax`, `max2_batch` | already batched | unchanged |
+
+Measured by `baru bench-abstraction` (n=64, dense 8×64, real transport):
+
+| workload | naive messages | batched messages | naive @ RTT 20 ms | batched |
+|---|---|---|---|---|
+| relu | 771 | 141 | 9454 ms | 1049 ms |
+| max-reduce | 635 | 65 | 8418 ms | 865 ms |
+| dense | 549 | 38 | 6880 ms | 154 ms |
+
+**Bytes differ by <5% across routes.** Same protocol, same data, same values
+bit-for-bit — only the number of round trips differs. After the fix the
+`gadget` route matches the hand-batched route *message for message*, and a
+test asserts it so the library cannot regress. The `naive` route is kept in
+the benchmark permanently, because deleting it would make the size of the
+defect unmeasurable.
+
+This is worth stating in the paper: composing from the gadget library is
+secure by construction **and now costs nothing over hand-writing the batched
+calls**. Before the fix, the second half of that sentence was false, and the
+benchmarked pipeline avoided the gadgets for exactly the operations where it
+mattered.
+
+**Not yet measured:** the Lisp front end (`Participant::new_transport`, which
+runs `Expr` on a real `TransportBackend`). It sits on the same gadgets and
+primitives, so it inherits the fix, but whether the interpreter or
+`CircuitCompiler` introduces its *own* serialization — e.g. lowering a vector
+builtin to a scalar chain — is an open question. Add a `language` route to
+`bench-abstraction`; the harness is already shaped for it.
+
+### 2.2 The compiled path is a different story — and supports the thesis
+
+`bench-abstraction` measures the *eager* APIs. The **compiled** path
+(`Expr` → `CircuitCompiler` → `FlatOp` → `mpcc`) is where Baru can beat
+hand-written code rather than merely match it, and `baru bench-circuit`
+measures it:
+
+```
+  program          n      ops ops/no-cse   interactive   rounds
+  relu-layer       1        3          3             3        3
+  relu-layer      64      192   255 (1x)           129        3
+  dot             64      127        127            65        2
+  max-fold         8       28 4372 (156x)            15       15
+```
+
+**Independent work batches automatically.** ReLU-layer rounds are *flat in
+width* — 3 at n=1 and 3 at n=64, while interactive ops go 3 → 129. ASAP
+scheduling over the dependence DAG puts every independent operation at one
+level, with no vectorized IR and no user effort. That is exactly what the
+hand-written route needs explicit `lt_batch`/`mul_batch` calls to achieve, and
+what the gadget library had to be patched three times to get right. **On this
+axis the compiler is already better than hand-writing**, which is the thesis.
+
+**Dependent reductions are not batched, and that is the remaining gap.** A
+fold is a chain; ASAP is optimal for a *fixed* lowering but cannot
+reassociate, so a max-fold costs `O(n)` rounds where the hand-written
+tournament costs `O(log n)`. See §3.0.
+
+**CSE was missing from the compile path entirely (fixed 2026-07-28).**
+`mpcc::opt` had a `Cse` rule, but it was reachable only from
+`baru mpcc optimize` — the FHE and ZKP pipelines ran `fold_constants` +
+dead-wire elimination and nothing else. So every circuit handed to a backend
+carried whatever redundancy the source expression had. A fold written the
+obvious way repeats its accumulator subtree at each step and flattens
+**exponentially**: 4372 ops at n=8.
+
+The pass now lives in `zkp::circuit_compiler` beside `fold_constants` (it had
+to move *down*: `mpcc::opt` imports `FlatOp` from `zkp`, so the dependency
+only runs one way) and `mpcc::opt::cse` delegates to it. Measured effect:
+
+| circuit | before | after |
+|---|---|---|
+| max-fold n=8 | 4372 ops | 28 ops (156×) |
+| **MNIST demo (real)** | **2365 gates** | **1764 gates (−25%)** |
+
+MNIST scores are bit-identical (3389.7422 / 2853.0156), and all 18 FHE
+differential tests pass including real TFHE and SEAL CKKS. At TFHE's
+~0.2–0.5 s/gate those 601 gates are minutes per run.
+
+`CircuitCompiler::without_cse()` exists for A/B measurement only.
+
 ---
 
 ## 3. Next steps, in priority order
+
+### 3.0 Reassociate dependent reductions in the compiler
+
+The one axis where the hand-written gadget still beats the compiler. `mpcc`
+already has `Rule::Reassociate`, but it rebalances a chain of **one
+associative primitive**; a max-fold's operator is a *compound* subgraph
+(`acc + (x>acc)·(x−acc)`), so the rule never fires.
+
+**What to build:** recognise an associative reduction whose operator is a
+repeated subgraph *shape* and rebalance the chain into a tournament —
+`O(n)` rounds → `⌈log₂ n⌉`. Max-pooling, argmax and max-reduction are the AI
+idioms this covers, and they are everywhere in a CNN.
+
+**Why it is the right next compiler work:** it is precisely the optimization
+we performed by hand three times today (`argmax`, `max_reduce`, and the
+gadget audit). Doing it in the compiler does it *everywhere*, including in
+user programs nobody audited — which is the whole argument for Baru being a
+circuit language rather than a library.
+
+**Verify with:** `mpcc::opt::equivalent` (the differential oracle rewrites are
+already accepted or rejected by) plus `bench-circuit`, whose max-fold row
+should go linear → logarithmic. The tie-breaking caution from
+`gadgets::argmax` applies if the rule is ever extended to argmax-style
+reductions that return an *index*: only the value is order-insensitive.
+
 
 ### 3.1 Precompute the encrypted **model** — best remaining win, low risk
 
@@ -212,9 +369,26 @@ cargo build --release
 # isolated protocol comparison
 ./target/release/baru bench-gc-compare
 
-# correctness
-cargo test --release --lib -- --ignored bench::cnn gadgets
+# what the abstraction costs: naive vs gadget library vs hand-batched
+./target/release/baru bench-abstraction --n 64 --out-dim 8
+
+# circuit generation quality: ops, CSE contribution, ASAP round count
+./target/release/baru bench-circuit
+
+# circuit size on a real AI workload (prints "N gates")
+cargo run --release --example mnist
+
+# correctness — all three must be green
+cargo test --release --lib                                   # fast suite (~380)
+cargo test --release --lib -- --ignored \
+    --skip bench::cohort --skip bench::net                   # slow suite (~41)
+cargo test --release --test fhe_differential -- --ignored    # 18, real TFHE + SEAL
 ```
+
+The gadget and circuit-quality tests are in the **fast** suite (they use the
+in-process simulator); the pipeline exactness tests are `#[ignore]`d because
+they run real BFV at `n=4096`. To run just the slow pipeline ones:
+`cargo test --release --lib -- --ignored bench::cnn`.
 
 `bench::cohort` needs `BARUDB_BIN=~/github/barudb/target/release/barudb` and
 `BLINDSEARCH_PASSWORD` (not `BARUDB_PASSWORD`). The two `bench::net` tests
@@ -230,6 +404,10 @@ Key tests to keep green when touching any of this:
 | `precomputed_masks_change_nothing_but_the_timing` | preprocessing is not cheating |
 | `scheme_switch_import_does_not_scale_with_layer_width` | import stays batched (message count, not wall-clock) |
 | `argmax_breaks_ties_to_first_over_every_small_input` | tournament tie-breaking, exhaustive |
+| `gadget_route_matches_the_hand_batched_route_and_the_reference` | the gadget library stays batched (round count, not results) |
+| `layer_round_count_is_flat_in_width` | ASAP scheduling still batches independent ops |
+| `cse_collapses_the_exponential_fold_and_is_on_by_default` | CSE is part of compilation, not opt-in |
+| `compiled_circuits_arrive_already_cse_d` | backends never see duplicate subexpressions |
 | `batched_input_sharing_matches_the_scalar_protocol` | batched == scalar sharing |
 
 ---
@@ -244,6 +422,9 @@ Key tests to keep green when touching any of this:
 | batched import | `aby3_protocol::share_input_batch`, `bench::cnn::import_raw_batch` |
 | mask preprocessing | `bench::cnn::{MaskPool, Masks}` |
 | tournament argmax | `gadgets::argmax` |
+| abstraction-cost bench | `bench::abstraction` (`baru bench-abstraction`) |
+| circuit-quality bench | `bench::circuit` (`baru bench-circuit`) |
+| shared FlatOp passes | `zkp::circuit_compiler::{cse, rename}`, `CircuitCompiler::fold_constants` |
 | BFV / NTT | `fhe::bfv`, `fhe::ntt` |
 | conv packing | `fhe::conv_pack` |
 
@@ -251,3 +432,59 @@ Docstrings in `bench::cnn` and `bench::medmnist` carry the current measured
 tables. **If you change a number, change them in the same commit** — a stale
 docstring citing a measurement is worse than no docstring
 (see the reproducibility note in `tools/README.md`).
+
+---
+
+## 7. Working conventions in this repo
+
+Not style preferences — each of these came from something going wrong.
+
+- **Never write a measured number you have not just run.** A results table
+  written ahead of the run survives into a commit and reads as a measurement.
+  This document's own §2.2 table was drafted from an estimate and had to be
+  corrected against the real output before it was committed.
+- **Update docstrings in the same change as the number.** `bench::cnn` and
+  `bench::medmnist` module docs carry the current tables. A stale docstring
+  citing a measurement is worse than no docstring, because it looks
+  authoritative.
+- **Anything that produces a committed artifact goes in `tools/`,** never in a
+  scratch directory — see `tools/README.md`. The MNIST weights once outlived
+  their trainer and the result became unreproducible.
+- **A cross-stage ratio is invalidated by improving either stage.**
+  `bench-cohort-eval`'s "cohort selection is N× cheaper than inference" went
+  1900× → 388× in one day. Quote the command's output, never a remembered
+  number.
+- **When a bench prints both an isolated primitive and a full protocol, quote
+  the protocol.** The paper claimed 2.7–3.4× for garbled ReLU; that was the
+  2-party garbling primitive. The deployable 3-party protocol with its Y2A
+  return leg is 1.4–1.7×.
+- **`cargo fmt` reformats ~35 pre-existing files.** Run `rustfmt` on specific
+  files. `src/bench/medmnist.rs` is rustfmt-clean and should stay that way;
+  `cnn.rs`, `gadgets/mod.rs` and `aby3_protocol.rs` are not and never were.
+- **Preprocessing: say which kind it is.** Per-*query* work (masks) moved
+  offline shifts latency but buys **no throughput** — a saturated server does
+  the same total work. Per-*session* work (encrypted weights, keys) is genuine
+  amortization. §3.1 depends on this distinction.
+- **Two environment-dependent test groups.** `bench::cohort` needs
+  `BARUDB_BIN` + `BLINDSEARCH_PASSWORD`; the two `bench::net` tests measure a
+  real socket and fail under machine load but pass in isolation. Both
+  reproduce on a clean tree — neither is a regression you introduced.
+
+### Traps that already bit once
+
+- **The mask pool must use the same key as the pipeline.** The first
+  `--precompute` draft called `s.keygen()` a second time to build the pool;
+  the masks then did not decrypt. Keygen is hoisted above the preamble.
+- **Tie-breaking survives reassociation only by accident of ordering.**
+  `gadgets::argmax` returns the *first* maximum. The tournament preserves that
+  only because the bracket pairs adjacent elements in index order. Random
+  logits never produce a tie split across sibling subtrees, so it is pinned by
+  an exhaustive test over small alphabets, not by sampling. `max_reduce`
+  returns a value, not an index, so it is exempt.
+- **CSE had to move *down*, not up.** `mpcc::opt` imports `FlatOp` from
+  `zkp::circuit_compiler`, so the dependency runs one way; the pass lives in
+  `zkp` and `mpcc::opt::cse` delegates to it.
+- **Message count, not wall-clock, is the right regression metric for round
+  structure.** Nothing about the *results* changes when a gadget regresses to
+  a per-element loop, and at zero latency the wall-clock barely moves either.
+  Two tests assert message counts for exactly this reason.

@@ -1,5 +1,8 @@
 # Research agenda: private AI for healthcare, and what Baru has to become
 
+> Performance state, method and next steps for the private-inference
+> pipeline: [`private-inference-performance.md`](private-inference-performance.md).
+
 This document exists to stop a good instinct from becoming a bad repository.
 The instinct is right: healthcare is the application where privacy-preserving
 computation stops being a demo, and Baru already has an unusual amount of the
@@ -118,7 +121,7 @@ them, and there is a 64×64/128×128/224×224 variant to scale into later.
   (`src/bench/medmnist.rs`), the same two-conv hybrid `bench-mnist` runs:
   BFV ct×ct conv/dense, ABY3 nonlinearities, zero bootstraps.
 * **The linear discriminator** — `cargo run --release --example mnist --
-  --pneumonia [--mpc] [--tfhe] [--ckks]`, the 2380-gate circuit across every
+  --pneumonia [--mpc] [--tfhe] [--ckks]`, the 1669-gate circuit across every
   FHE scheme. Digits stay available as the default, unchanged.
 * Weights are trained and quantised by `tools/train_medmnist.py` — kept in
   `tools/`, not `scratchpad/`, because that is how the original MNIST trainer
@@ -140,7 +143,11 @@ Three things worth carrying into the paper.
 float parents to within 0.2 points, and the encrypted pipeline reproduces the
 plaintext diagnosis bit-exactly — so neither the fixed-point scheme the FHE
 layer demands nor the encryption itself costs accuracy. The price is entirely
-wall-clock (~33 s per encrypted image).
+wall-clock — **2.90 s per encrypted diagnosis online** (plus ~2.0 s of
+query-independent preprocessing) as of 2026-07-28; it was ~33 s when this
+section was written. See
+[private-inference-performance.md](private-inference-performance.md) for how,
+and for what to optimise next.
 
 **The model, not the crypto, is the accuracy ceiling.** This is a 2-conv
 classifier sized to fit the depth-1 noise budget; it matches published

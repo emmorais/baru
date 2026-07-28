@@ -458,12 +458,38 @@ gadget & definition & primitives \\
 \midrule
 \bt{relu} & $x\cdot(0<x)$ & \bt{sub}, \bt{lt}, \bt{mul} \\
 \bt{max2} & $\mathsf{mux}(a<b,\,b,\,a)$ & \bt{lt}, \bt{sub}, \bt{mul}, \bt{add} \\
-\bt{maxpool2d} & fold of \bt{max2} over a window & (above) \\
-\bt{argmax} & scan tracking $(\text{best},\text{idx})$ & \bt{lt}, \bt{mul}, \bt{add}, \bt{share\_public} \\
+\bt{maxpool2d} & level-batched \bt{max2} over all windows & (above) \\
+\bt{max\_reduce} / \bt{argmax} & tournament over the window / logits & (above) \\
 \bt{dense} / \bt{conv2d} & $\sum W\!\cdot\! x + b$ & \bt{mul}, \bt{add} \\
 \bottomrule
 \end{tabular}
 \end{table}
+
+\paragraph{Composition must be free in cost, not only in security.} The
+argument above says a network built from these gadgets inherits their
+security. It says nothing about their cost, and the two came apart: every
+gadget was originally written as the definition reads --- one \bt{lt} and one
+\bt{mul} \emph{per element} for \bt{relu}, one \bt{mul} \emph{per weight}
+for \bt{dense}, a left fold for \bt{max\_reduce}. Each is a correct
+composition of ABB primitives and each serializes a layer into $O(n)$
+dependent communication rounds. Measured over the real transport on a
+$64$-wide layer, that cost $5$--$14\times$ the messages and, at RTT $20$ ms,
+$9$--$45\times$ the wall-clock of the same computation issued through the
+batched primitives --- with the byte counts within $5\%$ and the outputs
+bit-identical. The defect is invisible to a security argument, invisible to a
+correctness test, and invisible at zero latency.
+
+The gadgets are therefore defined over the \emph{batched} primitives
+(\bt{lt\_batch}, \bt{mul\_batch}): operations within a layer are independent,
+so a layer costs a constant number of rounds regardless of width, and
+reductions that are genuinely dependent (\bt{max\_reduce}, \bt{argmax}) are
+reassociated into $\lceil\log_2 n\rceil$ batched levels rather than $n-1$
+sequential steps. Composing through the library now costs exactly what
+hand-writing the batched calls costs, message for message, which is what makes
+the composability claim usable rather than merely true.
+The comparison is reproducible --- \bt{bench-abstraction} retains the
+per-element form as a control, and a test pins the library's round count
+against the hand-written one so it cannot regress.
 
 \section{Security Model}\label{sec:security}
 

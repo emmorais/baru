@@ -284,6 +284,11 @@ pub struct CircuitCompiler {
     /// fixed-point literals become `ConstF`, int→fixed coercion is the
     /// identity, and no Q16.16 shift/rescale gadgets are emitted.
     real_arith: bool,
+    /// Run [`cse`] as part of compilation. On by default — it is a strict win
+    /// for every backend. The switch exists so `bench-circuit` can measure
+    /// what the pass contributes; turning it off in production only makes
+    /// circuits bigger.
+    cse_enabled: bool,
 }
 
 impl Default for CircuitCompiler {
@@ -302,7 +307,15 @@ impl CircuitCompiler {
             inline_depth: 0,
             fixed_wires: HashSet::new(),
             real_arith: false,
+            cse_enabled: true,
         }
+    }
+
+    /// Disable common-subexpression elimination. For A/B measurement only —
+    /// see [`Self::cse_enabled`].
+    pub fn without_cse(mut self) -> Self {
+        self.cse_enabled = false;
+        self
     }
 
     /// A compiler in real-arithmetic mode, for CKKS-style backends that
@@ -564,6 +577,9 @@ impl CircuitCompiler {
 
         // ── Phase 1b: optimise flat IR ────────────────────────
         let flat = Self::fold_constants(flat);
+        // CSE before DCE: collapsing duplicates is what *creates* the dead
+        // wires DCE then removes.
+        let flat = if self.cse_enabled { cse(&flat, &result_wire) } else { flat };
         let flat =
             Self::eliminate_dead_wires(flat, &result_wire, &self.witnesses, &self.public_inputs);
 
@@ -610,6 +626,7 @@ impl CircuitCompiler {
         )?;
 
         let flat = Self::fold_constants(flat);
+        let flat = if self.cse_enabled { cse(&flat, &result_wire) } else { flat };
         let flat = Self::eliminate_dead_wires(
             flat,
             &result_wire,
@@ -1671,6 +1688,192 @@ impl CircuitCompiler {
 }
 
 // ─── Tests ───────────────────────────────────────────────────
+
+
+// ─── Shared FlatOp passes (used by the compile pipeline and `mpcc::opt`) ──────
+
+/// Common subexpression elimination over the `FlatOp` SSA.
+///
+/// Commutative operations are keyed on sorted operands so `a+b` and `b+a`
+/// collide. The output wire's definition is never eliminated — the caller's
+/// circuit signature depends on it.
+///
+/// This lives here, beside [`CircuitCompiler::fold_constants`], rather than in
+/// `mpcc::opt` where it started, because **every** backend needs it: `mpcc` was
+/// the only consumer for a while, so a circuit handed to FHE or ZKP kept every
+/// redundant gate the source expression happened to contain. A fold written the
+/// obvious way (`acc = f(acc, x)` with `acc` textually repeated) duplicates its
+/// accumulator subtree at each step and grows *exponentially*: an 8-step
+/// max-fold flattens to 4372 ops and collapses to 28 under CSE.
+pub fn rename(op: &FlatOp, subst: &HashMap<String, String>) -> FlatOp {
+    let r = |w: &String| subst.get(w).cloned().unwrap_or_else(|| w.clone());
+    match op {
+        FlatOp::Const { dst, value } => FlatOp::Const {
+            dst: dst.clone(),
+            value: *value,
+        },
+        FlatOp::ConstF { dst, value } => FlatOp::ConstF {
+            dst: dst.clone(),
+            value: *value,
+        },
+        FlatOp::IAdd32 { dst, lhs, rhs } => FlatOp::IAdd32 {
+            dst: dst.clone(),
+            lhs: r(lhs),
+            rhs: r(rhs),
+        },
+        FlatOp::ISub32 { dst, lhs, rhs } => FlatOp::ISub32 {
+            dst: dst.clone(),
+            lhs: r(lhs),
+            rhs: r(rhs),
+        },
+        FlatOp::IMul { dst, lhs, rhs } => FlatOp::IMul {
+            dst: dst.clone(),
+            lhs: r(lhs),
+            rhs: r(rhs),
+        },
+        FlatOp::IDiv {
+            dst_q,
+            dst_r,
+            lhs,
+            rhs,
+        } => FlatOp::IDiv {
+            dst_q: dst_q.clone(),
+            dst_r: dst_r.clone(),
+            lhs: r(lhs),
+            rhs: r(rhs),
+        },
+        FlatOp::ICmpEq { dst, lhs, rhs } => FlatOp::ICmpEq {
+            dst: dst.clone(),
+            lhs: r(lhs),
+            rhs: r(rhs),
+        },
+        FlatOp::ICmpUlt { dst, lhs, rhs } => FlatOp::ICmpUlt {
+            dst: dst.clone(),
+            lhs: r(lhs),
+            rhs: r(rhs),
+        },
+        FlatOp::ICmpSlt { dst, lhs, rhs } => FlatOp::ICmpSlt {
+            dst: dst.clone(),
+            lhs: r(lhs),
+            rhs: r(rhs),
+        },
+        FlatOp::BAnd { dst, lhs, rhs } => FlatOp::BAnd {
+            dst: dst.clone(),
+            lhs: r(lhs),
+            rhs: r(rhs),
+        },
+        FlatOp::BOr { dst, lhs, rhs } => FlatOp::BOr {
+            dst: dst.clone(),
+            lhs: r(lhs),
+            rhs: r(rhs),
+        },
+        FlatOp::BXor { dst, lhs, rhs } => FlatOp::BXor {
+            dst: dst.clone(),
+            lhs: r(lhs),
+            rhs: r(rhs),
+        },
+        FlatOp::BNot { dst, src } => FlatOp::BNot {
+            dst: dst.clone(),
+            src: r(src),
+        },
+        FlatOp::Shl { dst, src, amount } => FlatOp::Shl {
+            dst: dst.clone(),
+            src: r(src),
+            amount: *amount,
+        },
+        FlatOp::Shr { dst, src, amount } => FlatOp::Shr {
+            dst: dst.clone(),
+            src: r(src),
+            amount: *amount,
+        },
+        FlatOp::Mux {
+            dst,
+            cond,
+            t_val,
+            e_val,
+        } => FlatOp::Mux {
+            dst: dst.clone(),
+            cond: r(cond),
+            t_val: r(t_val),
+            e_val: r(e_val),
+        },
+        FlatOp::PopCount { dst, src } => FlatOp::PopCount {
+            dst: dst.clone(),
+            src: r(src),
+        },
+    }
+}
+
+pub fn cse(flat: &[FlatOp], output_wire: &str) -> Vec<FlatOp> {
+    let mut seen: HashMap<String, String> = HashMap::new();
+    let mut subst: HashMap<String, String> = HashMap::new();
+    let mut out: Vec<FlatOp> = Vec::with_capacity(flat.len());
+
+    for op in flat {
+        let op = rename(op, &subst);
+        // As in `algebraic`: the output wire's definition must survive, or the
+        // circuit's signature changes underneath the caller.
+        if op.dst() == output_wire {
+            out.push(op);
+            continue;
+        }
+        // `IDiv` writes two wires; keeping the key/substitution bookkeeping
+        // honest for it is not worth the complexity, and divisions are rare.
+        let key = match &op {
+            FlatOp::IDiv { .. } | FlatOp::ConstF { .. } => None,
+            other => Some(cse_key(other)),
+        };
+        match key {
+            Some(k) => match seen.get(&k) {
+                Some(prev) => {
+                    subst.insert(op.dst().to_string(), prev.clone());
+                }
+                None => {
+                    seen.insert(k, op.dst().to_string());
+                    out.push(op);
+                }
+            },
+            None => out.push(op),
+        }
+    }
+    out
+}
+
+fn cse_key(op: &FlatOp) -> String {
+    let commutative = matches!(
+        op,
+        FlatOp::IAdd32 { .. }
+            | FlatOp::IMul { .. }
+            | FlatOp::ICmpEq { .. }
+            | FlatOp::BAnd { .. }
+            | FlatOp::BOr { .. }
+            | FlatOp::BXor { .. }
+    );
+    let mut ins: Vec<&str> = op.inputs();
+    if commutative {
+        ins.sort_unstable();
+    }
+    let tag = match op {
+        FlatOp::Const { value, .. } => format!("const:{}", value),
+        FlatOp::ConstF { value, .. } => format!("constf:{}", value),
+        FlatOp::IAdd32 { .. } => "add".into(),
+        FlatOp::ISub32 { .. } => "sub".into(),
+        FlatOp::IMul { .. } => "mul".into(),
+        FlatOp::IDiv { .. } => "div".into(),
+        FlatOp::ICmpEq { .. } => "eq".into(),
+        FlatOp::ICmpUlt { .. } => "ult".into(),
+        FlatOp::ICmpSlt { .. } => "slt".into(),
+        FlatOp::BAnd { .. } => "and".into(),
+        FlatOp::BOr { .. } => "or".into(),
+        FlatOp::BXor { .. } => "xor".into(),
+        FlatOp::BNot { .. } => "not".into(),
+        FlatOp::Shl { amount, .. } => format!("shl:{}", amount),
+        FlatOp::Shr { amount, .. } => format!("shr:{}", amount),
+        FlatOp::Mux { .. } => "mux".into(),
+        FlatOp::PopCount { .. } => "popcount".into(),
+    };
+    format!("{}({})", tag, ins.join(","))
+}
 
 #[cfg(test)]
 mod tests {

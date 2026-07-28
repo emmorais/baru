@@ -64,7 +64,8 @@ so depth does not reach their cost at all.
 | naive hash-exchange PSI (**insecure**) | 32 B, 0.43 µs per item | `baru bench-psi` |
 | BFV PIR response | 13× the shard's whole plaintext content | `baru bench-pir` |
 | TFHE gate | ~0.2–0.5 s | `baru bench` |
-| CKKS vs TFHE, same 2365-gate circuit | 1.6 s vs 2829 s | `cargo run --release --example mnist -- --ckks` |
+| CKKS vs TFHE, same circuit | 1.6 s vs 2829 s | `cargo run --release --example mnist -- --ckks` |
+| *(measured on the pre-CSE 2365-gate circuit; CSE now emits 1764 gates, so both sides should be ~25% lower — **not re-measured**)* | | |
 
 ## How to use this file
 
