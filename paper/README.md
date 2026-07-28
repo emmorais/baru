@@ -49,9 +49,15 @@ Headline correspondences:
 | §6 Composability / gadgets | `src/gadgets/` |
 | §7.2 MPC-segment cost table | `bench-cnn --img 28` (prints the per-phase split) |
 | §7.3 Garbled vs bit-decomposition | `bench-gc-compare`, `bench-cnn --img 28 --both`, `gc_and_a2b_nonlinearities_agree` |
-| §7.6 Private diagnosis on MedMNIST | `bench-medmnist --dataset all --hybrid 3 --both` |
+| §7.3 Tournament argmax | `gadgets::argmax`, `argmax_breaks_ties_to_first_over_every_small_input` |
+| §7.5 Preprocessing the switch | `bench-cnn --img 28 --gc --precompute`, `precomputed_masks_change_nothing_but_the_timing` |
+| §7.6 Private diagnosis on MedMNIST | `bench-medmnist --dataset all --hybrid 3 --gc --precompute` |
 | §7.7 Two-conv MNIST, 98.89% | `bench-mnist`, `two_conv_hybrid_matches_plaintext` |
 
-Every number in §7.2, §7.3 and §7.6 comes from one of those commands on an
+Performance state, the method that produced these numbers, and the prioritized
+next steps are in
+[`../docs/private-inference-performance.md`](../docs/private-inference-performance.md).
+
+Every number in §7.2, §7.3, §7.5 and §7.6 comes from one of those commands on an
 Apple-silicon laptop, single-threaded, `--release`. Ratios transfer across
 machines; absolute seconds do not.

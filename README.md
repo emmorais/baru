@@ -975,14 +975,41 @@ At MNIST resolution that is a **294× faster convolution** and 5.5× faster
 end to end (94.0 s → 17.1 s) — and it puts a full 28×28 image within reach,
 which the module previously documented as out of scope (`D ≤ ~12`).
 
+**Half the remaining FHE time was query-independent (`--precompute`).**
+With MPC down to a fraction, the same per-phase treatment applied to the FHE
+side gave: model encryption 218 ms, ct×ct products 210 ms, decrypting the
+masked openings 217 ms, re-encrypting shares 50 ms, input 17 ms — and
+encrypting the **scheme-switch masks 656 ms**, 48% of FHE and 39 of the
+inference's 52 encryptions.
+
+Masks are uniform random values. They depend on neither the image nor the
+weights, only on the network's *shape*, so they can be generated before the
+query exists — Delphi's preprocessing idea applied to the *switch* rather
+than to the linear layer. They must still be **fresh per query** (two queries
+masked identically would reveal the difference of their pre-activations), so
+this moves work off the critical path rather than removing it — which is
+exactly the deployment question: a server idle between patients has the time,
+a patient waiting does not. Precomputing also lets the three parties' mask
+ciphertexts be *summed* in advance, so the online step is one ciphertext
+addition instead of three encryptions plus three additions.
+
+D=28: online **1.99 s → 1.31 s** against 680 ms offline. On the trained
+two-conv medical model, which switches four times rather than twice:
+**4.94 s → 2.90 s** online against 2.03 s offline. A test runs the identical
+inference both ways and requires the same class, and the pool asserts exact
+consumption so its size prediction cannot drift from the pipeline.
+
 **The bottleneck moved off FHE — and has since moved back.** Right after
 packing, the FHE work was 264 ms of a 17.1 s run (1.5%) and the rest was the
 MPC segment, which is what motivated the batching work above. But most of that
 MPC time was the unbatched scheme-switch import, not the comparisons; with the
 import batched and the nonlinearities garbled, the same D=28 classifier runs
-in **2.06 s of which 1.36 s (66%) is FHE**, and the trained two-conv medical
-model — four encrypted linear layers to this one's two — is **84% FHE**. So
-the highest-value remaining optimization is `fhe::bfv`, not the MPC layer.
+in **1.31 s of which 695 ms (53%) is FHE**, and the trained two-conv medical
+model — four encrypted linear layers to this one's two — is **73% FHE**. What
+is left is the irreducible part: the ct×ct products and the model encryption
+depend on the query or the weights, so no preprocessing reaches them. The
+highest-value remaining optimization is `fhe::bfv` itself (a single-threaded
+schoolbook NTT, no GPU), not the MPC layer.
 The general lesson is in the batching section above: a segment-level
 measurement told us which *component* was slow and nothing about *why*.
 
@@ -1103,8 +1130,10 @@ baru bench-medmnist --dataset all --hybrid 3 --both
 | encrypted == plaintext diagnosis | 3/3 | 3/3 |
 | FHE bootstraps | 0 | 0 |
 | latency/diagnosis, `a2b` | 5.71 s | 5.95 s |
-| latency/diagnosis, `--gc` | **4.94 s** | **5.05 s** |
-| same at WAN (`--rtt-ms 20 --bandwidth-mbps 1000`) | 7.00 s | 7.34 s |
+| + `--gc` | 4.94 s | 5.05 s |
+| + `--precompute` (**online**) | **2.90 s** | **3.00 s** |
+| offline, per query | 2.03 s | 2.04 s |
+| online at WAN (`--rtt-ms 20 --bandwidth-mbps 1000`) | 5.00 s | 5.30 s |
 
 Three readings. **Quantisation and encryption are both free**: the integer net
 tracks its float parent to within 0.2 points (agreeing on 99.7% / 98.7% of test
@@ -1113,14 +1142,15 @@ bit-exactly — privacy costs wall-clock, not accuracy.
 **The model, not the crypto, is the ceiling**: this 2-conv classifier is
 sized to fit the depth-1 noise budget, which is enough to match published
 ResNet-18 on pneumonia and 12 points short of it on the 11-class organ task.
-And **the cost centre is now FHE**: of the 4.94 s chest-X-ray diagnosis,
-**4.15 s (84%) is FHE arithmetic** and 0.77 s is the whole MPC segment
-(import 0.02 s, ReLU 0.51 s, pool 0.22 s, argmax 0.01 s). A diagnosis used to
-take ~33 s; the batched scheme-switch import above took it to 5.71 s and
-garbled nonlinearities (`--gc`) to 4.94 s. Anyone optimising this further
-should go to `fhe::bfv`, not to the MPC layer. On a wide-area link
-(RTT 20 ms, 1 Gbps) a diagnosis is 7.00 s — the pipeline is not round-bound,
-and garbling is worth 2.0× on the MPC segment there (3.39 s → 1.70 s).
+And **the cost centre is now FHE**: of the 2.90 s chest-X-ray diagnosis,
+**2.13 s (73%) is FHE arithmetic** and 0.76 s is the whole MPC segment
+(import 0.02 s, ReLU 0.51 s, pool 0.21 s, argmax 0.01 s). A diagnosis used to
+take ~33 s: the batched scheme-switch import took it to 5.71 s, garbled
+nonlinearities (`--gc`) to 4.94 s, and preprocessed masks (`--precompute`) to
+**2.90 s online** — an 11× reduction with the construction unchanged. Anyone
+optimising this further should go to `fhe::bfv`, not to the MPC layer. On a
+wide-area link (RTT 20 ms, 1 Gbps) a diagnosis is 5.00 s — the pipeline is
+not round-bound, and garbling is worth 2.0× on the MPC segment there.
 
 The same swap applies to the linear-discriminator demo, where the medical
 version runs on every FHE scheme:
@@ -1341,7 +1371,9 @@ trips.
 ## The headline: deep private inference with ZERO bootstrapping (`baru bench-deep-nn`)
 
 This is the result the whole stack was built toward, and the basis of the
-paper outline in [`docs/paper-outline.md`](docs/paper-outline.md).
+paper outline in [`docs/paper-outline.md`](docs/paper-outline.md). For where
+the pipeline's time actually goes today and what to optimise next, see
+[`docs/private-inference-performance.md`](docs/private-inference-performance.md).
 
 **The claim.** In the hybrid pipeline, the scheme switch that computes each
 ReLU *also refreshes the ciphertext*: the switch-back re-encrypts from
@@ -1476,7 +1508,8 @@ pair and prints the ratio, and every run prints the MPC **phase breakdown**
 | D=8, rtt=0 | exact ✓ | **0** | 1.17 s | 957 ms | 184 ms | import 8 / relu 47 / pool 59 / argmax 60 ms |
 | D=8, rtt=20 ms | exact ✓ | **0** | 2.45 s | 1.19 s | 1.24 s | import 40 / relu 176 / pool 420 / argmax 546 ms |
 | D=28, rtt=0 | exact ✓ | **0** | 2.54 s | 1.36 s | 1.15 s | import 9 / relu 615 / pool 467 / argmax 55 ms |
-| D=28, rtt=0, `--gc` | exact ✓ | **0** | **1.99 s** | 1.35 s | 609 ms | import 11 / relu 407 / pool 155 / argmax 27 ms |
+| D=28, rtt=0, `--gc` | exact ✓ | **0** | 1.99 s | 1.35 s | 609 ms | import 11 / relu 407 / pool 155 / argmax 27 ms |
+| D=28, `--gc --precompute` | exact ✓ | **0** | **1.31 s** | 695 ms | 600 ms | + 680 ms offline |
 
 At **rtt=0 the FHE side is now the majority** of the run — the reverse of what
 this section used to claim. The breakdown is also what surfaced the two

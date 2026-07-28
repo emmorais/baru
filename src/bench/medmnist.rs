@@ -49,15 +49,17 @@
 //! | FHE bootstraps | 0 | 0 |
 //! | plaintext modulus | 2^20 | 2^22 |
 //! | latency/diagnosis, `a2b` | 5.71 s | 5.95 s |
-//! | latency/diagnosis, `--gc` | **4.94 s** | **5.05 s** |
-//! | same, WAN (`--rtt-ms 20 --bandwidth-mbps 1000`) | 7.00 s | 7.34 s |
+//! | + `--gc` | 4.94 s | 5.05 s |
+//! | + `--precompute` (online) | **2.90 s** | **3.00 s** |
+//! | offline, per query | 2.03 s | 2.04 s |
+//! | online at WAN (`--rtt-ms 20 --bandwidth-mbps 1000`) | 5.00 s | 5.30 s |
 //!
-//! Cost of one encrypted pneumonia diagnosis under `--gc`: **4.94 s**, of
-//! which FHE is 4.15 s (**84%**) and the whole MPC segment 0.77 s (import
-//! 0.02 s, ReLU 0.51 s, pool 0.22 s, argmax 0.01 s), over 27.4 MB of
-//! party-to-party traffic. At RTT 20 ms / 1 Gbit/s the diagnosis is 7.00 s
-//! and the MPC segment 1.70 s, so garbling is worth 2.0× there against
-//! `a2b`'s 3.39 s — latency is where the constant-round protocol pays.
+//! Cost of one encrypted pneumonia diagnosis, `--gc --precompute`: **2.90 s**
+//! online, of which FHE is 2.13 s (**73%**) and the whole MPC segment 0.76 s
+//! (import 0.02 s, ReLU 0.51 s, pool 0.21 s, argmax 0.01 s), over 27.4 MB of
+//! party-to-party traffic, against 2.03 s of query-independent preprocessing.
+//! At RTT 20 ms / 1 Gbit/s it is 5.00 s. Garbling is worth 2.0× on the MPC
+//! segment at that latency — a constant-round protocol pays where rounds cost.
 //!
 //! Two things to read off that table. **Quantisation is free**: the integer
 //! net matches its float parent to within 0.2 points, agreeing with it on
@@ -71,9 +73,11 @@
 //! was ~19 s: importing an opened layer ran three blocking input-sharing
 //! rounds **per activation**, so a 5408-wide convolution cost 16 224 round
 //! trips (`import_raw_batch` in [`crate::bench::cnn`] now does it in three).
-//! With that gone and the nonlinearities garbled, a diagnosis is **4.94 s**
-//! and FHE is 84% of it. Anyone reading this module for where to optimise
-//! next should read that number and go to `fhe::bfv`, not here.
+//! Then the nonlinearities were garbled (1.7×), and then the *other* half of
+//! the switch — encrypting its query-independent masks, 48% of all FHE time —
+//! moved to an offline phase (1.7×). A diagnosis is now **2.90 s online**,
+//! 73% of it FHE. Anyone reading this module for where to optimise next
+//! should read that number and go to `fhe::bfv`, not here.
 //!
 //! **The model, not the crypto, is the accuracy ceiling.** Published
 //! ResNet-18 at 28×28 reaches 0.854 / 0.935 on these two datasets; this net
@@ -96,7 +100,7 @@ use std::time::Instant;
 
 use serde::Serialize;
 
-use crate::bench::cnn::{run_cnn_hybrid_with, CnnModel, ConvLayer, Nonlin};
+use crate::bench::cnn::{run_cnn_hybrid_full, CnnModel, ConvLayer, Nonlin};
 use crate::bench::comm::NetworkProfile;
 
 /// A trained, quantised CNN plus the real test images it was measured on, in
@@ -210,6 +214,17 @@ pub struct MedMnistReport {
     /// Party-to-party messages and bytes for one encrypted diagnosis.
     pub per_image_messages: f64,
     pub per_image_bytes: f64,
+    /// Query-independent work per image (keygen, plus the mask pool when
+    /// `--precompute`), excluded from `per_image_ms`.
+    pub per_image_offline_ms: f64,
+    /// Per-image FHE sub-split — which of the FHE operations the online time
+    /// is actually in. `weights` is query-independent and not yet preprocessed.
+    pub per_image_weights_ms: f64,
+    pub per_image_mul_ms: f64,
+    pub per_image_maskenc_ms: f64,
+    pub per_image_decrypt_ms: f64,
+    pub per_image_reencrypt_ms: f64,
+    pub precomputed_masks: bool,
 }
 
 pub fn run(
@@ -217,6 +232,7 @@ pub fn run(
     hybrid_n: usize,
     profile: NetworkProfile,
     nonlin: Nonlin,
+    precompute: bool,
 ) -> Result<MedMnistReport, String> {
     let data = load(name)?;
     let model = data.model();
@@ -242,7 +258,7 @@ pub fn run(
         .zip(&data.labels)
         .take(hybrid_n)
     {
-        let run = run_cnn_hybrid_with(&model, img, profile, nonlin);
+        let run = run_cnn_hybrid_full(&model, img, profile, nonlin, precompute);
         if run.class == plain {
             matches += 1;
         }
@@ -280,6 +296,13 @@ pub fn run(
         per_image_argmax_ms: per.argmax_ms,
         per_image_messages: per.messages,
         per_image_bytes: per.bytes,
+        per_image_offline_ms: per.offline_ms,
+        per_image_weights_ms: per.weights_ms,
+        per_image_mul_ms: per.mul_ms,
+        per_image_maskenc_ms: per.maskenc_ms,
+        per_image_decrypt_ms: per.decrypt_ms,
+        per_image_reencrypt_ms: per.reencrypt_ms,
+        precomputed_masks: precompute,
     })
 }
 
@@ -296,6 +319,12 @@ struct CnnTotals {
     argmax_ms: f64,
     messages: f64,
     bytes: f64,
+    offline_ms: f64,
+    weights_ms: f64,
+    mul_ms: f64,
+    maskenc_ms: f64,
+    decrypt_ms: f64,
+    reencrypt_ms: f64,
 }
 
 impl CnnTotals {
@@ -309,6 +338,12 @@ impl CnnTotals {
         self.argmax_ms += r.phases.argmax_ms;
         self.messages += r.comm.messages as f64;
         self.bytes += r.comm.bytes as f64;
+        self.offline_ms += r.offline_ms;
+        self.weights_ms += r.fhe_phases.weights_ms;
+        self.mul_ms += r.fhe_phases.mul_ms;
+        self.maskenc_ms += r.fhe_phases.mask_ms;
+        self.decrypt_ms += r.fhe_phases.decrypt_ms;
+        self.reencrypt_ms += r.fhe_phases.reencrypt_ms;
     }
 
     fn mean(self, n: usize) -> Self {
@@ -326,6 +361,12 @@ impl CnnTotals {
             argmax_ms: self.argmax_ms / d,
             messages: self.messages / d,
             bytes: self.bytes / d,
+            offline_ms: self.offline_ms / d,
+            weights_ms: self.weights_ms / d,
+            mul_ms: self.mul_ms / d,
+            maskenc_ms: self.maskenc_ms / d,
+            decrypt_ms: self.decrypt_ms / d,
+            reencrypt_ms: self.reencrypt_ms / d,
         }
     }
 }
@@ -345,6 +386,8 @@ options:
                   circuits instead of batched bit decomposition (same
                   function, bit-exact; constant-round)
   --both          report both nonlinearity protocols
+  --precompute    generate the query-independent scheme-switch masks in an
+                  offline phase, so the reported latency is ONLINE latency
   --rtt-ms N            round-trip latency between parties (default 0)
   --bandwidth-mbps X    link bandwidth in Mbit/s (default: unlimited)
   --json          machine-readable output
@@ -384,14 +427,40 @@ fn print_report(r: &MedMnistReport) {
     );
     println!("    FHE bootstraps            : {}", r.bootstraps);
     println!("    plaintext modulus         : 2^{}", r.log2_t);
-    println!("  cost of ONE encrypted diagnosis ({}):", r.nonlin);
+    println!(
+        "  cost of ONE encrypted diagnosis ({}{}):",
+        r.nonlin,
+        if r.precomputed_masks {
+            ", masks precomputed"
+        } else {
+            ""
+        }
+    );
     println!(
         "    latency  : {:.0} ms   (fhe {:.0} ms, mpc {:.0} ms)",
         r.per_image_ms, r.per_image_fhe_ms, r.per_image_mpc_ms
     );
     println!(
+        "    fhe split: weights {:.0} ms, mul {:.0} ms, mask-enc {:.0} ms, \
+         decrypt {:.0} ms, re-encrypt {:.0} ms",
+        r.per_image_weights_ms,
+        r.per_image_mul_ms,
+        r.per_image_maskenc_ms,
+        r.per_image_decrypt_ms,
+        r.per_image_reencrypt_ms
+    );
+    println!(
         "    mpc split: import {:.0} ms, relu {:.0} ms, pool {:.0} ms, argmax {:.0} ms",
         r.per_image_import_ms, r.per_image_relu_ms, r.per_image_pool_ms, r.per_image_argmax_ms
+    );
+    println!(
+        "    offline  : {:.0} ms query-independent (keygen{}), NOT in the latency above",
+        r.per_image_offline_ms,
+        if r.precomputed_masks {
+            " + mask pool"
+        } else {
+            ""
+        }
     );
     println!(
         "    traffic  : {:.0} messages, {:.1} MB party-to-party",
@@ -410,6 +479,7 @@ pub fn run_cli(args: &[String]) -> Result<(), String> {
     let mut json = false;
     let mut nonlin = Nonlin::A2b;
     let mut both = false;
+    let mut precompute = false;
     let mut rtt_ms = 0u64;
     let mut bandwidth_mbps: Option<f64> = None;
     let mut it = args.iter();
@@ -426,6 +496,7 @@ pub fn run_cli(args: &[String]) -> Result<(), String> {
             "--json" => json = true,
             "--gc" => nonlin = Nonlin::Gc,
             "--both" => both = true,
+            "--precompute" => precompute = true,
             "--rtt-ms" => {
                 rtt_ms = it
                     .next()
@@ -467,7 +538,7 @@ pub fn run_cli(args: &[String]) -> Result<(), String> {
     let mut reports = Vec::new();
     for n in &names {
         for p in &protocols {
-            reports.push(run(n, hybrid_n, profile, *p)?);
+            reports.push(run(n, hybrid_n, profile, *p, precompute)?);
         }
     }
 
@@ -533,8 +604,12 @@ mod tests {
     #[ignore] // runs the real BFV × ABY3 hybrid; slow in debug
     fn encrypted_matches_plaintext_on_real_scans() {
         for (name, _) in DATASETS {
-            for nonlin in [Nonlin::A2b, Nonlin::Gc] {
-                let r = run(name, 2, NetworkProfile::INSTANT, nonlin).unwrap();
+            for (nonlin, precompute) in [
+                (Nonlin::A2b, false),
+                (Nonlin::Gc, false),
+                (Nonlin::Gc, true),
+            ] {
+                let r = run(name, 2, NetworkProfile::INSTANT, nonlin, precompute).unwrap();
                 assert_eq!(
                     r.hybrid_matches_plaintext, r.hybrid_evaluated,
                     "{name}/{nonlin:?}: every encrypted prediction must equal the plaintext one"

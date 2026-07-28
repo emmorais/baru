@@ -10,8 +10,8 @@
 \@writefile{toc}{\contentsline {section}{\numberline {1}Introduction}{1}{section.1}\protected@file@percent }
 \newlabel{sec:intro}{{1}{1}{Introduction}{section.1}{}}
 \newlabel{sec:intro@cref}{{[section][1][]1}{[1][1][]1}}
-\@writefile{toc}{\contentsline {paragraph}{Our observation.}{1}{section*.1}\protected@file@percent }
 \citation{MedMNIST}
+\@writefile{toc}{\contentsline {paragraph}{Our observation.}{2}{section*.1}\protected@file@percent }
 \@writefile{toc}{\contentsline {paragraph}{Contributions.}{2}{section*.2}\protected@file@percent }
 \citation{FV}
 \citation{HEStandard}
@@ -102,12 +102,12 @@
 \newlabel{sec:mnist}{{8.5}{10}{Real MNIST: a fully encrypted two-convolution CNN}{subsection.8.5}{}}
 \newlabel{sec:mnist@cref}{{[subsection][5][8]8.5}{[1][10][]10}}
 \citation{MedMNIST}
-\@writefile{lot}{\contentsline {table}{\numberline {5}{\ignorespaces Private diagnosis on MedMNIST v2. Accuracy is the deployed \emph  {integer} model on the full official test split; the encrypted pipeline reproduces it bit-exactly, so it is also the encrypted accuracy. Latency is one encrypted diagnosis with garbled nonlinearities, single-threaded, no GPU.}}{11}{table.5}\protected@file@percent }
-\newlabel{tab:diagnosis}{{5}{11}{Private diagnosis on MedMNIST v2. Accuracy is the deployed \emph {integer} model on the full official test split; the encrypted pipeline reproduces it bit-exactly, so it is also the encrypted accuracy. Latency is one encrypted diagnosis with garbled nonlinearities, single-threaded, no GPU}{table.5}{}}
-\newlabel{tab:diagnosis@cref}{{[table][5][]5}{[1][11][]11}}
-\@writefile{toc}{\contentsline {subsection}{\numberline {8.6}Private diagnosis: real medical images end to end}{11}{subsection.8.6}\protected@file@percent }
-\newlabel{sec:diagnosis}{{8.6}{11}{Private diagnosis: real medical images end to end}{subsection.8.6}{}}
-\newlabel{sec:diagnosis@cref}{{[subsection][6][8]8.6}{[1][11][]11}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {8.6}Preprocessing the switch}{11}{subsection.8.6}\protected@file@percent }
+\newlabel{sec:preproc}{{8.6}{11}{Preprocessing the switch}{subsection.8.6}{}}
+\newlabel{sec:preproc@cref}{{[subsection][6][8]8.6}{[1][11][]11}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {8.7}Private diagnosis: real medical images end to end}{11}{subsection.8.7}\protected@file@percent }
+\newlabel{sec:diagnosis}{{8.7}{11}{Private diagnosis: real medical images end to end}{subsection.8.7}{}}
+\newlabel{sec:diagnosis@cref}{{[subsection][7][8]8.7}{[1][11][]11}}
 \citation{Gazelle}
 \citation{Delphi}
 \citation{CrypTFlow2}
@@ -117,6 +117,11 @@
 \citation{Delphi}
 \citation{Cheetah}
 \citation{CrypTFlow2}
+\@writefile{lot}{\contentsline {table}{\numberline {5}{\ignorespaces Private diagnosis on MedMNIST v2. Accuracy is the deployed \emph  {integer} model on the full official test split; the encrypted pipeline reproduces it bit-exactly, so it is also the encrypted accuracy. Latency is one encrypted diagnosis with garbled nonlinearities, single-threaded, no GPU.}}{12}{table.5}\protected@file@percent }
+\newlabel{tab:diagnosis}{{5}{12}{Private diagnosis on MedMNIST v2. Accuracy is the deployed \emph {integer} model on the full official test split; the encrypted pipeline reproduces it bit-exactly, so it is also the encrypted accuracy. Latency is one encrypted diagnosis with garbled nonlinearities, single-threaded, no GPU}{table.5}{}}
+\newlabel{tab:diagnosis@cref}{{[table][5][]5}{[1][11][]12}}
+\@writefile{toc}{\contentsline {paragraph}{Scope.}{12}{section*.11}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {8.8}Positioning against prior inference systems}{12}{subsection.8.8}\protected@file@percent }
 \citation{Delphi}
 \citation{CHIMERA}
 \citation{PEGASUS}
@@ -128,19 +133,20 @@
 \citation{ABDucas}
 \citation{KirchnerFouque}
 \citation{DucasvanWoerden}
-\@writefile{lot}{\contentsline {table}{\numberline {6}{\ignorespaces Positioning on MNIST. The comparison axis is \emph  {what is hidden}, not accuracy.}}{12}{table.6}\protected@file@percent }
-\newlabel{tab:sota}{{6}{12}{Positioning on MNIST. The comparison axis is \emph {what is hidden}, not accuracy}{table.6}{}}
-\newlabel{tab:sota@cref}{{[table][6][]6}{[1][12][]12}}
-\@writefile{toc}{\contentsline {paragraph}{Scope.}{12}{section*.11}\protected@file@percent }
-\@writefile{toc}{\contentsline {subsection}{\numberline {8.7}Positioning against prior inference systems}{12}{subsection.8.7}\protected@file@percent }
-\@writefile{toc}{\contentsline {section}{\numberline {9}Related Work}{12}{section.9}\protected@file@percent }
-\newlabel{sec:related}{{9}{12}{Related Work}{section.9}{}}
-\newlabel{sec:related@cref}{{[section][9][]9}{[1][12][]12}}
-\@writefile{toc}{\contentsline {paragraph}{Hybrid linear-FHE / nonlinear-MPC inference.}{12}{section*.12}\protected@file@percent }
-\@writefile{toc}{\contentsline {paragraph}{Preprocessing.}{12}{section*.13}\protected@file@percent }
-\@writefile{toc}{\contentsline {paragraph}{Scheme switching between FHE schemes.}{12}{section*.14}\protected@file@percent }
-\@writefile{toc}{\contentsline {paragraph}{Leveled and bootstrapped FHE.}{12}{section*.15}\protected@file@percent }
-\@writefile{toc}{\contentsline {paragraph}{Overstretched NTRU.}{12}{section*.16}\protected@file@percent }
+\@writefile{lot}{\contentsline {table}{\numberline {6}{\ignorespaces Positioning on MNIST. The comparison axis is \emph  {what is hidden}, not accuracy.}}{13}{table.6}\protected@file@percent }
+\newlabel{tab:sota}{{6}{13}{Positioning on MNIST. The comparison axis is \emph {what is hidden}, not accuracy}{table.6}{}}
+\newlabel{tab:sota@cref}{{[table][6][]6}{[1][12][]13}}
+\@writefile{toc}{\contentsline {section}{\numberline {9}Related Work}{13}{section.9}\protected@file@percent }
+\newlabel{sec:related}{{9}{13}{Related Work}{section.9}{}}
+\newlabel{sec:related@cref}{{[section][9][]9}{[1][12][]13}}
+\@writefile{toc}{\contentsline {paragraph}{Hybrid linear-FHE / nonlinear-MPC inference.}{13}{section*.12}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Preprocessing.}{13}{section*.13}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Scheme switching between FHE schemes.}{13}{section*.14}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Leveled and bootstrapped FHE.}{13}{section*.15}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Overstretched NTRU.}{13}{section*.16}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {10}Limitations}{13}{section.10}\protected@file@percent }
+\newlabel{sec:limitations}{{10}{13}{Limitations}{section.10}{}}
+\newlabel{sec:limitations@cref}{{[section][10][]10}{[1][13][]13}}
 \bibstyle{plain}
 \bibdata{references}
 \bibcite{HEStandard}{1}
@@ -148,15 +154,12 @@
 \bibcite{AsharovMHE}{3}
 \bibcite{Beaver}{4}
 \bibcite{YASHE}{5}
-\@writefile{toc}{\contentsline {section}{\numberline {10}Limitations}{13}{section.10}\protected@file@percent }
-\newlabel{sec:limitations}{{10}{13}{Limitations}{section.10}{}}
-\newlabel{sec:limitations@cref}{{[section][10][]10}{[1][12][]13}}
-\@writefile{toc}{\contentsline {section}{\numberline {11}Conclusion}{13}{section.11}\protected@file@percent }
-\newlabel{sec:conclusion}{{11}{13}{Conclusion}{section.11}{}}
-\newlabel{sec:conclusion@cref}{{[section][11][]11}{[1][13][]13}}
 \bibcite{CHIMERA}{6}
 \bibcite{BGV}{7}
 \bibcite{Canetti}{8}
+\@writefile{toc}{\contentsline {section}{\numberline {11}Conclusion}{14}{section.11}\protected@file@percent }
+\newlabel{sec:conclusion}{{11}{14}{Conclusion}{section.11}{}}
+\newlabel{sec:conclusion@cref}{{[section][11][]11}{[1][14][]14}}
 \bibcite{ASTRA}{9}
 \bibcite{CKKS}{10}
 \bibcite{TFHE}{11}
@@ -180,4 +183,4 @@
 \bibcite{MedMNIST}{29}
 \bibcite{Yao}{30}
 \bibcite{HalfGates}{31}
-\gdef \@abspage@last{15}
+\gdef \@abspage@last{16}

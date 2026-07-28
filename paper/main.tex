@@ -78,14 +78,15 @@ nonlinearities. We implement the whole pipeline and validate it by
 On real biomedical images (MedMNIST v2), a fully encrypted two-convolution
 CNN --- four encrypted linear layers, three MPC nonlinearities, three scheme
 switches, and zero bootstraps --- diagnoses a pediatric chest X-ray in
-$\mathbf{4.9}$ seconds at $84.78\%$ accuracy, and reaches $98.89\%$ on MNIST,
+$\mathbf{2.9}$ seconds at $84.78\%$ accuracy, and reaches $98.89\%$ on MNIST,
 with every encrypted prediction provably equal to its plaintext counterpart.
 Unlike two-party inference services, the model weights are encrypted as well
-as the input. Along the way we correct a diagnosis of our own: the segment
-that dominated runtime was neither the FHE arithmetic nor the MPC protocols
-but the \emph{plumbing between them}, an unbatched scheme-switch import whose
-removal cut end-to-end latency $8.3\times$ and moved the cost center back
-onto FHE.
+as the input. Getting from $32.7$ s to $2.9$ s cost us a diagnosis of our
+own, which we report: the dominant cost was neither the FHE arithmetic nor
+the MPC protocols but the \emph{plumbing between them} --- an unbatched
+scheme-switch import ($8.3\times$), and then the query-independent masking
+that same switch performs ($1.7\times$, moved offline). The construction
+never changed; only its round structure did.
 \end{abstract}
 
 \section{Introduction}\label{sec:intro}
@@ -172,9 +173,10 @@ was quantized from --- in $4.9$ s per encrypted diagnosis. Reaching that
 number required finding that the pipeline's dominant cost was not what a
 segment-level measurement suggested: $88\%$ of end-to-end runtime was an
 unbatched scheme-switch \emph{import}, not the FHE arithmetic and not the MPC
-comparison protocols. Batching it ($8.3\times$) and garbling the
-nonlinearities ($1.7\times$ on the MPC segment) leaves $84\%$ of a diagnosis
-in FHE.
+comparison protocols. Batching it ($8.3\times$), garbling the
+nonlinearities ($1.7\times$ on the MPC segment), and moving the switch's
+query-independent masking offline ($1.7\times$ again, \Cref{sec:preproc})
+give $2.9$ s, of which $73\%$ is now the FHE multiplications themselves.
 \end{enumerate}
 
 \paragraph{Honesty about scope.} We separate what is proven, what is
@@ -663,7 +665,7 @@ That is no longer where it sits. With the segment's import batched and its
 nonlinearities garbled, the same $28\times28$ classifier spends $1.35$ s of
 its $1.99$ s in FHE and $0.61$ s in MPC, and the trained two-convolution
 medical model of \Cref{sec:diagnosis} --- four encrypted linear layers to
-this one's two --- spends $84\%$ of a diagnosis in FHE. The cost center has
+this one's two --- spends $73\%$ of an online diagnosis in FHE. The cost center has
 crossed back. We note this in favor of the construction rather than against
 it: the switch-as-bootstrap argument buys unbounded depth at a
 \emph{constant} FHE cost per layer, and the residual cost is now that
@@ -717,6 +719,35 @@ zero bootstraps. Because the hybrid is bit-exact, the encrypted accuracy
 \emph{equals} the plaintext accuracy of $98.89\%$: privacy costs nothing in
 accuracy, demonstrated on real inputs rather than asserted.
 
+\subsection{Preprocessing the switch}\label{sec:preproc}
+
+With the MPC segment down to a fraction of runtime, we broke the FHE side
+down the same way. On the $28\times28$ classifier it divides as: encrypting
+the model $218$ ms, the ct$\times$ct products $210$ ms, decrypting the masked
+openings $217$ ms, re-encrypting MPC shares $50$ ms, encrypting the input
+$17$ ms --- and encrypting the \emph{masks} $656$ ms, $48\%$ of the FHE total
+and $39$ of the $52$ encryptions the inference performs.
+
+Those masks are uniform random values. They depend on neither the image nor
+the weights, only on the network's shape, so every one of them can be
+generated and encrypted before the query exists. They must still be
+\emph{fresh per query} --- two queries masked identically would reveal the
+difference of their pre-activations --- so preprocessing does not remove the
+work, it moves it off the critical path, which is precisely the deployment
+question. A server idle between patients has the time; a patient waiting for
+a diagnosis does not. Precomputing also lets the three parties' mask
+ciphertexts be \emph{summed} in advance, since the evaluator only ever needs
+their sum, so the online step becomes a single ciphertext addition in place
+of three encryptions and three additions.
+
+Measured on the $28\times28$ classifier, this takes the online time from
+$1.98$ s to $1.31$ s ($1.51\times$) against $0.68$ s of offline work per
+query --- the same total, differently placed. On the trained two-convolution
+medical model the effect is larger, because it performs four scheme switches
+rather than two: \Cref{tab:diagnosis}. The encrypted diagnosis is unchanged,
+which we check by running the identical inference both ways and requiring the
+same class.
+
 \subsection{Private diagnosis: real medical images end to end}\label{sec:diagnosis}
 
 Handwritten digits are a correctness and cost instrument, not an application.
@@ -734,13 +765,22 @@ assumes a single input channel.
 cost of one encrypted diagnosis. Because the hybrid is bit-exact, the
 encrypted diagnosis \emph{equals} the plaintext one on every image tested, so
 the accuracy column is simultaneously the encrypted accuracy: privacy costs
-nothing in diagnostic quality. What it costs is $4.9$ s per chest X-ray, of
-which $84\%$ is FHE arithmetic and $0.77$ s is the entire MPC segment
-(import $0.02$ s, ReLU $0.51$ s, max-pool $0.22$ s, argmax $0.01$ s), over
+nothing in diagnostic quality. What it costs is $2.9$ s per chest X-ray
+online, against $2.0$ s of query-independent preprocessing; of the online
+time $73\%$ is FHE arithmetic and $0.76$ s is the entire MPC segment
+(import $0.02$ s, ReLU $0.51$ s, max-pool $0.21$ s, argmax $0.01$ s), over
 $27.4$ MB of party-to-party traffic and zero bootstraps. Placing the three
 parties on a wide-area link (RTT $20$ ms, $1$ Gbps) costs $2.1$ s more, of
 which the MPC segment is $0.9$ s: the pipeline is not round-bound, which is
 what the constant-round nonlinearities buy.
+
+For scale, this diagnosis cost $32.7$ s at the start of the optimization
+sequence in \Cref{sec:eval} and $2.9$ s at the end, an $11\times$ reduction in
+which the cryptographic construction never changed --- only the batching of
+its round trips, the protocol chosen for its comparisons, and what was moved
+off the critical path. Every intermediate version was bit-exact against the
+same plaintext reference, which is what let the sequence be driven by
+measurement rather than by argument.
 
 \begin{table}[t]
 \centering
@@ -760,11 +800,15 @@ accuracy (integer $=$ encrypted) & $\mathbf{84.78\%}$ & $\mathbf{81.18\%}$ \\
 float parent of the same net & $84.78\%$ & $81.03\%$ \\
 \midrule
 latency, \texttt{a2b} nonlinearities & $5.71$ s & $5.95$ s \\
-latency, garbled nonlinearities & $\mathbf{4.94}$ s & $\mathbf{5.05}$ s \\
-\quad of which FHE & $4.15$ s & $4.15$ s \\
-\quad of which MPC & $0.77$ s & $0.87$ s \\
-same, WAN (RTT $20$ ms, $1$ Gbps) & $7.00$ s & $7.34$ s \\
-\quad of which MPC & $1.70$ s & $2.01$ s \\
+$+$ garbled nonlinearities & $4.94$ s & $5.05$ s \\
+$+$ preprocessed masks (online) & $\mathbf{2.90}$ s & $\mathbf{3.00}$ s \\
+\quad of which FHE & $2.13$ s & $2.13$ s \\
+\quad of which MPC & $0.76$ s & $0.85$ s \\
+offline, per query & $2.03$ s & $2.04$ s \\
+\midrule
+same online figure at WAN (RTT $20$ ms, $1$ Gbps) & $5.00$ s & $5.30$ s \\
+\quad of which MPC & $1.71$ s & $2.02$ s \\
+\midrule
 FHE bootstraps & $0$ & $0$ \\
 \bottomrule
 \end{tabular}
@@ -830,9 +874,12 @@ bootstrapping-elimination mechanism enabling unbounded depth with a
 depth-one FHE engine, and we encrypt the weights.
 
 \paragraph{Preprocessing.} Delphi~\cite{Delphi} moves query-independent HE
-work off the critical path. The same idea applies to the scheme switch: mask
-and return-path randomness are query-independent and can be precomputed, so
-the online return leg becomes a plaintext addition.
+work off the critical path. We apply the same idea to the scheme switch
+rather than to the linear layers: the masks are uniform and depend only on
+the network's shape, so they are generated and encrypted before the query
+arrives (\Cref{sec:preproc}). Where Delphi preprocesses to make the linear
+layer cheap online, we preprocess the \emph{switching} machinery --- the part
+a switch-as-bootstrap construction performs most often.
 
 \paragraph{Scheme switching between FHE schemes.} CHIMERA~\cite{CHIMERA} and
 PEGASUS~\cite{PEGASUS} switch FHE$\leftrightarrow$FHE to pick the cheapest
@@ -855,8 +902,9 @@ non-secure reference and RLWE as the secure instantiation.
 The construction wins on depth scaling, on encrypting the model, and on the
 thin-pipe regime, \emph{not} on a single small layer over a fast LAN, where
 pure MPC is faster. Absolute latency remains seconds per image and is now
-dominated by the FHE ciphertext$\times$ciphertext multiplications --- $84\%$
-of a diagnosis, four of them for a two-convolution network. Our FHE engine is
+dominated by the FHE arithmetic --- $73\%$ of an online diagnosis, and the
+part of it that preprocessing cannot touch, since the products depend on both
+the image and the weights. Our FHE engine is
 a single-threaded schoolbook implementation with no GPU and no
 machine-specific NTT; the residual cost is therefore an engineering number,
 not an information-theoretic one, but it is the number that matters for

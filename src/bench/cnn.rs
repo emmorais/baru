@@ -51,17 +51,23 @@
 //! Read this before optimising anything here — the answer has changed twice,
 //! and both times the intuitive answer was wrong.
 //!
-//! | | a2b | gc |
-//! |---|---|---|
-//! | total | 2535 ms | **1986 ms** |
-//! | FHE | 1356 ms | 1351 ms |
-//! | MPC | 1153 ms | 609 ms |
-//! | — import | 9 ms | 11 ms |
-//! | — ReLU∘rescale | 615 ms | 407 ms |
-//! | — max-pool | 467 ms | 155 ms |
-//! | — argmax | 55 ms | 27 ms |
-//! | wire bytes | 39.5 MB | 21.8 MB |
-//! | messages | 88 | 319 139 |
+//! | | a2b | gc | gc + `--precompute` |
+//! |---|---|---|---|
+//! | total (online) | 2535 ms | 1986 ms | **1312 ms** |
+//! | offline | — | — | 680 ms |
+//! | FHE | 1356 ms | 1351 ms | 695 ms |
+//! | MPC | 1153 ms | 609 ms | 600 ms |
+//! | — import | 9 ms | 11 ms | 10 ms |
+//! | — ReLU∘rescale | 615 ms | 407 ms | 404 ms |
+//! | — max-pool | 467 ms | 155 ms | 152 ms |
+//! | — argmax | 55 ms | 27 ms | 27 ms |
+//! | wire bytes | 39.5 MB | 21.8 MB | 21.8 MB |
+//! | messages | 88 | 319 139 | 319 139 |
+//!
+//! FHE breakdown of the middle column (`--gc`, masks online): keygen 9 ms,
+//! input 17 ms, weights 218 ms (13 encryptions), mul 210 ms, **mask 656 ms
+//! (39 encryptions)**, decrypt 217 ms, re-encrypt 50 ms (3). The right column
+//! is the same with the mask row moved offline.
 //!
 //! (Separate `--gc` and default runs, so the two columns are two invocations;
 //! `--both` runs them back to back and prints the ratio.) Note the message
@@ -86,10 +92,16 @@
 //!    fold made `nclasses−1` *dependent* comparisons. Reassociating it into a
 //!    tournament (`⌈log₂ n⌉` batched levels) cut it 2.4× at RTT 20 ms, where
 //!    it had been the single largest phase.
+//! 5. With MPC down to a fraction, the same breakdown applied to the FHE side
+//!    ([`FhePhases`]) showed **48% of it was encrypting scheme-switch masks**
+//!    — 39 of the inference's 52 encryptions. Masks are uniform and
+//!    query-independent, so `--precompute` ([`MaskPool`]) moves them offline:
+//!    online 1979 ms → 1312 ms here, 4.94 s → 2.90 s on the medical model.
 //!
-//! The cost centre is now the **FHE arithmetic** (~68% here, 84% on the
-//! trained two-conv medical model, which has four encrypted linear layers to
-//! this one's two). That is where the next optimisation belongs.
+//! The cost centre is now the **FHE arithmetic proper** — the ct×ct products,
+//! the model encryption and the decryptions, which depend on the query or the
+//! weights and so cannot be preprocessed away. That is where the next
+//! optimisation belongs, and it is a schoolbook single-threaded NTT.
 //!
 //! The lesson worth keeping: "MPC is slow" was true of this pipeline for the
 //! wrong reason, and a protocol-level fix (garbled comparisons) was proposed
@@ -386,6 +398,173 @@ impl CnnModel {
 /// by a mask-and-open switch. Returns per-output opened residues and the
 /// three per-output masks (so the MPC side can reconstruct the raw share).
 #[allow(clippy::type_complexity)]
+/// How many weight rows a single packed matvec ciphertext can carry. Shared
+/// by the matvec itself and by [`MaskPool::for_model`], which must predict
+/// the same chunking — the two drifting apart is what the pool's
+/// exact-consumption assertion catches.
+fn rows_per_chunk(n: usize, in_dim: usize) -> usize {
+    (n / in_dim).saturating_sub(1).max(1)
+}
+
+/// One layer-output's worth of scheme-switch masking: the three parties'
+/// plaintext masks, and a single ciphertext encrypting their sum.
+///
+/// The evaluator only ever needs the sum (it adds one ciphertext onto the
+/// product); each party needs its own plaintext mask to reconstruct its
+/// share afterwards. Summing the three encryptions in advance is therefore
+/// faithful to the protocol and strictly cheaper than doing it online.
+struct MaskTriple {
+    plain: [Vec<u64>; 3],
+    combined: BfvCt,
+}
+
+/// Precomputed scheme-switch masks — the pipeline's **offline phase**.
+///
+/// The masks are uniform random values: they depend on neither the query nor
+/// the model, only on the network's *shape*. So every one of them can be
+/// generated and encrypted before a patient's image exists, which is the
+/// classic Delphi-style online/offline split applied to the switch rather
+/// than to the linear layers. Measured, this is where roughly half the FHE
+/// time was going.
+///
+/// Masks must still be **fresh per inference** — a pool is consumed once and
+/// refilled between queries, never reused across them, since two queries
+/// masked identically would reveal the difference of their pre-activations.
+/// Precomputation moves the cost off the critical path; it does not remove it.
+struct MaskPool {
+    triples: std::collections::VecDeque<MaskTriple>,
+    /// Wall-clock spent generating the pool — reported as offline cost.
+    offline_ms: f64,
+    /// How many triples were drawn, so the caller can assert exact consumption.
+    drawn: usize,
+}
+
+impl MaskPool {
+    /// Build exactly the masks `model` will consume. Under-counting panics at
+    /// draw time and over-counting panics at the end of the run, so the
+    /// prediction cannot silently drift from the pipeline.
+    fn for_model(s: &Bfv, ck: &[u8], model: &CnnModel, rng: &mut impl Rng) -> Self {
+        let n = s.params.n;
+        let t_mask = s.params.t() - 1;
+
+        let mut count = model.out_channels();
+        for cl in &model.extra_conv {
+            count += cl.out_c();
+        }
+        let mut in_dim = {
+            let fs = last_feature_shape(model);
+            fs.c * fs.h * fs.w
+        };
+        for (hidden_w, _) in &model.hidden {
+            count += hidden_w.len().div_ceil(rows_per_chunk(n, in_dim));
+            in_dim = hidden_w.len();
+        }
+        count += model.dense_w.len().div_ceil(rows_per_chunk(n, in_dim));
+
+        let t = Instant::now();
+        let triples = (0..count)
+            .map(|_| {
+                let plain: [Vec<u64>; 3] = std::array::from_fn(|_| {
+                    (0..n).map(|_| rng.gen::<u64>() & t_mask).collect()
+                });
+                let mut combined: Option<BfvCt> = None;
+                for m in &plain {
+                    let enc = s.encrypt_poly(ck, m);
+                    combined = Some(match combined {
+                        None => enc,
+                        Some(acc) => s.add(&acc, &enc),
+                    });
+                }
+                MaskTriple { plain, combined: combined.expect("three parties") }
+            })
+            .collect();
+        MaskPool { triples, offline_ms: ms(t), drawn: 0 }
+    }
+
+    fn draw(&mut self) -> MaskTriple {
+        self.drawn += 1;
+        self.triples
+            .pop_front()
+            .expect("mask pool exhausted: MaskPool::for_model under-counted the model's switches")
+    }
+
+    fn assert_fully_consumed(&self) {
+        assert!(
+            self.triples.is_empty(),
+            "mask pool over-counted: {} triples left unused after {} draws",
+            self.triples.len(),
+            self.drawn
+        );
+    }
+}
+
+/// Borrow the pool as a [`Masks`] source, or fall back to online generation.
+fn masks_src(pool: &mut Option<MaskPool>) -> Masks<'_> {
+    match pool {
+        Some(p) => Masks::Pool(p),
+        None => Masks::Online,
+    }
+}
+
+/// The feature-map shape entering the first dense layer.
+fn last_feature_shape(model: &CnnModel) -> Chw {
+    let mut shape = model.pool_shape;
+    for cl in &model.extra_conv {
+        shape = Chw { c: cl.out_c(), h: cl.out_h() / POOL, w: cl.out_w() / POOL };
+    }
+    shape
+}
+
+/// Where a layer's masks come from: generated on the critical path (the
+/// control, and what a system without an offline phase must do), or drawn
+/// from a pool built before the query arrived.
+enum Masks<'a> {
+    Online,
+    Pool(&'a mut MaskPool),
+}
+
+impl Masks<'_> {
+    /// Produce one output's masks and the single ciphertext to add onto the
+    /// product, charging the time to `ph.mask_ms` only when it is online.
+    fn take(
+        &mut self,
+        s: &Bfv,
+        ck: &[u8],
+        n: usize,
+        t_mask: u64,
+        rng: &mut impl Rng,
+        ph: &mut FhePhases,
+    ) -> ([Vec<u64>; 3], BfvCt, usize) {
+        match self {
+            Masks::Online => {
+                let plain: [Vec<u64>; 3] =
+                    std::array::from_fn(|_| (0..n).map(|_| rng.gen::<u64>() & t_mask).collect());
+                let t = Instant::now();
+                let mut combined: Option<BfvCt> = None;
+                let mut bytes = 0usize;
+                for m in &plain {
+                    let enc = s.encrypt_poly(ck, m);
+                    bytes += s.ct_bytes(&enc);
+                    combined = Some(match combined {
+                        None => enc,
+                        Some(acc) => s.add(&acc, &enc),
+                    });
+                }
+                ph.mask_ms += ms(t);
+                ph.n_mask_enc += 3;
+                (plain, combined.expect("three parties"), bytes)
+            }
+            Masks::Pool(pool) => {
+                let tr = pool.draw();
+                // Same bytes on the wire: the three parties still ship their
+                // mask ciphertexts, just before the query rather than during it.
+                let bytes = 3 * s.ct_bytes(&tr.combined);
+                (tr.plain, tr.combined, bytes)
+            }
+        }
+    }
+}
+
 fn hybrid_matvec_open(
     s: &Bfv,
     ck: &[u8],
@@ -394,29 +573,33 @@ fn hybrid_matvec_open(
     in_dim: usize,
     profile: NetworkProfile,
     rng: &mut impl Rng,
-) -> (Vec<u64>, Vec<[u64; 3]>) {
+    masks_src: &mut Masks,
+) -> (Vec<u64>, Vec<[u64; 3]>, FhePhases) {
     let n = s.params.n;
     let t_mask = s.params.t() - 1;
-    let rows_per_chunk = (n / in_dim).saturating_sub(1).max(1);
+    let rows_per_chunk = rows_per_chunk(n, in_dim);
+    let mut ph = FhePhases::default();
     // The input's forward NTT is computed once and reused across chunks.
+    let t = Instant::now();
     let cxt = s.transform(c_input);
+    ph.mul_ms += ms(t);
 
     let mut opened = Vec::with_capacity(weights.len());
     let mut masks = Vec::with_capacity(weights.len());
     for chunk in weights.chunks(rows_per_chunk) {
+        let t = Instant::now();
         let cw = s.encrypt_poly(ck, &s.pack_weights(chunk));
+        ph.weights_ms += ms(t);
+        ph.n_weight_enc += 1;
+        let t = Instant::now();
         let prod = s.mul_pre(&cxt, &cw);
-        let chunk_masks: Vec<Vec<u64>> = (0..3)
-            .map(|_| (0..n).map(|_| rng.gen::<u64>() & t_mask).collect())
-            .collect();
-        let mut conv_bytes = 0usize;
-        let mut masked = prod;
-        for m in &chunk_masks {
-            let enc = s.encrypt_poly(ck, m);
-            conv_bytes += s.ct_bytes(&enc);
-            masked = s.add(&masked, &enc);
-        }
+        ph.mul_ms += ms(t);
+        let (chunk_masks, mask_ct, conv_bytes) =
+            masks_src.take(s, ck, n, t_mask, rng, &mut ph);
+        let masked = s.add(&prod, &mask_ct);
+        let t = Instant::now();
         let y = s.decrypt_poly(ck, &masked);
+        ph.decrypt_ms += ms(t);
         sleep_link(&profile, conv_bytes + chunk.len() * 8, 2);
         for r in 0..chunk.len() {
             let pos = s.matvec_output_position(in_dim, r);
@@ -424,7 +607,7 @@ fn hybrid_matvec_open(
             masks.push([chunk_masks[0][pos], chunk_masks[1][pos], chunk_masks[2][pos]]);
         }
     }
-    (opened, masks)
+    (opened, masks, ph)
 }
 
 /// Convolution via [`crate::fhe::conv_pack`]: one ct×ct multiply per output
@@ -440,7 +623,8 @@ fn hybrid_conv_open(
     kernels: &[Vec<i64>],
     profile: NetworkProfile,
     rng: &mut impl Rng,
-) -> (Vec<u64>, Vec<[u64; 3]>) {
+    masks_src: &mut Masks,
+) -> (Vec<u64>, Vec<[u64; 3]>, FhePhases) {
     let n = s.params.n;
     let t_mask = s.params.t() - 1;
     assert!(
@@ -452,28 +636,31 @@ fn hybrid_conv_open(
     let (oh, ow) = (shape.out_h(), shape.out_w());
     let mut opened = Vec::with_capacity(out_c * oh * ow);
     let mut masks = Vec::with_capacity(out_c * oh * ow);
+    let mut ph = FhePhases::default();
     // Every output channel multiplies against the *same* encrypted input, so
     // its forward NTT is computed once and reused (`mul_pre`).
+    let t = Instant::now();
     let cxt = s.transform(c_input);
+    ph.mul_ms += ms(t);
 
     for kernel in kernels.iter() {
+        let t = Instant::now();
         let kpoly = conv_pack::pack_kernel(kernel, shape, n, t_mask);
         let cw = s.encrypt_poly(ck, &kpoly);
+        ph.weights_ms += ms(t);
+        ph.n_weight_enc += 1;
+        let t = Instant::now();
         let prod = s.mul_pre(&cxt, &cw);
+        ph.mul_ms += ms(t);
 
         // Fresh masks per output channel (reuse across channels would leak
         // the difference of their pre-activations).
-        let chan_masks: Vec<Vec<u64>> = (0..3)
-            .map(|_| (0..n).map(|_| rng.gen::<u64>() & t_mask).collect())
-            .collect();
-        let mut conv_bytes = 0usize;
-        let mut masked = prod;
-        for m in &chan_masks {
-            let enc = s.encrypt_poly(ck, m);
-            conv_bytes += s.ct_bytes(&enc);
-            masked = s.add(&masked, &enc);
-        }
+        let (chan_masks, mask_ct, conv_bytes) =
+            masks_src.take(s, ck, n, t_mask, rng, &mut ph);
+        let masked = s.add(&prod, &mask_ct);
+        let t = Instant::now();
         let y = s.decrypt_poly(ck, &masked);
+        ph.decrypt_ms += ms(t);
         sleep_link(&profile, conv_bytes + oh * ow * 8, 2);
         for oy in 0..oh {
             for ox in 0..ow {
@@ -483,7 +670,7 @@ fn hybrid_conv_open(
             }
         }
     }
-    (opened, masks)
+    (opened, masks, ph)
 }
 
 /// Re-encrypt a layer's MPC output (three parties' additive share
@@ -496,9 +683,11 @@ fn pack_shares_to_fhe(
     per_party: &[Vec<Fr>],
     t_mask: u64,
     profile: NetworkProfile,
-) -> (BfvCt, usize) {
+) -> (BfvCt, usize, FhePhases) {
     let mut c: Option<BfvCt> = None;
     let mut bytes = 0usize;
+    let mut ph = FhePhases::default();
+    let t = Instant::now();
     for comps in per_party {
         let m: Vec<u64> = comps.iter().map(|&v| (v as u64) & t_mask).collect();
         let enc = s.encrypt_poly(ck, &m);
@@ -508,8 +697,10 @@ fn pack_shares_to_fhe(
             Some(acc) => s.add(&acc, &enc),
         });
     }
+    ph.reencrypt_ms += ms(t);
+    ph.n_reencrypt += per_party.len();
     sleep_link(&profile, bytes, 1);
-    (c.expect("three parties"), bytes)
+    (c.expect("three parties"), bytes, ph)
 }
 
 /// MPC half of one convolution layer: reconstruct each opened pre-activation,
@@ -571,6 +762,52 @@ fn mpc_conv_relu_pool(
 
 fn ms(t: Instant) -> f64 {
     t.elapsed().as_secs_f64() * 1000.0
+}
+
+/// Where the FHE segment's time actually goes.
+///
+/// Same motivation as [`MpcPhases`], applied to the side that now dominates:
+/// "FHE" is four different operations with different fixes. A
+/// ciphertext$\times$ciphertext multiply is irreducible work the construction
+/// needs; a *mask* encryption is query-independent and could in principle
+/// move offline. Only a breakdown distinguishes them.
+#[derive(Default, Clone, Copy, Debug, Serialize)]
+pub struct FhePhases {
+    /// Key generation (once per inference here; amortizable in deployment).
+    pub keygen_ms: f64,
+    /// Encrypting the input image.
+    pub input_ms: f64,
+    /// Encrypting the model: kernels and weight chunks.
+    pub weights_ms: f64,
+    /// The ct×ct products themselves, including the reused forward NTT.
+    pub mul_ms: f64,
+    /// Encrypting the per-party masks and adding them onto the product —
+    /// the outbound half of each scheme switch.
+    pub mask_ms: f64,
+    /// Decrypting the masked product to open a layer.
+    pub decrypt_ms: f64,
+    /// Re-encrypting MPC shares back into a ciphertext (the switch's return
+    /// leg, [`pack_shares_to_fhe`]).
+    pub reencrypt_ms: f64,
+    /// How many `encrypt_poly` calls the whole inference made, by purpose.
+    pub n_weight_enc: usize,
+    pub n_mask_enc: usize,
+    pub n_reencrypt: usize,
+}
+
+impl FhePhases {
+    fn add(&mut self, o: &FhePhases) {
+        self.keygen_ms += o.keygen_ms;
+        self.input_ms += o.input_ms;
+        self.weights_ms += o.weights_ms;
+        self.mul_ms += o.mul_ms;
+        self.mask_ms += o.mask_ms;
+        self.decrypt_ms += o.decrypt_ms;
+        self.reencrypt_ms += o.reencrypt_ms;
+        self.n_weight_enc += o.n_weight_enc;
+        self.n_mask_enc += o.n_mask_enc;
+        self.n_reencrypt += o.n_reencrypt;
+    }
 }
 
 /// Where the MPC segment's time actually goes. The segment is the pipeline's
@@ -710,6 +947,11 @@ pub struct CnnRun {
     pub mpc_ms: f64,
     /// Breakdown of `mpc_ms` — see [`MpcPhases`].
     pub phases: MpcPhases,
+    /// Breakdown of `fhe_ms` — see [`FhePhases`].
+    pub fhe_phases: FhePhases,
+    /// Query-independent work done before the clock started (keygen, and the
+    /// mask pool when precomputing). Not part of `total_ms`.
+    pub offline_ms: f64,
     pub comm: CommStats,
     pub bootstraps: u64,
     /// ct×ct multiplications the packed convolution actually performed.
@@ -764,6 +1006,20 @@ pub fn run_cnn_hybrid_with(
     profile: NetworkProfile,
     nonlin: Nonlin,
 ) -> CnnRun {
+    run_cnn_hybrid_full(model, input, profile, nonlin, false)
+}
+
+/// [`run_cnn_hybrid`] with both knobs: the nonlinearity protocol, and whether
+/// the scheme-switch masks are precomputed in an offline phase
+/// ([`MaskPool`]). With `precompute`, `total_ms`/`fhe_ms` are the **online**
+/// latency and `offline_ms` reports what was moved off the critical path.
+pub fn run_cnn_hybrid_full(
+    model: &CnnModel,
+    input: &[i64],
+    profile: NetworkProfile,
+    nonlin: Nonlin,
+    precompute: bool,
+) -> CnnRun {
     let (expected, max_abs) = model.forward(input);
     assert!(
         (max_abs as i128) < (1i128 << (model.nbits - 1)),
@@ -780,13 +1036,31 @@ pub fn run_cnn_hybrid_with(
     assert!((n_in + 1) <= s.params.n, "input too large for coefficient packing");
     let t_mask = s.params.t() - 1;
 
-    let start = Instant::now();
     let (mut fhe_ms, mut mpc_ms) = (0.0, 0.0);
     let mut comm = CommStats::default();
     let mut rng = rand::thread_rng();
+    let mut fhe_ph = FhePhases::default();
 
+    // ── Offline, before the clock starts ──
+    // Keys are per-session, not per-image, and the scheme-switch masks depend
+    // only on the network's *shape* — neither is a function of the patient's
+    // image, so a deployment produces both while waiting for work. `total_ms`
+    // is therefore the latency of a query against a warm server, which is the
+    // quantity a deployment is judged on. Both are reported separately so the
+    // amortization is visible rather than hidden.
+    let tk = Instant::now();
     let (ck, _sk) = s.keygen();
+    fhe_ph.keygen_ms = ms(tk);
+    // The pool must be encrypted under the *same* key the products are, or the
+    // masked ciphertext will not decrypt.
+    let mut pool =
+        precompute.then(|| MaskPool::for_model(&s, &ck, model, &mut rand::thread_rng()));
+    let offline_ms = fhe_ph.keygen_ms + pool.as_ref().map_or(0.0, |p| p.offline_ms);
+
+    let start = Instant::now();
+    let ti = Instant::now();
     let c_input = s.encrypt_poly(&ck, &s.pack_input(input));
+    fhe_ph.input_ms = ms(ti);
 
     let shift = model.shift;
 
@@ -797,8 +1071,9 @@ pub fn run_cnn_hybrid_with(
     // channel appears at once. See `fhe::conv_pack`.
     let t0 = Instant::now();
     let conv1_shape = ConvShape { in_c: 1, h: model.d, w: model.d, kh: K, kw: K };
-    let (conv_open, conv_masks) =
-        hybrid_conv_open(&s, &ck, &c_input, conv1_shape, &model.kernels, profile, &mut rng);
+    let (conv_open, conv_masks, ph) =
+        hybrid_conv_open(&s, &ck, &c_input, conv1_shape, &model.kernels, profile, &mut rng, &mut masks_src(&mut pool));
+    fhe_ph.add(&ph);
     fhe_ms += t0.elapsed().as_secs_f64() * 1000.0;
 
     // ── MPC: +cbias≪s, fused ReLU∘rescale, max-pool → pooled feature shares ──
@@ -818,10 +1093,12 @@ pub fn run_cnn_hybrid_with(
     //    conv is just the same three steps composed again — no bootstrap. ──
     for cl in &model.extra_conv {
         let tc = Instant::now();
-        let (c_conv_in, _) = pack_shares_to_fhe(&s, &ck, &per_party_feat, t_mask, profile);
+        let (c_conv_in, _, ph) = pack_shares_to_fhe(&s, &ck, &per_party_feat, t_mask, profile);
+        fhe_ph.add(&ph);
         let shape = ConvShape { in_c: cl.in_c, h: cl.in_h, w: cl.in_w, kh: K, kw: K };
-        let (co, cm) =
-            hybrid_conv_open(&s, &ck, &c_conv_in, shape, &cl.kernels, profile, &mut rng);
+        let (co, cm, ph) =
+            hybrid_conv_open(&s, &ck, &c_conv_in, shape, &cl.kernels, profile, &mut rng, &mut masks_src(&mut pool));
+        fhe_ph.add(&ph);
         fhe_ms += tc.elapsed().as_secs_f64() * 1000.0;
 
         let tm = Instant::now();
@@ -841,7 +1118,8 @@ pub fn run_cnn_hybrid_with(
     // ── Switch pooled features → packed FHE dense input ──
     let t0 = Instant::now();
     let flat = feat_shape.c * feat_shape.h * feat_shape.w;
-    let (mut c_dense_in, _) = pack_shares_to_fhe(&s, &ck, &per_party_feat, t_mask, profile);
+    let (mut c_dense_in, _, ph) = pack_shares_to_fhe(&s, &ck, &per_party_feat, t_mask, profile);
+    fhe_ph.add(&ph);
     let mut dense_in_dim = flat;
     fhe_ms += t0.elapsed().as_secs_f64() * 1000.0;
 
@@ -851,8 +1129,9 @@ pub fn run_cnn_hybrid_with(
     //    switch again" invariant made concrete for arbitrary depth. ──
     for (hidden_w, hidden_b) in model.hidden.clone() {
         let th = Instant::now();
-        let (hidden_open, hidden_masks) =
-            hybrid_matvec_open(&s, &ck, &c_dense_in, &hidden_w, dense_in_dim, profile, &mut rng);
+        let (hidden_open, hidden_masks, ph) =
+            hybrid_matvec_open(&s, &ck, &c_dense_in, &hidden_w, dense_in_dim, profile, &mut rng, &mut masks_src(&mut pool));
+        fhe_ph.add(&ph);
         fhe_ms += th.elapsed().as_secs_f64() * 1000.0;
 
         let t1 = Instant::now();
@@ -892,7 +1171,8 @@ pub fn run_cnn_hybrid_with(
         mpc_ms += t1.elapsed().as_secs_f64() * 1000.0;
 
         let t2 = Instant::now();
-        let (c_hidden, _) = pack_shares_to_fhe(&s, &ck, &per_party_hidden, t_mask, profile);
+        let (c_hidden, _, ph) = pack_shares_to_fhe(&s, &ck, &per_party_hidden, t_mask, profile);
+        fhe_ph.add(&ph);
         c_dense_in = c_hidden;
         dense_in_dim = h;
         fhe_ms += t2.elapsed().as_secs_f64() * 1000.0;
@@ -900,7 +1180,7 @@ pub fn run_cnn_hybrid_with(
 
     // ── Output dense (FHE ct×ct matvec) → open ──
     let t3 = Instant::now();
-    let (dense_open, dense_masks) = hybrid_matvec_open(
+    let (dense_open, dense_masks, ph) = hybrid_matvec_open(
         &s,
         &ck,
         &c_dense_in,
@@ -908,7 +1188,9 @@ pub fn run_cnn_hybrid_with(
         dense_in_dim,
         profile,
         &mut rng,
+        &mut masks_src(&mut pool),
     );
+    fhe_ph.add(&ph);
     fhe_ms += t3.elapsed().as_secs_f64() * 1000.0;
 
     // ── MPC: +dense bias, argmax → reveal class only ──
@@ -947,6 +1229,10 @@ pub fn run_cnn_hybrid_with(
     mpc_ms += t0.elapsed().as_secs_f64() * 1000.0;
     let class = classes[0].0;
 
+    if let Some(p) = &pool {
+        p.assert_fully_consumed();
+    }
+
     CnnRun {
         correct: class == expected,
         class,
@@ -955,6 +1241,8 @@ pub fn run_cnn_hybrid_with(
         fhe_ms,
         mpc_ms,
         phases,
+        fhe_phases: fhe_ph,
+        offline_ms,
         comm,
         bootstraps: 0,
         ring_n: s.params.n,
@@ -1034,6 +1322,9 @@ options:
                        circuits (constant-round) instead of the default
                        batched bit decomposition; same function, bit-exact
   --both               run both nonlinearity protocols and report the speedup
+  --precompute         generate the scheme-switch masks in an offline phase
+                       (they are query-independent), so the reported time is
+                       online latency; offline cost is reported separately
   --json               emit JSON
 ";
 
@@ -1045,6 +1336,7 @@ pub fn run_cli(args: &[String]) -> Result<(), String> {
     let mut json = false;
     let mut nonlin = Nonlin::A2b;
     let mut both = false;
+    let mut precompute = false;
 
     let mut i = 0;
     while i < args.len() {
@@ -1056,6 +1348,7 @@ pub fn run_cli(args: &[String]) -> Result<(), String> {
             "--json" => json = true,
             "--gc" => nonlin = Nonlin::Gc,
             "--both" => both = true,
+            "--precompute" => precompute = true,
             "--img" => {
                 i += 1;
                 d = args.get(i).ok_or("--img needs a value")?.parse().map_err(|_| "bad img".to_string())?;
@@ -1088,8 +1381,8 @@ pub fn run_cli(args: &[String]) -> Result<(), String> {
         // Same model, same input, same transport — the only difference is
         // which protocol evaluates the nonlinearities, so the ratio is
         // attributable to that and nothing else.
-        let a = run_cnn_hybrid_with(&model, &input, profile, Nonlin::A2b);
-        let g = run_cnn_hybrid_with(&model, &input, profile, Nonlin::Gc);
+        let a = run_cnn_hybrid_full(&model, &input, profile, Nonlin::A2b, precompute);
+        let g = run_cnn_hybrid_full(&model, &input, profile, Nonlin::Gc, precompute);
         if json {
             let pts: Vec<CnnPoint> = [(Nonlin::A2b, &a), (Nonlin::Gc, &g)]
                 .iter()
@@ -1137,7 +1430,7 @@ pub fn run_cli(args: &[String]) -> Result<(), String> {
         return Ok(());
     }
 
-    let r = run_cnn_hybrid_with(&model, &input, profile, nonlin);
+    let r = run_cnn_hybrid_full(&model, &input, profile, nonlin, precompute);
 
     if json {
         let p = cnn_point(d, nonlin, &r);
@@ -1169,6 +1462,25 @@ pub fn run_cli(args: &[String]) -> Result<(), String> {
     );
     println!("  nonlinearity    : {}", nonlin.label());
     println!("  time            : total {:.0}ms  (fhe {:.0}ms, mpc {:.0}ms)", r.total_ms, r.fhe_ms, r.mpc_ms);
+    println!(
+        "  offline         : {:.0}ms  (query-independent: keygen{}; NOT in total)",
+        r.offline_ms,
+        if precompute { " + mask pool" } else { "" }
+    );
+    println!(
+        "  fhe breakdown   : keygen {:.0}ms, input {:.0}ms, weights {:.0}ms ({}x), \
+         mul {:.0}ms, mask {:.0}ms ({}x), decrypt {:.0}ms, re-encrypt {:.0}ms ({}x)",
+        r.fhe_phases.keygen_ms,
+        r.fhe_phases.input_ms,
+        r.fhe_phases.weights_ms,
+        r.fhe_phases.n_weight_enc,
+        r.fhe_phases.mul_ms,
+        r.fhe_phases.mask_ms,
+        r.fhe_phases.n_mask_enc,
+        r.fhe_phases.decrypt_ms,
+        r.fhe_phases.reencrypt_ms,
+        r.fhe_phases.n_reencrypt
+    );
     println!(
         "  mpc breakdown   : import {:.0}ms, relu {:.0}ms, pool {:.0}ms, argmax {:.0}ms",
         r.phases.import_ms, r.phases.relu_ms, r.phases.pool_ms, r.phases.argmax_ms
@@ -1248,6 +1560,33 @@ mod tests {
         }
     }
 
+    /// Precomputing the scheme-switch masks must not change the result — it
+    /// is the *same* masks, generated earlier. Checked on both nonlinearity
+    /// routes and on a two-conv model, because [`MaskPool::for_model`]
+    /// predicts the pool size from the model's shape and the multi-layer
+    /// chunking is where that prediction can go wrong. (An under-count panics
+    /// at draw time and an over-count at the end of the run, so this test also
+    /// exercises those assertions.)
+    #[test]
+    #[ignore] // n=4096 secure ring — slow in debug, fast in release
+    fn precomputed_masks_change_nothing_but_the_timing() {
+        for (d, seed) in [(8usize, 1u64), (10, 5)] {
+            let (model, input) = CnnModel::random(d, seed);
+            for nonlin in [Nonlin::A2b, Nonlin::Gc] {
+                let on = run_cnn_hybrid_full(&model, &input, NetworkProfile::INSTANT, nonlin, false);
+                let pre = run_cnn_hybrid_full(&model, &input, NetworkProfile::INSTANT, nonlin, true);
+                assert!(on.correct && pre.correct, "d={d} seed={seed}: must match plaintext");
+                assert_eq!(pre.class, on.class, "d={d} seed={seed}: precompute changed the class");
+                assert_eq!(pre.fhe_phases.n_mask_enc, 0, "online path still encrypted masks");
+                assert!(pre.offline_ms > 0.0, "offline work must be reported, not hidden");
+            }
+        }
+        // The two-conv model exercises the multi-layer pool-size prediction.
+        let (model, input, _) = two_conv_model();
+        let pre = run_cnn_hybrid_full(&model, &input, NetworkProfile::INSTANT, Nonlin::Gc, true);
+        assert!(pre.correct, "two-conv: precomputed masks must still be exact");
+    }
+
     /// The scheme-switch import must cost a *constant* number of rounds, not
     /// one per activation.
     ///
@@ -1281,10 +1620,10 @@ mod tests {
     /// the encrypted pipeline — the extra conv is just another
     /// FHE-conv + MPC-nonlinearity + scheme-switch, still zero bootstraps.
     /// Small controlled weights so `forward` is deterministic and in budget.
-    #[test]
-    #[ignore] // real BFV × ABY3 hybrid, two conv layers
-    fn two_conv_hybrid_matches_plaintext() {
-        // d=16: conv1(OC) 14×14 → pool 7×7 → conv2(C2) 5×5 → pool 2×2.
+    /// d=16: conv1(OC) 14×14 → pool 7×7 → conv2(C2) 5×5 → pool 2×2. Small
+    /// controlled weights so `forward` is deterministic and in budget.
+    /// Shared by every test that needs more than one scheme switch.
+    fn two_conv_model() -> (CnnModel, Vec<i64>, usize) {
         let d = 16;
         let (mut model, input) = CnnModel::random(d, 3);
         let c2 = 4usize;
@@ -1304,7 +1643,13 @@ mod tests {
         let (_, max_abs) = model.forward(&input);
         model.nbits = ((64 - (max_abs.max(1) as u64).leading_zeros() as usize) + 2).max(20);
         assert!(model.nbits <= 30);
+        (model, input, c2)
+    }
 
+    #[test]
+    #[ignore] // real BFV × ABY3 hybrid, two conv layers
+    fn two_conv_hybrid_matches_plaintext() {
+        let (model, input, c2) = two_conv_model();
         let r = run_cnn_hybrid(&model, &input, NetworkProfile::INSTANT);
         assert!(r.correct, "two-conv: encrypted class {} != plaintext {}", r.class, r.expected);
         assert_eq!(r.bootstraps, 0);
