@@ -908,6 +908,7 @@ pub mod deep_nn;
 pub mod medmnist;
 pub mod ot;
 pub mod pir;
+pub mod psi;
 pub mod mnist;
 pub mod fhe_innerprod;
 pub mod comm;

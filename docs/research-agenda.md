@@ -47,7 +47,7 @@ Two hospitals and a model owner; nobody trusts the others with raw data.
 |---|---|---|---|---|
 | 1 | *"How many patients aged 40–60 with HbA1c > 7?"* | cohort selection over records at rest | BaruDB (DET + ORE) | ✅ measured — `baru bench-cohort` |
 | 2 | *Fetch record `r` for review* | the **access pattern** leaks who is interesting | **PIR** | ⚠️ built + measured (`baru bench-pir`), and it **loses to downloading the database** — §3a |
-| 3 | *Which patients appear at both hospitals?* | linkage without disclosure | **PSI** (from OT) | 🔨 OT done + measured (`baru bench-ot`, §3b); PSI still to build |
+| 3 | *Which patients appear at both hospitals?* | linkage without disclosure | **PSI** (DH today, OT next) | ✅ measured — `baru bench-psi`; OT also done (§3b) |
 | 4 | *Classify this scan* | image + model both private | MPC / FHE / hybrid | ✅ measured on real biomedical images — `baru bench-medmnist` (§3) |
 | 5 | *Train on the union of both cohorts* | cross-institution learning | MPC (Shamir / SPDZ2k) | partial (`bench/train`) |
 | 6 | *Iterate over a private index during training* | data-dependent addressing | **ORAM** | 🔨 |
@@ -263,10 +263,39 @@ it as an upper bound on the OT side (vector OLE and batched sacrifice both beat
 naive Gilboa), and note that the CPU half of LowGear's trade is still missing, so
 its total is still flattering.
 
-**PSI is still to build**, and the interesting question there is which
-construction — a DH-based PSI needs no OT at all and is the practical baseline at
-moderate set sizes, so the cost model should be asked which wins before assuming
-the OT-based one does.
+### PSI: built the baseline, then asked the cost model which construction to keep
+
+This document wrote stage 3 as "PSI (**from OT**)". That was an assumption, and
+the thesis of this whole repo is that the cost model decides. So `src/psi/`
+implements the construction that needs *no* OT — DH-PSI over Ristretto255,
+semi-honest, one-sided — and `baru bench-psi` prices the OT route from the
+measured OT cost above rather than from intuition.
+
+| | hides non-shared items? | bytes/item | µs/item |
+|---|---|---|---|
+| naive hash exchange | **no** | 32 | **0.43** |
+| DH-PSI (measured) | yes | 96 | 165 |
+| OT-based (projected) | yes | ~58 | ~1 |
+
+DH-PSI is flat in both, as it must be: three flights of compressed points and two
+scalar multiplications per item. The insecure baseline is **~380× faster**, which
+is worth stating because it explains why hash-exchange keeps getting shipped —
+and what the 380× buys is an offline dictionary attack that recovers the sender's
+*entire set*, not just the overlap. Patient identifiers are exactly the
+low-entropy inputs that attack needs.
+
+**The assumption was right, and now for a stated reason.** An OT-based PSI should
+win on bytes by only ~1.7×, but on *time* by two orders of magnitude, because
+DH-PSI's cost is two scalar multiplications per item and no engineering removes
+them. The deciding axis is **compute, not bandwidth** — which is not what the
+"from OT" shorthand suggested, and is the kind of thing worth knowing before
+building the harder protocol.
+
+Two honest qualifications. The ~58 B/item is a *projection* (measured per-OT cost
+× a literature 448-bit OPRF code width), not a measured PSI, so it belongs in a
+"what to build next" argument and not a results table. And DH-PSI stays the right
+choice for small sets, where 165 µs × n is irrelevant and a construction needing
+no OT infrastructure is worth more than a constant factor.
 
 ---
 
@@ -397,12 +426,13 @@ Ordered by value per unit of work, with the dependency structure respected.
    `src/fhe/bfv.rs`) — and the estimate for *that* is not a few hundred lines.
    Worth doing only if stage 2 stays in the story; the cost model now says the
    dull answer wins today.
-6. **OT + PSI** (stage 3). **OT done 2026-07-28** (§3b) — base + IKNP, measured,
-   semi-honest. Remaining: (a) feed the measured OT cost into the Semi2k/MASCOT
-   offline parameters, which is the "pays twice" payoff and roadmap P1; (b) PSI,
-   deciding by cost model rather than by assumption whether the OT-based
-   construction or a DH-based one wins at the set sizes this workflow has;
-   (c) KOS-style consistency checks if malicious security is wanted.
+6. ~~**OT + PSI** (stage 3)~~ — **done 2026-07-28** (§3b): base OT + IKNP
+   measured, their cost wired into the Semi2k/SPDZ2k/MASCOT offline parameters,
+   and DH-PSI built and measured with the OT route priced against it. Remaining
+   and now well-specified: a KKRT-style OT-based PSI (the projection says ~100×
+   on time, and it is the compute axis that decides), and KOS-style consistency
+   checks if malicious security is wanted. Both are optional — stage 3 is served
+   today.
 7. **ORAM** (stage 6). Path ORAM over the storage layer. Largest of these; do it
    last, and only if stage 6 is still in the story by then.
 8. **Circuit-optimization skill** (§5).

@@ -45,3 +45,6 @@ pub mod pir;
 
 /// Oblivious transfer — base OT and IKNP extension.
 pub mod ot;
+
+/// Private set intersection.
+pub mod psi;
