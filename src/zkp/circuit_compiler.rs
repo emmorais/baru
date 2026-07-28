@@ -117,6 +117,67 @@ impl FlatOp {
         }
     }
 
+    /// Rewrite **every** wire this op mentions — destination included —
+    /// through `f`.
+    ///
+    /// [`rename`] deliberately leaves the destination alone, because it exists
+    /// to substitute *operands* in place. Instantiating a template needs the
+    /// opposite: a fresh copy of a subgraph with all of its wires renamed.
+    pub fn remap(&self, f: &dyn Fn(&str) -> String) -> FlatOp {
+        let w = |s: &Wire| f(s);
+        match self {
+            FlatOp::Const { dst, value } => FlatOp::Const { dst: w(dst), value: *value },
+            FlatOp::ConstF { dst, value } => FlatOp::ConstF { dst: w(dst), value: *value },
+            FlatOp::IAdd32 { dst, lhs, rhs } => {
+                FlatOp::IAdd32 { dst: w(dst), lhs: w(lhs), rhs: w(rhs) }
+            }
+            FlatOp::ISub32 { dst, lhs, rhs } => {
+                FlatOp::ISub32 { dst: w(dst), lhs: w(lhs), rhs: w(rhs) }
+            }
+            FlatOp::IMul { dst, lhs, rhs } => {
+                FlatOp::IMul { dst: w(dst), lhs: w(lhs), rhs: w(rhs) }
+            }
+            FlatOp::ICmpEq { dst, lhs, rhs } => {
+                FlatOp::ICmpEq { dst: w(dst), lhs: w(lhs), rhs: w(rhs) }
+            }
+            FlatOp::ICmpUlt { dst, lhs, rhs } => {
+                FlatOp::ICmpUlt { dst: w(dst), lhs: w(lhs), rhs: w(rhs) }
+            }
+            FlatOp::ICmpSlt { dst, lhs, rhs } => {
+                FlatOp::ICmpSlt { dst: w(dst), lhs: w(lhs), rhs: w(rhs) }
+            }
+            FlatOp::BAnd { dst, lhs, rhs } => {
+                FlatOp::BAnd { dst: w(dst), lhs: w(lhs), rhs: w(rhs) }
+            }
+            FlatOp::BOr { dst, lhs, rhs } => {
+                FlatOp::BOr { dst: w(dst), lhs: w(lhs), rhs: w(rhs) }
+            }
+            FlatOp::BXor { dst, lhs, rhs } => {
+                FlatOp::BXor { dst: w(dst), lhs: w(lhs), rhs: w(rhs) }
+            }
+            FlatOp::BNot { dst, src } => FlatOp::BNot { dst: w(dst), src: w(src) },
+            FlatOp::Shl { dst, src, amount } => {
+                FlatOp::Shl { dst: w(dst), src: w(src), amount: *amount }
+            }
+            FlatOp::Shr { dst, src, amount } => {
+                FlatOp::Shr { dst: w(dst), src: w(src), amount: *amount }
+            }
+            FlatOp::Mux { dst, cond, t_val, e_val } => FlatOp::Mux {
+                dst: w(dst),
+                cond: w(cond),
+                t_val: w(t_val),
+                e_val: w(e_val),
+            },
+            FlatOp::PopCount { dst, src } => FlatOp::PopCount { dst: w(dst), src: w(src) },
+            FlatOp::IDiv { dst_q, dst_r, lhs, rhs } => FlatOp::IDiv {
+                dst_q: w(dst_q),
+                dst_r: w(dst_r),
+                lhs: w(lhs),
+                rhs: w(rhs),
+            },
+        }
+    }
+
     /// All wires this op reads (inputs).
     pub fn inputs(&self) -> Vec<&str> {
         match self {

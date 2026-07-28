@@ -8,6 +8,10 @@ A Lisp-like language interpreter with built-in **three-party secure computation*
 > [`docs/private-inference-performance.md`](docs/private-inference-performance.md)
 > — current measured state, the method that produced it, the prioritized next
 > steps, and the traps. It is written to be read cold.
+>
+> **Working on the circuit-optimization paper?** See
+> [`docs/paper-circuit-optimization.md`](docs/paper-circuit-optimization.md) —
+> what the evidence supports, the three gaps, and the phased plan.
 
 ---
 
@@ -1559,12 +1563,25 @@ route needs explicit `lt_batch`/`mul_batch` for, and what the gadget library
 had to be patched three times to get right — so **on this axis the compiler is
 already ahead of hand-writing.**
 
-**Dependent reductions are the remaining gap.** A fold is a chain, and ASAP is
-optimal for a fixed lowering but cannot reassociate: a max-fold is `O(n)`
-rounds where the hand-written tournament is `O(log n)`. `Rule::Reassociate`
-only rebalances chains of a *single* associative primitive, and a max-fold's
-operator is a compound subgraph, so it never fires. Recognising associative
-reductions by subgraph shape is the designed next compiler pass.
+**Dependent reductions needed a rewrite, and now have one.** A fold is a
+chain, and ASAP is optimal for a fixed lowering but cannot reassociate.
+`Rule::ReassociateReduction` recognises an associative reduction whose
+operator is a repeated *subgraph shape* — a maximum is `acc + (x>acc)·(x−acc)`,
+four instructions, which `Rule::Reassociate` cannot see — and rebalances the
+chain into a tournament, `2n−1` rounds → `2⌈log₂ n⌉+1`:
+
+| max-fold | as written | rebalanced |
+|---|---|---|
+| n=4 | 7 rounds | 5 |
+| n=8 | 15 | **7** |
+| n=10 | 19 | **9** |
+
+End to end under Shamir: **65 → 29 rounds (2.21×)**, instruction count
+unchanged, differentially verified. This is the transformation `gadgets::argmax`
+and `max_reduce` needed *by hand*; the compiler now derives it for any
+associative operator — and refuses it for non-associative ones, since a
+subtraction fold is left alone. Associativity is tested by evaluation, not
+assumed, because the optimizer accepts rewrites on cost rather than semantics.
 
 **CSE was missing from the compile path entirely, and now isn't.** `mpcc::opt`
 had a `Cse` rule reachable only from `baru mpcc optimize`; `compile_fhe` ran
@@ -1581,6 +1598,40 @@ obvious way repeats its accumulator subtree per step and flattens
 MNIST scores bit-identical, all 18 FHE differential tests pass (real TFHE and
 SEAL CKKS included). At TFHE's ~0.2–0.5 s/gate, those 601 gates are minutes
 per run.
+
+### A whole network: hand-written vs compiled (`baru bench-compiled-nn`)
+
+The question the circuit-optimization paper is actually about. Same network —
+`x(n) → dense(h) → ReLU → dense(c) → max`, **secret weights** — evaluated two
+ways over the *same* 3-party transport, both checked bit-exact against a
+plaintext integer reference:
+
+- `gadget` — Rust calling `gadgets::{dense, relu, max_reduce}` (the batched
+  expert baseline)
+- `compiled` — the same network as a **Baru expression**, through
+  `CircuitCompiler` → `FlatOp` → `mpcc::exec`, a level-batched executor
+
+The source says nothing about batching — it is scalar arithmetic, a mux-style
+ReLU and a left-fold `max`. n=32, h=16, c=8, RTT 20 ms:
+
+| route | ops | interactive calls | messages | wall-clock |
+|---|---|---|---|---|
+| `gadget` (expert) | — | 39 | 95 | 677 ms |
+| `compiled` | 1317 | 27 | 87 | 1272 ms |
+| `compiled+reassoc` | 1317 | **15** | **47** | 663 ms |
+
+**0.38× the interactive calls and 0.49× the messages of expert hand-written
+code**, at parity on wall-clock. The advantage *grows with width*: the
+compiled route stays at 15 interactive calls while the expert route goes
+31 → 39, because ASAP scheduling batches every independent operation however
+many there are.
+
+Two honest notes. **Without `ReassociateReduction` the compiled route loses**
+(1.88× wall-clock) — the expert's `max_reduce` is a hand-written tournament,
+and that ablation is what shows which compiler pass buys what. And **the
+wall-clock is parity, not a win**: both routes perform the same number of
+comparison layers, which dominate latency; the compiler's gain is in
+multiplies and sharing.
 
 ### Composable gadget library: arbitrary private CNNs, secure by construction (`src/gadgets/`)
 

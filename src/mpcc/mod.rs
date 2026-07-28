@@ -34,6 +34,7 @@
 //! baru mpcc optimize  --case dot4-builtin        # backend-aware rewriting
 //! ```
 
+pub mod exec;
 pub mod assign;
 pub mod cost;
 pub mod fhe_cost;

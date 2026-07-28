@@ -38,6 +38,14 @@ pub struct TransportBackend<T: Transport> {
     /// setting: it changes which protocol runs, hence the id-allocation
     /// sequence the parties execute in lockstep.
     gc_nonlin: bool,
+    /// Batched interactive protocol invocations — every point at which this
+    /// party stopped computing and talked to its peers.
+    ///
+    /// Exactly comparable between any two routes that share a backend, which
+    /// is what makes "hand-written versus compiled" a fair question: both go
+    /// through the same primitives, so this counts *how often each route had
+    /// to synchronise*, independently of how it was written.
+    interactive_calls: std::sync::atomic::AtomicUsize,
 }
 
 impl<T: Transport> TransportBackend<T> {
@@ -48,7 +56,18 @@ impl<T: Transport> TransportBackend<T> {
             shares: HashMap::new(),
             next_id: 1,
             gc_nonlin: false,
+            interactive_calls: std::sync::atomic::AtomicUsize::new(0),
         }
+    }
+
+    /// Batched interactive protocol invocations so far — see the field docs.
+    pub fn interactive_calls(&self) -> usize {
+        self.interactive_calls.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn note_interactive(&self) {
+        self.interactive_calls
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Enable/disable the garbled-circuit route for batched comparisons — see
@@ -129,6 +148,7 @@ impl<T: Transport> TransportBackend<T> {
         if values.is_empty() {
             return Vec::new();
         }
+        self.note_interactive();
         let base = self.alloc_block(values.len() as u64);
         let shares = crate::crypto::aby3_protocol::share_input_batch(
             values,
@@ -195,6 +215,7 @@ impl<T: Transport> TransportBackend<T> {
 
 impl<T: Transport + 'static> Backend for TransportBackend<T> {
     fn share_secret(&mut self, value: Fr, nbits: usize, owner: usize) -> ShareRef {
+        self.note_interactive();
         let id = self.alloc_id();
         let ps =
             crate::crypto::aby3_protocol::share_input(value, id, owner, self.me, &self.mailbox);
@@ -218,6 +239,7 @@ impl<T: Transport + 'static> Backend for TransportBackend<T> {
     }
 
     fn mul(&mut self, a: &ShareRef, b: &ShareRef) -> ShareRef {
+        self.note_interactive();
         let id = self.alloc_id();
         let pa = self.get_cloned(a);
         let pb = self.get_cloned(b);
@@ -229,6 +251,7 @@ impl<T: Transport + 'static> Backend for TransportBackend<T> {
     /// batch (`aby3_protocol::mul_batch_party`), instead of one round per
     /// pair via the trait's default loop-over-`mul` implementation.
     fn mul_batch(&mut self, pairs: &[(ShareRef, ShareRef)]) -> Vec<ShareRef> {
+        self.note_interactive();
         if pairs.is_empty() {
             return Vec::new();
         }
@@ -318,6 +341,7 @@ impl<T: Transport + 'static> Backend for TransportBackend<T> {
     }
 
     fn lt(&mut self, a: &ShareRef, b: &ShareRef) -> ShareRef {
+        self.note_interactive();
         // lt(a,b) = MSB of (a - b) under two's-complement
         let nbits = a.nbits.max(b.nbits);
         let diff = self.sub(a, b);
@@ -326,6 +350,7 @@ impl<T: Transport + 'static> Backend for TransportBackend<T> {
     }
 
     fn lt_batch(&mut self, pairs: &[(ShareRef, ShareRef)]) -> Vec<ShareRef> {
+        self.note_interactive();
         if pairs.is_empty() {
             return Vec::new();
         }
@@ -358,11 +383,13 @@ impl<T: Transport + 'static> Backend for TransportBackend<T> {
     }
 
     fn reveal(&mut self, a: &ShareRef, reveal_to: Option<usize>) -> Fr {
+        self.note_interactive();
         let ps = self.get_cloned(a);
         crate::crypto::aby3_protocol::reveal(&ps, a.id, reveal_to, self.me, &self.mailbox)
     }
 
     fn a2b(&mut self, a: &ShareRef, nbits: usize) -> Vec<ShareRef> {
+        self.note_interactive();
         let pa = self.get_cloned(a);
         // Reserve a block: the bit decomposition runs ~9 batched
         // multiplication rounds internally, each consuming two ids.
@@ -385,6 +412,7 @@ impl<T: Transport + 'static> Backend for TransportBackend<T> {
     }
 
     fn a2b_batch(&mut self, values: &[ShareRef], nbits: usize) -> Vec<Vec<ShareRef>> {
+        self.note_interactive();
         if values.is_empty() {
             return Vec::new();
         }
@@ -415,6 +443,7 @@ impl<T: Transport + 'static> Backend for TransportBackend<T> {
     }
 
     fn b2a(&mut self, bits: &[ShareRef]) -> ShareRef {
+        self.note_interactive();
         // b2a: sum_i bit_i * 2^i  (local, no communication needed)
         let id = self.alloc_id();
         let zero = crate::crypto::aby3_protocol::share_public(0, self.me);

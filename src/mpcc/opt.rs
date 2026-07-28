@@ -155,6 +155,9 @@ pub enum Rule {
     /// Re-parenthesise a chain of one associative operator into a balanced
     /// tree, trading dependence *depth* for nothing else.
     Reassociate,
+    /// The same, for a fold whose combining operator is a compound subgraph
+    /// (a maximum, a min, a saturating add) rather than a single instruction.
+    ReassociateReduction,
 }
 
 impl Rule {
@@ -164,6 +167,7 @@ impl Rule {
         Rule::FuseShifts,
         Rule::StrengthReduce,
         Rule::Reassociate,
+        Rule::ReassociateReduction,
     ];
 
     pub fn name(&self) -> &'static str {
@@ -173,6 +177,7 @@ impl Rule {
             Rule::FuseShifts => "fuse-shifts",
             Rule::StrengthReduce => "strength-reduce",
             Rule::Reassociate => "reassociate",
+            Rule::ReassociateReduction => "reassociate-reduction",
         }
     }
 
@@ -184,6 +189,7 @@ impl Rule {
             Rule::FuseShifts => fuse_shifts(flat, output_wire),
             Rule::StrengthReduce => strength_reduce(flat, only),
             Rule::Reassociate => reassociate(flat, output_wire, only),
+            Rule::ReassociateReduction => reassociate_reduction(flat, output_wire, only),
         }
     }
 
@@ -198,6 +204,7 @@ impl Rule {
         match self {
             Rule::StrengthReduce => Some(strength_reduce_sites(flat)),
             Rule::Reassociate => Some(reassociate_sites(flat, output_wire)),
+            Rule::ReassociateReduction => Some(reduction_sites(flat, output_wire)),
             Rule::Algebraic | Rule::Cse | Rule::FuseShifts => None,
         }
     }
@@ -696,6 +703,481 @@ fn reassociate(flat: &[FlatOp], output_wire: &str, only: Option<&str>) -> Vec<Fl
             continue; // folded into the rebuilt tree at its root
         }
         out.push(op.clone());
+    }
+    out
+}
+
+
+// ─── Reassociating a *compound* reduction ─────────────────────────────────────
+
+/// Largest number of `FlatOp`s a single reduction step may contain.
+const MAX_STEP_OPS: usize = 8;
+/// Below this many elements the depth win cannot pay for the search.
+const MIN_REDUCTION_LEAVES: usize = 4;
+/// Random triples used to test the step operator for associativity.
+const ASSOC_TRIALS: usize = 64;
+
+/// One peeled step of a fold: the ops between the accumulator wire and the
+/// step's result, plus the two wires that enter it.
+struct Step {
+    ops: Vec<usize>,
+    acc: String,
+    elem: String,
+    dst: String,
+}
+
+/// A textual tag identifying an op's *kind* (and any baked-in constant), used
+/// to decide whether two steps compute the same function.
+fn op_tag(op: &FlatOp) -> String {
+    match op {
+        FlatOp::Const { value, .. } => format!("const:{value}"),
+        FlatOp::ConstF { value, .. } => format!("constf:{value}"),
+        FlatOp::IAdd32 { .. } => "add".into(),
+        FlatOp::ISub32 { .. } => "sub".into(),
+        FlatOp::IMul { .. } => "mul".into(),
+        FlatOp::ICmpEq { .. } => "eq".into(),
+        FlatOp::ICmpUlt { .. } => "ult".into(),
+        FlatOp::ICmpSlt { .. } => "slt".into(),
+        FlatOp::BAnd { .. } => "and".into(),
+        FlatOp::BOr { .. } => "or".into(),
+        FlatOp::BXor { .. } => "xor".into(),
+        FlatOp::BNot { .. } => "not".into(),
+        FlatOp::Shl { amount, .. } => format!("shl:{amount}"),
+        FlatOp::Shr { amount, .. } => format!("shr:{amount}"),
+        FlatOp::Mux { .. } => "mux".into(),
+        FlatOp::PopCount { .. } => "popcount".into(),
+        FlatOp::IDiv { .. } => "div".into(),
+    }
+}
+
+/// Every step region rooted at `flat[root]`, one per candidate accumulator.
+///
+/// A region is the set of ops strictly between the accumulator wire and the
+/// root. It is only a step if every op inside is *private* to it (read exactly
+/// once, from inside) and exactly two wires enter it: the accumulator and the
+/// element. That second condition is what makes the region a pure binary
+/// function, which is the only thing a tournament can rebuild.
+fn steps_at(
+    flat: &[FlatOp],
+    root: usize,
+    counts: &HashMap<String, usize>,
+    producer: &HashMap<String, usize>,
+    output_wire: &str,
+) -> Vec<Step> {
+    // Candidate accumulators: any wire read inside the maximal private cone.
+    let mut cone: Vec<usize> = vec![root];
+    let mut seen: HashSet<usize> = HashSet::from([root]);
+    let mut cand: Vec<String> = Vec::new();
+    let mut k = 0;
+    while k < cone.len() && cone.len() <= MAX_STEP_OPS {
+        let op = &flat[cone[k]];
+        k += 1;
+        for w in op.inputs() {
+            cand.push(w.to_string());
+            if counts.get(w).copied().unwrap_or(0) != 1 || w == output_wire {
+                continue;
+            }
+            if let Some(&p) = producer.get(w) {
+                if seen.insert(p) {
+                    cone.push(p);
+                }
+            }
+        }
+    }
+    cand.sort();
+    cand.dedup();
+
+    let mut out = Vec::new();
+    for stop in cand {
+        let mut inside: Vec<usize> = vec![root];
+        let mut in_set: HashSet<usize> = HashSet::from([root]);
+        let mut i = 0;
+        let mut too_big = false;
+        while i < inside.len() {
+            let op = &flat[inside[i]];
+            i += 1;
+            for w in op.inputs() {
+                if w == stop || w == output_wire {
+                    continue;
+                }
+                if counts.get(w).copied().unwrap_or(0) != 1 {
+                    continue; // shared: a boundary, not ours to absorb
+                }
+                if let Some(&p) = producer.get(w) {
+                    if in_set.insert(p) {
+                        if inside.len() >= MAX_STEP_OPS {
+                            too_big = true;
+                            break;
+                        }
+                        inside.push(p);
+                    }
+                }
+            }
+            if too_big {
+                break;
+            }
+        }
+        if too_big {
+            continue;
+        }
+        let produced: HashSet<&str> = inside.iter().map(|&j| flat[j].dst()).collect();
+        let mut boundary: Vec<String> = Vec::new();
+        for &j in &inside {
+            for w in flat[j].inputs() {
+                if !produced.contains(w) {
+                    boundary.push(w.to_string());
+                }
+            }
+        }
+        boundary.sort();
+        boundary.dedup();
+        if boundary.len() != 2 || !boundary.contains(&stop) {
+            continue;
+        }
+        let elem = boundary.into_iter().find(|b| *b != stop).expect("two boundaries");
+        inside.sort_unstable();
+        out.push(Step {
+            ops: inside,
+            acc: stop.clone(),
+            elem,
+            dst: flat[root].dst().to_string(),
+        });
+    }
+    out
+}
+
+/// Canonical form of a step: ops in topological order with the accumulator as
+/// `$a`, the element as `$b` and internal wires numbered by definition order.
+/// Two steps with equal keys compute the same binary function.
+fn step_template(flat: &[FlatOp], s: &Step) -> (String, Vec<FlatOp>) {
+    let mut map: HashMap<String, String> = HashMap::new();
+    map.insert(s.acc.clone(), "$a".into());
+    map.insert(s.elem.clone(), "$b".into());
+    let mut n = 0usize;
+    for &j in &s.ops {
+        let d = flat[j].dst().to_string();
+        let name = if d == s.dst { "$out".to_string() } else { let x = format!("$t{n}"); n += 1; x };
+        map.insert(d, name);
+    }
+    let tmpl: Vec<FlatOp> = s
+        .ops
+        .iter()
+        .map(|&j| flat[j].remap(&|w: &str| map.get(w).cloned().unwrap_or_else(|| w.to_string())))
+        .collect();
+    let key = tmpl
+        .iter()
+        .map(|o| format!("{}({})->{}", op_tag(o), o.inputs().join(","), o.dst()))
+        .collect::<Vec<_>>()
+        .join(";");
+    (key, tmpl)
+}
+
+/// Instantiate a step template as `out = f(acc, elem)`, minting fresh internal
+/// wires through `fresh`.
+fn instantiate(
+    tmpl: &[FlatOp],
+    acc: &str,
+    elem: &str,
+    out: &str,
+    fresh: &mut impl FnMut() -> String,
+) -> Vec<FlatOp> {
+    let mut map: HashMap<String, String> = HashMap::new();
+    map.insert("$a".into(), acc.to_string());
+    map.insert("$b".into(), elem.to_string());
+    map.insert("$out".into(), out.to_string());
+    for op in tmpl {
+        let d = op.dst().to_string();
+        map.entry(d).or_insert_with(&mut *fresh);
+    }
+    tmpl.iter()
+        .map(|o| o.remap(&|w: &str| map.get(w).cloned().unwrap_or_else(|| w.to_string())))
+        .collect()
+}
+
+/// Is the step operator associative? Tested, not proved.
+///
+/// The optimizer accepts candidates on **cost**, not on semantics, so a rule
+/// must be sound by construction — which for a compound operator means
+/// checking here rather than hoping the search notices. `f(f(a,b),c)` and
+/// `f(a,f(b,c))` are evaluated on edge values and random triples; disagreement
+/// anywhere rejects the rewrite. This is the same standard
+/// [`equivalent`] applies to a whole circuit, applied to one operator.
+fn step_is_associative(tmpl: &[FlatOp]) -> bool {
+    let mut counter = 0usize;
+    let mut fresh = || {
+        counter += 1;
+        format!("$z{counter}")
+    };
+    let mut left = instantiate(tmpl, "$p", "$q", "$m", &mut fresh);
+    left.extend(instantiate(tmpl, "$m", "$r", "$o", &mut fresh));
+    let mut right = instantiate(tmpl, "$q", "$r", "$m2", &mut fresh);
+    right.extend(instantiate(tmpl, "$p", "$m2", "$o", &mut fresh));
+
+    let edges: [i64; 6] = [0, 1, -1, 2, i32::MAX as i64, i32::MIN as i64];
+    let mut trials: Vec<[i64; 3]> = Vec::new();
+    for &a in &edges {
+        for &b in &edges {
+            for &c in &edges {
+                trials.push([a, b, c]);
+            }
+        }
+    }
+    let mut seed = 0x9E3779B97F4A7C15u64;
+    let mut next = || {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        (seed as i64) >> 32
+    };
+    for _ in 0..ASSOC_TRIALS {
+        trials.push([next(), next(), next()]);
+    }
+
+    for t in trials {
+        let inputs: HashMap<String, i64> = [("$p", t[0]), ("$q", t[1]), ("$r", t[2])]
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v))
+            .collect();
+        let l = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            eval_flat(&left, "$o", &inputs)
+        }));
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            eval_flat(&right, "$o", &inputs)
+        }));
+        match (l, r) {
+            (Ok(a), Ok(b)) if a == b => {}
+            _ => return false,
+        }
+    }
+    true
+}
+
+/// The maximal fold chain ending at `flat[root]`, if there is one.
+#[allow(clippy::type_complexity)]
+fn reduction_chain(
+    flat: &[FlatOp],
+    root: usize,
+    counts: &HashMap<String, usize>,
+    producer: &HashMap<String, usize>,
+    output_wire: &str,
+) -> Option<(Vec<FlatOp>, Vec<String>, Vec<usize>, String)> {
+    for s0 in steps_at(flat, root, counts, producer, output_wire) {
+        let (key, tmpl) = step_template(flat, &s0);
+        let root_dst = s0.dst.clone();
+        let mut consumed: Vec<usize> = s0.ops.clone();
+        let mut elems: Vec<String> = vec![s0.elem.clone()];
+        let mut cur = s0;
+
+        loop {
+            // The accumulator is read several times *within* its own step (a
+            // maximum reads it in the compare, the subtract and the add), so
+            // "used once" is the wrong test. What matters is that nothing
+            // *outside* the chain reads it — otherwise rebuilding the chain
+            // would change a value someone else depends on.
+            let inside: usize = cur
+                .ops
+                .iter()
+                .map(|&j| flat[j].inputs().iter().filter(|w| **w == cur.acc).count())
+                .sum();
+            if counts.get(cur.acc.as_str()).copied().unwrap_or(0) != inside
+                || cur.acc == output_wire
+            {
+                break;
+            }
+            let Some(&p) = producer.get(&cur.acc) else { break };
+            let Some(next) = steps_at(flat, p, counts, producer, output_wire)
+                .into_iter()
+                .find(|s| step_template(flat, s).0 == key)
+            else {
+                break;
+            };
+            consumed.extend(next.ops.iter().copied());
+            elems.push(next.elem.clone());
+            cur = next;
+        }
+        let acc = cur.acc.clone();
+
+        // Fold order: the innermost accumulator is the base, then elements
+        // from innermost step outwards. Preserving that order means the
+        // rewrite needs associativity only, never commutativity.
+        let mut leaves = vec![acc];
+        leaves.extend(elems.into_iter().rev());
+        if leaves.len() < MIN_REDUCTION_LEAVES {
+            continue;
+        }
+        if !step_is_associative(&tmpl) {
+            continue;
+        }
+        consumed.sort_unstable();
+        consumed.dedup();
+        return Some((tmpl, leaves, consumed, root_dst));
+    }
+    None
+}
+
+/// Sites, longest chain first.
+///
+/// Order matters here in a way it does not for the other per-site rules. The
+/// search accepts the first site that improves, and a fold's *inner* roots are
+/// also valid sites covering a prefix of the same chain — taking one of those
+/// first rebalances four leaves and leaves the rest a chain. Offering the
+/// outermost root first rebalances the whole reduction in one rewrite.
+/// Longest dependence path to `output_wire`, in instructions. Under ASAP
+/// scheduling this is what becomes the online round count.
+fn flat_depth_of(flat: &[FlatOp], output_wire: &str) -> usize {
+    let mut d: HashMap<&str, usize> = HashMap::new();
+    for op in flat {
+        let here = op
+            .inputs()
+            .iter()
+            .map(|w| d.get(*w).copied().unwrap_or(0))
+            .max()
+            .unwrap_or(0)
+            + 1;
+        for w in flat_dsts(op) {
+            d.insert(w, here);
+        }
+    }
+    d.get(output_wire).copied().unwrap_or(0)
+}
+
+/// Rebalance every compound reduction in `flat`, to a fixpoint.
+///
+/// The per-site search in [`optimize`] applies rewrites only when the cost
+/// model says they pay for the chosen protocol, which is the right behaviour
+/// for compilation. This applies the rule unconditionally, so a benchmark can
+/// report the depth win that is *available* independently of any backend.
+pub fn reassociate_reductions(flat: &[FlatOp], output_wire: &str) -> Vec<FlatOp> {
+    const PASSES: usize = 8;
+    let mut cur = flat.to_vec();
+    for _ in 0..PASSES {
+        let next = dead_code_eliminate(&reassociate_reduction(&cur, output_wire, None), output_wire);
+        if next == cur {
+            break;
+        }
+        cur = next;
+    }
+    cur
+}
+
+fn reduction_sites(flat: &[FlatOp], output_wire: &str) -> Vec<String> {
+    let counts = use_counts(flat, output_wire);
+    let producer = producer_map(flat);
+    let mut sites: Vec<(usize, String)> = Vec::new();
+    for root in 0..flat.len() {
+        if let Some((_, leaves, _, dst)) =
+            reduction_chain(flat, root, &counts, &producer, output_wire)
+        {
+            sites.push((leaves.len(), dst));
+        }
+    }
+    sites.sort_by(|a, b| b.0.cmp(&a.0));
+    sites.into_iter().map(|(_, d)| d).collect()
+}
+
+fn producer_map(flat: &[FlatOp]) -> HashMap<String, usize> {
+    let mut producer: HashMap<String, usize> = HashMap::new();
+    for (i, op) in flat.iter().enumerate() {
+        for d in flat_dsts(op) {
+            producer.insert(d.to_string(), i);
+        }
+    }
+    producer
+}
+
+/// Rebalance a fold whose combining operator is a **compound subgraph**, not a
+/// single instruction: `f(f(f(x0,x1),x2),x3)` → `f(f(x0,x1),f(x2,x3))`.
+///
+/// [`Rule::Reassociate`] handles chains of one associative *primitive*. The
+/// reductions an AI workload actually contains are not primitives: a maximum is
+/// `acc + (x>acc)·(x−acc)`, four instructions with two entry wires. Because the
+/// chain is data-dependent, ASAP scheduling cannot help — it is optimal for a
+/// *fixed* lowering, and this changes the lowering. Depth falls from `n−1`
+/// steps to `⌈log₂ n⌉`, and under a secret-sharing protocol depth *is* the
+/// round count.
+///
+/// The operator is checked for associativity by evaluation
+/// ([`step_is_associative`]) before the rewrite is offered, because the search
+/// accepts candidates on cost and would not catch an unsound one.
+///
+/// Instruction count is unchanged; only depth moves. Whether that is worth
+/// anything is the backend's business — a large WAN win under an interactive
+/// protocol, exactly nothing under a constant-round garbled circuit — and
+/// [`objective`] is what prices it.
+fn reassociate_reduction(flat: &[FlatOp], output_wire: &str, only: Option<&str>) -> Vec<FlatOp> {
+    let counts = use_counts(flat, output_wire);
+    let producer = producer_map(flat);
+
+    // One chain per application. With no site pinned, take the **longest** —
+    // a fold's inner roots are valid chains too, and rebalancing a prefix
+    // leaves the tail serial.
+    let mut best: Option<(usize, Vec<FlatOp>, Vec<String>, String, Vec<usize>)> = None;
+    for root in 0..flat.len() {
+        let dst = flat[root].dst();
+        if only.is_some_and(|w| w != dst) {
+            continue;
+        }
+        if let Some((tmpl, leaves, used, d)) =
+            reduction_chain(flat, root, &counts, &producer, output_wire)
+        {
+            if best.as_ref().is_none_or(|b| leaves.len() > b.2.len()) {
+                best = Some((root, tmpl, leaves, d, used));
+            }
+        }
+    }
+    let Some((root, tmpl, leaves, dst, used)) = best else {
+        return flat.to_vec();
+    };
+    let consumed: HashSet<usize> = used.into_iter().collect();
+
+    let taken: HashSet<String> = flat
+        .iter()
+        .flat_map(|o| flat_dsts(o).into_iter().map(String::from))
+        .collect();
+    let mut n = 0usize;
+    let mut fresh = move || loop {
+        n += 1;
+        let c = format!("red${n}");
+        if !taken.contains(&c) {
+            return c;
+        }
+    };
+
+    let mut out: Vec<FlatOp> = Vec::with_capacity(flat.len());
+    for (i, op) in flat.iter().enumerate() {
+        if i == root {
+            // Pair adjacent leaves level by level, preserving order; the last
+            // combine writes the chain's dst so nothing downstream notices.
+            let mut level = leaves.clone();
+            while level.len() > 1 {
+                let mut next: Vec<String> = Vec::with_capacity(level.len().div_ceil(2));
+                let last = level.len() == 2;
+                let mut k = 0;
+                while k + 1 < level.len() {
+                    let into = if last { dst.clone() } else { fresh() };
+                    out.extend(instantiate(&tmpl, &level[k], &level[k + 1], &into, &mut fresh));
+                    next.push(into);
+                    k += 2;
+                }
+                if k < level.len() {
+                    next.push(level[k].clone());
+                }
+                level = next;
+            }
+            continue;
+        }
+        if consumed.contains(&i) {
+            continue;
+        }
+        out.push(op.clone());
+    }
+
+    // A rebalanced tree still *contains* chains — any root-to-leaf path is one
+    // — so re-applying the rule to a tree can rebuild a balanced path into a
+    // deeper one. Depth is the only thing this rewrite is for, so refuse it
+    // when depth does not actually fall.
+    if flat_depth_of(&out, output_wire) >= flat_depth_of(flat, output_wire) {
+        return flat.to_vec();
     }
     out
 }
@@ -1357,6 +1839,76 @@ mod tests {
     ///
     /// Both cases used to emit a duplicated product; commutativity is included
     /// because the key sorts operands, so `x*y` and `y*x` must collide.
+    /// A maximum written as a left fold is the AI reduction that matters
+    /// (max-pooling, argmax), and its combining operator is a *compound*
+    /// subgraph — `acc + (x>acc)·(x−acc)`, four instructions — so
+    /// `Rule::Reassociate`, which only handles chains of a single associative
+    /// primitive, cannot see it.
+    ///
+    /// The rewrite must keep the circuit exactly equivalent and cut dependence
+    /// depth from `n−1` steps to `⌈log₂ n⌉`, leaving the instruction count
+    /// alone.
+
+    /// Longest dependence path to `out`, in instructions — the quantity ASAP
+    /// scheduling turns into a communication round count.
+    fn flat_depth(flat: &[FlatOp], out: &str) -> usize {
+        let mut d: HashMap<String, usize> = HashMap::new();
+        for op in flat {
+            let this = op
+                .inputs()
+                .iter()
+                .map(|w| d.get(*w).copied().unwrap_or(0))
+                .max()
+                .unwrap_or(0)
+                + 1;
+            for w in flat_dsts(op) {
+                d.insert(w.to_string(), this);
+            }
+        }
+        d.get(out).copied().unwrap_or(0)
+    }
+
+    #[test]
+    fn compound_reduction_rebalances_and_stays_exact() {
+        let mut e = String::from("x0");
+        for i in 1..8 {
+            e = format!("(+ {e} (* (> x{i} {e}) (- x{i} {e})))");
+        }
+        let (flat, out) = compile(&e);
+        let rebuilt = dead_code_eliminate(&reassociate_reduction(&flat, &out, None), &out);
+
+        equivalent(&flat, &rebuilt, &out, 24)
+            .expect("rebalancing an associative reduction must be exact");
+        assert_eq!(
+            rebuilt.len(),
+            flat.len(),
+            "reassociation moves depth, not instruction count: {} -> {}",
+            flat.len(),
+            rebuilt.len()
+        );
+        assert!(
+            flat_depth(&rebuilt, &out) < flat_depth(&flat, &out),
+            "depth must fall: {} -> {}",
+            flat_depth(&flat, &out),
+            flat_depth(&rebuilt, &out)
+        );
+    }
+
+    /// The guard that keeps the rule sound. The optimizer accepts candidates on
+    /// **cost**, not on semantics, so a rule that fired on a non-associative
+    /// operator would silently produce a wrong circuit. Subtraction folded left
+    /// is the counterexample: `((a−b)−c) ≠ (a−(b−c))`.
+    #[test]
+    fn a_non_associative_reduction_is_left_alone() {
+        let mut e = String::from("x0");
+        for i in 1..8 {
+            e = format!("(- {e} x{i})");
+        }
+        let (flat, out) = compile(&e);
+        let rebuilt = reassociate_reduction(&flat, &out, None);
+        assert_eq!(rebuilt, flat, "a subtraction fold must not be reassociated");
+    }
+
     #[test]
     fn compiled_circuits_arrive_already_cse_d() {
         for src in ["(+ (* x y) (* x y))", "(+ (* x y) (* y x))"] {

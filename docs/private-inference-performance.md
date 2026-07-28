@@ -11,6 +11,12 @@ single-threaded. Ratios transfer between machines; absolute seconds do not.
 
 ---
 
+> **If you are here to work on the *circuit-optimization paper*** (Baru as a
+> language for private AI), read
+> [`paper-circuit-optimization.md`](paper-circuit-optimization.md) instead —
+> this document is the engineering state of the switch-as-bootstrap pipeline,
+> which that paper uses as its expert baseline.
+
 ## 0. Orientation
 
 **The project.** Baru evaluates a neural network with the *image and the
@@ -187,10 +193,25 @@ hand-written route needs explicit `lt_batch`/`mul_batch` calls to achieve, and
 what the gadget library had to be patched three times to get right. **On this
 axis the compiler is already better than hand-writing**, which is the thesis.
 
-**Dependent reductions are not batched, and that is the remaining gap.** A
+**Dependent reductions needed a rewrite, and now have one (2026-07-28).** A
 fold is a chain; ASAP is optimal for a *fixed* lowering but cannot
-reassociate, so a max-fold costs `O(n)` rounds where the hand-written
-tournament costs `O(log n)`. See §3.0.
+reassociate. `Rule::ReassociateReduction` rebalances a fold whose combining
+operator is a **compound subgraph** into a tournament — `2n−1` rounds become
+`2⌈log₂ n⌉+1`:
+
+| max-fold | as written | rebalanced |
+|---|---|---|
+| n=4 | 7 rounds | 5 |
+| n=8 | 15 | **7** |
+| n=10 | 19 | **9** |
+
+End to end through `mpcc optimize --protocol shamir` on the n=8 fold:
+**65 → 29 rounds (2.21×)**, instruction count unchanged, differentially
+verified. This closes the last axis on which hand-written code beat the
+compiler, and it generalises: `gadgets::argmax` and `max_reduce` had to be
+rewritten as tournaments *by hand*, whereas the rule derives the same
+transformation for any associative operator, including compound ones it has
+never seen.
 
 **CSE was missing from the compile path entirely (fixed 2026-07-28).**
 `mpcc::opt` had a `Cse` rule, but it was reachable only from
@@ -219,29 +240,42 @@ differential tests pass including real TFHE and SEAL CKKS. At TFHE's
 
 ## 3. Next steps, in priority order
 
-### 3.0 Reassociate dependent reductions in the compiler
+### 3.0 ~~Reassociate dependent reductions~~ — DONE 2026-07-28
 
-The one axis where the hand-written gadget still beats the compiler. `mpcc`
-already has `Rule::Reassociate`, but it rebalances a chain of **one
-associative primitive**; a max-fold's operator is a *compound* subgraph
-(`acc + (x>acc)·(x−acc)`), so the rule never fires.
+Landed as `Rule::ReassociateReduction` (`src/mpcc/opt.rs`). It recognises an
+associative reduction whose operator is a repeated *subgraph shape* and
+rebalances the chain into a tournament. Max-pooling, argmax and max-reduction
+are the AI idioms it covers, and they are everywhere in a CNN.
 
-**What to build:** recognise an associative reduction whose operator is a
-repeated subgraph *shape* and rebalance the chain into a tournament —
-`O(n)` rounds → `⌈log₂ n⌉`. Max-pooling, argmax and max-reduction are the AI
-idioms this covers, and they are everywhere in a CNN.
+**Verified by** `compound_reduction_rebalances_and_stays_exact` (equivalence
+via `mpcc::opt::equivalent`, plus depth strictly falls),
+`a_non_associative_reduction_is_left_alone` (a subtraction fold must not
+move), and `compound_reductions_become_logarithmic_in_depth` (the gap widens
+with width). `optimize` additionally runs `equivalent` over the whole result.
 
-**Why it is the right next compiler work:** it is precisely the optimization
-we performed by hand three times today (`argmax`, `max_reduce`, and the
-gadget audit). Doing it in the compiler does it *everywhere*, including in
-user programs nobody audited — which is the whole argument for Baru being a
-circuit language rather than a library.
+**Soundness.** `optimize` accepts candidates on **cost**, not on semantics, so
+a rule cannot rely on the search to reject an unsound rewrite.
+`step_is_associative` therefore tests the operator by evaluation — edge values
+plus random triples, `f(f(a,b),c)` against `f(a,f(b,c))` — before the rewrite
+is offered at all.
 
-**Verify with:** `mpcc::opt::equivalent` (the differential oracle rewrites are
-already accepted or rejected by) plus `bench-circuit`, whose max-fold row
-should go linear → logarithmic. The tie-breaking caution from
-`gadgets::argmax` applies if the rule is ever extended to argmax-style
-reductions that return an *index*: only the value is order-insensitive.
+**Three things that bit, all worth knowing before touching this code:**
+
+1. **"Used once" is the wrong privacy test for the accumulator.** A maximum
+   reads `acc` three times *inside its own step* (compare, subtract, add). The
+   correct condition is that every use of `acc` lies inside the step that
+   consumes it. Getting this wrong made the rule silently never fire.
+2. **Prefer the longest chain.** A fold's inner roots are valid chains too, so
+   taking the first match rebalanced a 4-leaf prefix and left the tail serial
+   — 65 → 47 rounds instead of 65 → 29.
+3. **A rebalanced tree still contains chains.** Every root-to-leaf path is one,
+   so a fixpoint pass cheerfully rebuilt a balanced path into a deeper one and
+   depth came out `n+1` instead of `2⌈log₂n⌉+1`. The rule now refuses any
+   rewrite that does not strictly reduce depth.
+
+The tie-breaking caution from `gadgets::argmax` still applies if this is ever
+extended to reductions returning an *index*: only the value is
+order-insensitive.
 
 
 ### 3.1 Precompute the encrypted **model** — best remaining win, low risk
@@ -408,6 +442,9 @@ Key tests to keep green when touching any of this:
 | `layer_round_count_is_flat_in_width` | ASAP scheduling still batches independent ops |
 | `cse_collapses_the_exponential_fold_and_is_on_by_default` | CSE is part of compilation, not opt-in |
 | `compiled_circuits_arrive_already_cse_d` | backends never see duplicate subexpressions |
+| `compiled_and_hand_written_agree_on_the_whole_network` | the compiled route computes the network |
+| `compound_reduction_rebalances_and_stays_exact` | the reduction rewrite is exact and cuts depth |
+| `a_non_associative_reduction_is_left_alone` | it refuses non-associative operators |
 | `batched_input_sharing_matches_the_scalar_protocol` | batched == scalar sharing |
 
 ---
@@ -424,6 +461,9 @@ Key tests to keep green when touching any of this:
 | tournament argmax | `gadgets::argmax` |
 | abstraction-cost bench | `bench::abstraction` (`baru bench-abstraction`) |
 | circuit-quality bench | `bench::circuit` (`baru bench-circuit`) |
+| compiled-vs-handwritten NN | `bench::compiled_nn` (`baru bench-compiled-nn`) |
+| level-batched circuit executor | `mpcc::exec::run_flat` |
+| interactive-call counter | `TransportBackend::interactive_calls` |
 | shared FlatOp passes | `zkp::circuit_compiler::{cse, rename}`, `CircuitCompiler::fold_constants` |
 | BFV / NTT | `fhe::bfv`, `fhe::ntt` |
 | conv packing | `fhe::conv_pack` |
