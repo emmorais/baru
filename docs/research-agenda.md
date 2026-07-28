@@ -525,11 +525,45 @@ Semi2k *prediction* against an ABY3 *measurement* — two different threat model
 on the decision. The lesson is worth keeping: a prediction and a measurement must
 name the same protocol before they can disagree.
 
-**The honest gap:** the dishonest-majority arm — the one where the model says FHE
-wins — is **not measured**, because no dishonest-majority MPC baseline exists in
-the artifact (Semi2k is P1-planned, `mpcc::RUNNABLE` is Dealer and Shamir only).
-That experiment is the highest-value thing left for this claim, and until it exists
-the FHE-wins half is a prediction, not a result.
+#### The gap closed: Semi2k now runs, and the triple cost is measured
+
+`src/mpcc/semi2k.rs` implements the missing dishonest-majority baseline —
+additive sharing mod `2^k`, semi-honest, two parties, with Beaver triples from
+**real oblivious transfer** (Gilboa OLE over the IKNP correlated OT added in
+`src/ot/iknp.rs`). It is in `mpcc::RUNNABLE`, so `baru mpcc calibrate` runs it.
+
+Two results:
+
+* **Online phase: 0% prediction error.** Rounds, bytes, multiplications and
+  triples all match on a comparison-heavy program (303 triples), same as Dealer.
+* **Offline bytes per triple, measured: 3104 B against a predicted 3136 B — 1%.**
+  This is the number the whole crossover claim rests on, and it was previously
+  derived rather than measured. It now runs through real OT and lands within 1% of
+  `mpcc::ot_cost`'s Gilboa derivation (2k correlated OTs × (16.5 B measured + k/8
+  payload)). A test pins the ratio.
+
+So the chain behind "FHE takes the wide layer under a dishonest majority" is now:
+measured OT cost → analytic Gilboa count → **measured triple cost** → the
+crossover. Only the last step is still model rather than measurement.
+
+Two measurement traps worth recording, both hit:
+
+1. **Offline cost amortizes over the generation batch, not the consumption count.**
+   Dividing offline bytes by triples *consumed* reported 68 288 B/triple on a
+   program that used 3 of a 64-triple batch — a 21× apparent miss that was purely
+   a wrong denominator. `Counters::triples_generated` now exists so the ratio is
+   taken against the right thing.
+2. **Correlated OT, not chosen-message OT.** Gilboa's two messages differ by a
+   known correlation, so only one `k`-bit correction is sent — `κ + k` bits per OT,
+   not `κ + 2κ`. Measuring with the chosen-message interface would have inflated
+   triple cost by ~2× and made the model look wrong. `iknp::correlated` implements
+   the right interface and a test pins it just above its `24 B/OT` analytic floor.
+
+**Still open:** the *whole-layer* dishonest-majority measurement — Semi2k end to
+end against hybrid-BFV, the way `bench-hybrid-nn` does for ABY3. Semi2k runs on
+`mpcc`'s VM, while `bench-hybrid-nn` is built on the ABY3 transport backend, so
+that comparison needs one of the two to move. Until then the crossover *point* is a
+prediction resting on measured inputs, rather than a measured crossover.
 
 The mechanism is specific and worth stating: **MPC's Beaver-triple preprocessing
 grows linearly with layer width while FHE's packed ciphertext is flat and needs
@@ -683,13 +717,13 @@ Things that are genuinely interesting and deliberately not being built. Parking
 them here rather than leaving them as open to-dos is the point: an agenda where
 everything is "planned" cannot express priority.
 
-* **A dishonest-majority MPC baseline for `bench-hybrid-nn`** — *the highest-value
-  experiment left, and it validates a live claim.* §4's FHE-wins result is a
-  prediction: the artifact measures only ABY3 (honest majority), so the regime
-  where the model says FHE takes the layer has never been measured. Semi2k is
-  roadmap P1 and shares Dealer's online phase, so the work is OT-generated triples
-  plus a `ShareEngine` — and `src/ot/` already provides the OT. Until this exists,
-  the hybrid-pays half of §4 must be stated as a prediction.
+* **A whole-layer dishonest-majority measurement** — *what is left of the item
+  above, now that Semi2k itself is done (§4).* Semi2k runs on `mpcc`'s VM and
+  calibrates; `bench-hybrid-nn` measures layers on the ABY3 transport backend. To
+  compare Semi2k end-to-end against hybrid-BFV, one of the two has to move — most
+  likely re-expressing the ABY3 transport backend as a `ShareEngine` (already on the
+  roadmap's P1 list). That would turn the crossover *point* from a prediction resting
+  on measured inputs into a measured crossover.
 
 * **Secret-index array access, priced** — *ahead of ORAM, and cheap.* CirC
   (`docs/related-work.md` §2) implements exactly the two cases either side of the

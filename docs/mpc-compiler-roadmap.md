@@ -221,10 +221,18 @@ it is an upper bound (vector OLE and batched sacrifice both do better), and the
 offline *time* is still volume ÷ bandwidth, so the CPU half of LowGear's trade is
 still missing and its total remains flattering.
 
-Remaining: Semi2k (Dealer's online phase with OT-generated triples), the existing
-ABY3 transport backend re-expressed as a `ShareEngine`, a LAN/WAN measurement
-harness so the latency and bandwidth terms get calibrated too, and a CPU term for
-preprocessing (`ot_cost::US_PER_OT` is measured and recorded but unused).
+**Semi2k landed 2026-07-28** (`src/mpcc/semi2k.rs`): Dealer's online phase with
+triples from real OT (Gilboa OLE over `ot::iknp::correlated`). It is in `RUNNABLE`
+and calibrates at 0% error online; more importantly its **offline bytes are
+measured** — 3104 B/triple against `ot_cost`'s predicted 3136, a 1% agreement that
+validates the Gilboa derivation. Note `engine_supports`: the protocol is n-party
+but this implementation is 2-party, because Gilboa OLE is pairwise, and the registry
+describes the protocol while `engine_supports` describes what is built.
+
+Remaining: the existing ABY3 transport backend re-expressed as a `ShareEngine`, a
+LAN/WAN measurement harness so the latency and bandwidth terms get calibrated too,
+a CPU term for preprocessing (`ot_cost::US_PER_OT` is measured and recorded but
+unused), and an n-party Semi2k (n(n−1) cross terms).
 
 **P2 — comparisons, malicious security & mixed circuits.** *Comparisons done.*
 

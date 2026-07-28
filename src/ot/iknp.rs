@@ -311,6 +311,70 @@ impl super::OtProtocol for Iknp {
     }
 }
 
+/// **Correlated OT** over `Z_2^k`: the receiver gets `r + c·δ`, the sender keeps
+/// `r`, and only one `k`-bit correction is sent per OT.
+///
+/// This is the interface Beaver-triple generation actually wants, and it is
+/// cheaper than the chosen-message one for a specific reason: because the two
+/// messages differ by a *known* correlation, the sender does not have to pad both.
+/// From random OT outputs `(y0, y1)` it sets `r = y0` and sends
+/// `t = δ − (y1 − y0)`; the receiver adds `t` exactly when its choice bit is 1:
+///
+/// ```text
+/// c = 0 → y0            = r
+/// c = 1 → y1 + t = y1 + δ − y1 + y0 = r + δ
+/// ```
+///
+/// Cost is therefore `κ` bits for the extension column plus `k` bits of
+/// correction — which is the figure [`crate::mpcc::ot_cost`] prices Beaver
+/// triples from. Using the chosen-message interface here instead would send two
+/// `κ`-bit pads and overcharge triple generation by roughly 2×.
+pub struct Correlated {
+    /// `r` per OT, the sender's half of the additive sharing.
+    pub sender_r: Vec<u64>,
+    /// `r + c·δ` per OT, the receiver's half.
+    pub receiver: Vec<u64>,
+    pub traffic: OtTraffic,
+}
+
+/// Run `choices.len()` correlated OTs with per-OT correlations `deltas`,
+/// in process, mod `2^k`.
+pub fn correlated(choices: &[bool], deltas: &[u64], k: u32) -> Result<Correlated, String> {
+    if choices.len() != deltas.len() {
+        return Err(format!(
+            "{} choices for {} correlations",
+            choices.len(),
+            deltas.len()
+        ));
+    }
+    let mask: u64 = if k >= 64 { u64::MAX } else { (1u64 << k) - 1 };
+    let ext = simulate(choices)?;
+
+    let block_u64 = |b: &Block| -> u64 { u64::from_le_bytes(b[..8].try_into().unwrap()) & mask };
+
+    let mut sender_r = Vec::with_capacity(choices.len());
+    let mut receiver = Vec::with_capacity(choices.len());
+    for (i, (&c, &delta)) in choices.iter().zip(deltas).enumerate() {
+        let (y0, y1) = ext.sender[i];
+        let (r, y1v) = (block_u64(&y0), block_u64(&y1));
+        // t = delta - (y1 - y0), all mod 2^k.
+        let t = delta.wrapping_sub(y1v.wrapping_sub(r)) & mask;
+        let got = block_u64(&ext.receiver[i]);
+        let out = if c { got.wrapping_add(t) & mask } else { got };
+        sender_r.push(r);
+        receiver.push(out);
+    }
+
+    let mut traffic = ext.traffic;
+    // One k-bit correction per OT, sender to receiver.
+    traffic.sender_to_receiver += choices.len() * (k as usize).div_ceil(8);
+    Ok(Correlated {
+        sender_r,
+        receiver,
+        traffic,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -378,6 +442,60 @@ mod tests {
         let (_, cols) = ExtReceiver::new(&choices, &base_keys).unwrap();
         // One column per base OT, m bits each ⇒ exactly κ bits per output OT.
         assert_eq!(cols.bytes(), KAPPA * m / 8);
+    }
+
+    /// The defining property of correlated OT.
+    #[test]
+    fn correlated_ot_delivers_r_plus_c_delta() {
+        let mut rng = rand::thread_rng();
+        let k = 64u32;
+        let n = 200;
+        let choices: Vec<bool> = (0..n).map(|_| rng.gen::<bool>()).collect();
+        let deltas: Vec<u64> = (0..n).map(|_| rng.gen::<u64>()).collect();
+        let out = correlated(&choices, &deltas, k).unwrap();
+        for i in 0..n {
+            let want = if choices[i] {
+                out.sender_r[i].wrapping_add(deltas[i])
+            } else {
+                out.sender_r[i]
+            };
+            assert_eq!(out.receiver[i], want, "COT {i} (choice {})", choices[i]);
+        }
+    }
+
+    /// COT must be cheaper than the chosen-message interface, since it sends one
+    /// `k`-bit correction instead of two `κ`-bit pads. That gap is exactly why
+    /// triple generation is priced from this interface.
+    #[test]
+    fn correlated_ot_is_cheaper_than_chosen_message() {
+        use crate::ot::OtProtocol;
+        // Large enough that the fixed kappa base OTs amortize: at n = 2048 the
+        // base phase still adds 2.0 B/OT on top of the analytic 24.
+        let n = 8192;
+        let mut rng = rand::thread_rng();
+        let choices: Vec<bool> = (0..n).map(|_| rng.gen::<bool>()).collect();
+        let deltas: Vec<u64> = (0..n).map(|_| rng.gen::<u64>()).collect();
+        let cot = correlated(&choices, &deltas, 64).unwrap();
+
+        let msgs: Vec<(Block, Block)> = (0..n)
+            .map(|_| (random_block(&mut rng), random_block(&mut rng)))
+            .collect();
+        let chosen = Iknp.transfer(&choices, &msgs).unwrap();
+
+        let per = |b: usize| b as f64 / n as f64;
+        assert!(
+            per(cot.traffic.total()) < per(chosen.traffic.total()),
+            "COT {:.1} B/OT should beat chosen-message {:.1} B/OT",
+            per(cot.traffic.total()),
+            per(chosen.traffic.total())
+        );
+        // kappa/8 column + k/8 correction = 16 + 8 = 24 B, plus the amortized base.
+        let floor = 16.0 + 8.0;
+        assert!(
+            per(cot.traffic.total()) >= floor && per(cot.traffic.total()) < floor + 1.0,
+            "COT should sit just above the {floor} B/OT analytic floor, got {:.2}",
+            per(cot.traffic.total())
+        );
     }
 
     #[test]

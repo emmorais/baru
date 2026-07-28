@@ -43,6 +43,7 @@ pub mod opt;
 pub mod ot_cost;
 pub mod protocols;
 pub mod schedule;
+pub mod semi2k;
 pub mod sim;
 pub mod vm;
 
@@ -65,7 +66,24 @@ pub use vm::{execute, Measured};
 
 /// Protocols the VM can actually execute today.  Everything else in the
 /// registry is analysis-only until its roadmap phase lands.
-pub const RUNNABLE: &[&str] = &["dealer", "shamir"];
+pub const RUNNABLE: &[&str] = &["dealer", "shamir", "semi2k"];
+
+/// Whether the *implementation* can run `id` at `parties`, which is not the same
+/// question as whether the *protocol* supports it.
+///
+/// Semi2k is an `n`-party protocol, but this artifact's triple generation is
+/// Gilboa OLE, which is pairwise — `n` parties would need `n(n−1)` cross terms.
+/// The registry describes the protocol; this describes what is built. Keeping the
+/// two separate is why `calibrate` can skip a row instead of failing, and why the
+/// gap is visible rather than encoded in an error string.
+pub fn engine_supports(id: &str, parties: usize) -> bool {
+    match id {
+        "dealer" => parties >= 2,
+        "shamir" => parties >= 3,
+        "semi2k" => parties == 2,
+        _ => false,
+    }
+}
 
 /// Execute `prog` under the named protocol.
 ///
@@ -97,6 +115,19 @@ pub fn run_protocol(
             let mut e = ShamirEngine::new(parties)?;
             execute(prog, sched, &mut e, id, inputs)
         }
+        "semi2k" => {
+            let bits = match prog.domain {
+                Domain::Ring { k } => k,
+                other => {
+                    return Err(format!(
+                        "semi2k computes mod 2^k, but the program was lowered for {}",
+                        other
+                    ))
+                }
+            };
+            let mut e = semi2k::Semi2kEngine::new(parties, bits)?;
+            execute(prog, sched, &mut e, id, inputs)
+        }
         other => Err(format!(
             "`{}` is not executable yet — Baru can run {:?}.  Every other protocol \
              in the registry is costed analytically only; see \
@@ -119,6 +150,13 @@ pub struct Calibration {
     pub measured_triples: u64,
     pub predicted_muls: u64,
     pub measured_muls: u64,
+    /// Preprocessing bytes. Only Semi2k moves any — Dealer gets triples free by
+    /// assumption and Shamir needs none — so this column is what validates
+    /// `mpcc::ot_cost`'s Gilboa derivation against real OT traffic.
+    pub predicted_offline_bytes: u64,
+    pub measured_offline_bytes: u64,
+    /// Triples generated, so offline bytes can be divided by the right thing.
+    pub measured_triples_generated: u64,
     /// Program output, and the plaintext value it is checked against.
     pub result: Option<i64>,
     pub expected: Option<i64>,
@@ -161,7 +199,9 @@ pub fn calibrate(
     let mut out = Vec::new();
     for id in RUNNABLE {
         let spec = find(id).ok_or_else(|| format!("unknown protocol `{}`", id))?;
-        if !spec.supports_parties(parties) {
+        // The protocol must allow this party count *and* the implementation must
+        // handle it — see `engine_supports`.
+        if !spec.supports_parties(parties) || !engine_supports(id, parties) {
             continue;
         }
         let cfg = LowerConfig {
@@ -191,6 +231,9 @@ pub fn calibrate(
             measured_triples: measured.triples,
             predicted_muls: predicted.muls,
             measured_muls: measured.muls,
+            predicted_offline_bytes: predicted.offline_bytes,
+            measured_offline_bytes: measured.offline_bytes,
+            measured_triples_generated: measured.triples_generated,
             result,
             expected,
             correct: match (result, expected) {
@@ -436,9 +479,7 @@ pub fn format_calibration(rows: &[Calibration], source: &str) -> String {
         ));
     }
     out.push_str(
-        "\nnotes:\n  · online rounds and bytes are measured from the simulated protocol; \
-         preprocessing\n    is drawn locally and only counted, so triples are trustworthy and \
-         offline *time*\n    is not measured at all (see crate::mpcc::vm).\n",
+        "\nnotes:\n  · online rounds and bytes are measured from the simulated protocol.\n  · Dealer and Shamir draw preprocessing locally and only count it.  Semi2k is\n    the exception — its triples come from real OT, so its offline BYTES are\n    measured, and offline bytes/triple must be divided by triples *generated*\n    (generation is batched), not by triples consumed.\n  · offline *time* is not measured for any protocol.\n",
     );
     out
 }
@@ -1313,17 +1354,22 @@ mod tests {
             run_protocol("mascot", 3, &prog, &sched, &bindings(&[("x", 1), ("y", 2)])).unwrap_err();
         assert!(err.contains("not executable yet"), "{}", err);
 
-        // Shamir has no honest majority with two parties.
-        assert!(calibrate(
+        // Shamir has no honest majority with two parties, so it is skipped —
+        // Dealer and Semi2k both run there.
+        let rows = calibrate(
             "(* x y)",
             &bindings(&[("x", 1), ("y", 2)]),
             2,
             &Deployment::lan(2),
-            32
+            32,
         )
-        .unwrap()
-        .iter()
-        .all(|r| r.protocol == "dealer"));
+        .unwrap();
+        assert!(
+            rows.iter().all(|r| r.protocol != "shamir"),
+            "shamir needs 3 parties: {:?}",
+            rows.iter().map(|r| &r.protocol).collect::<Vec<_>>()
+        );
+        assert!(rows.iter().any(|r| r.protocol == "semi2k"));
     }
 
     #[test]

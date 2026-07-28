@@ -225,6 +225,22 @@ pub struct Counters {
     pub triples: u64,
     /// Shared random bits consumed.
     pub random_bits: u64,
+    /// Triples *generated*, which can exceed [`Counters::triples`] consumed
+    /// because generation is batched.
+    ///
+    /// Offline cost amortizes over the batch, so bytes-per-triple is only
+    /// meaningful against this number. Dividing by the consumed count instead
+    /// reports the cost of a half-used batch and looks like a 20× modelling miss.
+    pub triples_generated: u64,
+    /// **Preprocessing** bytes actually moved, for engines that generate their own
+    /// correlated randomness rather than assuming a dealer.
+    ///
+    /// Zero for `DealerEngine` (a trusted dealer hands triples over for free — that
+    /// is what makes it a lower bound) and for `ShamirEngine` (honest majority,
+    /// multiplication needs no triples). Non-zero only for `Semi2kEngine`, which
+    /// runs real OT — and that is what lets `mpcc::ot_cost`'s derivation be checked
+    /// against a measurement instead of trusted.
+    pub offline_bytes: u64,
 }
 
 /// The four things that actually differ between secret-sharing protocols.
@@ -499,6 +515,11 @@ pub struct Measured {
     pub opens: u64,
     pub triples: u64,
     pub random_bits: u64,
+    /// Preprocessing bytes actually moved — non-zero only for engines that
+    /// generate their own correlated randomness (Semi2k's OT).
+    pub offline_bytes: u64,
+    /// Triples generated (batched), the denominator offline cost amortizes over.
+    pub triples_generated: u64,
     /// Wall clock, microseconds.  In-process, so this measures local compute
     /// only — there is no network to wait for.
     pub micros: u128,
@@ -597,6 +618,8 @@ pub fn execute<E: ShareEngine>(
         opens: c.opens,
         triples: c.triples,
         random_bits: c.random_bits,
+        offline_bytes: c.offline_bytes,
+        triples_generated: c.triples_generated,
         micros: t0.elapsed().as_micros(),
         outputs,
     })
