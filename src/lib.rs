@@ -42,3 +42,6 @@ pub mod db;
 
 /// Private information retrieval — fetch a record without revealing which.
 pub mod pir;
+
+/// Oblivious transfer — base OT and IKNP extension.
+pub mod ot;

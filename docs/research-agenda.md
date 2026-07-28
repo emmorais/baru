@@ -47,7 +47,7 @@ Two hospitals and a model owner; nobody trusts the others with raw data.
 |---|---|---|---|---|
 | 1 | *"How many patients aged 40–60 with HbA1c > 7?"* | cohort selection over records at rest | BaruDB (DET + ORE) | ✅ measured — `baru bench-cohort` |
 | 2 | *Fetch record `r` for review* | the **access pattern** leaks who is interesting | **PIR** | ⚠️ built + measured (`baru bench-pir`), and it **loses to downloading the database** — §3a |
-| 3 | *Which patients appear at both hospitals?* | linkage without disclosure | **PSI** (from OT) | 🔨 |
+| 3 | *Which patients appear at both hospitals?* | linkage without disclosure | **PSI** (from OT) | 🔨 OT done + measured (`baru bench-ot`, §3b); PSI still to build |
 | 4 | *Classify this scan* | image + model both private | MPC / FHE / hybrid | ✅ measured on real biomedical images — `baru bench-medmnist` (§3) |
 | 5 | *Train on the union of both cohorts* | cross-institution learning | MPC (Shamir / SPDZ2k) | partial (`bench/train`) |
 | 6 | *Iterate over a private index during training* | data-dependent addressing | **ORAM** | 🔨 |
@@ -219,6 +219,48 @@ should be used to check *before* writing the automorphisms.
 
 ---
 
+## 3b. Stage 3, part one: oblivious transfer is done and measured
+
+Done 2026-07-28: `src/ot/` implements Chou–Orlandi base OT over Ristretto255 and
+the IKNP extension on top, with `baru bench-ot` measuring both. OT was put ahead
+of the other criptolandia items in §6 because it pays twice — stage 3's PSI is
+built on it, *and* Semi2k's and MASCOT's triples come from it, so it is also
+roadmap P1/P3 infrastructure.
+
+| protocol | OTs | µs/OT | bytes/OT | rounds |
+|---|---|---|---|---|
+| base | 128 | 126.35 | 64.2 | 2 |
+| extension | 128 | 127.99 | 48.2 | 3 |
+| base | 8192 | 123.92 | 64.0 | 2 |
+| **extension** | **8192** | **4.67** | **16.5** | 3 |
+
+Base OT is flat in the batch size, as it must be — each transfer is its own pair
+of scalar multiplications. The extension starts level with it at 128 OTs (that
+batch *is* the `κ = 128` base OTs it must pay for first) and is **27× cheaper per
+OT and 4× smaller by 8192**. Bytes per OT converge to `κ/8 = 16` from above
+(48 → 20 → 16.5), which is the protocol's analytic online cost of one column bit
+per output OT — the measured curve landing exactly on that floor is what says the
+byte accounting is the protocol's rather than an artifact of the harness.
+
+Two honest limits. **Both layers are semi-honest**, and for IKNP that is a
+concrete gap rather than a caveat: nothing forces the receiver to use the same
+choice vector in every column, and an inconsistent one leaks the sender's `s`
+bit by bit. KOS15's correlation check is what closes it, and until that exists
+this module cannot instantiate anything maliciously secure. Second, the per-OT
+*time* has a floor because row extraction from the column-major matrix is `O(κ)`
+bit lookups rather than a blocked transpose — the shape of the curve is the
+claim here, not the absolute throughput.
+
+**What this unblocks, in priority order:** the Semi2k and MASCOT offline cost
+parameters in `mpcc::protocols` are currently literature estimates flagged as
+such; measured bytes-per-OT and µs-per-OT are exactly what turns them into
+measurements (roadmap P1). PSI itself is still to build, and the interesting
+question there is which construction — a DH-based PSI needs no OT at all and is
+the practical baseline at moderate set sizes, so the cost model should be asked
+which wins before assuming the OT-based one does.
+
+---
+
 ## 4. Backend-aware circuit optimization — the novel contribution
 
 Implemented as a first slice in [`src/mpcc/opt.rs`](../src/mpcc/opt.rs).
@@ -346,8 +388,12 @@ Ordered by value per unit of work, with the dependency structure respected.
    `src/fhe/bfv.rs`) — and the estimate for *that* is not a few hundred lines.
    Worth doing only if stage 2 stays in the story; the cost model now says the
    dull answer wins today.
-6. **OT + PSI** (stage 3). OT is also what Semi2k/MASCOT preprocessing needs, so
-   it pays twice.
+6. **OT + PSI** (stage 3). **OT done 2026-07-28** (§3b) — base + IKNP, measured,
+   semi-honest. Remaining: (a) feed the measured OT cost into the Semi2k/MASCOT
+   offline parameters, which is the "pays twice" payoff and roadmap P1; (b) PSI,
+   deciding by cost model rather than by assumption whether the OT-based
+   construction or a DH-based one wins at the set sizes this workflow has;
+   (c) KOS-style consistency checks if malicious security is wanted.
 7. **ORAM** (stage 6). Path ORAM over the storage layer. Largest of these; do it
    last, and only if stage 6 is still in the story by then.
 8. **Circuit-optimization skill** (§5).

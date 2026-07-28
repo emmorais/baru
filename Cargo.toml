@@ -12,6 +12,10 @@ ed25519-dalek = { version = "2", features = ["rand_core"] }
 sha2 = "0.10"
 # End-to-end encryption for the p2p chat (pure Rust, no native toolchain).
 x25519-dalek = { version = "2", features = ["static_secrets"] }
+# Group operations for oblivious transfer (`src/ot/`): x25519 exposes only DH,
+# and Chou-Orlandi needs point addition. Already in the tree transitively via
+# the dalek crates above, so this pins no new code — only a direct path to it.
+curve25519-dalek = "4"
 chacha20poly1305 = "0.10"
 # REST control plane (pure Rust async: tokio + axum).
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net"] }
