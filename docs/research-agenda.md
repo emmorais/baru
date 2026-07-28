@@ -559,11 +559,48 @@ Two measurement traps worth recording, both hit:
    triple cost by ~2× and made the model look wrong. `iknp::correlated` implements
    the right interface and a test pins it just above its `24 B/OT` analytic floor.
 
-**Still open:** the *whole-layer* dishonest-majority measurement — Semi2k end to
-end against hybrid-BFV, the way `bench-hybrid-nn` does for ABY3. Semi2k runs on
-`mpcc`'s VM, while `bench-hybrid-nn` is built on the ABY3 transport backend, so
-that comparison needs one of the two to move. Until then the crossover *point* is a
-prediction resting on measured inputs, rather than a measured crossover.
+#### The crossover, measured (`baru bench-layer`)
+
+One private layer, both operands secret, plus a ReLU. MPC costs are **measured by
+running the protocols** on `mpcc`'s VM; the FHE side uses measured per-operation
+costs; wall-clock is computed from those counts and the WAN profile.
+
+| width | `dealer` (lower bound) | `semi2k` (deployable) | hybrid/bfv | semi2k offline |
+|---|---|---|---|---|
+| 8 | 600.4 ms | **682.4 ms** | 692.1 ms | 1000 KiB |
+| 64 | 600.6 ms | 715.4 ms | **692.1 ms** | 1.4 MiB |
+| 256 | 601.4 ms | 814.4 ms | **692.1 ms** | 2.5 MiB |
+| 1024 | 604.3 ms | 1.21 s | **692.1 ms** | 7.2 MiB |
+
+**The hybrid overtakes the deployable dishonest-majority protocol from width 64**,
+and by 1024 it is 1.75× ahead. The model predicted the crossover between 64 and 256;
+measured, it is at 64 — the model was slightly conservative, in the direction that
+does not flatter it.
+
+The mechanism is visible in the last column and it is measured, not modelled:
+Semi2k's real OT preprocessing grows 1000 KiB → 7.2 MiB across the sweep while the
+hybrid's packed ciphertext stays at 256 KiB. Online bytes and rounds barely move for
+anyone.
+
+**`dealer` is the control, and it carries the argument.** It assumes a trusted party
+hands out triples for free — not a threat model, a lower bound — and it stays flat
+and cheapest at every width. So the entire case for FHE here is the cost of
+*preprocessing*, not of computation. If triples were free, MPC would win outright.
+
+Two comparison errors were caught building this, both of the same kind — comparing
+things that are not the same computation:
+
+1. The first version priced FHE's *linear* part against MPC's *whole layer*,
+   omitting the ReLU from one side, and FHE appeared to win at every width. BFV
+   cannot evaluate a comparison at any price, so the nonlinearity stays on MPC
+   either way and the honest comparison is against the **hybrid**.
+2. The crossover was first computed against *every* MPC protocol including
+   `dealer`, i.e. asking whether FHE beats free preprocessing. It does not, and the
+   question is meaningless. Deployable protocols only.
+
+**Still open:** an end-to-end wall-clock measurement over a real network. Every
+number here is a measured *count* put through a latency/bandwidth model — roadmap
+P1's remaining item.
 
 The mechanism is specific and worth stating: **MPC's Beaver-triple preprocessing
 grows linearly with layer width while FHE's packed ciphertext is flat and needs

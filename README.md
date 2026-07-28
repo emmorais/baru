@@ -1642,6 +1642,8 @@ src/
                        fetched (currently loses to a whole-db download)
     ot.rs           — `baru bench-ot`: base OT vs IKNP extension, us/OT and
                        bytes/OT (the input the MPC offline cost model needs)
+    layer.rs        — `baru bench-layer`: the measured MPC<->FHE crossover for one
+                       private layer (hybrid wins from width 64 vs Semi2k)
     psi.rs          — `baru bench-psi`: DH-PSI measured, the insecure hash
                        baseline, and the OT route priced from measured OT cost
     fhe_innerprod.rs— `baru bench-fhe-innerprod`: BFV (secure) vs SI-NTRU

@@ -905,6 +905,7 @@ pub mod cohort;
 pub mod cnn;
 pub mod gc_compare;
 pub mod deep_nn;
+pub mod layer;
 pub mod medmnist;
 pub mod ot;
 pub mod pir;
