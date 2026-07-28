@@ -42,7 +42,7 @@ pub type Wire = String;
 /// One instruction in the flat, straight-line SSA block.
 /// Every variant maps to exactly one or a small fixed number of
 /// Binius64 gates, making constraint emission trivial.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum FlatOp {
     /// dst = constant
     Const { dst: Wire, value: i64 },

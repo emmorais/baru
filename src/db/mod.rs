@@ -9,10 +9,12 @@
 //!
 //! * [`local::JsonlStore`] — a plain append-only file.  Always available, never
 //!   the reason a benchmark loses its result.
-//! * [`blindsearch::BlindSearchStore`] — **BaruDB**
-//!   (<https://github.com/emmorais/blindsearch>), the encrypted searchable
-//!   store.  Baru supplies the schema and the keyword vocabulary; BaruDB owns
-//!   the cryptography.  The contract is `docs/barudb-api.md`.
+//! * [`barudb::BaruDbStore`] — **BaruDB**
+//!   (<https://github.com/emmorais/blindsearch>, crate and binary `barudb`),
+//!   the encrypted searchable store, driven over a pipe.  Baru supplies the
+//!   schema and the keyword vocabulary; BaruDB owns the cryptography, and the
+//!   process boundary is what keeps that division real rather than merely
+//!   conventional.  The contract is `docs/barudb-api.md`.
 //!
 //! Both sit behind [`ResultStore`], so harnesses take a `--store` string and
 //! neither knows nor cares which one it got.
@@ -26,14 +28,16 @@
 //! baru db stats
 //! ```
 
-pub mod blindsearch;
+pub mod barudb;
+pub mod cohort;
 pub mod local;
 pub mod query;
 pub mod record;
 
 use serde::Serialize;
 
-pub use blindsearch::BlindSearchStore;
+pub use barudb::BaruDbStore;
+pub use cohort::{CohortDb, Column as CohortColumn};
 pub use local::JsonlStore;
 pub use query::{aggregate, render, Filter, Format, Group};
 pub use record::{Metric, Provenance, Run};
@@ -72,7 +76,8 @@ pub trait ResultStore {
 /// Open a store from a `--store` specifier.
 ///
 /// * `local:PATH` (or a bare path) — [`JsonlStore`]
-/// * `blindsearch:PATH` — [`BlindSearchStore`]
+/// * `barudb:PATH` — [`BaruDbStore`] (`blindsearch:` is accepted as an alias,
+///   after the repository the crate still lives in)
 ///
 /// Defaults to `local:baru-results.jsonl` when the specifier is empty.
 pub fn open(spec: &str) -> Result<Box<dyn ResultStore>, String> {
@@ -83,9 +88,9 @@ pub fn open(spec: &str) -> Result<Box<dyn ResultStore>, String> {
     };
     match spec.split_once(':') {
         Some(("local", path)) => Ok(Box::new(JsonlStore::new(path))),
-        Some(("blindsearch" | "barudb", path)) => Ok(Box::new(BlindSearchStore::new(path))),
+        Some(("barudb" | "blindsearch", path)) => Ok(Box::new(BaruDbStore::new(path))),
         Some((scheme, _)) if scheme.len() > 1 => Err(format!(
-            "unknown store scheme `{}`; expected local:PATH or blindsearch:PATH",
+            "unknown store scheme `{}`; expected local:PATH or barudb:PATH",
             scheme
         )),
         // No scheme (or a Windows drive letter): treat it as a plain path.
@@ -104,7 +109,7 @@ baru db — the experiment store
   baru db get    --id ID
   baru db stats
 
-  --store local:PATH | blindsearch:PATH     (default local:baru-results.jsonl)
+  --store local:PATH | barudb:PATH          (default local:baru-results.jsonl)
 
 record opts
   --metric name=value[unit]   repeatable
@@ -287,7 +292,7 @@ fn cmd_stats(args: &[String]) -> Result<(), String> {
         if s.encrypted {
             ""
         } else {
-            "   (results are stored in the clear — use blindsearch: for anything publishable)"
+            "   (results are stored in the clear — use barudb: for anything publishable)"
         }
     );
     Ok(())
@@ -303,14 +308,15 @@ mod tests {
             .unwrap()
             .describe()
             .starts_with("local:"));
-        assert!(open("blindsearch:/tmp/x.db")
-            .unwrap()
-            .describe()
-            .starts_with("blindsearch:"));
         assert!(open("barudb:/tmp/x.db")
             .unwrap()
             .describe()
-            .starts_with("blindsearch:"));
+            .starts_with("barudb:"));
+        // The repository is still called blindsearch; accept it as an alias.
+        assert!(open("blindsearch:/tmp/x.db")
+            .unwrap()
+            .describe()
+            .starts_with("barudb:"));
         // A bare path is a local file.
         assert!(open("results.jsonl")
             .unwrap()

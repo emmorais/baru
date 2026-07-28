@@ -592,7 +592,7 @@ options:
   --input NAME=VAL  input binding for --expr (repeatable)
   --json            emit reports as JSON instead of tables
   --list            list built-in cases and exit
-  --store SPEC      persist every result: local:PATH or blindsearch:PATH
+  --store SPEC      persist every result: local:PATH or barudb:PATH
                     (see docs/barudb-api.md; `baru db query` reads it back)
   --tag NAME        tag stored records, e.g. --tag paper-table-3 (repeatable)
 ";
@@ -901,6 +901,7 @@ mod tests {
 }
 
 pub mod ckks_compare;
+pub mod cohort;
 pub mod cnn;
 pub mod gc_compare;
 pub mod deep_nn;

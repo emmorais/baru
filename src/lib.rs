@@ -37,5 +37,5 @@ pub mod demo;
 /// analytic cost comparison across the protocol matrix.
 pub mod mpcc;
 
-/// Encrypted experiment store (BaruDB / blindsearch client + local fallback).
+/// Encrypted experiment store (BaruDB client + local JSONL fallback).
 pub mod db;

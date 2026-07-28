@@ -10,29 +10,40 @@
 //!
 //! ```text
 //!   Expr ──CircuitCompiler──► FlatOp SSA ──lower──► Bytecode ──schedule──► rounds
-//!                                                       │
-//!                                    protocols::REGISTRY┴──cost──► ranked comparison
+//!                                                       │            │
+//!                                    protocols::REGISTRY┴──cost──► predicted
+//!                                                       │            ├──► calibrate
+//!                                             sim engines┴──vm────► measured
 //! ```
 //!
 //! See `docs/mpc-compiler-roadmap.md` for the phasing and the target protocol
-//! matrix.  Phase P0 (this module) implements the framework and validates it
-//! against the two backends Baru already has; each later phase adds real
-//! protocol implementations that *validate* one row of the registry.
+//! matrix.  P0 built the framework; P1 (in progress) adds executable protocols
+//! and closes the loop — `baru mpcc calibrate` runs a program and reports
+//! measured cost against the model's prediction, which is the only thing that
+//! makes the estimates for the *unimplemented* protocols worth anything.
 //!
 //! ## CLI
 //!
 //! ```text
-//! baru mpcc protocols                         # the protocol matrix
-//! baru mpcc dump     --expr '(* x y)'         # bytecode listing
-//! baru mpcc analyse  --expr '(* x y)'         # + instruction census and round schedule
-//! baru mpcc compare  --expr '(* x y)' [opts]  # ranked cost estimate per protocol
+//! baru mpcc protocols                            # the protocol matrix
+//! baru mpcc dump      --expr '(* x y)'           # bytecode listing
+//! baru mpcc analyse   --expr '(* x y)'           # + instruction census and schedule
+//! baru mpcc compare   --expr '(* x y)' [opts]    # ranked cost estimate per protocol
+//! baru mpcc run       --case dot2 --protocol shamir --parties 5
+//! baru mpcc calibrate --case dot2                # measured vs predicted
+//! baru mpcc optimize  --case dot4-builtin        # backend-aware rewriting
 //! ```
 
 pub mod cost;
 pub mod ir;
 pub mod lower;
+pub mod opt;
 pub mod protocols;
 pub mod schedule;
+pub mod sim;
+pub mod vm;
+
+use std::collections::HashMap;
 
 use serde::Serialize;
 
@@ -41,8 +52,173 @@ use crate::zkp::circuit_compiler::CircuitCompiler;
 pub use cost::{estimate, CostEstimate, Deployment};
 pub use ir::{Domain, Program};
 pub use lower::{lower, LowerConfig};
+pub use opt::{optimize, Optimized};
+
 pub use protocols::{find, ProtocolSpec, Security, REGISTRY};
 pub use schedule::{schedule, Schedule};
+pub use sim::{DealerEngine, ShamirEngine};
+pub use vm::{execute, Measured};
+
+/// Protocols the VM can actually execute today.  Everything else in the
+/// registry is analysis-only until its roadmap phase lands.
+pub const RUNNABLE: &[&str] = &["dealer", "shamir"];
+
+/// Execute `prog` under the named protocol.
+///
+/// The program must have been lowered for that protocol's native domain
+/// ([`cost::native_domain`]); otherwise a measured run and a predicted one are
+/// not comparable, and `calibrate` would be measuring the wrong thing.
+pub fn run_protocol(
+    id: &str,
+    parties: usize,
+    prog: &Program,
+    sched: &Schedule,
+    inputs: &HashMap<String, i64>,
+) -> Result<Measured, String> {
+    match id {
+        "dealer" => {
+            let bits = match prog.domain {
+                Domain::Ring { k } => k,
+                other => {
+                    return Err(format!(
+                        "dealer computes mod 2^k, but the program was lowered for {}",
+                        other
+                    ))
+                }
+            };
+            let mut e = DealerEngine::new(parties, bits)?;
+            execute(prog, sched, &mut e, id, inputs)
+        }
+        "shamir" => {
+            let mut e = ShamirEngine::new(parties)?;
+            execute(prog, sched, &mut e, id, inputs)
+        }
+        other => Err(format!(
+            "`{}` is not executable yet — Baru can run {:?}.  Every other protocol \
+             in the registry is costed analytically only; see \
+             docs/mpc-compiler-roadmap.md for its phase.",
+            other, RUNNABLE
+        )),
+    }
+}
+
+/// One row of `baru mpcc calibrate`: what the model said, what actually happened.
+#[derive(Debug, Clone, Serialize)]
+pub struct Calibration {
+    pub protocol: String,
+    pub parties: usize,
+    pub predicted_rounds: u64,
+    pub measured_rounds: u64,
+    pub predicted_online_bytes: u64,
+    pub measured_online_bytes: u64,
+    pub predicted_triples: u64,
+    pub measured_triples: u64,
+    pub predicted_muls: u64,
+    pub measured_muls: u64,
+    /// Program output, and the plaintext value it is checked against.
+    pub result: Option<i64>,
+    pub expected: Option<i64>,
+    pub correct: bool,
+}
+
+impl Calibration {
+    /// Signed relative error of the prediction, as a fraction of the measurement.
+    pub fn bytes_error(&self) -> f64 {
+        rel_error(self.predicted_online_bytes, self.measured_online_bytes)
+    }
+    pub fn rounds_error(&self) -> f64 {
+        rel_error(self.predicted_rounds, self.measured_rounds)
+    }
+}
+
+fn rel_error(predicted: u64, measured: u64) -> f64 {
+    if measured == 0 {
+        if predicted == 0 {
+            0.0
+        } else {
+            f64::INFINITY
+        }
+    } else {
+        (predicted as f64 - measured as f64) / measured as f64
+    }
+}
+
+/// Run `src` under every executable protocol and compare against the model.
+pub fn calibrate(
+    src: &str,
+    inputs: &HashMap<String, i64>,
+    parties: usize,
+    dep: &Deployment,
+    bit_width: u32,
+) -> Result<Vec<Calibration>, String> {
+    // Ground truth from the plain interpreter, so a protocol bug cannot hide.
+    let expected = plain_value(src, inputs);
+
+    let mut out = Vec::new();
+    for id in RUNNABLE {
+        let spec = find(id).ok_or_else(|| format!("unknown protocol `{}`", id))?;
+        if !spec.supports_parties(parties) {
+            continue;
+        }
+        let cfg = LowerConfig {
+            domain: cost::native_domain(spec, 64),
+            parties,
+            bit_width,
+            public_vars: Vec::new(),
+        };
+        let prog = compile(src, &cfg)?;
+        let sched = schedule(&prog);
+
+        let mut dep = dep.clone();
+        dep.parties = parties;
+        dep.allow_dealer = true;
+        let predicted = estimate(&prog, &sched, spec, &dep)?;
+        let measured = run_protocol(id, parties, &prog, &sched, inputs)?;
+
+        let result = measured.outputs.first().map(|(_, v)| *v);
+        out.push(Calibration {
+            protocol: (*id).to_string(),
+            parties,
+            predicted_rounds: predicted.rounds,
+            measured_rounds: measured.rounds,
+            predicted_online_bytes: predicted.online_bytes,
+            measured_online_bytes: measured.online_bytes,
+            predicted_triples: predicted.triples,
+            measured_triples: measured.triples,
+            predicted_muls: predicted.muls,
+            measured_muls: measured.muls,
+            result,
+            expected,
+            correct: match (result, expected) {
+                (Some(r), Some(e)) => r == e,
+                _ => false,
+            },
+        });
+    }
+    if out.is_empty() {
+        return Err(format!(
+            "no executable protocol supports {} parties (dealer needs 2+, shamir 3+)",
+            parties
+        ));
+    }
+    Ok(out)
+}
+
+/// Evaluate `src` in the plain interpreter to get the ground-truth answer.
+fn plain_value(src: &str, inputs: &HashMap<String, i64>) -> Option<i64> {
+    let mut names: Vec<&String> = inputs.keys().collect();
+    names.sort();
+    let bindings: Vec<String> = names
+        .iter()
+        .map(|k| format!("({} {})", k, inputs[*k]))
+        .collect();
+    let wrapped = format!("(let ({}) {})", bindings.join(" "), src);
+    let expr = crate::interpreter::parse(&wrapped).ok()?;
+    match crate::interpreter::Participant::new(0).eval_quiet(&expr) {
+        crate::interpreter::Types::Num(n) => Some(n),
+        _ => None,
+    }
+}
 
 /// Parse, flatten and lower a Baru expression to MPC bytecode.
 pub fn compile(src: &str, cfg: &LowerConfig) -> Result<Program, String> {
@@ -212,6 +388,103 @@ pub fn format_comparison(c: &Comparison) -> String {
     out
 }
 
+/// Render a calibration run: what the model predicted against what happened.
+pub fn format_calibration(rows: &[Calibration], source: &str) -> String {
+    let mut out = format!("program   {}\n\n", source);
+    out.push_str(&format!(
+        "{:<10} {:>6} {:>17} {:>21} {:>15} {:>15}  {}\n",
+        "protocol",
+        "parties",
+        "rounds pred/meas",
+        "online bytes pred/meas",
+        "muls p/m",
+        "triples p/m",
+        "result"
+    ));
+    for r in rows {
+        out.push_str(&format!(
+            "{:<10} {:>6} {:>8}/{:<8} {:>10}/{:<10} {:>7}/{:<7} {:>7}/{:<7}  {}\n",
+            r.protocol,
+            r.parties,
+            r.predicted_rounds,
+            r.measured_rounds,
+            r.predicted_online_bytes,
+            r.measured_online_bytes,
+            r.predicted_muls,
+            r.measured_muls,
+            r.predicted_triples,
+            r.measured_triples,
+            match (r.correct, r.result, r.expected) {
+                (true, Some(v), _) => format!("{} ✓", v),
+                (false, Some(v), Some(e)) => format!("{} ✗ (expected {})", v, e),
+                (_, Some(v), None) => format!("{} (no plain baseline)", v),
+                _ => "no output".to_string(),
+            }
+        ));
+    }
+    out.push_str("\nprediction error (signed, relative to the measurement):\n");
+    for r in rows {
+        out.push_str(&format!(
+            "  {:<10} rounds {:+.1}%   bytes {:+.1}%\n",
+            r.protocol,
+            r.rounds_error() * 100.0,
+            r.bytes_error() * 100.0
+        ));
+    }
+    out.push_str(
+        "\nnotes:\n  · online rounds and bytes are measured from the simulated protocol; \
+         preprocessing\n    is drawn locally and only counted, so triples are trustworthy and \
+         offline *time*\n    is not measured at all (see crate::mpcc::vm).\n",
+    );
+    out
+}
+
+/// Render a backend-aware optimization run.
+pub fn format_optimizations(rows: &[Optimized], source: &str) -> String {
+    let mut out = format!("program   {}\n\n", source);
+    out.push_str(&format!(
+        "{:<10} {:>13} {:>15} {:>17} {:>9}  {}\n",
+        "protocol", "ops b/a", "AND gates b/a", "predicted b/a", "speed-up", "rules kept"
+    ));
+    for r in rows {
+        let rules: Vec<&str> = r.applied.iter().map(|a| a.rule).collect();
+        out.push_str(&format!(
+            "{:<10} {:>6}/{:<6} {:>7}/{:<7} {:>8}/{:<8} {:>8.2}x  {}\n",
+            r.protocol,
+            r.before.ops,
+            r.after.ops,
+            r.before.and_gates,
+            r.after.and_gates,
+            human_secs(r.before.secs),
+            human_secs(r.after.secs),
+            r.speedup(),
+            if rules.is_empty() {
+                "-".to_string()
+            } else {
+                rules.join(", ")
+            }
+        ));
+    }
+    // Compare the actual instruction sequences, not a proxy: the claim is that
+    // the circuits differ, so it should be checked on the circuits.
+    let differ = rows.windows(2).any(|w| w[0].flat != w[1].flat);
+    out.push_str(&format!(
+        "\n{}\n",
+        if differ {
+            "the optimized circuits differ between backends — which is the point: a \
+             backend-blind\noptimizer would have to pick one and be wrong for the others"
+        } else {
+            "every backend ended up with the same circuit for this program.  Multiplication \
+             by a\nconstant with several set bits is where they diverge — try\n  \
+             --expr '(+ (* x 100) (* y 100))' --parties 2 --only yao,semi2k"
+        }
+    ));
+    if rows.iter().all(|r| r.verified) && !rows.is_empty() {
+        out.push_str("all rewrites differentially checked against the original circuit\n");
+    }
+    out
+}
+
 /// Render the protocol registry as a table.
 pub fn format_registry() -> String {
     let mut out = String::new();
@@ -252,6 +525,13 @@ baru mpcc — MPC compiler and protocol comparison
   baru mpcc dump    (--expr EXPR | --case NAME) [lowering opts]
   baru mpcc analyse (--expr EXPR | --case NAME) [lowering opts]
   baru mpcc compare (--expr EXPR | --case NAME) [lowering opts] [deployment opts]
+  baru mpcc run     (--expr EXPR | --case NAME) --protocol ID [--input k=v ...]
+  baru mpcc calibrate (--expr EXPR | --case NAME) [--input k=v ...] [deployment opts]
+  baru mpcc optimize  (--expr EXPR | --case NAME) [--protocol ID] [deployment opts]
+
+run/calibrate opts
+  --protocol ID                     dealer | shamir  (the executable protocols)
+  --input NAME=VAL                  input binding, repeatable; implied by --case
 
 lowering opts
   --domain ring64|ring32|field128   arithmetic domain      (default ring64)
@@ -277,6 +557,8 @@ struct Args {
     network: &'static str,
     only: Vec<String>,
     json: bool,
+    protocol: Option<String>,
+    inputs: Vec<(String, i64)>,
 }
 
 fn parse_args(args: &[String]) -> Result<Args, String> {
@@ -291,6 +573,8 @@ fn parse_args(args: &[String]) -> Result<Args, String> {
     let mut include_offline = true;
     let mut only: Vec<String> = Vec::new();
     let mut json = false;
+    let mut protocol: Option<String> = None;
+    let mut inputs: Vec<(String, i64)> = Vec::new();
 
     let mut i = 0;
     // Values are read as `args[i + 1]`; each arm advances `i` past its value.
@@ -344,6 +628,21 @@ fn parse_args(args: &[String]) -> Result<Args, String> {
                 let v = value()?;
                 security =
                     Security::parse(&v).ok_or_else(|| format!("unknown security level `{}`", v))?;
+                true
+            }
+            "--protocol" => {
+                protocol = Some(value()?);
+                true
+            }
+            "--input" => {
+                let v = value()?;
+                let (k, n) = v
+                    .split_once('=')
+                    .ok_or_else(|| format!("--input `{}` is not NAME=VAL", v))?;
+                let n: i64 = n
+                    .parse()
+                    .map_err(|_| format!("--input `{}`: value is not an integer", v))?;
+                inputs.push((k.to_string(), n));
                 true
             }
             "--only" => {
@@ -410,7 +709,31 @@ fn parse_args(args: &[String]) -> Result<Args, String> {
         },
         only,
         json,
+        protocol,
+        inputs,
     })
+}
+
+/// Input bindings for `run`/`calibrate`: explicit `--input` flags win, and a
+/// `--case` supplies the suite's own inputs when none are given.
+fn inputs_of(a: &Args) -> Result<HashMap<String, i64>, String> {
+    if !a.inputs.is_empty() {
+        return Ok(a.inputs.iter().cloned().collect());
+    }
+    if let Some(name) = &a.case {
+        if let Some(c) = crate::bench::SUITE.iter().find(|c| c.name == *name) {
+            return Ok(c
+                .inputs
+                .iter()
+                .map(|(k, v)| ((*k).to_string(), *v))
+                .collect());
+        }
+    }
+    Err(
+        "need --input NAME=VAL for every program input (or use --case, which \
+         supplies the suite's own bindings)"
+            .to_string(),
+    )
 }
 
 /// Resolve `--expr` / `--case` to source text.
@@ -442,6 +765,123 @@ pub fn run_cli(args: &[String]) -> Result<(), String> {
         }
         "protocols" => {
             print!("{}", format_registry());
+            Ok(())
+        }
+        "run" => {
+            let a = parse_args(&args[1..])?;
+            let src = source_of(&a)?;
+            let id = a
+                .protocol
+                .clone()
+                .ok_or_else(|| format!("--protocol is required; Baru can run {:?}", RUNNABLE))?;
+            let spec = find(&id).ok_or_else(|| format!("unknown protocol `{}`", id))?;
+            let cfg = LowerConfig {
+                domain: cost::native_domain(spec, 64),
+                parties: a.dep.parties,
+                bit_width: a.lower.bit_width,
+                public_vars: a.lower.public_vars.clone(),
+            };
+            let prog = compile(&src, &cfg)?;
+            let sched = schedule(&prog);
+            let measured = run_protocol(&id, a.dep.parties, &prog, &sched, &inputs_of(&a)?)?;
+            if a.json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&measured).map_err(|e| e.to_string())?
+                );
+            } else {
+                println!("program   {}", src);
+                println!(
+                    "protocol  {} over {}, {} parties",
+                    measured.protocol, prog.domain, measured.parties
+                );
+                for (name, value) in &measured.outputs {
+                    println!("output    {} = {}", name, value);
+                }
+                println!(
+                    "cost      {} rounds, {} bytes/party online, {} muls, {} opens, \
+                     {} triples ({} µs local)",
+                    measured.rounds,
+                    measured.online_bytes,
+                    measured.muls,
+                    measured.opens,
+                    measured.triples,
+                    measured.micros
+                );
+            }
+            Ok(())
+        }
+        "calibrate" => {
+            let a = parse_args(&args[1..])?;
+            let src = source_of(&a)?;
+            let rows = calibrate(
+                &src,
+                &inputs_of(&a)?,
+                a.dep.parties,
+                &a.dep,
+                a.lower.bit_width,
+            )?;
+            if a.json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&rows).map_err(|e| e.to_string())?
+                );
+            } else {
+                print!("{}", format_calibration(&rows, &src));
+            }
+            if rows.iter().any(|r| !r.correct) {
+                return Err("a protocol produced the wrong answer".to_string());
+            }
+            Ok(())
+        }
+        "optimize" | "optimise" => {
+            let a = parse_args(&args[1..])?;
+            let src = source_of(&a)?;
+            let expr =
+                crate::interpreter::parse(&src).map_err(|e| format!("parse error: {}", e))?;
+            let circuit = CircuitCompiler::new()
+                .compile_fhe(&expr)
+                .map_err(|e| format!("circuit compile error: {}", e))?;
+
+            // With no --protocol, optimize for every eligible backend, which is
+            // the point: the circuits come out different.
+            let targets: Vec<&ProtocolSpec> = match &a.protocol {
+                Some(id) => vec![find(id).ok_or_else(|| format!("unknown protocol `{}`", id))?],
+                None => REGISTRY
+                    .iter()
+                    .filter(|s| cost::eligibility(s, &a.dep).is_ok())
+                    .filter(|s| a.only.is_empty() || a.only.iter().any(|o| o == s.id))
+                    .collect(),
+            };
+
+            let mut results = Vec::new();
+            for spec in targets {
+                let cfg = LowerConfig {
+                    domain: cost::native_domain(spec, 64),
+                    parties: a.dep.parties,
+                    bit_width: a.lower.bit_width,
+                    public_vars: a.lower.public_vars.clone(),
+                };
+                match opt::optimize(
+                    &circuit.flat_ops,
+                    &circuit.output_wire,
+                    spec,
+                    &a.dep,
+                    &cfg,
+                    true,
+                ) {
+                    Ok(o) => results.push(o),
+                    Err(e) => eprintln!("{}: {}", spec.id, e),
+                }
+            }
+            if a.json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&results).map_err(|e| e.to_string())?
+                );
+            } else {
+                print!("{}", format_optimizations(&results, &src));
+            }
             Ok(())
         }
         "dump" | "analyse" | "analyze" | "compare" => {
@@ -534,6 +974,228 @@ mod tests {
         assert!(run_cli(&["compare".into(), "--nope".into()]).is_err());
         assert!(run_cli(&["compare".into(), "--case".into(), "nosuch".into()]).is_err());
         assert!(run_cli(&["protocols".into()]).is_ok());
+    }
+
+    fn bindings(pairs: &[(&str, i64)]) -> HashMap<String, i64> {
+        pairs.iter().map(|(k, v)| (k.to_string(), *v)).collect()
+    }
+
+    #[test]
+    fn simulated_protocols_compute_the_same_answers_as_the_interpreter() {
+        let cases: &[(&str, &[(&str, i64)])] = &[
+            ("(* x y)", &[("x", -6), ("y", 7)]),
+            ("(+ (* x 3) (* y 7))", &[("x", 12), ("y", 5)]),
+            ("(* (* (* x y) x) y)", &[("x", 3), ("y", -2)]),
+            ("(- (* x x) (* y y))", &[("x", -9), ("y", 4)]),
+            (
+                "(+ (+ (* a b) (* c d)) (* e f))",
+                &[("a", 2), ("b", 3), ("c", 4), ("d", 5), ("e", 6), ("f", 7)],
+            ),
+        ];
+        for parties in [3usize, 5] {
+            for (src, ins) in cases {
+                let rows = calibrate(src, &bindings(ins), parties, &Deployment::lan(parties), 32)
+                    .unwrap_or_else(|e| panic!("{} @ {} parties: {}", src, parties, e));
+                assert_eq!(rows.len(), 2, "dealer and shamir both run at {}", parties);
+                for r in &rows {
+                    assert!(
+                        r.correct,
+                        "{} under {} with {} parties: got {:?}, expected {:?}",
+                        src, r.protocol, parties, r.result, r.expected
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_cost_model_agrees_with_the_simulator_on_the_online_phase() {
+        // Not a tautology: the model derives rounds from the schedule's depth
+        // and bytes from per-protocol volume rules, while the simulator counts
+        // actual send points during a real execution.  A mistake in either the
+        // scheduler or a protocol's volume rule shows up here.
+        for (src, ins) in [
+            ("(* x y)", vec![("x", 6), ("y", 7)]),
+            ("(* (* (* x y) x) y)", vec![("x", 3), ("y", -2)]),
+            (
+                "(+ (* a b) (* c d))",
+                vec![("a", 2), ("b", 3), ("c", 4), ("d", 5)],
+            ),
+        ] {
+            let rows = calibrate(src, &bindings(&ins), 3, &Deployment::lan(3), 32).unwrap();
+            for r in rows {
+                assert_eq!(
+                    r.predicted_rounds, r.measured_rounds,
+                    "{} {}",
+                    src, r.protocol
+                );
+                assert_eq!(
+                    r.predicted_online_bytes, r.measured_online_bytes,
+                    "{} {}",
+                    src, r.protocol
+                );
+                assert_eq!(
+                    r.predicted_triples, r.measured_triples,
+                    "{} {}",
+                    src, r.protocol
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn independent_multiplications_really_do_collapse_into_one_round() {
+        let parallel = calibrate(
+            "(+ (+ (* a b) (* c d)) (* e f))",
+            &bindings(&[("a", 2), ("b", 3), ("c", 4), ("d", 5), ("e", 6), ("f", 7)]),
+            3,
+            &Deployment::lan(3),
+            32,
+        )
+        .unwrap();
+        let serial = calibrate(
+            "(* (* (* x y) x) y)",
+            &bindings(&[("x", 3), ("y", -2)]),
+            3,
+            &Deployment::lan(3),
+            32,
+        )
+        .unwrap();
+        // Three multiplications either way; batching turns 3 rounds into 1.
+        assert_eq!(parallel[0].measured_triples, 3);
+        assert_eq!(serial[0].measured_triples, 3);
+        assert!(
+            parallel[0].measured_rounds < serial[0].measured_rounds,
+            "parallel {} should beat serial {}",
+            parallel[0].measured_rounds,
+            serial[0].measured_rounds
+        );
+    }
+
+    #[test]
+    fn comparisons_run_and_agree_with_the_interpreter() {
+        // Phase P2: the whole point is that these no longer merely *cost*.
+        let cases: &[(&str, &[(&str, i64)])] = &[
+            ("(* x (> x 0))", &[("x", -7)]),
+            ("(* x (> x 0))", &[("x", 12)]),
+            (
+                "(let ((m (> x y))) (+ (* x m) (* y (- 1 m))))",
+                &[("x", 9), ("y", 4)],
+            ),
+            (
+                "(let ((m (> x y))) (+ (* x m) (* y (- 1 m))))",
+                &[("x", -9), ("y", -4)],
+            ),
+            ("(< x y)", &[("x", -3), ("y", 3)]),
+            ("(== x y)", &[("x", 5), ("y", 5)]),
+            ("(== x y)", &[("x", 5), ("y", 6)]),
+            ("(ash-right x 3)", &[("x", 1000)]),
+        ];
+        for (src, ins) in cases {
+            for parties in [3usize, 5] {
+                let rows = calibrate(src, &bindings(ins), parties, &Deployment::lan(parties), 32)
+                    .unwrap_or_else(|e| panic!("{} @ {}: {}", src, parties, e));
+                for r in &rows {
+                    assert!(
+                        r.correct,
+                        "{} under {} with {} parties: got {:?}, expected {:?}",
+                        src, r.protocol, parties, r.result, r.expected
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn comparison_costs_are_predicted_exactly_too() {
+        // The Kogge-Stone borrow chain in `vm` and the `bit_decompose_muls`
+        // formula in `cost` are two independent statements of the same
+        // algorithm; this is what keeps them from drifting apart.
+        for (src, ins) in [
+            ("(* x (> x 0))", vec![("x", -7)]),
+            ("(== x y)", vec![("x", 5), ("y", 6)]),
+            ("(ash-right x 3)", vec![("x", 1000)]),
+        ] {
+            let rows = calibrate(src, &bindings(&ins), 3, &Deployment::lan(3), 32).unwrap();
+            for r in rows {
+                assert_eq!(
+                    r.predicted_rounds, r.measured_rounds,
+                    "{} {}",
+                    src, r.protocol
+                );
+                assert_eq!(r.predicted_muls, r.measured_muls, "{} {}", src, r.protocol);
+                assert_eq!(
+                    r.predicted_online_bytes, r.measured_online_bytes,
+                    "{} {}",
+                    src, r.protocol
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn comparisons_batch_into_one_decomposition_round() {
+        // Four independent comparisons at the same dependence level must cost
+        // the rounds of *one*, or the whole round-scheduling story is wrong.
+        let one = calibrate(
+            "(> a b)",
+            &bindings(&[("a", 1), ("b", 2)]),
+            3,
+            &Deployment::lan(3),
+            32,
+        )
+        .unwrap();
+        let four = calibrate(
+            "(+ (+ (> a b) (> c d)) (+ (> e f) (> g h)))",
+            &bindings(&[
+                ("a", 1),
+                ("b", 2),
+                ("c", 3),
+                ("d", 4),
+                ("e", 5),
+                ("f", 6),
+                ("g", 7),
+                ("h", 8),
+            ]),
+            3,
+            &Deployment::lan(3),
+            32,
+        )
+        .unwrap();
+        assert_eq!(
+            one[0].measured_rounds, four[0].measured_rounds,
+            "batched comparisons must not cost more rounds"
+        );
+        assert!(four[0].measured_muls > 3 * one[0].measured_muls);
+    }
+
+    #[test]
+    fn unrunnable_programs_and_protocols_say_why() {
+        // Secret division still needs restoring long division — phase P3.
+        let cfg = LowerConfig::default();
+        let prog = compile("(/ x y)", &cfg).unwrap();
+        let sched = schedule(&prog);
+        let err =
+            run_protocol("dealer", 3, &prog, &sched, &bindings(&[("x", 6), ("y", 3)])).unwrap_err();
+        assert!(err.contains("P3"), "{}", err);
+
+        let prog = compile("(* x y)", &cfg).unwrap();
+        let sched = schedule(&prog);
+        let err =
+            run_protocol("mascot", 3, &prog, &sched, &bindings(&[("x", 1), ("y", 2)])).unwrap_err();
+        assert!(err.contains("not executable yet"), "{}", err);
+
+        // Shamir has no honest majority with two parties.
+        assert!(calibrate(
+            "(* x y)",
+            &bindings(&[("x", 1), ("y", 2)]),
+            2,
+            &Deployment::lan(2),
+            32
+        )
+        .unwrap()
+        .iter()
+        .all(|r| r.protocol == "dealer"));
     }
 
     #[test]

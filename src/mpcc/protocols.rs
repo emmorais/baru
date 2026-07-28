@@ -155,6 +155,11 @@ pub struct CostParams {
     /// Total rounds for a constant-round protocol (input OT, garbling
     /// transfer, output).  Ignored unless `constant_round`.
     pub constant_rounds: u32,
+    /// Size of the prime a field protocol works over.  Honest-majority
+    /// protocols are happy with a ~61-bit Mersenne prime; SPDZ-family protocols
+    /// need a large prime for MAC security.  Ignored by ring and binary
+    /// protocols.
+    pub field_bits: u32,
     /// Local cryptographic work per interactive lane, in nanoseconds.  Captures
     /// AES calls for garbling, MAC checks for authenticated protocols, and plain
     /// field arithmetic otherwise.  An estimate; calibrated in P1.
@@ -200,6 +205,7 @@ const SEMI_RING_SHARED: CostParams = CostParams {
     auth_overhead: 1.0,
     constant_round: false,
     constant_rounds: 0,
+    field_bits: 64,
     local_ns_per_lane: 5.0,
 };
 
@@ -361,6 +367,7 @@ pub const REGISTRY: &[ProtocolSpec] = &[
             open_elems: Elems::new(0.0, 1.0),
             triples_per_mul: 1.0,
             offline_elems_per_triple: 190.0,
+            field_bits: 128,
             and_bits: Elems::new(0.0, 2.0),
             auth_overhead: 2.0,
             local_ns_per_lane: 20.0,
@@ -384,6 +391,7 @@ pub const REGISTRY: &[ProtocolSpec] = &[
             // Somewhat-homomorphic preprocessing trades communication for
             // local work: far fewer bytes, far more CPU.
             offline_elems_per_triple: 8.0,
+            field_bits: 128,
             and_bits: Elems::new(0.0, 2.0),
             auth_overhead: 2.0,
             local_ns_per_lane: 40.0,
@@ -417,6 +425,7 @@ pub const REGISTRY: &[ProtocolSpec] = &[
             constant_round: true,
             // OT for the evaluator's inputs, table transfer, output decoding.
             constant_rounds: 3,
+            field_bits: 0,
             // ~4 fixed-key AES calls to garble + 2 to evaluate one AND gate.
             local_ns_per_lane: 40.0,
         },

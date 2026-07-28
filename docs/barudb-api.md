@@ -1,6 +1,6 @@
 # BaruDB — the encrypted experiment store
 
-**Repository:** <https://github.com/emmorais/blindsearch>
+**Repository:** <https://github.com/emmorais/blindsearch> — crate and binary `barudb`
 
 **Purpose.** Long-running privacy-preserving-ML experiments produce results over
 weeks (TFHE MNIST inference alone is ~47 min/run). Those results have to survive
@@ -65,21 +65,28 @@ crypto is required for v1.
 
 Baru is happy with **either** transport; the trait in `src/db/mod.rs` abstracts it.
 
-### 2a. Process transport (simplest — implement this first)
+### 2a. Process transport — **implemented**
 
 ```
-blindsearch put    --db <path> --keywords <k1,k2,...> [--stdin]      → {"id": "..."}
-blindsearch get    --db <path> --id <id>                             → record JSON on stdout
-blindsearch search --db <path> --keyword <k> [--keyword <k> ...]     → {"ids": [...]}
-blindsearch list   --db <path> [--limit N] [--after <id>]            → {"ids": [...]}
-blindsearch stats  --db <path>                                       → {"records": N, "bytes": N}
+barudb put    --db <path> --keywords <k1,k2,...> [--stdin]      → {"id": "..."}
+barudb get    --db <path> --id <id>                             → record JSON on stdout
+barudb search --db <path> --keyword <k> [--keyword <k> ...]     → {"ids": [...]}
+barudb list   --db <path> [--limit N] [--after <id>]            → {"ids": [...]}
+barudb stats  --db <path>                                       → {"records": N, "bytes": N}
 ```
+
+Baru finds the executable on `PATH`, or at `$BARUDB_BIN`.  Verified end to end
+on 2026-07-27: `baru bench --store barudb:<path>` writes records, `baru db
+query` reads them back through conjunctive keyword search, the database file
+contains no plaintext, and a wrong password fails with a readable error.
 
 Rules Baru relies on:
 
 * The password comes from `BLINDSEARCH_PASSWORD` when set, so Baru can run
   unattended in a benchmark loop; interactive prompting stays the default when it
-  is unset.
+  is unset.  (Baru never supplies it — `barudb` reads its own environment.  A
+  `BARUDB_PASSWORD` alias would match the binary's name, but the current
+  variable works and renaming it is not urgent.)
 * `put` reads the record body from stdin (`--stdin`) and encrypts it. The body is
   opaque JSON to BaruDB.
 * Multiple `--keyword` flags to `search` mean **conjunction** (AND). Baru needs AND;
@@ -101,6 +108,31 @@ Baru already runs an axum control plane (`src/rest.rs`), so mirroring that shape
 keeps the two services operationally identical.
 
 ---
+
+## 2c. Why a process, not a Cargo dependency
+
+BaruDB is a library crate (`src/lib.rs`), so Baru could link it and skip the
+pipe.  It deliberately does not:
+
+* **Key isolation is a fact, not a convention.**  §3 says Baru hands over
+  plaintext and BaruDB owns the cryptography.  Across a process boundary that is
+  enforced by the operating system.  In one binary it would rest on nobody
+  reaching into `barudb::crypto`, which is one `pub` away from being untrue —
+  and this is precisely the invariant that would be embarrassing to get wrong.
+* **Dependency trees stay separate.**  BaruDB brings redb, argon2, aes-gcm,
+  arkworks and bulletproofs; Baru brings SEAL (a C++ build), tfhe-rs and
+  binius64.  Neither project should pay for the other's compile.
+* **BaruDB stays replaceable.**  A future HTTP deployment (§2b) is a config
+  change, not a refactor.
+* **The overhead does not matter at this scale.**  A benchmark run writes ~30
+  records against workloads measured in minutes to hours; ~30 spawns cost well
+  under a second.  If per-sample logging ever pushes that to thousands of
+  records, the fix is a batch `put` reading JSON lines, not linking.
+
+Nor a git submodule: a submodule buys nothing a pinned Cargo git dependency
+would not, and costs detached HEADs and forgotten `--recursive` clones.  The two
+repositories are coupled by *this document*, which is the loosest coupling that
+still pins the behaviour Baru depends on.
 
 ## 3. What Baru guarantees
 

@@ -244,19 +244,7 @@ pub fn lower(flat: &[FlatOp], output_wire: &str, cfg: &LowerConfig) -> Result<Pr
     let mut lo = Lowerer::new(cfg);
 
     // ── Inputs: every wire read before it is written ──────────────────────
-    let defined: HashSet<&str> = flat.iter().flat_map(flat_dsts).collect();
-    let mut seen: HashSet<String> = HashSet::new();
-    let mut input_names: Vec<String> = Vec::new();
-    for op in flat {
-        for w in op.inputs() {
-            if !defined.contains(w) && seen.insert(w.to_string()) {
-                input_names.push(w.to_string());
-            }
-        }
-    }
-    if !defined.contains(output_wire) && seen.insert(output_wire.to_string()) {
-        input_names.push(output_wire.to_string());
-    }
+    let input_names = input_wires(flat, output_wire);
 
     let public: HashSet<&str> = cfg.public_vars.iter().map(String::as_str).collect();
     let mut next_party = 0usize;
@@ -462,8 +450,30 @@ fn lower_op(lo: &mut Lowerer, op: &FlatOp) -> Result<(), String> {
     Ok(())
 }
 
+/// A circuit's inputs: every wire read before any instruction writes it, in
+/// first-use order.  `FlatOp` has no input declaration, so this *is* the
+/// definition of a circuit's signature, and both lowering and
+/// [`crate::mpcc::opt`] need to agree on it.
+pub fn input_wires(flat: &[FlatOp], output_wire: &str) -> Vec<String> {
+    let defined: HashSet<&str> = flat.iter().flat_map(flat_dsts).collect();
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut names: Vec<String> = Vec::new();
+    for op in flat {
+        for w in op.inputs() {
+            if !defined.contains(w) && seen.insert(w.to_string()) {
+                names.push(w.to_string());
+            }
+        }
+    }
+    // A circuit that is just `x` has no instructions at all.
+    if !defined.contains(output_wire) && seen.insert(output_wire.to_string()) {
+        names.push(output_wire.to_string());
+    }
+    names
+}
+
 /// The wires an op writes.  `FlatOp::dst` only reports one; `IDiv` writes two.
-fn flat_dsts(op: &FlatOp) -> Vec<&str> {
+pub fn flat_dsts(op: &FlatOp) -> Vec<&str> {
     match op {
         FlatOp::IDiv { dst_q, dst_r, .. } => vec![dst_q.as_str(), dst_r.as_str()],
         other => vec![other.dst()],

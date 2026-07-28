@@ -157,9 +157,10 @@ Marked ✅ = implemented in Baru today, 🔨 = planned, in roughly the order bel
 |---|---|---|---|---|---|
 | ABY3 / Replicated | ring 2^k | 3 | honest | semi-honest | ✅ `crypto/aby3_protocol.rs` |
 | Yao GC | binary | 2 | dishonest | semi-honest | ✅ `interpreter/gc_backend.rs` |
-| Dealer | ring 2^k | n≥2 | — (trusted dealer) | semi-honest | 🔨 P1 — the online-cost lower bound |
-| Semi2k | ring 2^k | n≥2 | dishonest | semi-honest | 🔨 P1 |
-| Shamir | field p | n≥3 | honest | semi-honest | 🔨 P1 (already on the roadmap) |
+| Dealer | ring 2^k | n≥2 | — (trusted dealer) | semi-honest | ✅ `mpcc/sim.rs` — the online-cost lower bound |
+| Semi2k | ring 2^k | n≥2 | dishonest | semi-honest | 🔨 P1 (same online phase as Dealer; needs OT triples) |
+| Shamir | field p | n≥3 | honest | semi-honest | ✅ `mpcc/sim.rs` (GRR degree reduction) |
+
 | Replicated (field) | field p | 3 | honest | semi-honest | 🔨 P2 |
 | ATLAS | field p | n≥3 | honest | semi-honest | 🔨 P2 |
 | SPDZ2k | ring 2^k | n≥2 | dishonest | malicious | 🔨 P2 |
@@ -184,15 +185,52 @@ minimization, `mpcc::protocols` registry with capability + cost parameters,
 No new protocol implementations — the point is the framework, validated against
 the two backends we already have.
 
-**P1 — first new protocols.** Dealer, Semi2k, Shamir behind a single
-`MpcProtocol` VM interface; the existing ABY3 transport backend re-expressed
-through it. Calibrate the cost model against all four; report predicted vs
-measured. Deliverable: a table with prediction error per protocol.
+**P1 — first new protocols.** *In progress.*
 
-**P2 — malicious security & mixed circuits.** SPDZ2k MACs, replicated field,
-ATLAS. daBit/edaBit generation, so `Convert` becomes real and arithmetic↔binary
-mixed circuits work. This is what unlocks honest comparisons of comparison-heavy
-workloads (ReLU, argmax, decision trees).
+Done: the bytecode VM (`mpcc/vm.rs`) with a `ShareEngine` trait — a protocol
+supplies sharing, opening, multiplication and correlated randomness, and the
+driver composes the bytecode from those, so adding a protocol is one trait
+implementation rather than one VM. Two engines behind it (`mpcc/sim.rs`):
+**Dealer** (additive mod 2^k, Beaver) and **Shamir** (prime field, GRR degree
+reduction) — structurally different in exactly the way that matters for costing,
+one sending two elements per peer per multiplication and consuming a triple, the
+other sending one and consuming none. `baru mpcc calibrate` runs a program under
+both and tables measured against predicted cost, with the answer checked against
+the plain interpreter.
+
+Current status: online rounds, bytes and triple counts match the model exactly
+on the multiplicative core. That validates the *bookkeeping* — round scheduling,
+peer scaling, Beaver-vs-GRR volume — not the wall-clock constants, which need a
+real network (P1 remainder).
+
+Remaining: Semi2k (Dealer's online phase with OT-generated triples), the existing
+ABY3 transport backend re-expressed as a `ShareEngine`, and a LAN/WAN measurement
+harness so the latency and bandwidth terms get calibrated too.
+
+**P2 — comparisons, malicious security & mixed circuits.** *Comparisons done.*
+
+Done: shared random bits are a `ShareEngine` primitive, and
+`vm::bit_decompose_batch` implements masked-opening bit decomposition with a
+**Kogge–Stone parallel-prefix borrow chain** — `log₂(nbits)` rounds instead of
+the `nbits` a ripple-borrow chain would need. Two details make it cheap: the
+minuend is public after the opening, so generate/propagate are *local*; and
+`gᵢ·pᵢ = 0` always, so the `OR` in the prefix combine is a plain addition and
+each combine is two independent multiplications. `LtS`, `LtU`, `EqZ` and
+`TruncPr` all run on top of it, batched — ten comparisons at one dependence
+level cost one comparison's rounds.
+
+`relu` and `max` now execute under Dealer and Shamir and agree with the plain
+interpreter. The cost model was corrected to match the implemented algorithm
+(`cost::bit_decompose_muls` mirrors the VM instruction for instruction), and
+`baru mpcc calibrate` reports 0% error on rounds, multiplications and bytes for
+comparison-heavy programs. Note what that does and does not show: it shows the
+model and the implementation agree about the *algorithm*, not that either
+matches a real network — that still needs P1's remaining measurement harness.
+
+Remaining: secret division (restoring long division on top of the comparison
+machinery — still refused by the VM, with an error naming this phase), SPDZ2k
+MACs, replicated field, ATLAS, and daBit-based `Convert` for arithmetic↔binary
+mixed circuits.
 
 **P3 — preprocessing back-ends.** MASCOT (OT), LowGear (BFV). Split offline/online
 measurement in the harness (MP-SPDZ's `-v`). This is where Baru's existing FHE

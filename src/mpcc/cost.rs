@@ -42,6 +42,7 @@ use serde::Serialize;
 use super::ir::{Domain, DomainKind, Op, Program, Secrecy};
 use super::protocols::{Majority, ProtocolSpec, Security};
 use super::schedule::Schedule;
+use super::vm::KAPPA;
 
 /// The deployment a program is being costed for.
 #[derive(Debug, Clone)]
@@ -100,6 +101,10 @@ pub struct CostEstimate {
     pub offline_bytes: u64,
     pub triples: u64,
     pub and_triples: u64,
+    /// Secret x secret multiplications.
+    pub muls: u64,
+    /// Shared random bits consumed by comparisons and bit decompositions.
+    pub random_bits: u64,
     pub edabits: u64,
     pub dabits: u64,
     /// Boolean AND gates, for protocols that evaluate a binary circuit.
@@ -121,6 +126,8 @@ struct Acc {
     bytes: f64,
     triples: f64,
     and_triples: f64,
+    muls: f64,
+    random_bits: f64,
     edabits: f64,
     dabits: f64,
     and_gates: f64,
@@ -164,6 +171,19 @@ pub fn eligibility(spec: &ProtocolSpec, dep: &Deployment) -> Result<(), String> 
     Ok(())
 }
 
+/// The domain a protocol runs in, independent of any particular program —
+/// what [`crate::mpcc::lower`] should target so a measured run and a predicted
+/// one are comparable.
+pub fn native_domain(spec: &ProtocolSpec, ring_bits: u32) -> Domain {
+    match spec.domain {
+        DomainKind::Ring => Domain::Ring { k: ring_bits },
+        DomainKind::Field => Domain::Field {
+            bits: spec.cost.field_bits,
+        },
+        DomainKind::Binary => Domain::Binary,
+    }
+}
+
 /// The domain a protocol would actually run the program in.
 fn protocol_domain(spec: &ProtocolSpec, prog: &Program) -> Domain {
     match spec.domain {
@@ -171,11 +191,31 @@ fn protocol_domain(spec: &ProtocolSpec, prog: &Program) -> Domain {
             Domain::Ring { k } => Domain::Ring { k },
             _ => Domain::Ring { k: 64 },
         },
-        // The standard SPDZ prime size; a 64-bit program run mod p has
-        // different wraparound semantics, which `notes` flags.
-        DomainKind::Field => Domain::Field { bits: 128 },
+        // Each protocol declares its own prime size — honest-majority
+        // protocols use a ~61-bit Mersenne prime, SPDZ-family ones a large
+        // prime for MAC security.  Running a mod-2^k program mod p changes
+        // wraparound semantics, which `notes` flags.
+        DomainKind::Field => Domain::Field {
+            bits: spec.cost.field_bits,
+        },
         DomainKind::Binary => Domain::Binary,
     }
+}
+
+/// Multiplications one `nb`-bit decomposition costs.
+///
+/// Mirrors [`crate::mpcc::vm::bit_decompose_batch`] instruction for
+/// instruction: each Kogge-Stone level combines `nb - d` positions at two
+/// multiplications apiece, and a final layer XORs the borrows into the
+/// difference bits.  Keeping the two in step is the whole point of `calibrate`.
+fn bit_decompose_muls(nb: u32) -> f64 {
+    let mut total = 0u64;
+    let mut d = 1u32;
+    while d < nb {
+        total += 2 * u64::from(nb - d);
+        d *= 2;
+    }
+    (total + u64::from(nb.saturating_sub(1))) as f64
 }
 
 fn ceil_log2(n: u32) -> u32 {
@@ -200,8 +240,6 @@ fn arith_op_cost(
     let mul_bytes = lanes * c.mul_elems.total(n) * elem_bytes * c.auth_overhead;
     let open_bytes = lanes * c.open_elems.total(n) * elem_bytes * c.auth_overhead;
     let and_bytes_per_lane = c.and_bits.total(n) / 8.0 * c.auth_overhead;
-    let cmp_rounds = c.open_rounds + ceil_log2(bit_width) * c.and_rounds;
-    let cmp_ands = f64::from(bit_width);
     let local = |lanes: f64| lanes * c.local_ns_per_lane;
 
     match op {
@@ -210,6 +248,7 @@ fn arith_op_cost(
             acc: Acc {
                 bytes: mul_bytes,
                 triples: lanes * c.triples_per_mul,
+                muls: lanes,
                 local_ns: local(lanes),
                 ..Acc::default()
             },
@@ -232,19 +271,42 @@ fn arith_op_cost(
                 ..Acc::default()
             },
         },
-        // Mask with an edaBit, open, then run a k-bit binary adder to strip the
-        // mask: log-depth in AND gates.
-        Op::BitDecomp { nbits } => OpCost {
-            rounds: c.open_rounds + ceil_log2(*nbits) * c.and_rounds,
-            acc: Acc {
-                bytes: open_bytes + lanes * and_bytes_per_lane,
-                edabits: lanes * c.edabits_per_bit,
-                and_triples: lanes * c.triples_per_mul,
-                and_gates: lanes,
-                local_ns: local(lanes),
-                ..Acc::default()
-            },
-        },
+        // Everything comparison-shaped is one masked opening plus a
+        // Kogge-Stone borrow chain over *arithmetic* 0/1 shares -- there are no
+        // GF(2) gates in this construction, which is why `and_gates` stays zero
+        // for an arithmetic protocol.  `nb` is one bit wider than the value so
+        // a difference still has a meaningful sign bit, matching the VM.
+        Op::BitDecomp { .. } | Op::LtS | Op::LtU | Op::TruncPr { .. } => {
+            let nb = bit_width + 1;
+            let muls = lanes * bit_decompose_muls(nb);
+            OpCost {
+                rounds: c.open_rounds + (ceil_log2(nb) + 1) * c.mul_rounds,
+                acc: Acc {
+                    bytes: open_bytes + muls * c.mul_elems.total(n) * elem_bytes * c.auth_overhead,
+                    triples: muls * c.triples_per_mul,
+                    muls,
+                    random_bits: lanes * f64::from(nb + KAPPA),
+                    local_ns: local(muls),
+                    ..Acc::default()
+                },
+            }
+        }
+        // A decomposition, then an AND tree over the complemented bits.
+        Op::EqZ => {
+            let nb = bit_width + 1;
+            let muls = lanes * (bit_decompose_muls(nb) + f64::from(nb - 1));
+            OpCost {
+                rounds: c.open_rounds + (2 * ceil_log2(nb) + 1) * c.mul_rounds,
+                acc: Acc {
+                    bytes: open_bytes + muls * c.mul_elems.total(n) * elem_bytes * c.auth_overhead,
+                    triples: muls * c.triples_per_mul,
+                    muls,
+                    random_bits: lanes * f64::from(nb + KAPPA),
+                    local_ns: local(muls),
+                    ..Acc::default()
+                },
+            }
+        }
         Op::BitComp { .. } | Op::Convert => OpCost {
             rounds: c.open_rounds,
             acc: Acc {
@@ -254,57 +316,41 @@ fn arith_op_cost(
                 ..Acc::default()
             },
         },
-        Op::LtS | Op::LtU | Op::EqZ => OpCost {
-            rounds: cmp_rounds,
-            acc: Acc {
-                bytes: open_bytes + lanes * cmp_ands * and_bytes_per_lane,
-                edabits: lanes * f64::from(bit_width) * c.edabits_per_bit,
-                and_triples: lanes * cmp_ands * c.triples_per_mul,
-                and_gates: lanes * cmp_ands,
-                local_ns: local(lanes * cmp_ands),
-                ..Acc::default()
-            },
-        },
-        // Probabilistic truncation: one masked opening plus a correction term.
-        // Cheap in rounds, but not free — and Baru emits one per fixed-point
-        // multiplication.
-        Op::TruncPr { .. } => OpCost {
-            rounds: c.open_rounds + c.mul_rounds,
-            acc: Acc {
-                bytes: open_bytes + mul_bytes,
-                edabits: lanes * f64::from(bit_width) * c.edabits_per_bit,
-                triples: lanes * c.triples_per_mul,
-                local_ns: local(lanes),
-                ..Acc::default()
-            },
-        },
-        // Restoring long division, exactly as `Backend::divmod` implements it:
-        // one comparison and one multiplication per quotient bit, serially.
+        // Restoring long division: one comparison and one multiplication per
+        // quotient bit, serially -- exactly what `Backend::divmod` does.
         Op::Div => {
+            let nb = bit_width + 1;
             let steps = f64::from(bit_width);
+            let cmp_rounds = c.open_rounds + (ceil_log2(nb) + 1) * c.mul_rounds;
+            let muls = steps * lanes * (bit_decompose_muls(nb) + 1.0);
             OpCost {
                 rounds: bit_width * (cmp_rounds + c.mul_rounds),
                 acc: Acc {
-                    bytes: steps * (open_bytes + mul_bytes + lanes * cmp_ands * and_bytes_per_lane),
-                    triples: steps * lanes * c.triples_per_mul,
-                    and_triples: steps * lanes * cmp_ands * c.triples_per_mul,
-                    and_gates: steps * lanes * cmp_ands,
-                    local_ns: local(steps * lanes * cmp_ands),
+                    bytes: steps * open_bytes
+                        + muls * c.mul_elems.total(n) * elem_bytes * c.auth_overhead,
+                    triples: muls * c.triples_per_mul,
+                    muls,
+                    random_bits: steps * lanes * f64::from(nb + KAPPA),
+                    local_ns: local(muls),
                     ..Acc::default()
                 },
             }
         }
-        Op::PopCount { nbits } => OpCost {
-            rounds: c.open_rounds + ceil_log2(*nbits) * c.and_rounds,
-            acc: Acc {
-                bytes: open_bytes + lanes * f64::from(*nbits) * and_bytes_per_lane,
-                edabits: lanes * f64::from(*nbits) * c.edabits_per_bit,
-                dabits: lanes * f64::from(*nbits) * c.dabits_per_bit,
-                and_gates: lanes * f64::from(*nbits),
-                local_ns: local(lanes * f64::from(*nbits)),
-                ..Acc::default()
-            },
-        },
+        Op::PopCount { nbits } => {
+            let nb = bit_width + 1;
+            let muls = lanes * (bit_decompose_muls(nb) + f64::from(*nbits));
+            OpCost {
+                rounds: c.open_rounds + (ceil_log2(nb) + 1) * c.mul_rounds,
+                acc: Acc {
+                    bytes: open_bytes + muls * c.mul_elems.total(n) * elem_bytes * c.auth_overhead,
+                    triples: muls * c.triples_per_mul,
+                    muls,
+                    random_bits: lanes * f64::from(nb + KAPPA),
+                    local_ns: local(muls),
+                    ..Acc::default()
+                },
+            }
+        }
         // Local: linear operations, public constants, register plumbing.
         // Input sharing is charged once, as a batched prelude round, in
         // `estimate` — it never appears in a schedule level.
@@ -446,6 +492,8 @@ pub fn estimate(
             acc.bytes += cost.acc.bytes;
             acc.triples += cost.acc.triples;
             acc.and_triples += cost.acc.and_triples;
+            acc.muls += cost.acc.muls;
+            acc.random_bits += cost.acc.random_bits;
             acc.edabits += cost.acc.edabits;
             acc.dabits += cost.acc.dabits;
             acc.and_gates += cost.acc.and_gates;
@@ -483,7 +531,7 @@ pub fn estimate(
 
     let offline_bytes =
         (acc.triples + acc.and_triples) * spec.cost.offline_elems_per_triple * elem_bytes
-            + (acc.edabits + acc.dabits) * elem_bytes;
+            + (acc.edabits + acc.dabits + acc.random_bits) * elem_bytes;
 
     let latency_secs = rounds as f64 * dep.latency_us / 1e6;
     let bandwidth_secs = acc.bytes / dep.bandwidth_bytes_per_sec;
@@ -521,6 +569,8 @@ pub fn estimate(
         offline_bytes: offline_bytes as u64,
         triples: acc.triples as u64,
         and_triples: acc.and_triples as u64,
+        muls: acc.muls as u64,
+        random_bits: acc.random_bits as u64,
         edabits: acc.edabits as u64,
         dabits: acc.dabits as u64,
         and_gates: acc.and_gates as u64,

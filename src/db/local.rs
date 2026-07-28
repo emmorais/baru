@@ -5,7 +5,7 @@
 //! unreachable.  So the default store is a file: no daemon, no password, no
 //! network, and trivially greppable when something goes wrong.
 //!
-//! It is *not* encrypted — that is the whole reason [`crate::db::blindsearch`]
+//! It is *not* encrypted — that is the whole reason [`crate::db::barudb`]
 //! exists.  Use this for scratch work and CI; use BaruDB for anything whose
 //! numbers will end up in a paper.
 
