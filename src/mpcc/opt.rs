@@ -12,13 +12,20 @@
 //! resulting circuits are *different per backend*, which means a backend-blind
 //! optimizer has to pick one behaviour and be wrong the rest of the time.
 //!
-//! Two rules already demonstrate the effect:
+//! The rules demonstrate the effect from three directions:
 //!
 //! * **Strength reduction** — `x * 5` → `(x << 2) + x`.  Under Yao a `k × k`
 //!   schoolbook multiplier is `k²` AND gates and an adder is `k`, so at
 //!   `k = 64` this is a ~64× saving.  Under ABY3, multiplying by a *public*
 //!   constant is already a free local scalar multiply, so the rewrite adds an
 //!   instruction and buys nothing.
+//! * **Reassociation** ([`reassociate`]) trades dependence depth and *nothing
+//!   else* — same instruction count, same gate count — so it isolates the
+//!   round term.  Which operator it pays for inverts between protocol
+//!   families: multiplication under secret sharing (one round each), addition
+//!   under a binary protocol (a real AND-depth), neither under a
+//!   constant-round protocol.  That is the claim in its cleanest form, and the
+//!   tests pin all three cases.
 //! * **Shift fusion and CSE** are cheap everywhere, so they survive under every
 //!   backend — which is exactly why they make a good control.
 //!
@@ -125,6 +132,9 @@ pub enum Rule {
     FuseShifts,
     /// `x * c` for a public `c` with few set bits → shifts and adds.
     StrengthReduce,
+    /// Re-parenthesise a chain of one associative operator into a balanced
+    /// tree, trading dependence *depth* for nothing else.
+    Reassociate,
 }
 
 impl Rule {
@@ -133,6 +143,7 @@ impl Rule {
         Rule::Cse,
         Rule::FuseShifts,
         Rule::StrengthReduce,
+        Rule::Reassociate,
     ];
 
     pub fn name(&self) -> &'static str {
@@ -141,6 +152,7 @@ impl Rule {
             Rule::Cse => "cse",
             Rule::FuseShifts => "fuse-shifts",
             Rule::StrengthReduce => "strength-reduce",
+            Rule::Reassociate => "reassociate",
         }
     }
 
@@ -150,6 +162,7 @@ impl Rule {
             Rule::Cse => cse(flat, output_wire),
             Rule::FuseShifts => fuse_shifts(flat, output_wire),
             Rule::StrengthReduce => strength_reduce(flat),
+            Rule::Reassociate => reassociate(flat, output_wire),
         }
     }
 }
@@ -571,6 +584,213 @@ fn strength_reduce(flat: &[FlatOp]) -> Vec<FlatOp> {
     out
 }
 
+// ─── Reassociation ────────────────────────────────────────────────────────────
+
+/// Operators that are associative over the wrapping arithmetic `FlatOp` wires
+/// carry, so a chain of them can be re-parenthesised without changing the
+/// result.  `ISub32` is deliberately absent — subtraction is not associative.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Assoc {
+    Add,
+    Mul,
+    And,
+    Or,
+    Xor,
+}
+
+/// `(kind, dst, lhs, rhs)` when `op` is one of the associative binaries.
+fn assoc_of(op: &FlatOp) -> Option<(Assoc, &str, &str, &str)> {
+    match op {
+        FlatOp::IAdd32 { dst, lhs, rhs } => Some((Assoc::Add, dst, lhs, rhs)),
+        FlatOp::IMul { dst, lhs, rhs } => Some((Assoc::Mul, dst, lhs, rhs)),
+        FlatOp::BAnd { dst, lhs, rhs } => Some((Assoc::And, dst, lhs, rhs)),
+        FlatOp::BOr { dst, lhs, rhs } => Some((Assoc::Or, dst, lhs, rhs)),
+        FlatOp::BXor { dst, lhs, rhs } => Some((Assoc::Xor, dst, lhs, rhs)),
+        _ => None,
+    }
+}
+
+fn build_assoc(kind: Assoc, dst: String, lhs: String, rhs: String) -> FlatOp {
+    match kind {
+        Assoc::Add => FlatOp::IAdd32 { dst, lhs, rhs },
+        Assoc::Mul => FlatOp::IMul { dst, lhs, rhs },
+        Assoc::And => FlatOp::BAnd { dst, lhs, rhs },
+        Assoc::Or => FlatOp::BOr { dst, lhs, rhs },
+        Assoc::Xor => FlatOp::BXor { dst, lhs, rhs },
+    }
+}
+
+/// Collect the leaves of the maximal same-kind chain rooted at `flat[i]`, in
+/// left-to-right order, marking every chain instruction in `touched`.
+///
+/// An operand is followed into the chain only when it is produced by the same
+/// operator *and read exactly once* — otherwise some other instruction depends
+/// on that intermediate value and the chain cannot be rebuilt around it.
+struct ChainCtx<'a> {
+    flat: &'a [FlatOp],
+    counts: &'a HashMap<String, usize>,
+    producer: &'a HashMap<String, usize>,
+    output_wire: &'a str,
+}
+
+fn chain_leaves(
+    ctx: &ChainCtx<'_>,
+    i: usize,
+    kind: Assoc,
+    touched: &mut [bool],
+    leaves: &mut Vec<String>,
+) {
+    touched[i] = true;
+    let (_, _, lhs, rhs) = match assoc_of(&ctx.flat[i]) {
+        Some(t) => t,
+        None => return,
+    };
+    for w in [lhs.to_string(), rhs.to_string()] {
+        let single_use = ctx.counts.get(&w).copied().unwrap_or(0) == 1 && w != ctx.output_wire;
+        match ctx.producer.get(&w) {
+            Some(&j)
+                if single_use
+                    && !touched[j]
+                    && assoc_of(&ctx.flat[j]).map(|(k, ..)| k) == Some(kind) =>
+            {
+                chain_leaves(ctx, j, kind, touched, leaves);
+            }
+            _ => leaves.push(w),
+        }
+    }
+}
+
+/// Rebalance associative chains: `((((a·b)·c)·d)·e)` → `((a·b)·(c·d))·e`.
+///
+/// The instruction *count* is unchanged — only the dependence depth moves, from
+/// `n-1` to `⌈log₂ n⌉`. That is precisely why the rule belongs in a
+/// backend-aware optimizer rather than a generic one: under ASAP scheduling
+/// (see [`crate::mpcc::schedule`]) depth *is* the online round count, so for an
+/// interactive operator under a secret-sharing protocol this is a large WAN win,
+/// while for a constant-round garbled circuit it is worth exactly nothing. The
+/// search does not need to know which case it is in — [`objective`] prices it.
+///
+/// Note the asymmetry between operators, which is easy to state backwards:
+/// rebalancing a chain of *multiplications* pays under an arithmetic protocol
+/// (each multiply is a round), whereas rebalancing a chain of *additions* pays
+/// nothing there, because additions are local. Additions are the ones that
+/// matter for a binary protocol, where an adder is a real AND-depth.
+fn reassociate(flat: &[FlatOp], output_wire: &str) -> Vec<FlatOp> {
+    // A 3-leaf chain already has depth 2, which is what a balanced tree gives,
+    // so there is nothing to win below 4.
+    const MIN_LEAVES: usize = 4;
+
+    let counts = use_counts(flat, output_wire);
+    let mut producer: HashMap<String, usize> = HashMap::new();
+    for (i, op) in flat.iter().enumerate() {
+        for d in flat_dsts(op) {
+            producer.insert(d.to_string(), i);
+        }
+    }
+
+    // An instruction is *interior* to a longer chain when its result feeds one
+    // same-kind operator and nothing else; chains are rebuilt from their roots.
+    let mut interior = vec![false; flat.len()];
+    for op in flat {
+        if let Some((kind, _, lhs, rhs)) = assoc_of(op) {
+            for w in [lhs, rhs] {
+                if counts.get(w).copied().unwrap_or(0) != 1 || w == output_wire {
+                    continue;
+                }
+                if let Some(&j) = producer.get(w) {
+                    if assoc_of(&flat[j]).map(|(k, ..)| k) == Some(kind) {
+                        interior[j] = true;
+                    }
+                }
+            }
+        }
+    }
+
+    let mut consumed = vec![false; flat.len()];
+    let mut plan: HashMap<usize, (Assoc, String, Vec<String>)> = HashMap::new();
+    for i in 0..flat.len() {
+        if consumed[i] || interior[i] {
+            continue;
+        }
+        let (kind, dst) = match assoc_of(&flat[i]) {
+            Some((k, d, ..)) => (k, d.to_string()),
+            None => continue,
+        };
+        let mut touched = vec![false; flat.len()];
+        let mut leaves = Vec::new();
+        let ctx = ChainCtx {
+            flat,
+            counts: &counts,
+            producer: &producer,
+            output_wire,
+        };
+        chain_leaves(&ctx, i, kind, &mut touched, &mut leaves);
+        if leaves.len() < MIN_LEAVES {
+            continue; // leave the chain alone, and leave `consumed` untouched
+        }
+        for (j, t) in touched.iter().enumerate() {
+            if *t {
+                consumed[j] = true;
+            }
+        }
+        plan.insert(i, (kind, dst, leaves));
+    }
+
+    let taken: HashSet<String> = flat
+        .iter()
+        .flat_map(|o| flat_dsts(o).into_iter().map(String::from))
+        .collect();
+    let mut fresh = 0usize;
+    let name = |fresh: &mut usize| loop {
+        *fresh += 1;
+        let n = format!("opt${}", fresh);
+        if !taken.contains(&n) {
+            return n;
+        }
+    };
+
+    let mut out: Vec<FlatOp> = Vec::with_capacity(flat.len());
+    for (i, op) in flat.iter().enumerate() {
+        if let Some((kind, dst, leaves)) = plan.get(&i) {
+            // Pair up level by level; the last combine writes the chain's dst,
+            // so nothing downstream notices the rebuild.  Every leaf is defined
+            // before the root in SSA order, so emitting the whole tree here is
+            // topologically sound.
+            let mut level = leaves.clone();
+            while level.len() > 1 {
+                let mut next: Vec<String> = Vec::with_capacity(level.len().div_ceil(2));
+                let final_combine = level.len() == 2;
+                let mut k = 0;
+                while k + 1 < level.len() {
+                    let into = if final_combine {
+                        dst.clone()
+                    } else {
+                        name(&mut fresh)
+                    };
+                    out.push(build_assoc(
+                        *kind,
+                        into.clone(),
+                        level[k].clone(),
+                        level[k + 1].clone(),
+                    ));
+                    next.push(into);
+                    k += 2;
+                }
+                if k < level.len() {
+                    next.push(level[k].clone()); // odd leaf rides to the next level
+                }
+                level = next;
+            }
+            continue;
+        }
+        if consumed[i] {
+            continue; // folded into the rebuilt tree at its root
+        }
+        out.push(op.clone());
+    }
+    out
+}
+
 /// How many times each wire is read, counting the output wire as one use.
 fn use_counts(flat: &[FlatOp], output_wire: &str) -> HashMap<String, usize> {
     let mut counts: HashMap<String, usize> = HashMap::new();
@@ -860,6 +1080,172 @@ mod tests {
             aby3_flat,
             "backend-aware optimization must produce backend-specific circuits"
         );
+    }
+
+    /// A left-nested chain of `n` copies of `op` over distinct inputs.
+    fn chain(op: &str, n: usize) -> String {
+        let mut s = "a0".to_string();
+        for i in 1..n {
+            s = format!("({} {} a{})", op, s, i);
+        }
+        s
+    }
+
+    fn opt_wan(src: &str, id: &str) -> Optimized {
+        let (flat, out) = compile(src);
+        let parties = if id == "yao" { 2 } else { 3 };
+        optimize(
+            &flat,
+            &out,
+            find(id).unwrap(),
+            &Deployment::wan(parties),
+            &cfg_for(id),
+            true,
+        )
+        .expect("optimize")
+    }
+
+    /// Reassociation is the sharpest form of the claim: it changes *only* the
+    /// dependence depth, leaving the instruction count and the gate count
+    /// identical, so any cost difference it produces is purely about rounds.
+    #[test]
+    fn reassociating_a_multiply_chain_pays_for_rounds_and_not_for_gates() {
+        let shamir = opt_wan(&chain("*", 8), "shamir");
+        assert!(
+            shamir.applied.iter().any(|a| a.rule == "reassociate"),
+            "a secret-sharing protocol pays one round per multiply, so a \
+             balanced tree is a real win on a WAN: {:?}",
+            shamir
+        );
+        assert_eq!(
+            shamir.before.ops, shamir.after.ops,
+            "reassociation must not change the instruction count"
+        );
+        assert!(
+            shamir.after.rounds < shamir.before.rounds,
+            "rounds should fall from the chain depth to log2: {} -> {}",
+            shamir.before.rounds,
+            shamir.after.rounds
+        );
+        assert!(shamir.speedup() > 1.5, "got {:.2}x", shamir.speedup());
+    }
+
+    #[test]
+    fn a_constant_round_protocol_declines_reassociation() {
+        // BMR is constant-round: its cost does not depend on circuit depth at
+        // all, so rebalancing buys precisely nothing and the search drops it.
+        let bmr = opt_wan(&chain("*", 8), "bmr");
+        assert!(
+            bmr.applied.iter().all(|a| a.rule != "reassociate"),
+            "depth is worth nothing to a constant-round protocol: {:?}",
+            bmr
+        );
+        assert_eq!(bmr.before.rounds, bmr.after.rounds);
+    }
+
+    /// The operator decides *which* backends care, and it inverts between the
+    /// two chains — which is the part a backend-blind optimizer cannot express.
+    #[test]
+    fn which_operator_pays_for_depth_depends_on_the_protocol() {
+        // Additions are local in an arithmetic protocol: zero rounds either
+        // way, so there is nothing for reassociation to win.
+        let arith_add = opt_wan(&chain("+", 8), "shamir");
+        assert!(
+            arith_add.applied.iter().all(|a| a.rule != "reassociate"),
+            "additions are local under secret sharing — depth is free: {:?}",
+            arith_add
+        );
+
+        // Under a non-constant-round *binary* protocol the adder is a real
+        // AND-depth, so the same rewrite on the same program is now a win.
+        let binary_add = opt_wan(&chain("+", 8), "semi-bin");
+        assert!(
+            binary_add.applied.iter().any(|a| a.rule == "reassociate"),
+            "an adder has AND-depth in a binary protocol: {:?}",
+            binary_add
+        );
+        assert!(
+            binary_add.after.rounds < binary_add.before.rounds,
+            "{} -> {} rounds",
+            binary_add.before.rounds,
+            binary_add.after.rounds
+        );
+        assert_eq!(
+            binary_add.before.and_gates, binary_add.after.and_gates,
+            "the gate count is untouched; only the depth moved"
+        );
+    }
+
+    /// Chained *local* arithmetic must accumulate AND-depth along the
+    /// dependence path in a binary protocol. Charging the maximum over the
+    /// program instead (what the cost model used to do) prices a chain of `n`
+    /// adders as though it were one, which under-prices exactly the deep local
+    /// arithmetic that decides MPC-vs-GC.
+    #[test]
+    fn binary_protocols_charge_chained_local_arithmetic_by_path_depth() {
+        let (short_flat, short_out) = compile(&chain("+", 2));
+        let (long_flat, long_out) = compile(&chain("+", 8));
+        let spec = find("semi-bin").unwrap();
+        let dep = Deployment::wan(3);
+        let cfg = cfg_for("semi-bin");
+        let short = objective(&short_flat, &short_out, spec, &dep, &cfg).unwrap();
+        let long = objective(&long_flat, &long_out, spec, &dep, &cfg).unwrap();
+        assert!(
+            long.rounds > short.rounds,
+            "a 7-adder chain must cost more rounds than a 1-adder one: {} vs {}",
+            long.rounds,
+            short.rounds
+        );
+    }
+
+    #[test]
+    fn reassociation_preserves_semantics_on_every_associative_operator() {
+        // The differential oracle is the real guarantee; run it directly on
+        // each operator the surface language can build a chain of.
+        for op in ["+", "*", "and", "or"] {
+            let (flat, out) = compile(&chain(op, 6));
+            let rebuilt = reassociate(&flat, &out);
+            assert_ne!(rebuilt, flat, "`{op}` chain should have been rebalanced");
+            equivalent(&flat, &rebuilt, &out, 64)
+                .unwrap_or_else(|e| panic!("`{op}` reassociation changed semantics: {e}"));
+        }
+    }
+
+    /// `BXor` has no surface syntax (it is emitted by the fixed-point and
+    /// logical-NOT gadgets), so build the chain directly rather than leave the
+    /// variant untested.
+    #[test]
+    fn reassociation_handles_a_hand_built_xor_chain() {
+        let mut flat = Vec::new();
+        for i in 0..5 {
+            flat.push(FlatOp::Const {
+                dst: format!("k{i}"),
+                value: 1 << i,
+            });
+        }
+        let mut acc = "k0".to_string();
+        for i in 1..5 {
+            let dst = format!("t{i}");
+            flat.push(FlatOp::BXor {
+                dst: dst.clone(),
+                lhs: acc,
+                rhs: format!("k{i}"),
+            });
+            acc = dst;
+        }
+        let rebuilt = reassociate(&flat, &acc);
+        assert_ne!(rebuilt, flat, "the xor chain should have been rebalanced");
+        assert_eq!(rebuilt.len(), flat.len(), "op count must be unchanged");
+        equivalent(&flat, &rebuilt, &acc, 32).expect("xor reassociation must be exact");
+    }
+
+    #[test]
+    fn reassociation_leaves_shared_intermediates_alone() {
+        // `(a+b)` is read twice, so the chain cannot be rebuilt around it
+        // without duplicating work — the rule must decline.
+        let (flat, out) = compile("(* (+ a b) (+ (+ a b) c))");
+        let rebuilt = reassociate(&flat, &out);
+        equivalent(&flat, &rebuilt, &out, 64).expect("must stay correct");
     }
 
     #[test]

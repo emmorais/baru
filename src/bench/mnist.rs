@@ -9,11 +9,16 @@
 //!
 //! # What is embedded
 //!
-//! `examples/data/mnist_cnn.rs` carries weights trained by
-//! `scratchpad/train_modeA.py` (numpy SGD on the full 60 000-image MNIST
-//! training set, then post-training quantisation to the exact integer
-//! fixed-point scheme [`crate::bench::cnn::CnnModel::forward`] evaluates),
+//! `examples/data/mnist_cnn.rs` carries weights trained on the full MNIST
+//! training set and then post-training-quantised into the exact integer
+//! fixed-point scheme [`crate::bench::cnn::CnnModel::forward`] evaluates,
 //! plus the first `N_TEST` real MNIST **test** images with their labels.
+//!
+//! Regenerate with `tools/train_medmnist.py mnist/ examples/data/mnist_cnn.rs
+//! --test-order first` (see `tools/README.md` for the data download and the
+//! full command). The weights were originally produced by a numpy script that
+//! lived in a scratch directory and was lost, leaving a trained artifact that
+//! could not be retrained — which is why the trainer now lives in the repo.
 //!
 //! # The two numbers, and why they coincide
 //!
@@ -50,10 +55,13 @@ use crate::bench::comm::NetworkProfile;
 #[allow(dead_code)] // generated file exports a few descriptive consts we don't read
 mod data;
 
-/// Full-test-set (all 10 000 images) integer accuracy measured offline by
-/// `train_modeA.py` on the identical weights. Stated here so the in-repo
-/// subset number can be read against it.
-pub const FULL_TEST_ACCURACY: f64 = 0.9805;
+/// Full-test-set (all 10 000 images) integer accuracy, measured offline by
+/// the trainer on the identical weights, so the in-repo subset number can be
+/// read against it. Re-exported *from the weight file* rather than restated
+/// here: a hand-maintained copy silently drifts the moment the weights are
+/// regenerated, which is exactly the kind of stale claim this benchmark
+/// exists to avoid.
+pub const FULL_TEST_ACCURACY: f64 = data::FULL_TEST_ACCURACY;
 
 fn load_model() -> (CnnModel, Vec<Vec<i64>>, Vec<u8>) {
     let images: Vec<Vec<i64>> = data::TEST_IMAGES.iter().map(|im| im.to_vec()).collect();

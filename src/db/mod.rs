@@ -10,7 +10,7 @@
 //! * [`local::JsonlStore`] — a plain append-only file.  Always available, never
 //!   the reason a benchmark loses its result.
 //! * [`barudb::BaruDbStore`] — **BaruDB**
-//!   (<https://github.com/emmorais/blindsearch>, crate and binary `barudb`),
+//!   (<https://github.com/emmorais/barudb>, crate and binary `barudb`),
 //!   the encrypted searchable store, driven over a pipe.  Baru supplies the
 //!   schema and the keyword vocabulary; BaruDB owns the cryptography, and the
 //!   process boundary is what keeps that division real rather than merely
@@ -76,8 +76,7 @@ pub trait ResultStore {
 /// Open a store from a `--store` specifier.
 ///
 /// * `local:PATH` (or a bare path) — [`JsonlStore`]
-/// * `barudb:PATH` — [`BaruDbStore`] (`blindsearch:` is accepted as an alias,
-///   after the repository the crate still lives in)
+/// * `barudb:PATH` — [`BaruDbStore`]
 ///
 /// Defaults to `local:baru-results.jsonl` when the specifier is empty.
 pub fn open(spec: &str) -> Result<Box<dyn ResultStore>, String> {
@@ -88,7 +87,7 @@ pub fn open(spec: &str) -> Result<Box<dyn ResultStore>, String> {
     };
     match spec.split_once(':') {
         Some(("local", path)) => Ok(Box::new(JsonlStore::new(path))),
-        Some(("barudb" | "blindsearch", path)) => Ok(Box::new(BaruDbStore::new(path))),
+        Some(("barudb", path)) => Ok(Box::new(BaruDbStore::new(path))),
         Some((scheme, _)) if scheme.len() > 1 => Err(format!(
             "unknown store scheme `{}`; expected local:PATH or barudb:PATH",
             scheme
@@ -312,11 +311,8 @@ mod tests {
             .unwrap()
             .describe()
             .starts_with("barudb:"));
-        // The repository is still called blindsearch; accept it as an alias.
-        assert!(open("blindsearch:/tmp/x.db")
-            .unwrap()
-            .describe()
-            .starts_with("barudb:"));
+        // The old `blindsearch:` scheme is gone, not silently accepted.
+        assert!(open("blindsearch:/tmp/x.db").is_err());
         // A bare path is a local file.
         assert!(open("results.jsonl")
             .unwrap()

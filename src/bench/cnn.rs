@@ -36,9 +36,10 @@
 //!   axis that needs trained weights. The weights *here* are
 //!   controlled-magnitude synthetic values (a cost/correctness
 //!   microbenchmark, standard for this line of work), not a trained
-//!   classifier — for the trained model on real MNIST test digits (97.6%,
+//!   classifier — for the trained model on real MNIST test digits (98.9%,
 //!   run through this same hybrid, bit-exact) see `baru bench-mnist` /
-//!   `crate::bench::mnist`.
+//!   `crate::bench::mnist`, and for real *biomedical* images see
+//!   `baru bench-medmnist` / `crate::bench::medmnist`.
 //! - Conv packing needs `2·in_c·H·W ≲ n`, so a full 28×28 MNIST image runs
 //!   comfortably at `n = 4096` (it needs degree 841). Multi-channel CIFAR
 //!   (3×32×32) needs 5185 and so must split channels across ciphertexts (or
@@ -191,11 +192,11 @@ impl CnnModel {
         shift: u32,
         sample_inputs: &[Vec<i64>],
     ) -> Self {
-        assert_eq!(kernels.len(), OC);
-        assert_eq!(dense_w.len(), NCLASSES);
+        assert_eq!(dense_w.len(), dense_b.len(), "dense weights/bias length mismatch");
         for (w, b) in &hidden {
             assert_eq!(w.len(), b.len(), "hidden layer weights/bias length mismatch");
         }
+        let oc = kernels.len();
         let oh = d - (K - 1);
         let ph = oh / POOL;
         let mut model = CnnModel {
@@ -208,8 +209,8 @@ impl CnnModel {
             dense_b,
             shift,
             nbits: 20,
-            conv_shape: Chw { c: OC, h: oh, w: oh },
-            pool_shape: Chw { c: OC, h: ph, w: ph },
+            conv_shape: Chw { c: oc, h: oh, w: oh },
+            pool_shape: Chw { c: oc, h: ph, w: ph },
         };
         // Calibrate nbits from the worst activation seen over the samples.
         let mut max_abs = 1i64;
@@ -220,6 +221,20 @@ impl CnnModel {
         assert!(needed <= 30, "trained model needs 2^{needed}, past the noise budget");
         model.nbits = needed.max(20);
         model
+    }
+
+    /// First-conv output channels. `bench-cnn`'s synthetic model uses the `OC`
+    /// default; a trained model (`bench-mnist`, `bench-medmnist`) carries
+    /// whatever its weight file was generated with.
+    pub fn out_channels(&self) -> usize {
+        self.kernels.len()
+    }
+
+    /// Number of output classes — 10 for MNIST, 2 for PneumoniaMNIST, 11 for
+    /// OrganAMNIST. Read from the weights rather than a const so one pipeline
+    /// serves every dataset.
+    pub fn nclasses(&self) -> usize {
+        self.dense_w.len()
     }
 
     fn conv_dot(&self, input: &[i64], oc: usize, oy: usize, ox: usize) -> i64 {
@@ -236,10 +251,11 @@ impl CnnModel {
     /// Returns `(class, max_abs_intermediate)`.
     pub fn forward(&self, input: &[i64]) -> (usize, i64) {
         let oh = self.conv_shape.h;
+        let out_c = self.out_channels();
         let mut max_abs = input.iter().map(|v| v.abs()).max().unwrap_or(0);
         // conv → fused ReLU∘rescale
-        let mut conv_act = vec![0i64; OC * oh * oh];
-        for oc in 0..OC {
+        let mut conv_act = vec![0i64; out_c * oh * oh];
+        for oc in 0..out_c {
             for oy in 0..oh {
                 for ox in 0..oh {
                     let dot = self.conv_dot(input, oc, oy, ox);
@@ -717,12 +733,13 @@ pub fn run_cnn_hybrid(model: &CnnModel, input: &[i64], profile: NetworkProfile) 
     // ── MPC: +dense bias, argmax → reveal class only ──
     let t0 = Instant::now();
     let dense_b = model.dense_b.clone();
+    let nclasses = model.nclasses();
     let (classes, argmax_comm) = run_parties(profile, |me| {
         let dense_open = dense_open.clone();
         let dense_masks = dense_masks.clone();
         let dense_b = dense_b.clone();
         move |be: &mut TransportBackend<MpcTransport>| {
-            let logits: Vec<ShareRef> = (0..NCLASSES)
+            let logits: Vec<ShareRef> = (0..nclasses)
                 .map(|j| {
                     let raw = import_raw(be, me, &dense_open, &dense_masks, j, nbits);
                     let bsh = be.share_public(residue(dense_b[j], nbits), nbits);
@@ -749,10 +766,11 @@ pub fn run_cnn_hybrid(model: &CnnModel, input: &[i64], profile: NetworkProfile) 
         ring_n: s.params.n,
         log2_q: s.params.log2_q,
         log2_t: s.params.log2_t,
-        conv_mults: OC + model.extra_conv.iter().map(|c| c.out_c()).sum::<usize>(),
+        conv_mults: model.out_channels()
+            + model.extra_conv.iter().map(|c| c.out_c()).sum::<usize>(),
         conv_mults_toeplitz: conv_pack::toeplitz_multiplications(
             ConvShape { in_c: 1, h: model.d, w: model.d, kh: K, kw: K },
-            OC,
+            model.out_channels(),
             BfvParams::DEFAULT.n,
         ),
     }

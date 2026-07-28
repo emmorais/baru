@@ -1,6 +1,6 @@
 # BaruDB — the encrypted experiment store
 
-**Repository:** <https://github.com/emmorais/blindsearch> — crate and binary `barudb`
+**Repository:** <https://github.com/emmorais/barudb> — crate and binary `barudb`
 
 **Purpose.** Long-running privacy-preserving-ML experiments produce results over
 weeks (TFHE MNIST inference alone is ~47 min/run). Those results have to survive
@@ -11,7 +11,7 @@ its first client.
 
 This document is the **contract**: what Baru needs BaruDB to provide, and what
 Baru guarantees about what it sends. It is written from Baru's side so that
-blindsearch can implement against it. Baru ships a local-file store implementing
+BaruDB can implement against it. Baru ships a local-file store implementing
 the same trait, so Baru is never blocked on BaruDB being ready.
 
 ---
@@ -42,7 +42,7 @@ Run
 The split matters: **keywords are what BaruDB can search over; the payload is
 what BaruDB can only store and return.** Baru will never ask BaruDB to filter on
 a metric value — range queries over encrypted numerics are exactly the hard part
-blindsearch is still building (see its `DESIGN.md`). Baru filters keywords
+BaruDB is still building (see its `DESIGN.md`). Baru filters keywords
 server-side and metrics client-side after decryption. If/when BaruDB gains
 order-preserving or range-capable indexes, §6 says how the contract extends.
 
@@ -56,7 +56,7 @@ tag:paper-table-3   host:eduardo-mbp   commit:981e639
 ```
 
 That is the entire vocabulary a query needs, and it is deterministic, so
-blindsearch's existing deterministic-token construction is sufficient — no new
+BaruDB's existing deterministic-token construction is sufficient — no new
 crypto is required for v1.
 
 ---
@@ -82,11 +82,14 @@ contains no plaintext, and a wrong password fails with a readable error.
 
 Rules Baru relies on:
 
-* The password comes from `BLINDSEARCH_PASSWORD` when set, so Baru can run
+* The password comes from an environment variable when set, so Baru can run
   unattended in a benchmark loop; interactive prompting stays the default when it
-  is unset.  (Baru never supplies it — `barudb` reads its own environment.  A
-  `BARUDB_PASSWORD` alias would match the binary's name, but the current
-  variable works and renaming it is not urgent.)
+  is unset.  Baru never supplies it — `barudb` reads its own environment.
+  **Open item:** the binary still reads `BLINDSEARCH_PASSWORD`
+  (`PASSWORD_ENV` in its `src/main.rs`); renaming it to `BARUDB_PASSWORD` is the
+  last piece of the `blindsearch` → `barudb` rename and belongs to that repo,
+  not this one.  Named here so the discrepancy is recorded rather than
+  discovered.
 * `put` reads the record body from stdin (`--stdin`) and encrypts it. The body is
   opaque JSON to BaruDB.
 * Multiple `--keyword` flags to `search` mean **conjunction** (AND). Baru needs AND;
@@ -167,7 +170,7 @@ src/db/
   mod.rs      ResultStore trait, `baru db` CLI
   record.rs   Run / Metric / Provenance schema (serde)
   local.rs    JSONL store — the always-available default
-  blindsearch.rs  BaruDB client over §2a, then §2b
+  barudb.rs   BaruDB client over §2a, then §2b
   query.rs    client-side filtering, aggregation, CSV/LaTeX export
 ```
 
@@ -178,7 +181,7 @@ baru db stats
 baru db export --suite bench-cnn --format latex > paper/tables/cnn.tex
 ```
 
-Benchmark harnesses gain `--store <local:path|blindsearch:path|blindsearch:url>`;
+Benchmark harnesses gain `--store <local:path|barudb:path|barudb:url>`;
 with it, every `baru bench*` run is persisted automatically. Paper tables are then
 generated from the store rather than pasted from scrollback — which is the whole
 point: **the numbers in the paper are queries, not transcriptions.**

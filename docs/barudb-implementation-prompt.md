@@ -1,13 +1,13 @@
-# Prompt for the blindsearch repo
+# Prompt for the barudb repo
 
 Paste the block below into a Claude Code session opened in
-`~/github/blindsearch` (or wherever the checkout lives). It is written to be
+`~/github/barudb` (or wherever the checkout lives). It is written to be
 self-contained: it restates the contract rather than assuming the other repo can
 read `baru/docs/barudb-api.md`.
 
 ---
 
-I want to add a **store API** to blindsearch so that another project of mine
+I want to add a **store API** to barudb so that another project of mine
 (Baru, an MPC/FHE/ZKP compiler) can use it as a durable encrypted archive for
 long-running experiment results. Baru's client is already written and expects a
 specific interface, so please implement exactly this and not a variation.
@@ -18,7 +18,7 @@ Baru runs privacy-preserving-ML benchmarks that take minutes to hours per case
 (a single TFHE MNIST inference is ~47 min). Each run produces a small JSON
 record of timings and metadata that has to survive for months so it can end up
 in a paper. The records are sensitive: unpublished numbers, model configuration,
-timing data. blindsearch already does the hard part — AES-256-GCM with Argon2id
+timing data. barudb already does the hard part — AES-256-GCM with Argon2id
 key derivation and deterministic keyword tokens — so it should own **all** of the
 cryptography. Baru hands over plaintext JSON plus a keyword list and never
 encrypts anything itself.
@@ -26,18 +26,18 @@ encrypts anything itself.
 ## What to add: five subcommands
 
 ```
-blindsearch put    --db <path> --keywords k1,k2,... --stdin      → {"id": "..."}
-blindsearch get    --db <path> --id <id>                         → the record's JSON
-blindsearch search --db <path> --keyword k [--keyword k ...]     → {"ids": [...]}
-blindsearch list   --db <path> [--limit N] [--after <id>]        → {"ids": [...]}
-blindsearch stats  --db <path>                                   → {"records": N, "bytes": N}
+barudb put    --db <path> --keywords k1,k2,... --stdin      → {"id": "..."}
+barudb get    --db <path> --id <id>                         → the record's JSON
+barudb search --db <path> --keyword k [--keyword k ...]     → {"ids": [...]}
+barudb list   --db <path> [--limit N] [--after <id>]        → {"ids": [...]}
+barudb stats  --db <path>                                   → {"records": N, "bytes": N}
 ```
 
 Requirements the client depends on — these are not negotiable, the client will
 break without them:
 
 1. **`put` reads the record body from stdin** (`--stdin`) and encrypts it. The
-   body is opaque JSON to blindsearch: parse it as UTF-8 bytes, do not validate
+   body is opaque JSON to barudb: parse it as UTF-8 bytes, do not validate
    or reshape it.
 2. **Ids are caller-supplied.** The body contains an `"id"` field, a string like
    `1753605600123-9f3a1c04`, sortable so that lexicographic order is
@@ -59,8 +59,11 @@ break without them:
 7. **Machine-readable output on stdout only**, one JSON object, nothing else.
    Human-facing messages, progress, and warnings go to stderr. Anything on
    stdout that is not the JSON object breaks parsing.
-8. **Password from `BLINDSEARCH_PASSWORD` when that variable is set**, falling
-   back to the existing interactive prompt when it is not. Baru runs these
+8. **Password from `BARUDB_PASSWORD` when that variable is set**, falling
+   back to the existing interactive prompt when it is not. (The binary reads
+   `BLINDSEARCH_PASSWORD` today — `PASSWORD_ENV` in `src/main.rs`. Please switch
+   the primary name to `BARUDB_PASSWORD` to match the crate, and keep accepting
+   the old one for a while so existing scripts keep working.) Baru runs these
    commands inside unattended benchmark loops that may last hours, so there is
    nobody to answer a prompt. Please keep the prompt as the default for
    interactive use — only the env var should bypass it.
@@ -98,14 +101,14 @@ choose simplicity.
    `legacy` without changing their behaviour.
 2. Integration tests covering: put→get round-trip; conjunctive search; unknown
    keyword returns an empty list with exit 0; duplicate id is rejected; `get` on
-   a missing id exits non-zero saying "not found"; `BLINDSEARCH_PASSWORD` works
+   a missing id exits non-zero saying "not found"; `BARUDB_PASSWORD` works
    non-interactively; stdout contains only the JSON object.
 3. A short section in README.md documenting the five commands, and a note in
    DESIGN.md stating the leakage profile of this API in one paragraph (what an
    adversary with the database file learns: number of records, record sizes,
    keyword equality patterns, and query access patterns).
 4. Tell me if anything above conflicts with the existing design — I would rather
-   change Baru's client than have blindsearch grow an awkward shape.
+   change Baru's client than have barudb grow an awkward shape.
 
 ## Later, not now
 

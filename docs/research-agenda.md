@@ -48,7 +48,7 @@ Two hospitals and a model owner; nobody trusts the others with raw data.
 | 1 | *"How many patients aged 40–60 with HbA1c > 7?"* | cohort selection over records at rest | BaruDB (DET + ORE) | ✅ measured — `baru bench-cohort` |
 | 2 | *Fetch record `r` for review* | the **access pattern** leaks who is interesting | **PIR** | 🔨 |
 | 3 | *Which patients appear at both hospitals?* | linkage without disclosure | **PSI** (from OT) | 🔨 |
-| 4 | *Classify this scan* | image + model both private | MPC / FHE / hybrid | ✅ (`gadgets`, `hybrid`, `bench/cnn`) |
+| 4 | *Classify this scan* | image + model both private | MPC / FHE / hybrid | ✅ measured on real biomedical images — `baru bench-medmnist` (§3) |
 | 5 | *Train on the union of both cohorts* | cross-institution learning | MPC (Shamir / SPDZ2k) | partial (`bench/train`) |
 | 6 | *Iterate over a private index during training* | data-dependent addressing | **ORAM** | 🔨 |
 | 7 | *Prove the approved model was the one applied* | regulatory audit | ZKP (Binius64) | ✅-ish (prover is simulated) |
@@ -101,22 +101,62 @@ command.
 
 ---
 
-## 3. The immediate problem: MNIST is not healthcare
+## 3. MNIST is not healthcare — done 2026-07-28
 
-The current image work uses MNIST. A reviewer will say, correctly, that
-handwritten digits are not a medical claim.
+The image work used MNIST, and a reviewer would say, correctly, that handwritten
+digits are not a medical claim.
 
 **Fix: MedMNIST v2** (<https://medmnist.com>, CC BY 4.0). Twelve 2D biomedical
 datasets — PathMNIST (colon pathology), ChestMNIST (chest X-ray, multi-label),
 DermaMNIST (skin lesions), OCTMNIST, PneumoniaMNIST, BloodMNIST… — distributed
-at **28×28, exactly MNIST's shape**. The existing 784-pixel pipeline
-(`examples/mnist.rs`, the 2365-gate circuit, the Q16.16 weights) runs on it with
-essentially no changes, and there is a 64×64/128×128/224×224 variant to scale
-into when the pipeline can afford it.
+at **28×28, exactly MNIST's shape**, so the existing 784-pixel pipeline runs on
+them, and there is a 64×64/128×128/224×224 variant to scale into later.
 
-That converts "we did MNIST" into "we did private diagnosis of colon pathology
-and pneumonia" for roughly a day of work. It is the single highest
-value-per-effort item on this list and should come before any new primitive.
+**Done**, on both models the pipeline has:
+
+* **The CNN** — `baru bench-medmnist [--dataset pneumonia|organa|all]`
+  (`src/bench/medmnist.rs`), the same two-conv hybrid `bench-mnist` runs:
+  BFV ct×ct conv/dense, ABY3 nonlinearities, zero bootstraps.
+* **The linear discriminator** — `cargo run --release --example mnist --
+  --pneumonia [--mpc] [--tfhe] [--ckks]`, the 2380-gate circuit across every
+  FHE scheme. Digits stay available as the default, unchanged.
+* Weights are trained and quantised by `tools/train_medmnist.py` — kept in
+  `tools/`, not `scratchpad/`, because that is how the original MNIST trainer
+  was lost.
+
+| | pneumonia (X-ray, 2 classes) | organa (CT, 11 classes) |
+|---|---|---|
+| CNN integer accuracy, full test set | **84.78%** (624) | **81.18%** (17 778) |
+| float accuracy, same net | 84.78% | 81.03% |
+| majority-class baseline | 62.50% | 18.48% |
+| published ResNet-18 (28×28) | 0.854 | 0.935 |
+| encrypted == plaintext diagnosis | 3/3 | 3/3 |
+| FHE bootstraps | 0 | 0 |
+| linear model, full test set | 84.13% | — (2-class only) |
+
+Three things worth carrying into the paper.
+
+**Quantisation is free, and so is encryption.** The integer nets match their
+float parents to within 0.2 points, and the encrypted pipeline reproduces the
+plaintext diagnosis bit-exactly — so neither the fixed-point scheme the FHE
+layer demands nor the encryption itself costs accuracy. The price is entirely
+wall-clock (~33 s per encrypted image).
+
+**The model, not the crypto, is the accuracy ceiling.** This is a 2-conv
+classifier sized to fit the depth-1 noise budget; it matches published
+ResNet-18 on pneumonia and gives up 12 points on organa. Saying so is stronger
+than quietly reporting only the dataset where a small model wins.
+
+**Two methodological traps, both hit and both fixed.** The quantisation gain is
+chosen on the *validation* split, never on test. And the gain is not free in
+either direction: it multiplies activations layer over layer, so too large
+overflows the plaintext modulus, while too small starves the output layer's
+weights to zero and the classifier silently collapses onto its majority class
+(62.50% — which is exactly what the first run produced). The linear model has
+the mirror-image constraint: chest X-rays are dense where digits are mostly
+zero, so the Q16.16 accumulator genuinely threatens the demo's 32-bit MPC
+shares, and the trainer picks the gain against a *measured* accumulator bound
+rather than by eye.
 
 Honest caveat to state in the paper: MedMNIST is pre-processed and small;
 clinical-grade imaging is 512³ volumes. The claim is about *cost structure*, and
@@ -131,7 +171,7 @@ Implemented as a first slice in [`src/mpcc/opt.rs`](../src/mpcc/opt.rs).
 
 The observation that makes it a result rather than an engineering detail:
 **the same rewrite can be a large win under one backend and a loss under
-another.** Two examples the implementation already demonstrates:
+another.** Two examples the implementation demonstrates:
 
 * **Strength reduction** (`x * 5` → `(x << 2) + x`). Under Yao, a `k×k`
   schoolbook multiplier is `k²` AND gates and an adder is `k` — a ~64× saving at
@@ -139,9 +179,35 @@ another.** Two examples the implementation already demonstrates:
   scalar multiply costing nothing, so the rewrite adds an instruction and buys
   nothing. A backend-blind optimizer must choose one behaviour and be wrong half
   the time.
-* **Reassociation** of an addition chain reduces dependence depth, which is
-  rounds, which is the dominant WAN cost for a secret-sharing protocol — and is
-  worth exactly zero for a constant-round garbled circuit.
+* **Reassociation** (done 2026-07-28) rebalances a chain of one associative
+  operator into a tree, cutting dependence depth from `n-1` to `⌈log₂ n⌉`. Under
+  ASAP scheduling depth *is* the online round count, so this is the sharpest
+  form of the claim: the instruction count and the AND-gate count come out
+  **identical**, so every cost difference it produces is purely rounds.
+
+  What makes it more than one more rule is that *which operator pays depends on
+  the protocol*, and it inverts. Measured on WAN, 8-element chains:
+
+  | | arithmetic sharing (ABY3, Shamir, SPDZ2k, …) | BMR (constant-round) | Semi-Bin / Tinier (binary, not constant-round) |
+  |---|---|---|---|
+  | `*` chain | **1.8–2.0× — kept** | 1.00× — dropped | **2.3× — kept** |
+  | `+` chain | 1.00× — dropped | 1.00× — dropped | **2.3× — kept** |
+
+  Multiplication costs a round under secret sharing, so rebalancing pays;
+  addition is *local* there, so it cannot. In a binary protocol the adder is a
+  real AND-depth, so the addition chain is exactly where the win moves to. And
+  a constant-round protocol is indifferent to depth by construction, so it
+  declines both. Three different answers to one rewrite, on two programs that
+  differ only in an operator — which is the thing a backend-blind optimizer has
+  no way to express.
+
+  Getting this right required **fixing the cost model**: it had been charging
+  chained *local* arithmetic the maximum AND-depth over the program rather than
+  the longest path, so a chain of `n` adders was priced as one. That
+  under-priced deep local arithmetic — fixed-point rescales and adder trees,
+  i.e. precisely what decides MPC-vs-GC for the NN workloads — by up to `n×`
+  (7× on the chain above). The model now accumulates depth along the dependence
+  DAG.
 
 So the pass takes the target protocol as a *parameter*, uses
 [`mpcc::cost`](../src/mpcc/cost.rs) as the objective function, and keeps a
@@ -187,8 +253,12 @@ generate into a target that does not exist yet.
 
 Ordered by value per unit of work, with the dependency structure respected.
 
-1. **MedMNIST swap** (§3). Turns the existing artifact into a healthcare
-   artifact. No new crypto.
+1. ~~**MedMNIST swap** (§3)~~ — **done 2026-07-28.** The artifact is now a
+   healthcare artifact: private pneumonia and organ diagnosis, plaintext-exact
+   under encryption, no new crypto. Next dataset in this direction would be a
+   *multi-channel* one (PathMNIST, DermaMNIST), which needs the conv packing to
+   split RGB channels across ciphertexts — a packing question, not a
+   construction one.
 2. **Backend-aware optimizer** (§4). Started. Extend the rule set; add
    reassociation-for-depth; report per-backend optimized circuits.
 3. **P2 of the MPC roadmap** — random bits and edaBits, so comparisons *run* and

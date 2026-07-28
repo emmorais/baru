@@ -1,4 +1,4 @@
-//! Client for **BaruDB** (<https://github.com/emmorais/blindsearch>, crate and
+//! Client for **BaruDB** (<https://github.com/emmorais/barudb>, crate and
 //! binary `barudb`) — the encrypted, searchable experiment store.
 //!
 //! This implements the process transport of `docs/barudb-api.md` §2a:
@@ -29,7 +29,9 @@
 //!   thousands of records, the fix is a batch `put`, not linking.
 //!
 //! Baru never supplies the password: `barudb` reads it from its own environment
-//! (`BLINDSEARCH_PASSWORD`) or prompts.  Baru only inherits whatever is set.
+//! or prompts, and Baru only inherits whatever is set.  That variable is still
+//! named `BLINDSEARCH_PASSWORD` in the `barudb` binary; see the open item in
+//! `docs/barudb-api.md` §2a.
 
 use std::io::Write;
 use std::path::PathBuf;

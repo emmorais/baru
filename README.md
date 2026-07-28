@@ -994,8 +994,9 @@ question a reviewer will ask: **what accuracy does it get on real data?**
 
 The model is a small but real **two-convolution** CNN —
 `1×28×28 → conv(8,3×3) → ReLU → pool → conv(16,3×3) → ReLU → pool → dense(→128) → ReLU → dense(→10) → argmax`
-— **trained** on the full 60 000-image MNIST training set (numpy SGD,
-`scratchpad/train_modeA.py`) and then **quantised into the very integer
+— **trained** on the full 60 000-image MNIST training set (numpy SGD; the
+original `scratchpad/train_modeA.py` was lost — `tools/train_medmnist.py`
+supersedes it and can regenerate these weights) and then **quantised into the very integer
 fixed-point scheme `CnnModel::forward` runs** — so the number below is the
 accuracy of the *deployed integer model*, not a float model that would lose
 something afterward. It has **four encrypted linear layers** (two conv, two
@@ -1005,31 +1006,37 @@ nothing but "switch again." Weights and a real test subset are embedded in
 `examples/data/mnist_cnn.rs`.
 
 ```
-plaintext-integer accuracy : 296/300 = 98.67%   (in-repo test subset)
-full MNIST test set (10 000): 98.05%             (identical weights, offline)
+plaintext-integer accuracy : 299/300 = 99.67%   (in-repo test subset)
+full MNIST test set (10 000): 98.89%             (identical weights, offline)
 ENCRYPTED pipeline (4 imgs) : 4/4 match plaintext exactly, 0 bootstraps
 ```
 
 The encrypted run matters more than the accuracy: because the hybrid is
 bit-exact against `forward`, **every encrypted prediction equals the
 plaintext one** — verified here on real digits through all four encrypted
-linear layers, not asserted. So the encrypted accuracy *is* 98.05%; privacy
+linear layers, not asserted. So the encrypted accuracy *is* 98.89%; privacy
 costs nothing in accuracy. The Rust integer forward was checked to agree
-with the numpy reference digit-for-digit on the embedded subset (296/300
+with the numpy reference digit-for-digit on the embedded subset (299/300
 both), so the offline 10 000-image number transfers faithfully.
+
+These weights were **regenerated on 2026-07-28** by `tools/train_medmnist.py`
+after the original trainer was lost, which is why the number moved from 98.05%
+to 98.89%: same architecture, same quantisation scheme, a fresh 30-epoch run.
+The embedded 300-image test subset is byte-identical to the original file, so
+the two models are directly comparable.
 
 **Where this sits vs. the literature.** The honest framing is like-for-like
 on *what is hidden*, since that — not accuracy — is the axis this work moves.
 
 | system | model | MNIST acc | what is hidden |
 |---|---|---|---|
-| **baru** (this repo) | conv(8)+conv(16)+128-hidden+dense | **98.0%** | **image *and* weights** (ct×ct) |
+| **baru** (this repo) | conv(8)+conv(16)+128-hidden+dense | **98.9%** | **image *and* weights** (ct×ct) |
 | Gazelle (2018) | larger CNN | ~99% | image only (server holds plaintext weights) |
 | Delphi (2019) | larger CNN | ~99% | image only |
 | CrypTFlow2 (2020) | larger CNN | ~99% | image only |
 | MiniONN / Cheetah | larger CNN | ~99% | image only |
 
-The residual ~1% accuracy gap is model size, and closing it is a *training*
+The residual ~0.1% accuracy gap is model size, and closing it is a *training*
 question the no-bootstrap construction is indifferent to (depth is free —
 this two-conv model is the same pipeline switched a few more times). The column
 that distinguishes this work is the last one: the systems above are
@@ -1041,6 +1048,44 @@ a different (stronger) privacy model, not a faster route to the same one —
 the comparison is about *what is protected*, and only secondarily about
 speed. A larger encrypted model would move the accuracy column without
 touching that distinction.
+
+### Private *diagnosis*: real biomedical images (`baru bench-medmnist`)
+
+Handwritten digits are not a medical claim. **MedMNIST v2**
+(<https://medmnist.com>, CC BY 4.0) distributes twelve 2D biomedical datasets at
+**28×28 — exactly MNIST's shape**, so the pipeline above runs on them unchanged:
+
+```
+baru bench-medmnist --dataset all --hybrid 3
+```
+
+| | pneumonia (chest X-ray, 2 classes) | organa (abdominal CT, 11 classes) |
+|---|---|---|
+| integer accuracy, full test set | **84.78%** (624 imgs) | **81.18%** (17 778 imgs) |
+| float accuracy of the same net | 84.78% | 81.03% |
+| majority-class baseline | 62.50% | 18.48% |
+| published ResNet-18 (28×28) | 0.854 | 0.935 |
+| encrypted == plaintext diagnosis | 3/3 | 3/3 |
+| FHE bootstraps | 0 | 0 |
+
+Two readings. **Quantisation and encryption are both free**: the integer net
+tracks its float parent to within 0.2 points (agreeing on 99.7% / 98.7% of test
+predictions), and the encrypted pipeline reproduces the plaintext diagnosis
+bit-exactly — the cost of privacy is wall-clock (~33 s/image), not accuracy.
+And **the model, not the crypto, is the ceiling**: this 2-conv classifier is
+sized to fit the depth-1 noise budget, which is enough to match published
+ResNet-18 on pneumonia and 12 points short of it on the 11-class organ task.
+
+The same swap applies to the linear-discriminator demo, where the medical
+version runs on every FHE scheme:
+
+```
+cargo run --release --example mnist -- --pneumonia --mpc --ckks
+```
+
+giving one 2380-gate circuit whose Q16.16 score is bit-identical across plain,
+fhe-mock and ABY3, and equal to ~1e-7 under CKKS. Weights for all of this are
+regenerated by `tools/train_medmnist.py`.
 
 ### Measured: one private dense layer, six ways (`baru bench-hybrid-nn`)
 
@@ -1506,6 +1551,10 @@ src/
                        ZERO FHE bootstraps, cost linear in depth
     cnn.rs          — `baru bench-cnn`: full conv classifier (conv/relu/
                        maxpool/dense/argmax) through the hybrid, 0 bootstraps
+    mnist.rs        — `baru bench-mnist`: trained+quantised CNN on real MNIST
+                       test digits, encrypted, bit-exact
+    medmnist.rs     — `baru bench-medmnist`: the same pipeline on real
+                       biomedical images (MedMNIST v2) — private diagnosis
     fhe_innerprod.rs— `baru bench-fhe-innerprod`: BFV (secure) vs SI-NTRU
                        (reference) on the minimal-FHE inner product
     train.rs        — `baru bench-train`: private SGD training (MSE loss),
@@ -1516,6 +1565,11 @@ src/
 docs/
   paper-outline.md  — publication framing: claims, proof sketch, security
                        model, related work, experiments, limitations
+  research-agenda.md— private AI for healthcare: the workflow, the admission
+                       rule for new primitives, measured cross-layer results
+tools/
+  train_medmnist.py — trains + quantises the CNN and the linear discriminator
+                       for `bench-medmnist` / `--example mnist --pneumonia`
 tests/
   features.rs       — unit/integration tests for the interpreter + MPC
   tcp_integration.rs — spawns 3 tcp_party processes over TCP

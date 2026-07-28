@@ -39,7 +39,7 @@
 
 use serde::Serialize;
 
-use super::ir::{Domain, DomainKind, Op, Program, Secrecy};
+use super::ir::{Domain, DomainKind, Op, Program, Reg, Secrecy};
 use super::protocols::{Majority, ProtocolSpec, Security};
 use super::schedule::Schedule;
 use super::vm::KAPPA;
@@ -506,17 +506,39 @@ pub fn estimate(
     // instructions as gates — additions are free in a secret-sharing protocol
     // but cost a ripple-carry adder here.  Walk them too.
     if is_binary_protocol {
+        // Their AND-depth has to be accumulated along the dependence DAG, not
+        // maxed over the program: `is_interactive` is domain-agnostic, so a
+        // chain of adders is "local" and every one of them inherits its
+        // operands' schedule level. Taking a max would charge a chain of `n`
+        // adders the depth of *one*, which silently under-prices exactly the
+        // deep local arithmetic (fixed-point rescales, adder trees) that
+        // decides MPC-vs-GC for the NN workloads. Longest path it is.
+        let mut depth_of: Vec<u32> = vec![0; prog.code.len()];
+        let mut producer: std::collections::HashMap<Reg, usize> = std::collections::HashMap::new();
         let mut extra_depth = 0u32;
-        for instr in &prog.code {
-            if prog.is_interactive(instr) || prog.srcs_secrecy(instr) == Secrecy::Clear {
-                continue; // already counted, or public computation with no gates
+        for (i, instr) in prog.code.iter().enumerate() {
+            let mut incoming = 0u32;
+            for src in &instr.src {
+                if let Some(&j) = producer.get(src) {
+                    incoming = incoming.max(depth_of[j]);
+                }
             }
-            let cost = binary_op_cost(&instr.op, f64::from(instr.width), spec, dep, bit_width);
-            acc.bytes += cost.acc.bytes;
-            acc.and_triples += cost.acc.and_triples;
-            acc.and_gates += cost.acc.and_gates;
-            acc.local_ns += cost.acc.local_ns;
-            extra_depth = extra_depth.max(cost.rounds);
+            let counted = !prog.is_interactive(instr) && prog.srcs_secrecy(instr) != Secrecy::Clear;
+            let own = if counted {
+                let cost = binary_op_cost(&instr.op, f64::from(instr.width), spec, dep, bit_width);
+                acc.bytes += cost.acc.bytes;
+                acc.and_triples += cost.acc.and_triples;
+                acc.and_gates += cost.acc.and_gates;
+                acc.local_ns += cost.acc.local_ns;
+                cost.rounds
+            } else {
+                0 // already counted as an interactive round, or public
+            };
+            depth_of[i] = incoming + own;
+            extra_depth = extra_depth.max(depth_of[i]);
+            for dst in &instr.dst {
+                producer.insert(*dst, i);
+            }
         }
         if spec.cost.constant_round {
             rounds = u64::from(spec.cost.constant_rounds);

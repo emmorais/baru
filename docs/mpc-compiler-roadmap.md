@@ -227,6 +227,18 @@ comparison-heavy programs. Note what that does and does not show: it shows the
 model and the implementation agree about the *algorithm*, not that either
 matches a real network — that still needs P1's remaining measurement harness.
 
+A second cost-model correction landed 2026-07-28, on the *binary* side this
+time. `Program::is_interactive` is domain-agnostic — an `Add` is local whatever
+the protocol — so in a binary protocol the adders are costed outside the round
+schedule, and their AND-depth was being charged as the **maximum over the
+program** rather than the longest path through it. A chain of `n` adders was
+therefore priced as one adder. That under-priced deep *local* arithmetic
+specifically: fixed-point rescales and adder trees, which is the term §7's
+MPC-vs-GC comparison turns on. `estimate` now accumulates that depth along the
+dependence DAG; on an 8-element addition chain the Semi-Bin estimate goes from
+251 ms to 1.75 s (7×). Arithmetic protocols are untouched, which is why the
+`calibrate` tests (Dealer/Shamir) still report 0% error.
+
 Remaining: secret division (restoring long division on top of the comparison
 machinery — still refused by the VM, with an error naming this phase), SPDZ2k
 MACs, replicated field, ATLAS, and daBit-based `Convert` for arithmetic↔binary
