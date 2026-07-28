@@ -201,7 +201,25 @@ another.** Two examples the implementation demonstrates:
   differ only in an operator — which is the thing a backend-blind optimizer has
   no way to express.
 
-  Getting this right required **fixing the cost model**: it had been charging
+**Per-site search** (also 2026-07-28) removed what had been the pass's main
+weakness. The two rules whose sign depends on their operand are now priced site
+by site instead of as one bundle. It mattered: on `(+ (* x 4) (* y 100))` a
+whole-circuit search has to take both rewrites or neither, and an arithmetic
+backend took neither — losing the free `x * 4 → x << 2` for the sake of
+declining `y * 100`. Now ABY3 and Shamir take the first site and decline the
+second, while the binary protocols take both.
+
+It also sharpens the claim, because backends now diverge *within* a rule and not
+merely over which rules they accept. On a 64-element constant dot product,
+Shamir accepts strength reduction at **5 sites** (the exact powers of two) and
+Semi-Bin at all **42** — one program, one rule, two different circuits, and the
+subset relation is the cost model's doing rather than a heuristic's. The price
+is search time (every site is a full lower → schedule → estimate;
+`sites_considered` is reported so coverage is visible, and a 2351-instruction
+circuit across all 11 backends takes ~1 minute). Still greedy and still
+site-independent, so a pair of rewrites that only pays *together* is missed.
+
+  Getting the reassociation result right required **fixing the cost model**: it had been charging
   chained *local* arithmetic the maximum AND-depth over the program rather than
   the longest path, so a chain of `n` adders was priced as one. That
   under-priced deep local arithmetic — fixed-point rescales and adder trees,

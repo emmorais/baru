@@ -39,15 +39,35 @@
 //! oracle would be validating the optimizer against the optimizer's own idea of
 //! what the ops mean.
 //!
-//! ## Known limitation: rule granularity
+//! ## Per-site search
 //!
-//! The search accepts or rejects each rule for the *whole circuit*, not per
-//! site.  So a program mixing `x * 4` (a pure win for everyone — one shift
-//! replaces a constant load and a multiply) with `x * 100` (a win only for
-//! binary protocols) is scored as one bundle, and an arithmetic backend may
-//! accept the bundle for the sake of the first even though the second does
-//! nothing for it.  Per-site search is the obvious next step and would sharpen
-//! the per-backend divergence rather than change its direction.
+//! The two rules whose sign depends on their operand — [`Rule::StrengthReduce`]
+//! and [`Rule::Reassociate`] — are searched **site by site**, each candidate
+//! priced on its own and kept only if it pays.  A site is named by the wire it
+//! writes, which the rewrites preserve, so accepting one site does not
+//! invalidate the addresses of the others.
+//!
+//! This was a real limitation until 2026-07-28, not a refinement.  On
+//! `(+ (* x 4) (* y 100))` a whole-circuit search bundles a pure win (`x * 4`:
+//! one shift replaces a constant load *and* a multiply) with a binary-only win
+//! (`y * 100`: four instructions replace one), and an arithmetic backend
+//! rejects the bundle — losing the free rewrite it should have taken.  With
+//! per-site search ABY3 and Shamir take the `x * 4` site and decline `y * 100`,
+//! while BMR and Semi-Bin take both.
+//!
+//! It also sharpens the central claim, because backends now diverge *within* a
+//! rule rather than only over which rules they accept.  On a 64-element
+//! constant dot product Shamir accepts strength reduction at 5 sites (the exact
+//! powers of two) and Semi-Bin at all 42.
+//!
+//! The cost is search time: every site is a full lower → schedule → estimate.
+//! `Optimized::sites_considered` reports how many were priced, so the coverage
+//! is visible rather than implied.  A 2351-instruction circuit across all 11
+//! backends takes ~1 minute.
+//!
+//! Still coarse: rules are applied greedily in a fixed order, so the search
+//! finds a local optimum, not the best circuit.  Sites are also considered
+//! independently, so a pair of rewrites that only pays *together* is missed.
 //!
 //! Random testing is not proof.  It is, however, the same standard the FHE
 //! backends are held to in `tests/fhe_differential.rs`, and it has caught real
@@ -156,13 +176,29 @@ impl Rule {
         }
     }
 
-    fn apply(&self, flat: &[FlatOp], output_wire: &str) -> Vec<FlatOp> {
+    /// Apply the rule at one site (`only`), or everywhere (`None`).
+    fn apply_at(&self, flat: &[FlatOp], output_wire: &str, only: Option<&str>) -> Vec<FlatOp> {
         match self {
             Rule::Algebraic => algebraic(flat, output_wire),
             Rule::Cse => cse(flat, output_wire),
             Rule::FuseShifts => fuse_shifts(flat, output_wire),
-            Rule::StrengthReduce => strength_reduce(flat),
-            Rule::Reassociate => reassociate(flat, output_wire),
+            Rule::StrengthReduce => strength_reduce(flat, only),
+            Rule::Reassociate => reassociate(flat, output_wire, only),
+        }
+    }
+
+    /// The wires this rule could rewrite, for rules whose benefit varies *per
+    /// site*; `None` for rules that are all-or-nothing.
+    ///
+    /// `Algebraic`, `Cse` and `FuseShifts` are cheap wherever they apply, so
+    /// searching them site by site would only cost time. `StrengthReduce` and
+    /// `Reassociate` are the two whose sign genuinely depends on the operand —
+    /// which is the whole reason per-site search exists.
+    fn sites(&self, flat: &[FlatOp], output_wire: &str) -> Option<Vec<String>> {
+        match self {
+            Rule::StrengthReduce => Some(strength_reduce_sites(flat)),
+            Rule::Reassociate => Some(reassociate_sites(flat, output_wire)),
+            Rule::Algebraic | Rule::Cse | Rule::FuseShifts => None,
         }
     }
 }
@@ -473,8 +509,53 @@ fn fuse_shifts(flat: &[FlatOp], output_wire: &str) -> Vec<FlatOp> {
 ///
 /// Only applied when `|c|` has at most `MAX_TERMS` set bits, so the replacement
 /// is a handful of instructions rather than a full multiplier.
-fn strength_reduce(flat: &[FlatOp]) -> Vec<FlatOp> {
-    const MAX_TERMS: u32 = 3;
+/// Set bits allowed in a constant multiplier before shift-and-add stops paying.
+const MAX_TERMS: u32 = 3;
+
+/// `(dst, x, c)` when `op` is an `x * c` that strength reduction can rewrite.
+///
+/// Shared by [`strength_reduce`] and [`strength_reduce_sites`] so the site
+/// enumeration cannot drift from the rewrite it is enumerating for.
+fn strength_reduce_candidate(
+    op: &FlatOp,
+    consts: &HashMap<String, i64>,
+) -> Option<(String, String, i64)> {
+    let (dst, x, c) = match op {
+        FlatOp::IMul { dst, lhs, rhs } => match (consts.get(lhs), consts.get(rhs)) {
+            // A constant × constant product is the constant folder's job.
+            (Some(_), Some(_)) => return None,
+            (Some(c), None) => (dst, rhs, *c),
+            (None, Some(c)) => (dst, lhs, *c),
+            _ => return None,
+        },
+        _ => return None,
+    };
+    let mag = c.unsigned_abs();
+    // `|c| == 1` is the algebraic rule's job (`x*1 → x`, `x*-1` is already a
+    // single instruction); `c == 0` likewise folds to a constant.
+    if mag <= 1 || mag.count_ones() > MAX_TERMS {
+        return None;
+    }
+    Some((dst.clone(), x.clone(), c))
+}
+
+/// Destination wires at which strength reduction can fire.
+fn strength_reduce_sites(flat: &[FlatOp]) -> Vec<String> {
+    let mut consts: HashMap<String, i64> = HashMap::new();
+    let mut sites = Vec::new();
+    for op in flat {
+        if let FlatOp::Const { dst, value } = op {
+            consts.insert(dst.clone(), *value);
+        }
+        if let Some((dst, ..)) = strength_reduce_candidate(op, &consts) {
+            sites.push(dst);
+        }
+    }
+    sites
+}
+
+/// Rewrite `x * c` into shifts and adds — at `only`, or everywhere when `None`.
+fn strength_reduce(flat: &[FlatOp], only: Option<&str>) -> Vec<FlatOp> {
     let mut consts: HashMap<String, i64> = HashMap::new();
     let mut out: Vec<FlatOp> = Vec::with_capacity(flat.len());
     let mut fresh = 0usize;
@@ -494,34 +575,16 @@ fn strength_reduce(flat: &[FlatOp]) -> Vec<FlatOp> {
         if let FlatOp::Const { dst, value } = op {
             consts.insert(dst.clone(), *value);
         }
-        let (dst, x, c) = match op {
-            FlatOp::IMul { dst, lhs, rhs } => match (consts.get(lhs), consts.get(rhs)) {
-                // A constant × constant product is the constant folder's job.
-                (Some(_), Some(_)) => {
-                    out.push(op.clone());
-                    continue;
-                }
-                (Some(c), None) => (dst, rhs, *c),
-                (None, Some(c)) => (dst, lhs, *c),
-                _ => {
-                    out.push(op.clone());
-                    continue;
-                }
-            },
-            other => {
-                out.push(other.clone());
+        let (dst, x, c) = match strength_reduce_candidate(op, &consts) {
+            Some(t) if only.is_none_or(|w| w == t.0) => t,
+            _ => {
+                out.push(op.clone());
                 continue;
             }
         };
+        let (dst, x) = (&dst, &x);
 
         let mag = c.unsigned_abs();
-        // `|c| == 1` is the algebraic rule's job (`x*1 → x`, `x*-1` is already
-        // a single instruction); `c == 0` likewise folds to a constant.
-        if mag <= 1 || mag.count_ones() > MAX_TERMS {
-            out.push(op.clone());
-            continue;
-        }
-
         // Σ (x << bᵢ) over the set bits of |c|, low to high.  `mag > 1`
         // guarantees at least one nonzero shift, so no term needs a copy of
         // `x` that `FlatOp` has no instruction for.
@@ -660,6 +723,25 @@ fn chain_leaves(
     }
 }
 
+/// A 3-leaf chain already has depth 2, which is what a balanced tree gives, so
+/// there is nothing to win below 4.
+const MIN_LEAVES: usize = 4;
+
+/// Chain-root wires at which reassociation can fire.
+fn reassociate_sites(flat: &[FlatOp], output_wire: &str) -> Vec<String> {
+    // The rewrite is its own site oracle: a root is a site exactly when
+    // rebuilding only that root changes the circuit.
+    let mut sites = Vec::new();
+    for op in flat {
+        if let Some((_, dst, ..)) = assoc_of(op) {
+            if reassociate(flat, output_wire, Some(dst)) != flat {
+                sites.push(dst.to_string());
+            }
+        }
+    }
+    sites
+}
+
 /// Rebalance associative chains: `((((a·b)·c)·d)·e)` → `((a·b)·(c·d))·e`.
 ///
 /// The instruction *count* is unchanged — only the dependence depth moves, from
@@ -675,11 +757,7 @@ fn chain_leaves(
 /// (each multiply is a round), whereas rebalancing a chain of *additions* pays
 /// nothing there, because additions are local. Additions are the ones that
 /// matter for a binary protocol, where an adder is a real AND-depth.
-fn reassociate(flat: &[FlatOp], output_wire: &str) -> Vec<FlatOp> {
-    // A 3-leaf chain already has depth 2, which is what a balanced tree gives,
-    // so there is nothing to win below 4.
-    const MIN_LEAVES: usize = 4;
-
+fn reassociate(flat: &[FlatOp], output_wire: &str, only: Option<&str>) -> Vec<FlatOp> {
     let counts = use_counts(flat, output_wire);
     let mut producer: HashMap<String, usize> = HashMap::new();
     for (i, op) in flat.iter().enumerate() {
@@ -725,7 +803,7 @@ fn reassociate(flat: &[FlatOp], output_wire: &str) -> Vec<FlatOp> {
             output_wire,
         };
         chain_leaves(&ctx, i, kind, &mut touched, &mut leaves);
-        if leaves.len() < MIN_LEAVES {
+        if leaves.len() < MIN_LEAVES || only.is_some_and(|w| w != dst) {
             continue; // leave the chain alone, and leave `consumed` untouched
         }
         for (j, t) in touched.iter().enumerate() {
@@ -901,6 +979,10 @@ pub fn equivalent(
 #[derive(Debug, Clone, Serialize)]
 pub struct Applied {
     pub rule: &'static str,
+    /// The wire rewritten, for per-site rules; `None` for whole-circuit ones.
+    /// Two backends accepting the *same rule at different sites* is the finest
+    /// grain at which the per-backend divergence shows up.
+    pub site: Option<String>,
     pub ops_before: usize,
     pub ops_after: usize,
     pub secs_before: f64,
@@ -918,6 +1000,9 @@ pub struct Optimized {
     pub applied: Vec<Applied>,
     /// Rules tried and rejected because they did not help *this* backend.
     pub rejected: Vec<&'static str>,
+    /// How many individual rewrite sites were priced (summed over passes).
+    /// Reported so the search's coverage is visible rather than implied.
+    pub sites_considered: usize,
     /// Whether the result was differentially checked against the original.
     pub verified: bool,
 }
@@ -956,33 +1041,74 @@ pub fn optimize(
     let mut applied: Vec<Applied> = Vec::new();
     let mut rejected: HashSet<&'static str> = HashSet::new();
 
+    // One speculative rewrite: price it, and keep it only if it improves.
+    let try_one = |current: &mut Vec<FlatOp>,
+                   current_obj: &mut Objective,
+                   applied: &mut Vec<Applied>,
+                   rejected: &mut HashSet<&'static str>,
+                   rule: &Rule,
+                   site: Option<&str>|
+     -> bool {
+        let candidate =
+            dead_code_eliminate(&rule.apply_at(current, output_wire, site), output_wire);
+        if candidate.len() == current.len() && candidate == *current {
+            return false;
+        }
+        // A rewrite that produces something the lowering rejects is simply not
+        // a candidate.
+        let Ok(obj) = objective(&candidate, output_wire, spec, dep, cfg) else {
+            return false;
+        };
+        if !obj.improves_on(current_obj) {
+            rejected.insert(rule.name());
+            return false;
+        }
+        applied.push(Applied {
+            rule: rule.name(),
+            site: site.map(str::to_string),
+            ops_before: current.len(),
+            ops_after: candidate.len(),
+            secs_before: current_obj.secs,
+            secs_after: obj.secs,
+        });
+        rejected.remove(rule.name());
+        *current = candidate;
+        *current_obj = obj;
+        true
+    };
+
+    let mut sites_seen = 0usize;
     for _ in 0..MAX_PASSES {
         let mut changed = false;
         for rule in Rule::ALL {
-            let candidate = dead_code_eliminate(&rule.apply(&current, output_wire), output_wire);
-            if candidate.len() == current.len() && candidate == current {
-                continue;
-            }
-            let obj = match objective(&candidate, output_wire, spec, dep, cfg) {
-                Ok(o) => o,
-                // A rewrite that produces something the lowering rejects is
-                // simply not a candidate.
-                Err(_) => continue,
-            };
-            if obj.improves_on(&current_obj) {
-                applied.push(Applied {
-                    rule: rule.name(),
-                    ops_before: current.len(),
-                    ops_after: candidate.len(),
-                    secs_before: current_obj.secs,
-                    secs_after: obj.secs,
-                });
-                rejected.remove(rule.name());
-                current = candidate;
-                current_obj = obj;
-                changed = true;
-            } else {
-                rejected.insert(rule.name());
+            match rule.sites(&current, output_wire) {
+                // All-or-nothing rule: one candidate for the whole circuit.
+                None => {
+                    changed |= try_one(
+                        &mut current,
+                        &mut current_obj,
+                        &mut applied,
+                        &mut rejected,
+                        rule,
+                        None,
+                    );
+                }
+                // Per-site rule: accept the sites that pay and leave the rest.
+                // A site is named by the wire it writes, which survives the
+                // rewrite, so accepting one does not invalidate the others.
+                Some(sites) => {
+                    sites_seen += sites.len();
+                    for site in sites {
+                        changed |= try_one(
+                            &mut current,
+                            &mut current_obj,
+                            &mut applied,
+                            &mut rejected,
+                            rule,
+                            Some(&site),
+                        );
+                    }
+                }
             }
         }
         if !changed {
@@ -1003,6 +1129,7 @@ pub fn optimize(
         after: current_obj,
         applied,
         rejected,
+        sites_considered: sites_seen,
         verified: verify,
     })
 }
@@ -1079,6 +1206,92 @@ mod tests {
             yao.flat.len(),
             aby3_flat,
             "backend-aware optimization must produce backend-specific circuits"
+        );
+    }
+
+    /// The case that motivated per-site search: one site is a free win for
+    /// everybody, the other only pays for a binary protocol.  A whole-circuit
+    /// search has to take both or neither, and taking neither costs an
+    /// arithmetic backend a rewrite it wanted.
+    #[test]
+    fn per_site_search_keeps_the_free_rewrite_and_drops_the_costly_one() {
+        const SRC: &str = "(+ (* x 4) (* y 100))";
+        let shamir = opt_wan(SRC, "shamir");
+        let semi_bin = opt_wan(SRC, "semi-bin");
+
+        let sr = |o: &Optimized| {
+            o.applied
+                .iter()
+                .filter(|a| a.rule == "strength-reduce")
+                .count()
+        };
+        assert_eq!(
+            sr(&shamir),
+            1,
+            "Shamir should take exactly the `x * 4` site: {:?}",
+            shamir.applied
+        );
+        assert!(
+            shamir.after.ops < shamir.before.ops,
+            "and that site is a strict instruction win: {} -> {}",
+            shamir.before.ops,
+            shamir.after.ops
+        );
+        assert_eq!(
+            sr(&semi_bin),
+            2,
+            "a binary protocol wants both sites: {:?}",
+            semi_bin.applied
+        );
+
+        // Every accepted per-site rewrite must name the wire it rewrote, since
+        // that is what makes the divergence inspectable.
+        for a in shamir.applied.iter().chain(&semi_bin.applied) {
+            if a.rule == "strength-reduce" || a.rule == "reassociate" {
+                assert!(
+                    a.site.is_some(),
+                    "per-site rule must record its site: {a:?}"
+                );
+            }
+        }
+        assert!(shamir.sites_considered > 0 && semi_bin.sites_considered > 0);
+    }
+
+    #[test]
+    fn per_site_search_discriminates_within_one_rule() {
+        // A constant dot product mixes powers of two (free everywhere) with
+        // multi-bit constants (worth it only where a multiplier is expensive).
+        // The two backends should keep *different subsets of the same rule*.
+        let src = format!(
+            "(dot (list {}) '({}))",
+            (0..16)
+                .map(|i| format!("a{i}"))
+                .collect::<Vec<_>>()
+                .join(" "),
+            (0..16)
+                .map(|i| (3 + i).to_string())
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
+        let shamir = opt_wan(&src, "shamir");
+        let semi_bin = opt_wan(&src, "semi-bin");
+        let sites = |o: &Optimized| -> HashSet<String> {
+            o.applied
+                .iter()
+                .filter(|a| a.rule == "strength-reduce")
+                .filter_map(|a| a.site.clone())
+                .collect()
+        };
+        let (s_sites, b_sites) = (sites(&shamir), sites(&semi_bin));
+        assert!(
+            !s_sites.is_empty() && s_sites.len() < b_sites.len(),
+            "the arithmetic backend should take a strict subset: {} vs {}",
+            s_sites.len(),
+            b_sites.len()
+        );
+        assert!(
+            s_sites.is_subset(&b_sites),
+            "and it should be the cheap sites, not different ones"
         );
     }
 
@@ -1204,7 +1417,7 @@ mod tests {
         // each operator the surface language can build a chain of.
         for op in ["+", "*", "and", "or"] {
             let (flat, out) = compile(&chain(op, 6));
-            let rebuilt = reassociate(&flat, &out);
+            let rebuilt = reassociate(&flat, &out, None);
             assert_ne!(rebuilt, flat, "`{op}` chain should have been rebalanced");
             equivalent(&flat, &rebuilt, &out, 64)
                 .unwrap_or_else(|e| panic!("`{op}` reassociation changed semantics: {e}"));
@@ -1233,7 +1446,7 @@ mod tests {
             });
             acc = dst;
         }
-        let rebuilt = reassociate(&flat, &acc);
+        let rebuilt = reassociate(&flat, &acc, None);
         assert_ne!(rebuilt, flat, "the xor chain should have been rebalanced");
         assert_eq!(rebuilt.len(), flat.len(), "op count must be unchanged");
         equivalent(&flat, &rebuilt, &acc, 32).expect("xor reassociation must be exact");
@@ -1244,7 +1457,7 @@ mod tests {
         // `(a+b)` is read twice, so the chain cannot be rebuilt around it
         // without duplicating work — the rule must decline.
         let (flat, out) = compile("(* (+ a b) (+ (+ a b) c))");
-        let rebuilt = reassociate(&flat, &out);
+        let rebuilt = reassociate(&flat, &out, None);
         equivalent(&flat, &rebuilt, &out, 64).expect("must stay correct");
     }
 
@@ -1301,7 +1514,7 @@ mod tests {
             "(+ (* x 12) (* y -20))",
         ] {
             let (flat, out) = compile(src);
-            let rewritten = dead_code_eliminate(&strength_reduce(&flat), &out);
+            let rewritten = dead_code_eliminate(&strength_reduce(&flat, None), &out);
             equivalent(&flat, &rewritten, &out, 32).unwrap_or_else(|e| panic!("{}: {}", src, e));
         }
     }

@@ -447,7 +447,25 @@ pub fn format_optimizations(rows: &[Optimized], source: &str) -> String {
         "protocol", "ops b/a", "AND gates b/a", "predicted b/a", "speed-up", "rules kept"
     ));
     for r in rows {
-        let rules: Vec<&str> = r.applied.iter().map(|a| a.rule).collect();
+        // Aggregate per rule, and show `rule×n` when a per-site rule was
+        // accepted at several sites — a rule taken at 2 of 5 sites is a
+        // different answer from one taken everywhere, and the whole point of
+        // per-site search is that backends differ in exactly that way.
+        let mut order: Vec<&str> = Vec::new();
+        let mut hits: HashMap<&str, usize> = HashMap::new();
+        for a in &r.applied {
+            if !hits.contains_key(a.rule) {
+                order.push(a.rule);
+            }
+            *hits.entry(a.rule).or_insert(0) += 1;
+        }
+        let rules: Vec<String> = order
+            .iter()
+            .map(|name| match hits[*name] {
+                1 => (*name).to_string(),
+                n => format!("{name}×{n}"),
+            })
+            .collect();
         out.push_str(&format!(
             "{:<10} {:>6}/{:<6} {:>7}/{:<7} {:>8}/{:<8} {:>8.2}x  {}\n",
             r.protocol,
