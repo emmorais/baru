@@ -137,7 +137,14 @@ pub struct CostParams {
     pub triples_per_mul: f64,
     /// Domain elements of *offline* communication per triple produced.
     /// Zero means the protocol has no separate preprocessing phase.
+    ///
+    /// Used only when `offline_from_ot` is `None`; an OT-based protocol derives
+    /// this from measured OT cost instead of restating a literature figure.
     pub offline_elems_per_triple: f64,
+    /// Set when preprocessing is OT-based, in which case offline volume is
+    /// computed from the measured OT cost in [`crate::mpcc::ot_cost`] rather
+    /// than from `offline_elems_per_triple`.
+    pub offline_from_ot: Option<crate::mpcc::ot_cost::OtTriples>,
     /// Rounds for a batch of `GF(2)` ANDs.
     pub and_rounds: u32,
     /// Bits one party sends per AND lane.  XOR is free everywhere.
@@ -198,6 +205,7 @@ const SEMI_RING_SHARED: CostParams = CostParams {
     open_elems: Elems::new(1.0, 0.0),
     triples_per_mul: 0.0,
     offline_elems_per_triple: 0.0,
+    offline_from_ot: None,
     and_rounds: 1,
     and_bits: Elems::new(1.0, 0.0),
     edabits_per_bit: 1.0,
@@ -324,8 +332,11 @@ pub const REGISTRY: &[ProtocolSpec] = &[
             mul_elems: Elems::new(0.0, 2.0),
             open_elems: Elems::new(0.0, 1.0),
             triples_per_mul: 1.0,
-            // ~2k correlated OTs of k bits per triple ⇒ ~2k elements.
-            offline_elems_per_triple: 128.0,
+            // Offline volume comes from the *measured* OT cost, not a
+            // literature figure: 2k correlated OTs per triple (Gilboa), each
+            // priced by `baru bench-ot`.  See `crate::mpcc::ot_cost`.
+            offline_from_ot: Some(crate::mpcc::ot_cost::OtTriples::PASSIVE),
+            offline_elems_per_triple: 0.0,
             and_bits: Elems::new(0.0, 2.0),
             ..SEMI_RING_SHARED
         },
@@ -344,8 +355,13 @@ pub const REGISTRY: &[ProtocolSpec] = &[
             mul_elems: Elems::new(0.0, 2.0),
             open_elems: Elems::new(0.0, 1.0),
             triples_per_mul: 1.0,
-            // Sacrifice doubles it, and shares are k+s bits wide.
-            offline_elems_per_triple: 600.0,
+            // Sacrifice doubles the OTs, and shares are k+s bits wide, which
+            // widens every OT payload.  Derived from measured OT cost.
+            offline_from_ot: Some(crate::mpcc::ot_cost::OtTriples {
+                sacrifice: 2.0,
+                extra_share_bits: 64,
+            }),
+            offline_elems_per_triple: 0.0,
             and_bits: Elems::new(0.0, 2.0),
             auth_overhead: 2.0,
             local_ns_per_lane: 20.0,
@@ -366,7 +382,12 @@ pub const REGISTRY: &[ProtocolSpec] = &[
             mul_elems: Elems::new(0.0, 2.0),
             open_elems: Elems::new(0.0, 1.0),
             triples_per_mul: 1.0,
-            offline_elems_per_triple: 190.0,
+            // MASCOT sacrifices a second triple to authenticate the first.
+            offline_from_ot: Some(crate::mpcc::ot_cost::OtTriples {
+                sacrifice: 2.0,
+                extra_share_bits: 0,
+            }),
+            offline_elems_per_triple: 0.0,
             field_bits: 128,
             and_bits: Elems::new(0.0, 2.0),
             auth_overhead: 2.0,
@@ -410,6 +431,7 @@ pub const REGISTRY: &[ProtocolSpec] = &[
         security: Security::SemiHonest,
         status: Status::Implemented("interpreter::gc_backend"),
         cost: CostParams {
+            offline_from_ot: None,
             mul_rounds: 0,
             mul_elems: Elems::new(0.0, 0.0),
             open_rounds: 0,

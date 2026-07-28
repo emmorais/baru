@@ -551,9 +551,18 @@ pub fn estimate(
         }
     }
 
-    let offline_bytes =
-        (acc.triples + acc.and_triples) * spec.cost.offline_elems_per_triple * elem_bytes
-            + (acc.edabits + acc.dabits + acc.random_bits) * elem_bytes;
+    // Preprocessing volume.  For the OT-based protocols this is measured OT cost
+    // times a protocol-level OT count (see `super::ot_cost`); for the rest it is
+    // still a per-triple literature figure, and the notes below say which.
+    // Gilboa's OLE needs one OT per bit of the *share*, not per bit of the
+    // comparison width — a ring2^64 triple costs 64 OTs whatever `--bits` says.
+    let share_bits = (elem_bytes * 8.0) as u32;
+    let triple_bytes = match spec.cost.offline_from_ot {
+        Some(ot) => ot.triple_bytes(share_bits),
+        None => spec.cost.offline_elems_per_triple * elem_bytes,
+    };
+    let offline_bytes = (acc.triples + acc.and_triples) * triple_bytes
+        + (acc.edabits + acc.dabits + acc.random_bits) * elem_bytes;
 
     let latency_secs = rounds as f64 * dep.latency_us / 1e6;
     let bandwidth_secs = acc.bytes / dep.bandwidth_bytes_per_sec;
@@ -569,11 +578,27 @@ pub fn estimate(
         "compute"
     };
 
-    if spec.cost.offline_elems_per_triple > 0.0 {
-        notes.push(
-            "offline volume is a literature estimate, not a measurement (roadmap P1 calibrates it)"
-                .to_string(),
-        );
+    match spec.cost.offline_from_ot {
+        Some(ot) => {
+            if acc.triples + acc.and_triples > 0.0 {
+                notes.push(format!(
+                    "offline volume is derived from MEASURED OT cost ({:.1} B/OT, `baru bench-ot`) \
+                     x {:.0} correlated OTs per triple; the offline *time* still ignores \
+                     preprocessing CPU",
+                    super::ot_cost::BYTES_PER_OT,
+                    ot.triple_ots(share_bits),
+                ));
+            }
+        }
+        None => {
+            if spec.cost.offline_elems_per_triple > 0.0 {
+                notes.push(
+                    "offline volume is a literature estimate, not a measurement (roadmap P1 \
+                     calibrates it)"
+                        .to_string(),
+                );
+            }
+        }
     }
     if spec.id == "lowgear" {
         notes.push(
@@ -611,6 +636,45 @@ pub fn estimate(
 
 #[cfg(test)]
 mod tests {
+    /// Replacing the hand-entered offline constants with a derivation from
+    /// measured OT cost changed a *ranking*: BFV-based preprocessing (LowGear)
+    /// moves far fewer bytes per triple than OT-based preprocessing. That is
+    /// LowGear's whole selling point, and the old constants understated it — so
+    /// it is worth a test rather than a comment.
+    #[test]
+    fn fhe_preprocessing_moves_far_less_than_ot_preprocessing() {
+        let src = "(* (* x y) (* z w))";
+        let mut dep = Deployment::lan(3);
+        dep.require_dishonest_majority = true;
+        let mut offline = std::collections::HashMap::new();
+        for id in ["semi2k", "spdz2k", "mascot", "lowgear"] {
+            let spec = crate::mpcc::protocols::find(id).unwrap();
+            let cfg = crate::mpcc::LowerConfig {
+                domain: native_domain(spec, 64),
+                parties: 3,
+                bit_width: 32,
+                public_vars: Vec::new(),
+            };
+            let expr = crate::interpreter::parse(src).unwrap();
+            let circuit = crate::zkp::circuit_compiler::CircuitCompiler::new()
+                .compile_fhe(&expr)
+                .unwrap();
+            let prog = crate::mpcc::lower(&circuit.flat_ops, &circuit.output_wire, &cfg).unwrap();
+            let sched = crate::mpcc::schedule(&prog);
+            let est = estimate(&prog, &sched, spec, &dep).unwrap();
+            offline.insert(id, est.offline_bytes);
+        }
+        let lowgear = offline["lowgear"];
+        for id in ["semi2k", "spdz2k", "mascot"] {
+            assert!(
+                offline[id] > lowgear * 4,
+                "{id} offline {} B should dwarf LowGear's {} B",
+                offline[id],
+                lowgear
+            );
+        }
+    }
+
     use super::*;
     use crate::mpcc::lower::{lower, LowerConfig};
     use crate::mpcc::protocols::find;

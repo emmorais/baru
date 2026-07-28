@@ -38,6 +38,7 @@ pub mod cost;
 pub mod ir;
 pub mod lower;
 pub mod opt;
+pub mod ot_cost;
 pub mod protocols;
 pub mod schedule;
 pub mod sim;

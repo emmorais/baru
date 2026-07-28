@@ -203,9 +203,28 @@ on the multiplicative core. That validates the *bookkeeping* — round schedulin
 peer scaling, Beaver-vs-GRR volume — not the wall-clock constants, which need a
 real network (P1 remainder).
 
+**Offline volume is now measured for the OT-based protocols (2026-07-28).**
+`src/ot/` implements base OT + IKNP and `baru bench-ot` measures it, so Semi2k,
+SPDZ2k and MASCOT no longer carry hand-entered `offline_elems_per_triple`
+constants: `mpcc::ot_cost` derives their offline bytes from measured OT cost
+(16.5 B/OT at large batch) times a protocol-level OT count (Gilboa: `2k`
+correlated OTs per triple, doubled where a triple is sacrificed, widened by
+SPDZ2k's `s` bits). `estimate` now says "derived from MEASURED OT cost" for those
+rows instead of disclaiming a literature estimate.
+
+That changed a **ranking**, in the direction the literature predicts: on a
+3-multiply program LowGear's BFV preprocessing moves ~384 B per triple against
+9.2 KiB (Semi2k), 24.4 KiB (SPDZ2k) and 48.8 KiB (MASCOT) — a gap the old
+constants understated by an order of magnitude, and precisely LowGear's selling
+point. A test pins it. Two things this is *not*: it is the naive Gilboa route, so
+it is an upper bound (vector OLE and batched sacrifice both do better), and the
+offline *time* is still volume ÷ bandwidth, so the CPU half of LowGear's trade is
+still missing and its total remains flattering.
+
 Remaining: Semi2k (Dealer's online phase with OT-generated triples), the existing
-ABY3 transport backend re-expressed as a `ShareEngine`, and a LAN/WAN measurement
-harness so the latency and bandwidth terms get calibrated too.
+ABY3 transport backend re-expressed as a `ShareEngine`, a LAN/WAN measurement
+harness so the latency and bandwidth terms get calibrated too, and a CPU term for
+preprocessing (`ot_cost::US_PER_OT` is measured and recorded but unused).
 
 **P2 — comparisons, malicious security & mixed circuits.** *Comparisons done.*
 

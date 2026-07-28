@@ -251,13 +251,22 @@ this module cannot instantiate anything maliciously secure. Second, the per-OT
 bit lookups rather than a blocked transpose — the shape of the curve is the
 claim here, not the absolute throughput.
 
-**What this unblocks, in priority order:** the Semi2k and MASCOT offline cost
-parameters in `mpcc::protocols` are currently literature estimates flagged as
-such; measured bytes-per-OT and µs-per-OT are exactly what turns them into
-measurements (roadmap P1). PSI itself is still to build, and the interesting
-question there is which construction — a DH-based PSI needs no OT at all and is
-the practical baseline at moderate set sizes, so the cost model should be asked
-which wins before assuming the OT-based one does.
+**The "pays twice" half is now cashed in (same day).** Semi2k's, SPDZ2k's and
+MASCOT's offline parameters were literature constants; `mpcc::ot_cost` now
+derives their offline volume from the measured OT cost above times a
+protocol-level OT count, and `baru mpcc compare` labels those rows "derived from
+MEASURED OT cost" rather than disclaiming an estimate. It moved a ranking:
+LowGear's BFV preprocessing moves ~384 B per triple against 9.2 / 24.4 / 48.8 KiB
+for Semi2k / SPDZ2k / MASCOT, a gap the old constants understated by an order of
+magnitude and exactly the bandwidth-for-CPU trade LowGear exists to make. Treat
+it as an upper bound on the OT side (vector OLE and batched sacrifice both beat
+naive Gilboa), and note that the CPU half of LowGear's trade is still missing, so
+its total is still flattering.
+
+**PSI is still to build**, and the interesting question there is which
+construction — a DH-based PSI needs no OT at all and is the practical baseline at
+moderate set sizes, so the cost model should be asked which wins before assuming
+the OT-based one does.
 
 ---
 
