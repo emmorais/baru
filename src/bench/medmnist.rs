@@ -37,7 +37,7 @@
 //! `tools/train_medmnist.py` on the identical integer weights, so the
 //! in-repo subset can be read against it.
 //!
-//! # Results (`baru bench-medmnist --dataset all --hybrid 3`, 2026-07-28)
+//! # Results (`baru bench-medmnist --dataset all --hybrid 3 --both`, 2026-07-28)
 //!
 //! | | pneumonia | organa |
 //! |---|---|---|
@@ -48,13 +48,29 @@
 //! | encrypted == plaintext diagnosis | 3/3 | 3/3 |
 //! | FHE bootstraps | 0 | 0 |
 //! | plaintext modulus | 2^20 | 2^22 |
+//! | latency/diagnosis, `a2b` | 5.67 s | 5.96 s |
+//! | latency/diagnosis, `--gc` | **4.94 s** | **5.17 s** |
+//!
+//! Cost of one encrypted pneumonia diagnosis under `--gc`: **4.94 s**, of
+//! which FHE is 4.15 s (**84%**) and the whole MPC segment 0.76 s (import
+//! 0.02 s, ReLU 0.51 s, pool 0.21 s, argmax 0.02 s), over 27.4 MB of
+//! party-to-party traffic.
 //!
 //! Two things to read off that table. **Quantisation is free**: the integer
 //! net matches its float parent to within 0.2 points, agreeing with it on
 //! 99.7% (pneumonia) / 98.7% (organa) of test predictions — so the
 //! fixed-point scheme the FHE layer demands costs no accuracy, and neither
 //! does the encryption, which reproduces the plaintext diagnosis bit-exactly.
-//! At ~33 s per encrypted image the *cost* is entirely elsewhere.
+//! The *cost* is entirely elsewhere — and as of 2026-07-28 it moved.
+//!
+//! **The cost centre is now the FHE arithmetic, not the MPC nonlinearities.**
+//! A diagnosis used to take ~33 s, of which the scheme-switch *import* alone
+//! was ~19 s: importing an opened layer ran three blocking input-sharing
+//! rounds **per activation**, so a 5408-wide convolution cost 16 224 round
+//! trips (`import_raw_batch` in [`crate::bench::cnn`] now does it in three).
+//! With that gone and the nonlinearities garbled, a diagnosis is **4.94 s**
+//! and FHE is 84% of it. Anyone reading this module for where to optimise
+//! next should read that number and go to `fhe::bfv`, not here.
 //!
 //! **The model, not the crypto, is the accuracy ceiling.** Published
 //! ResNet-18 at 28×28 reaches 0.854 / 0.935 on these two datasets; this net
@@ -77,7 +93,7 @@ use std::time::Instant;
 
 use serde::Serialize;
 
-use crate::bench::cnn::{run_cnn_hybrid, CnnModel, ConvLayer};
+use crate::bench::cnn::{run_cnn_hybrid_with, CnnModel, ConvLayer, Nonlin};
 use crate::bench::comm::NetworkProfile;
 
 /// A trained, quantised CNN plus the real test images it was measured on, in
@@ -173,10 +189,32 @@ pub struct MedMnistReport {
     pub hybrid_correct: usize,
     pub bootstraps: u64,
     pub log2_t: u32,
+    /// Wall-clock for the whole command, plaintext scoring pass included.
     pub ms: f64,
+    /// Which protocol evaluated the MPC nonlinearities.
+    pub nonlin: String,
+    /// Mean wall-clock of **one encrypted diagnosis**, and its split. This —
+    /// not [`Self::ms`] — is the deployable latency: `ms` also contains the
+    /// 300-image plaintext scoring pass, which no deployment runs.
+    pub per_image_ms: f64,
+    pub per_image_fhe_ms: f64,
+    pub per_image_mpc_ms: f64,
+    /// Per-image breakdown of the MPC segment, averaged over the encrypted runs.
+    pub per_image_import_ms: f64,
+    pub per_image_relu_ms: f64,
+    pub per_image_pool_ms: f64,
+    pub per_image_argmax_ms: f64,
+    /// Party-to-party messages and bytes for one encrypted diagnosis.
+    pub per_image_messages: f64,
+    pub per_image_bytes: f64,
 }
 
-pub fn run(name: &str, hybrid_n: usize, profile: NetworkProfile) -> Result<MedMnistReport, String> {
+pub fn run(
+    name: &str,
+    hybrid_n: usize,
+    profile: NetworkProfile,
+    nonlin: Nonlin,
+) -> Result<MedMnistReport, String> {
     let data = load(name)?;
     let model = data.model();
     let t0 = Instant::now();
@@ -193,6 +231,7 @@ pub fn run(name: &str, hybrid_n: usize, profile: NetworkProfile) -> Result<MedMn
     // plaintext one (bit-exact), and we count how many hit the true label.
     let hybrid_n = hybrid_n.min(data.images.len());
     let (mut matches, mut hybrid_correct, mut bootstraps) = (0usize, 0usize, 0u64);
+    let mut tot = CnnTotals::default();
     for ((img, &plain), &label) in data
         .images
         .iter()
@@ -200,7 +239,7 @@ pub fn run(name: &str, hybrid_n: usize, profile: NetworkProfile) -> Result<MedMn
         .zip(&data.labels)
         .take(hybrid_n)
     {
-        let run = run_cnn_hybrid(&model, img, profile);
+        let run = run_cnn_hybrid_with(&model, img, profile, nonlin);
         if run.class == plain {
             matches += 1;
         }
@@ -208,7 +247,9 @@ pub fn run(name: &str, hybrid_n: usize, profile: NetworkProfile) -> Result<MedMn
             hybrid_correct += 1;
         }
         bootstraps += run.bootstraps;
+        tot.add(&run);
     }
+    let per = tot.mean(hybrid_n);
 
     Ok(MedMnistReport {
         dataset: data.dataset.to_string(),
@@ -226,7 +267,64 @@ pub fn run(name: &str, hybrid_n: usize, profile: NetworkProfile) -> Result<MedMn
         bootstraps,
         log2_t: model.nbits as u32,
         ms: t0.elapsed().as_secs_f64() * 1000.0,
+        nonlin: nonlin.label().to_string(),
+        per_image_ms: per.total_ms,
+        per_image_fhe_ms: per.fhe_ms,
+        per_image_mpc_ms: per.mpc_ms,
+        per_image_import_ms: per.import_ms,
+        per_image_relu_ms: per.relu_ms,
+        per_image_pool_ms: per.pool_ms,
+        per_image_argmax_ms: per.argmax_ms,
+        per_image_messages: per.messages,
+        per_image_bytes: per.bytes,
     })
+}
+
+/// Running totals over the encrypted runs, so the report can quote a mean
+/// per-image cost rather than a sum that silently depends on `--hybrid N`.
+#[derive(Default)]
+struct CnnTotals {
+    total_ms: f64,
+    fhe_ms: f64,
+    mpc_ms: f64,
+    import_ms: f64,
+    relu_ms: f64,
+    pool_ms: f64,
+    argmax_ms: f64,
+    messages: f64,
+    bytes: f64,
+}
+
+impl CnnTotals {
+    fn add(&mut self, r: &crate::bench::cnn::CnnRun) {
+        self.total_ms += r.total_ms;
+        self.fhe_ms += r.fhe_ms;
+        self.mpc_ms += r.mpc_ms;
+        self.import_ms += r.phases.import_ms;
+        self.relu_ms += r.phases.relu_ms;
+        self.pool_ms += r.phases.pool_ms;
+        self.argmax_ms += r.phases.argmax_ms;
+        self.messages += r.comm.messages as f64;
+        self.bytes += r.comm.bytes as f64;
+    }
+
+    fn mean(self, n: usize) -> Self {
+        if n == 0 {
+            return Self::default();
+        }
+        let d = n as f64;
+        Self {
+            total_ms: self.total_ms / d,
+            fhe_ms: self.fhe_ms / d,
+            mpc_ms: self.mpc_ms / d,
+            import_ms: self.import_ms / d,
+            relu_ms: self.relu_ms / d,
+            pool_ms: self.pool_ms / d,
+            argmax_ms: self.argmax_ms / d,
+            messages: self.messages / d,
+            bytes: self.bytes / d,
+        }
+    }
 }
 
 const USAGE: &str = "usage: baru bench-medmnist [options]
@@ -240,6 +338,10 @@ options:
   --hybrid N      run the full ENCRYPTED pipeline on the first N test images
                   (default 5); the rest are scored with the bit-identical
                   plaintext-integer forward pass
+  --gc            evaluate the MPC nonlinearities with 3-party garbled
+                  circuits instead of batched bit decomposition (same
+                  function, bit-exact; constant-round)
+  --both          report both nonlinearity protocols
   --json          machine-readable output
   -h, --help      this message
 ";
@@ -277,13 +379,32 @@ fn print_report(r: &MedMnistReport) {
     );
     println!("    FHE bootstraps            : {}", r.bootstraps);
     println!("    plaintext modulus         : 2^{}", r.log2_t);
-    println!("  time: {:.0} ms\n", r.ms);
+    println!("  cost of ONE encrypted diagnosis ({}):", r.nonlin);
+    println!(
+        "    latency  : {:.0} ms   (fhe {:.0} ms, mpc {:.0} ms)",
+        r.per_image_ms, r.per_image_fhe_ms, r.per_image_mpc_ms
+    );
+    println!(
+        "    mpc split: import {:.0} ms, relu {:.0} ms, pool {:.0} ms, argmax {:.0} ms",
+        r.per_image_import_ms, r.per_image_relu_ms, r.per_image_pool_ms, r.per_image_argmax_ms
+    );
+    println!(
+        "    traffic  : {:.0} messages, {:.1} MB party-to-party",
+        r.per_image_messages,
+        r.per_image_bytes / 1e6
+    );
+    println!(
+        "  wall clock incl. plaintext scoring pass: {:.0} ms\n",
+        r.ms
+    );
 }
 
 pub fn run_cli(args: &[String]) -> Result<(), String> {
     let mut dataset = "pneumonia".to_string();
     let mut hybrid_n = 5usize;
     let mut json = false;
+    let mut nonlin = Nonlin::A2b;
+    let mut both = false;
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -296,6 +417,8 @@ pub fn run_cli(args: &[String]) -> Result<(), String> {
                     .map_err(|_| "bad --hybrid")?;
             }
             "--json" => json = true,
+            "--gc" => nonlin = Nonlin::Gc,
+            "--both" => both = true,
             "-h" | "--help" => {
                 println!("{USAGE}");
                 return Ok(());
@@ -310,9 +433,16 @@ pub fn run_cli(args: &[String]) -> Result<(), String> {
         vec![dataset]
     };
 
+    let protocols: Vec<Nonlin> = if both {
+        vec![Nonlin::A2b, Nonlin::Gc]
+    } else {
+        vec![nonlin]
+    };
     let mut reports = Vec::new();
     for n in &names {
-        reports.push(run(n, hybrid_n, NetworkProfile::INSTANT)?);
+        for p in &protocols {
+            reports.push(run(n, hybrid_n, NetworkProfile::INSTANT, *p)?);
+        }
     }
 
     if json {
@@ -370,17 +500,25 @@ mod tests {
     }
 
     /// The encrypted pipeline must reproduce the plaintext diagnosis on real
-    /// medical images — privacy costs nothing in accuracy.
+    /// medical images — privacy costs nothing in accuracy. Both nonlinearity
+    /// protocols, because the reported latencies are only comparable if both
+    /// produce the same diagnosis.
     #[test]
     #[ignore] // runs the real BFV × ABY3 hybrid; slow in debug
     fn encrypted_matches_plaintext_on_real_scans() {
         for (name, _) in DATASETS {
-            let r = run(name, 2, NetworkProfile::INSTANT).unwrap();
-            assert_eq!(
-                r.hybrid_matches_plaintext, r.hybrid_evaluated,
-                "{name}: every encrypted prediction must equal the plaintext one"
-            );
-            assert_eq!(r.bootstraps, 0, "{name}: the hybrid must not bootstrap");
+            for nonlin in [Nonlin::A2b, Nonlin::Gc] {
+                let r = run(name, 2, NetworkProfile::INSTANT, nonlin).unwrap();
+                assert_eq!(
+                    r.hybrid_matches_plaintext, r.hybrid_evaluated,
+                    "{name}/{nonlin:?}: every encrypted prediction must equal the plaintext one"
+                );
+                assert_eq!(r.bootstraps, 0, "{name}: the hybrid must not bootstrap");
+                assert!(
+                    r.per_image_ms > 0.0,
+                    "{name}: per-image latency must be measured, not defaulted"
+                );
+            }
         }
     }
 }

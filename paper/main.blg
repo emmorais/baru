@@ -8,45 +8,45 @@ Warning--can't use both volume and number fields in CHIMERA
 Warning--empty booktitle in TFHE
 Warning--can't use both volume and number fields in TFHE
 Warning--empty booktitle in FV
-You've used 26 entries,
+You've used 31 entries,
             2118 wiz_defined-function locations,
-            665 strings with 8341 characters,
-and the built_in function-call counts, 11841 in all, are:
-= -- 1178
-> -- 495
-< -- 23
-+ -- 196
-- -- 168
-* -- 747
-:= -- 1722
-add.period$ -- 79
-call.type$ -- 26
-change.case$ -- 161
+            700 strings with 9272 characters,
+and the built_in function-call counts, 14125 in all, are:
+= -- 1402
+> -- 599
+< -- 27
++ -- 237
+- -- 204
+* -- 896
+:= -- 2060
+add.period$ -- 94
+call.type$ -- 31
+change.case$ -- 194
 chr.to.int$ -- 0
-cite$ -- 31
-duplicate$ -- 527
-empty$ -- 973
-format.name$ -- 168
-if$ -- 2654
+cite$ -- 36
+duplicate$ -- 628
+empty$ -- 1156
+format.name$ -- 204
+if$ -- 3162
 int.to.chr$ -- 0
-int.to.str$ -- 26
-missing$ -- 25
-newline$ -- 134
-num.names$ -- 52
-pop$ -- 224
+int.to.str$ -- 31
+missing$ -- 30
+newline$ -- 159
+num.names$ -- 62
+pop$ -- 267
 preamble$ -- 1
-purify$ -- 135
+purify$ -- 163
 quote$ -- 0
-skip$ -- 456
+skip$ -- 541
 stack$ -- 0
-substring$ -- 842
-swap$ -- 232
-text.length$ -- 23
+substring$ -- 993
+swap$ -- 275
+text.length$ -- 27
 text.prefix$ -- 0
 top$ -- 0
-type$ -- 104
+type$ -- 124
 warning$ -- 5
-while$ -- 119
-width$ -- 28
-write$ -- 287
+while$ -- 142
+width$ -- 33
+write$ -- 342
 (There were 5 warnings)

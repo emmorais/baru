@@ -278,13 +278,29 @@ a level-batched fold. Both are bit-exact against the per-element versions.
 | correct `a2b`, Beaver triples | 76.9 s | 114 790 | 159.4 MB |
 | + ABY3 resharing (no triples) | 40.8 s | 29 211 | 10.4 MB |
 | + batched ReLU | 20.7 s | 15 701 | 10.2 MB |
-| + batched max-pool | **6.1 s** | **5 591** | 10.0 MB |
+| + batched max-pool | 6.1 s | 5 591 | 10.0 MB |
+| + batched scheme-switch import | **1.2 s** | **147** | 10.0 MB |
 
 Batching alone was 40.8 → 6.1 s (6.7×) and cut messages 5.2×. The endpoint is
-the payoff: the **private, triple-free** pipeline at 6.1 s is now **2.9×
-faster than the original leaky/insecure baseline** (17.6 s) it started from —
-correctness and privacy came out ahead on speed too, once the protocol was
-the right one.
+the payoff: the **private, triple-free** pipeline is now far **faster than the
+original leaky/insecure baseline** (17.6 s) it started from — correctness and
+privacy came out ahead on speed too, once the protocol was the right one.
+
+**The last row is the one that mattered, and it is not a protocol change.**
+After every *comparison* had been batched, a per-phase breakdown showed the
+comparisons were never the cost: **19.1 s of the remaining 20.4 s was the
+scheme-switch `import`** — reconstructing an opened layer into shares ran
+three blocking input-sharing rounds *per activation*, so D=28's 5408-wide conv
+output cost **16 224 sequential round trips**, while the ReLU it was importing
+values for cost 0.6 s. `share_input_batch` sends the same bytes with the same
+randomness in **three** rounds: import 19.1 s → **8 ms**, end-to-end
+**21.8 s → 2.6 s (8.3×)**.
+
+Worth remembering: *"the MPC segment dominates"* was true, but *"therefore the
+MPC protocols are the bottleneck"* did not follow. The cost was in the plumbing
+between the two representations — the part a switch-based construction crosses
+most often, and the part neither the FHE nor the MPC literature owns. The
+per-phase split that `bench-cnn` now prints exists so this is not repeatable.
 
 While batching, one latent bug surfaced and was fixed: the α re-randomiser
 counter (`op_id + i`) could repeat across multiplication rounds once a batch
@@ -945,11 +961,16 @@ At MNIST resolution that is a **294× faster convolution** and 5.5× faster
 end to end (94.0 s → 17.1 s) — and it puts a full 28×28 image within reach,
 which the module previously documented as out of scope (`D ≤ ~12`).
 
-**The bottleneck has now moved off FHE entirely.** At D=28 the FHE work is
-264 ms of a 17.1 s run — 1.5%; the other 98.5% is the MPC side evaluating
-~1352 ReLUs plus the max-pool comparisons. Speeding *those* up
-(CrypTFlow2-style comparison and truncation protocols) is therefore the
-highest-value remaining optimization, not more FHE packing work.
+**The bottleneck moved off FHE — and has since moved back.** Right after
+packing, the FHE work was 264 ms of a 17.1 s run (1.5%) and the rest was the
+MPC segment, which is what motivated the batching work above. But most of that
+MPC time was the unbatched scheme-switch import, not the comparisons; with the
+import batched and the nonlinearities garbled, the same D=28 classifier runs
+in **2.06 s of which 1.36 s (66%) is FHE**, and the trained two-conv medical
+model — four encrypted linear layers to this one's two — is **84% FHE**. So
+the highest-value remaining optimization is `fhe::bfv`, not the MPC layer.
+The general lesson is in the batching section above: a segment-level
+measurement told us which *component* was slow and nothing about *why*.
 
 ### The private CNN now runs on secure parameters
 
@@ -1056,7 +1077,7 @@ Handwritten digits are not a medical claim. **MedMNIST v2**
 **28×28 — exactly MNIST's shape**, so the pipeline above runs on them unchanged:
 
 ```
-baru bench-medmnist --dataset all --hybrid 3
+baru bench-medmnist --dataset all --hybrid 3 --both
 ```
 
 | | pneumonia (chest X-ray, 2 classes) | organa (abdominal CT, 11 classes) |
@@ -1067,14 +1088,22 @@ baru bench-medmnist --dataset all --hybrid 3
 | published ResNet-18 (28×28) | 0.854 | 0.935 |
 | encrypted == plaintext diagnosis | 3/3 | 3/3 |
 | FHE bootstraps | 0 | 0 |
+| latency/diagnosis, `a2b` | 5.67 s | 5.96 s |
+| latency/diagnosis, `--gc` | **4.94 s** | **5.17 s** |
 
-Two readings. **Quantisation and encryption are both free**: the integer net
+Three readings. **Quantisation and encryption are both free**: the integer net
 tracks its float parent to within 0.2 points (agreeing on 99.7% / 98.7% of test
 predictions), and the encrypted pipeline reproduces the plaintext diagnosis
-bit-exactly — the cost of privacy is wall-clock (~33 s/image), not accuracy.
-And **the model, not the crypto, is the ceiling**: this 2-conv classifier is
+bit-exactly — privacy costs wall-clock, not accuracy.
+**The model, not the crypto, is the ceiling**: this 2-conv classifier is
 sized to fit the depth-1 noise budget, which is enough to match published
 ResNet-18 on pneumonia and 12 points short of it on the 11-class organ task.
+And **the cost centre is now FHE**: of the 4.94 s chest-X-ray diagnosis,
+**4.15 s (84%) is FHE arithmetic** and 0.76 s is the whole MPC segment
+(import 0.02 s, ReLU 0.51 s, pool 0.21 s, argmax 0.02 s). A diagnosis used to
+take ~33 s; the batched scheme-switch import above took it to 5.67 s and
+garbled nonlinearities (`--gc`) to 4.94 s. Anyone optimising this further
+should go to `fhe::bfv`, not to the MPC layer.
 
 The same swap applies to the linear-discriminator demo, where the medical
 version runs on every FHE scheme:
@@ -1417,27 +1446,32 @@ plaintext reference:
 1×D×D image → conv(OC, 3×3) → ReLU∘rescale → maxpool(2×2) → dense(→10) → argmax → class
 ```
 
-Both the image *and* the weights are encrypted. The convolution runs as a
-single (chunked) packed matvec against an im2col/Toeplitz matrix — so it
-reuses the *same* proven SI-NTRU matvec + scheme-switch machinery as
-`bench-deep-nn`; only the nonlinearities differ (ReLU fused with the
-fixed-point rescale; max-pool and argmax are the `crate::gadgets`). Measured
-(D=8, this machine):
+Both the image *and* the weights are encrypted. The convolution uses the
+reversed-axis coefficient packing described above, and reuses the same
+scheme-switch machinery as `bench-deep-nn`; only the nonlinearities differ
+(ReLU fused with the fixed-point rescale; max-pool and argmax are the
+`crate::gadgets`). `--gc` swaps the nonlinearity protocol, `--both` runs the
+pair and prints the ratio, and every run prints the MPC **phase breakdown**
+— the thing whose absence hid an 8.3× win for months. Measured, this machine:
 
-| network | class | bootstraps | total | fhe | mpc | MPC wire |
+| network | class | bootstraps | total | fhe | mpc | breakdown |
 |---|---|---|---|---|---|---|
-| rtt = 0 | exact ✓ | **0** | 1.27 s | 344 ms | 880 ms | 2,040 msgs / 71 KB |
-| rtt = 20 ms | exact ✓ | **0** | 8.40 s | 410 ms | 7.95 s | 2,040 msgs / 71 KB |
+| D=8, rtt=0 | exact ✓ | **0** | 1.21 s | 955 ms | 228 ms | import 6 / relu 42 / pool 46 / argmax 127 ms |
+| D=8, rtt=20 ms | exact ✓ | **0** | 3.31 s | 1.25 s | 2.03 s | import 42 / relu 174 / pool 414 / argmax 1309 ms |
+| D=28, rtt=0 | exact ✓ | **0** | 2.61 s | 1.36 s | 1.23 s | import 8 / relu 624 / pool 466 / argmax 125 ms |
+| D=28, rtt=0, `--gc` | exact ✓ | **0** | **2.06 s** | 1.36 s | 679 ms | import 9 / relu 401 / pool 154 / argmax 106 ms |
 
-The cost lives where the theory predicts: the MPC nonlinearities (ReLU +
-max-pool + argmax, all comparison-heavy) dominate, and under WAN latency
-their round count is what stacks — exactly the profile the hybrid is built
-around (comparisons are cheap in MPC and ruinous in FHE). **Correctness is
-exact; accuracy** on a real dataset is the orthogonal ML step (trained
-weights via `crate::ml`, which `demo-private-mnist` already exercises on a
-real linear model). Coefficient packing bounds this to small D; CIFAR-scale
-needs SIMD-slot conv packing (Gazelle-style) — the noted next
-crypto-engineering step, independent of the no-bootstrap result.
+Two things to read off it. At **rtt=0 the FHE side is now the majority** of
+the run — the reverse of what this section used to claim. And under **WAN
+latency the round-serial `argmax` becomes the single largest phase** (1.3 s
+of 2.0 s at D=8): it folds `nclasses−1` comparisons through scalar `lt`, so
+unlike every other phase it is *not* batched. That is the next obvious fix,
+and the breakdown is what makes it obvious. **Correctness is
+exact; accuracy** on a real dataset is the orthogonal ML step — see
+`bench-mnist` (98.89%) and `bench-medmnist` (private diagnosis) above.
+Coefficient packing bounds this to small D; CIFAR-scale needs SIMD-slot conv
+packing (Gazelle-style) — the noted next crypto-engineering step, independent
+of the no-bootstrap result.
 
 > Building this surfaced two real transport-only bugs the earlier
 > benchmarks couldn't reach (they only ever compared secrets against zero):

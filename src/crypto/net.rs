@@ -50,6 +50,20 @@ pub enum MpcMsg {
         value: u128,
     },
 
+    /// A whole *layer* of input sharings in one message — the batched form of
+    /// [`MpcMsg::InputShare`]. `lefts[k]`/`rights[k]` are the two replicated
+    /// components for share `base_id + k`.
+    ///
+    /// The unbatched variant costs a blocking round trip **per element**, and
+    /// a scheme switch imports thousands of activations at once; batching does
+    /// not change the protocol, the randomness, or the bytes on the wire —
+    /// only how many round trips carry them.
+    InputShareBatch {
+        base_id: u64,
+        lefts: Vec<u128>,
+        rights: Vec<u128>,
+    },
+
     /// One party's additive share component sent during a reveal round.
     RevealShare {
         share_id: u64,

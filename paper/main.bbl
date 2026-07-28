@@ -47,6 +47,12 @@ Ran Canetti.
 \newblock In {\em 42nd IEEE Symposium on Foundations of Computer Science
   (FOCS)}, pages 136--145, 2001.
 
+\bibitem{ASTRA}
+Harsh Chaudhari, Ashish Choudhury, Arpita Patra, and Ajith Suresh.
+\newblock {ASTRA}: High throughput 3pc over rings with application to secure
+  prediction.
+\newblock In {\em ACM CCSW}, pages 81--92, 2019.
+
 \bibitem{CKKS}
 Jung~Hee Cheon, Andrey Kim, Miran Kim, and Yongsoo Song.
 \newblock Homomorphic encryption for arithmetic of approximate numbers.
@@ -115,6 +121,12 @@ Peter~M. Kogge and Harold~S. Stone.
   recurrence equations.
 \newblock {\em IEEE Transactions on Computers}, C-22(8):786--793, 1973.
 
+\bibitem{FreeXOR}
+Vladimir Kolesnikov and Thomas Schneider.
+\newblock Improved garbled circuit: Free {XOR} gates and applications.
+\newblock In {\em 35th International Colloquium on Automata, Languages and
+  Programming (ICALP)}, pages 486--498, 2008.
+
 \bibitem{MNIST}
 Yann LeCun, L{\'e}on Bottou, Yoshua Bengio, and Patrick Haffner.
 \newblock Gradient-based learning applied to document recognition.
@@ -148,5 +160,24 @@ Deevashwer Rathee, Mayank Rathee, Nishant Kumar, Nishanth Chandran, Divya
   Gupta, Aseem Rastogi, and Rahul Sharma.
 \newblock {CrypTFlow2}: Practical 2-party secure inference.
 \newblock In {\em ACM CCS}, pages 325--342, 2020.
+
+\bibitem{MedMNIST}
+Jiancheng Yang, Rui Shi, Donglai Wei, Zequan Liu, Lin Zhao, Bilian Ke,
+  Hanspeter Pfister, and Bingbing Ni.
+\newblock {MedMNIST} v2 -- a large-scale lightweight benchmark for {2D} and
+  {3D} biomedical image classification.
+\newblock {\em Scientific Data}, 10(1):41, 2023.
+
+\bibitem{Yao}
+Andrew Chi-Chih Yao.
+\newblock How to generate and exchange secrets.
+\newblock In {\em 27th IEEE Symposium on Foundations of Computer Science
+  (FOCS)}, pages 162--167, 1986.
+
+\bibitem{HalfGates}
+Samee Zahur, Mike Rosulek, and David Evans.
+\newblock Two halves make a whole: Reducing data transfer in garbled circuits
+  using half gates.
+\newblock In {\em EUROCRYPT}, pages 220--250, 2015.
 
 \end{thebibliography}

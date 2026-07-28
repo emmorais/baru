@@ -1,4 +1,4 @@
-This is pdfTeX, Version 3.141592653-2.6-1.40.26 (TeX Live 2024/Homebrew) (preloaded format=pdflatex 2025.1.26)  25 JUL 2026 08:18
+This is pdfTeX, Version 3.141592653-2.6-1.40.26 (TeX Live 2024/Homebrew) (preloaded format=pdflatex 2025.1.26)  28 JUL 2026 15:44
 entering extended mode
  restricted \write18 enabled.
  %&-line parsing enabled.
@@ -774,9 +774,9 @@ nc/dvips/lm/lm-ec.enc}{/opt/homebrew/Cellar/texlive/20240312_3/share/texmf-dist
 e/texmf-dist/fonts/enc/dvips/lm/lm-mathit.enc}{/opt/homebrew/Cellar/texlive/202
 40312_3/share/texmf-dist/fonts/enc/dvips/lm/lm-rm.enc}]
 LaTeX Font Info:    External font `lmex10' loaded for size
-(Font)              <10.95> on input line 116.
+(Font)              <10.95> on input line 122.
 LaTeX Font Info:    Trying to load font information for T1+lmtt on input line 1
-49.
+55.
 
 (/opt/homebrew/Cellar/texlive/20240312_3/share/texmf-dist/tex/latex/lm/t1lmtt.f
 d
@@ -788,7 +788,7 @@ Package microtype Info: Loading generic protrusion settings for font family
 (microtype)             See the microtype manual for details.
  [2]
 LaTeX Font Info:    Trying to load font information for OT1+lmss on input line 
-201.
+219.
 
 (/opt/homebrew/Cellar/texlive/20240312_3/share/texmf-dist/tex/latex/lm/ot1lmss.
 fd
@@ -801,35 +801,35 @@ Package microtype Info: Loading generic protrusion settings for font family
  [3] [4{/opt/homebrew/Cellar/texlive/20240312_3/share/texmf-dist/fonts/enc/dvip
 s/lm/lm-mathex.enc}]
 LaTeX Font Info:    Trying to load font information for TS1+lmr on input line 3
-51.
+69.
 
 (/opt/homebrew/Cellar/texlive/20240312_3/share/texmf-dist/tex/latex/lm/ts1lmr.f
 d
 File: ts1lmr.fd 2015/05/01 v1.6.1 Font defs for Latin Modern
 ) [5{/opt/homebrew/Cellar/texlive/20240312_3/share/texmf-dist/fonts/enc/dvips/l
-m/lm-ts1.enc}] [6] [7] [8]
-Overfull \hbox (8.8768pt too wide) in paragraph at lines 626--630
+m/lm-ts1.enc}] [6] [7] [8] [9] [10] [11]
+Overfull \hbox (8.8768pt too wide) in paragraph at lines 814--818
  []\T1/lmr/bx/n/10.95 (-20) Scheme switch-ing be-tween FHE schemes.[] \T1/lmr/m
 /n/10.95 (-20) CHIMERA [[]] and PE-GA-SUS [[]] switch FHE$\OMS/lmsy/m/n/10.95 $
 $\T1/lmr/m/n/10.95 (-20) FHE
  []
 
-[9] (./main.bbl [10] [11]) [12] (./main.aux)
+[12] (./main.bbl [13] [14]) [15] (./main.aux)
  ***********
 LaTeX2e <2023-11-01> patch level 1
 L3 programming layer <2024-02-20>
  ***********
 Package rerunfilecheck Info: File `main.out' has not changed.
-(rerunfilecheck)             Checksum: DAA02D4D3445318647807BA53F224413;4609.
+(rerunfilecheck)             Checksum: 9C3FC0EA8AA6AA1BACF645104BB94AD8;5261.
  ) 
 Here is how much of TeX's memory you used:
- 17445 strings out of 474116
- 287966 string characters out of 5732613
- 1941187 words of memory out of 5000000
- 39164 multiletter control sequences out of 15000+600000
- 668169 words of font info for 245 fonts, out of 8000000 for 9000
+ 17522 strings out of 474116
+ 288861 string characters out of 5732613
+ 1940187 words of memory out of 5000000
+ 39185 multiletter control sequences out of 15000+600000
+ 678865 words of font info for 268 fonts, out of 8000000 for 9000
  1141 hyphenation exceptions out of 8191
- 75i,12n,79p,1001b,600s stack positions out of 10000i,1000n,20000p,200000b,200000s
+ 75i,12n,79p,1001b,598s stack positions out of 10000i,1000n,20000p,200000b,200000s
 </opt/homebrew/Cellar/texlive/20240312_3/share/texmf-dist/fonts/type1/public/
 lm/lmbx10.pfb></opt/homebrew/Cellar/texlive/20240312_3/share/texmf-dist/fonts/t
 ype1/public/lm/lmbx12.pfb></opt/homebrew/Cellar/texlive/20240312_3/share/texmf-
@@ -851,10 +851,10 @@ c/lm/lmsy10.pfb></opt/homebrew/Cellar/texlive/20240312_3/share/texmf-dist/fonts
 /type1/public/lm/lmsy8.pfb></opt/homebrew/Cellar/texlive/20240312_3/share/texmf
 -dist/fonts/type1/public/lm/lmtt10.pfb></opt/homebrew/Cellar/texlive/20240312_3
 /share/texmf-dist/fonts/type1/public/amsfonts/symbols/msbm10.pfb>
-Output written on main.pdf (12 pages, 346531 bytes).
+Output written on main.pdf (15 pages, 366280 bytes).
 PDF statistics:
- 413 PDF objects out of 1000 (max. 8388607)
- 356 compressed objects within 4 object streams
- 99 named destinations out of 1000 (max. 500000)
- 61121 words of extra memory for PDF output out of 61914 (max. 10000000)
+ 458 PDF objects out of 1000 (max. 8388607)
+ 398 compressed objects within 4 object streams
+ 113 named destinations out of 1000 (max. 500000)
+ 67281 words of extra memory for PDF output out of 74296 (max. 10000000)
 

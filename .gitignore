@@ -5,3 +5,5 @@ store3.json
 state1.json
 state2.json
 state3.json
+paper/main.fdb_latexmk
+paper/main.fls

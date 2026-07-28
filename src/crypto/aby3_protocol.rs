@@ -98,6 +98,82 @@ pub fn share_input<T: Transport>(
     }
 }
 
+/// Distribute a whole batch of secret inputs owned by the *same* party — the
+/// batched form of [`share_input`], with identical semantics per element.
+///
+/// Share `k` of the batch takes id `base_id + k`, so ids stay in lockstep with
+/// the unbatched path. The owner sends **one** message per peer for the entire
+/// batch instead of two per element, and each non-owner performs **one**
+/// blocking receive instead of `n`.
+///
+/// This matters because the FHE→MPC scheme switch imports an entire layer of
+/// activations at once: at one round trip per element a $28\times28$
+/// convolution's output spent seconds in `recv` alone, dwarfing the
+/// nonlinearity it was importing values for.
+pub fn share_input_batch<T: Transport>(
+    values: &[Fr],
+    base_id: u64,
+    owner: PartyId,
+    me: PartyId,
+    mbx: &Mailbox<T>,
+) -> Vec<PartyShare> {
+    let n = values.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    if me == owner {
+        let mut rng = rand::thread_rng();
+        // Per-peer buffers: peer `i` receives its own component and the
+        // component of `i+1`, exactly as in the unbatched protocol.
+        let mut lefts = [Vec::with_capacity(n), Vec::with_capacity(n), Vec::with_capacity(n)];
+        let mut rights = [Vec::with_capacity(n), Vec::with_capacity(n), Vec::with_capacity(n)];
+        let mut mine = Vec::with_capacity(n);
+        for &value in values {
+            let s0: Fr = rng.gen();
+            let s1: Fr = rng.gen();
+            let s2 = value.wrapping_sub(s0).wrapping_sub(s1);
+            let s = [s0, s1, s2];
+            for i in 0..N {
+                lefts[i].push(s[i]);
+                rights[i].push(s[(i + 1) % N]);
+            }
+            mine.push(PartyShare { left: s[me], right: s[(me + 1) % N] });
+        }
+        for i in 0..N {
+            if i != me {
+                mbx.send(
+                    i,
+                    serialize_msg(&MpcMsg::InputShareBatch {
+                        base_id,
+                        lefts: std::mem::take(&mut lefts[i]),
+                        rights: std::mem::take(&mut rights[i]),
+                    }),
+                );
+            }
+        }
+        mine
+    } else {
+        let (_from, m) = mbx
+            .recv_matching(
+                TIMEOUT_MS,
+                |m| matches!(m, MpcMsg::InputShareBatch { base_id: b, .. } if *b == base_id),
+            )
+            .unwrap_or_else(|| {
+                panic!("share_input_batch: timeout waiting for InputShareBatch base_id={base_id}")
+            });
+        let MpcMsg::InputShareBatch { lefts, rights, .. } = m else {
+            unreachable!("predicate guarantees InputShareBatch")
+        };
+        assert_eq!(lefts.len(), n, "share_input_batch: owner sent a batch of the wrong length");
+        assert_eq!(rights.len(), n, "share_input_batch: owner sent a batch of the wrong length");
+        lefts
+            .into_iter()
+            .zip(rights)
+            .map(|(left, right)| PartyShare { left, right })
+            .collect()
+    }
+}
+
 /// Share a public constant locally (no communication).  Party 0 gets the
 /// value in its left component; others get 0 so that reconstruction = value.
 ///
@@ -753,6 +829,46 @@ mod tests {
             })
             .collect();
         joins.into_iter().map(|j| j.join().unwrap()).collect()
+    }
+
+    /// `share_input_batch` must be indistinguishable from a run of
+    /// `share_input`, element by element — it is the same protocol with the
+    /// round structure collapsed, and the only reason to prefer it is cost.
+    /// If it ever diverged, the scheme switch would import wrong activations
+    /// and every downstream exactness test would fail for a reason far from
+    /// the cause, so the equivalence is pinned here at the protocol level.
+    #[test]
+    fn batched_input_sharing_matches_the_scalar_protocol() {
+        let secrets: Vec<Fr> = vec![0, 1, 42, 0xDEAD_BEEF, Fr::MAX, 7];
+        let n = secrets.len();
+
+        for owner in 0..N {
+            let ss = secrets.clone();
+            let batched = run_parties(move |me, mbx| {
+                let vals: Vec<Fr> =
+                    if me == owner { ss.clone() } else { vec![0; ss.len()] };
+                let shares = share_input_batch(&vals, 0, owner, me, &mbx);
+                (0..shares.len())
+                    .map(|k| reveal(&shares[k], 1000 + k as u64, None, me, &mbx))
+                    .collect::<Vec<Fr>>()
+            });
+            let ss = secrets.clone();
+            let scalar = run_parties(move |me, mbx| {
+                (0..ss.len())
+                    .map(|k| {
+                        let v = if me == owner { ss[k] } else { 0 };
+                        let sh = share_input(v, k as u64, owner, me, &mbx);
+                        reveal(&sh, 1000 + k as u64, None, me, &mbx)
+                    })
+                    .collect::<Vec<Fr>>()
+            });
+            assert_eq!(batched[0], secrets, "batched sharing must reconstruct the inputs");
+            assert_eq!(
+                batched[0], scalar[0],
+                "batched and scalar input sharing must agree (owner {owner})"
+            );
+            assert_eq!(batched[0].len(), n);
+        }
     }
 
     /// Triple-free multiplication is correct *and* leaks nothing on the wire.

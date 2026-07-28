@@ -45,5 +45,13 @@ Headline correspondences:
 | §4 Evaluation-key-free linear layers | `bench-fhe-innerprod`, `fhe::bfv`, `fhe::conv_pack` |
 | §4.2 multi-modular NTT | `fhe::ntt` differential tests |
 | §5 Triple-free / batched MPC | `aby3_protocol` (`triple_free_mul_*`, `a2b_batch_*`) |
+| §5 batched scheme-switch import | `aby3_protocol::share_input_batch`, `batched_input_sharing_matches_the_scalar_protocol`, `scheme_switch_import_does_not_scale_with_layer_width` |
 | §6 Composability / gadgets | `src/gadgets/` |
-| §7.4 Two-conv MNIST, 98.05% | `bench-mnist`, `two_conv_hybrid_matches_plaintext` |
+| §7.2 MPC-segment cost table | `bench-cnn --img 28` (prints the per-phase split) |
+| §7.3 Garbled vs bit-decomposition | `bench-gc-compare`, `bench-cnn --img 28 --both`, `gc_and_a2b_nonlinearities_agree` |
+| §7.6 Private diagnosis on MedMNIST | `bench-medmnist --dataset all --hybrid 3 --both` |
+| §7.7 Two-conv MNIST, 98.89% | `bench-mnist`, `two_conv_hybrid_matches_plaintext` |
+
+Every number in §7.2, §7.3 and §7.6 comes from one of those commands on an
+Apple-silicon laptop, single-threaded, `--release`. Ratios transfer across
+machines; absolute seconds do not.

@@ -30,6 +30,14 @@ pub struct TransportBackend<T: Transport> {
     /// Per-instance monotonic counter — all parties executing the same
     /// expression in lockstep will generate the same sequence of IDs.
     next_id: u64,
+    /// Route batched comparisons through the **Yao leg** ([`Self::lt_gc_batch`])
+    /// instead of the log-round bit decomposition. Off by default so the a2b
+    /// path stays the control in every measurement; when on, every gadget that
+    /// reduces to `lt_batch` — max-pooling, argmax, `max2_batch` — becomes
+    /// constant-round without being rewritten. All parties must agree on the
+    /// setting: it changes which protocol runs, hence the id-allocation
+    /// sequence the parties execute in lockstep.
+    gc_nonlin: bool,
 }
 
 impl<T: Transport> TransportBackend<T> {
@@ -39,7 +47,20 @@ impl<T: Transport> TransportBackend<T> {
             mailbox: Mailbox::new(transport),
             shares: HashMap::new(),
             next_id: 1,
+            gc_nonlin: false,
         }
+    }
+
+    /// Enable/disable the garbled-circuit route for batched comparisons — see
+    /// the `gc_nonlin` field. Set it identically on every party, before any
+    /// operation that would diverge.
+    pub fn set_gc_nonlinearities(&mut self, on: bool) {
+        self.gc_nonlin = on;
+    }
+
+    /// Whether batched comparisons currently take the Yao leg.
+    pub fn gc_nonlinearities(&self) -> bool {
+        self.gc_nonlin
     }
 
     fn alloc_id(&mut self) -> u64 {
@@ -93,6 +114,34 @@ impl<T: Transport> TransportBackend<T> {
         let id = self.alloc_id();
         let ps = crate::crypto::aby3_protocol::share_public(value, self.me);
         self.store(id, ps, nbits, 0)
+    }
+
+    /// Batched [`Backend::share_secret`]: distribute `values`, all owned by
+    /// `owner`, in one round instead of one per element. Ids are allocated as
+    /// a consecutive block, so every party stays in lockstep exactly as the
+    /// scalar path does.
+    pub fn share_secret_batch(
+        &mut self,
+        values: &[Fr],
+        nbits: usize,
+        owner: usize,
+    ) -> Vec<ShareRef> {
+        if values.is_empty() {
+            return Vec::new();
+        }
+        let base = self.alloc_block(values.len() as u64);
+        let shares = crate::crypto::aby3_protocol::share_input_batch(
+            values,
+            base,
+            owner,
+            self.me,
+            &self.mailbox,
+        );
+        shares
+            .into_iter()
+            .enumerate()
+            .map(|(k, ps)| self.store(base + k as u64, ps, nbits, owner))
+            .collect()
     }
 
     /// Garbled-circuit batched comparison — the **Yao leg** of ABY3
@@ -279,6 +328,9 @@ impl<T: Transport + 'static> Backend for TransportBackend<T> {
     fn lt_batch(&mut self, pairs: &[(ShareRef, ShareRef)]) -> Vec<ShareRef> {
         if pairs.is_empty() {
             return Vec::new();
+        }
+        if self.gc_nonlin {
+            return self.lt_gc_batch(pairs);
         }
         // Each comparison is the MSB of `a − b`; batch all the decompositions
         // into one `a2b_batch` so the whole set costs ~9 rounds, not `9·len`.

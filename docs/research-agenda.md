@@ -337,15 +337,22 @@ accuracy overall     : 85.00%
 cohort std. error    : ±5.0 points on 66 patients — the gap is 1.2 SE, i.e. noise
 
 cost, by stage:
-  stage 1 ingest     : 126.7 ms for 300 records
-  stage 1 selection  : 16.5 ms
-  stage 4 inference  : 32626 ms per image, encrypted  (1/1 matched plaintext, 0 bootstraps)
+  stage 1 ingest     : 125.5 ms for 300 records
+  stage 1 selection  : 14.9 ms
+  stage 4 inference  : 5772 ms per image, encrypted  (2/2 matched plaintext, 0 bootstraps)
 ```
 
-**Selecting the entire cohort costs ~1900× less than classifying one member of
+**Selecting the entire cohort costs ~390× less than classifying one member of
 it.** The §2 headline — that the price of privacy is wildly non-uniform across a
 pipeline — is now visible *inside a single query* rather than only across separate
 benchmarks. That is the composed result the agenda was missing.
+
+> Re-measured 2026-07-28 after the scheme-switch import was batched. The ratio
+> was ~1900× when one encrypted inference cost 32.6 s; inference is now 5.8 s,
+> so the *spread narrowed by 5×* and the qualitative claim survived it. Worth
+> noting as a hazard: this ratio is a claim about two stages, and optimising
+> either one silently invalidates it. The command recomputes it, so quote the
+> command's output, never a remembered number.
 
 The cohort is computed **three ways** — encrypted BaruDB, plaintext BaruDB, and a
 local filter — and all three must agree or the command fails, so this is a

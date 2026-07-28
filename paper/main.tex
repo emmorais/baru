@@ -72,14 +72,20 @@ instantiate the FHE side so that a full matrix--vector product with
 ciphertext$\times$ciphertext multiplication decrypted under $s^2$ (no
 relinearization), and give a convolution packing that yields an entire
 output channel per multiplication. The MPC side is a triple-free,
-communication-batched honest-majority protocol. We implement the whole
-pipeline and validate it by \emph{bit-exact} agreement with a plaintext
-integer reference at every depth. On real MNIST test digits, a fully
-encrypted two-convolution CNN --- four encrypted linear layers, three MPC
-nonlinearities, three scheme switches, and zero bootstraps --- attains
-$98.05\%$ test accuracy, with every encrypted prediction provably equal to
-its plaintext counterpart. Unlike two-party inference services, the model
-weights are encrypted as well as the input.
+communication-batched honest-majority protocol with constant-round garbled
+nonlinearities. We implement the whole pipeline and validate it by
+\emph{bit-exact} agreement with a plaintext integer reference at every depth.
+On real biomedical images (MedMNIST v2), a fully encrypted two-convolution
+CNN --- four encrypted linear layers, three MPC nonlinearities, three scheme
+switches, and zero bootstraps --- diagnoses a pediatric chest X-ray in
+$\mathbf{4.9}$ seconds at $84.78\%$ accuracy, and reaches $98.89\%$ on MNIST,
+with every encrypted prediction provably equal to its plaintext counterpart.
+Unlike two-party inference services, the model weights are encrypted as well
+as the input. Along the way we correct a diagnosis of our own: the segment
+that dominated runtime was neither the FHE arithmetic nor the MPC protocols
+but the \emph{plumbing between them}, an unbatched scheme-switch import whose
+removal cut end-to-end latency $8.3\times$ and moved the cost center back
+onto FHE.
 \end{abstract}
 
 \section{Introduction}\label{sec:intro}
@@ -155,8 +161,20 @@ inherits security and correctness with no per-architecture proof.
 (\Cref{sec:eval}).} We implement the entire construction and check it against
 a plaintext integer reference: the encrypted output equals the plaintext
 output \emph{bit for bit} at every measured depth. On real MNIST test
-digits, a fully encrypted two-convolution CNN reaches $98.05\%$ accuracy at
+digits, a fully encrypted two-convolution CNN reaches $98.89\%$ accuracy at
 zero bootstraps.
+
+\item \textbf{Private diagnosis on real medical images
+(\Cref{sec:diagnosis}), and a corrected cost model.} The same pipeline,
+unchanged, classifies MedMNIST v2~\cite{MedMNIST} chest X-rays and abdominal
+CT at $84.78\%$ / $81.18\%$ --- within $0.2$ points of the float network it
+was quantized from --- in $4.9$ s per encrypted diagnosis. Reaching that
+number required finding that the pipeline's dominant cost was not what a
+segment-level measurement suggested: $88\%$ of end-to-end runtime was an
+unbatched scheme-switch \emph{import}, not the FHE arithmetic and not the MPC
+comparison protocols. Batching it ($8.3\times$) and garbling the
+nonlinearities ($1.7\times$ on the MPC segment) leaves $84\%$ of a diagnosis
+in FHE.
 \end{enumerate}
 
 \paragraph{Honesty about scope.} We separate what is proven, what is
@@ -498,21 +516,33 @@ report zero bootstraps.
 
 \subsection{The MPC segment: making it private, then fast}
 
-\Cref{tab:mpc} traces the MPC nonlinearity segment of the flagship CNN
-($28\times28$ input) through the sequence of protocol changes described in
+\Cref{tab:mpc} traces the MPC segment of the flagship CNN ($28\times28$
+input) through the sequence of protocol changes described in
 \Cref{sec:mpc}. An initial masked-open comparison was found to leak its input
 (the mask carried no secret entropy) and was replaced by the ABY3 bit
 decomposition; correctness held throughout, but the correct protocol costs
 more. Eliminating Beaver triples (PRF resharing) then cut bandwidth
 $15\times$, and batching the decomposition across each layer cut time a
-further $6.7\times$. The endpoint is \emph{private, triple-free, and batched}
---- and $2.9\times$ faster than the original leaky baseline it started from.
+further $6.7\times$.
+
+The last row is the one worth dwelling on, because it says the previous four
+were optimizing the wrong thing. Having batched every \emph{comparison}, we
+instrumented the segment per phase and found that the comparisons were
+never its cost: $19.1$ of the remaining $20.4$ s was the \emph{import} ---
+the MPC-side half of the scheme switch, which reconstructs an opened layer
+into secret shares. Importing ran three blocking input-sharing rounds
+\emph{per activation}, so the $5408$-wide first convolution cost $16{,}224$
+sequential round trips, while the ReLU those values were being imported for
+cost $0.6$ s. Batching the import per layer --- the same protocol, the same
+randomness, the same bytes, in three rounds instead of $3n$ --- takes it to
+$8$ ms and the end-to-end pipeline from $21.8$ s to $2.6$ s.
 
 \begin{table}[t]
 \centering
-\caption{MPC nonlinearity segment of the $28\times28$ CNN across protocol
-revisions. Every row is bit-exact against the plaintext reference; only
-privacy and cost differ.}
+\caption{MPC segment of the $28\times28$ CNN across protocol revisions. Every
+row is bit-exact against the plaintext reference; only privacy and cost
+differ. The final row changes no protocol --- only how many round trips carry
+the same bytes.}
 \label{tab:mpc}
 \begin{tabular}{@{}lrr@{}}
 \toprule
@@ -522,10 +552,20 @@ leaky masked-open (insecure baseline) & $17.6$ s & $1.2$ MB \\
 correct bit decomposition, Beaver triples & $76.9$ s & $159.4$ MB \\
 \quad + triple-free PRF resharing & $40.8$ s & $10.4$ MB \\
 \quad + batched ReLU decomposition & $20.7$ s & $10.2$ MB \\
-\quad + batched max-pooling & $\mathbf{6.1}$ s & $10.0$ MB \\
+\quad + batched max-pooling & $6.1$ s & $10.0$ MB \\
+\quad + batched scheme-switch import & $\mathbf{1.2}$ s & $10.0$ MB \\
 \bottomrule
 \end{tabular}
 \end{table}
+
+We report this misdiagnosis rather than quietly fixing it, because the shape
+of the error is a general hazard for hybrid systems. ``The MPC segment
+dominates'' was true; ``therefore the MPC \emph{protocols} are the
+bottleneck'' did not follow. The segment's cost lived in the plumbing between
+the two representations --- precisely the part that a construction organized
+around scheme switching performs most often, and the part that neither the
+FHE nor the MPC literature owns. A per-phase breakdown, not a per-segment
+one, is what makes such a cost visible.
 
 \subsection{Comparisons: garbled circuits vs.\ bit decomposition}\label{sec:gc}
 
@@ -565,17 +605,31 @@ round-count argument would predict, but on the LAN as well. The enabler is
 the honest-majority \emph{three-party} setting: a garbled circuit's input
 labels are delivered by the co-garbler with no oblivious
 transfer~\cite{ASTRA}, the expensive part of two-party garbling~\cite{Yao}
-and absent here. We further garble the \emph{entire} fused
-ReLU$\circ$rescale --- the pipeline's actual nonlinearity,
-$\mathrm{out} = (v \geq 0)\,?\,(v \gg s):0$ --- as one constant-round circuit
-(bit-exact against the plaintext op); measured through the transport and
-charged a B2A round to return its output to an arithmetic sharing, it beats
-the a2b fused nonlinearity by $2.7$--$3.4\times$. Since the MPC segment is
-dominated by ReLU and max-pooling comparisons, replacing the
-bit-decomposition nonlinearity with a three-party garbled one is the
-highest-value remaining MPC optimization; we report the measurement and leave
-the full integration (three-party label delivery and returning the output to
-an arithmetic sharing) as engineering.
+and absent here.
+
+\Cref{tab:gc} is a bare comparison, which is not the pipeline's actual
+nonlinearity. We therefore garble the \emph{entire} fused
+ReLU$\circ$rescale, $\mathrm{out} = (v \geq 0)\,?\,(v \gg s):0$, as one
+constant-round circuit, and run it as the real three-party protocol ---
+two garblers, an evaluator, and a Y2A round returning the output to an
+arithmetic sharing so the next scheme switch can consume it. Measured through
+the same transport, that full protocol beats the \texttt{a2b} fused
+nonlinearity by $1.7\times$ on the LAN and $1.4\times$ at RTT $80$ ms. We
+flag the gap between this and the $2.7$--$3.4\times$ that the garbling
+\emph{primitive} shows in isolation: the difference is the Y2A return leg and
+the three-party label delivery, and it is the honest number for a protocol
+one can deploy.
+
+Integrated into the pipeline --- so that the fused ReLU, and through the same
+mechanism every batched max-pool comparison, takes the Yao leg --- it takes
+the MPC segment of the $28\times28$ CNN from $1.20$ s to $0.68$ s
+($1.7\times$, matching the isolated measurement) and halves party-to-party
+traffic from $39.5$ to $21.9$ MB. The gain survives real networks: the
+segment stays $1.72\times$ ahead at RTT $2$ ms and $1.40\times$ at RTT
+$20$ ms, even though garbling inverts the message \emph{count} (147 messages
+becomes $319{,}190$ small ones while bytes halve). Both routes are bit-exact
+against the plaintext reference and against each other, which is what
+licenses reading the ratio as pure cost.
 
 \subsection{Convolution packing}
 
@@ -584,8 +638,19 @@ Replacing the im2col/Toeplitz convolution with the reversed-axis packing of
 hundreds to one per output channel, independent of image size. On the
 $28\times28$ classifier the convolution's FHE time drops from $77.5$ s to
 $0.26$ s ($294\times$), and the FHE share of runtime falls to a few percent
---- confirming that the MPC nonlinearities, not the FHE arithmetic, are the
-cost center that \Cref{sec:mpc} then addresses.
+--- which is what moved the cost center to the MPC segment and motivated
+\Cref{sec:mpc}.
+
+That is no longer where it sits. With the segment's import batched and its
+nonlinearities garbled, the same $28\times28$ classifier spends $1.36$ s of
+its $2.06$ s in FHE and $0.68$ s in MPC, and the trained two-convolution
+medical model of \Cref{sec:diagnosis} --- four encrypted linear layers to
+this one's two --- spends $84\%$ of a diagnosis in FHE. The cost center has
+crossed back. We note this in favor of the construction rather than against
+it: the switch-as-bootstrap argument buys unbounded depth at a
+\emph{constant} FHE cost per layer, and the residual cost is now that
+constant, paid four times, rather than any part of the switching machinery
+the construction adds.
 
 \subsection{Real MNIST: a fully encrypted two-convolution CNN}\label{sec:mnist}
 
@@ -603,7 +668,11 @@ multi-channel and packed with the same reversed-axis layout.
 \begin{table}[t]
 \centering
 \caption{Full-test-set accuracy of the deployed integer model, by
-architecture. All fit the depth-one noise budget ($\text{nbits}\le 30$).}
+architecture. All fit the depth-one noise budget ($\text{nbits}\le 30$). The
+selected architecture (last row) was subsequently retrained for longer under
+the same recipe, which is the $98.89\%$ reported; the other rows are from the
+original sweep, so the column is a comparison of architectures, not of
+training budgets.}
 \label{tab:arch}
 \begin{tabular}{@{}lr@{}}
 \toprule
@@ -613,7 +682,7 @@ $\texttt{conv}(8) \to \texttt{dense}(10)$ & $94.96\%$ \\
 $\texttt{conv}(12) \to \texttt{dense}(10)$ & $95.73\%$ \\
 $\texttt{conv}(8) \to \texttt{dense}(128) \to \texttt{dense}(10)$ & $97.63\%$ \\
 $\texttt{conv}(8) \to \texttt{dense}(256)\to\texttt{dense}(128)\to\texttt{dense}(10)$ & $97.89\%$ \\
-$\texttt{conv}(8)\to\texttt{conv}(16)\to\texttt{dense}(128)\to\texttt{dense}(10)$ & $\mathbf{98.05\%}$ \\
+$\texttt{conv}(8)\to\texttt{conv}(16)\to\texttt{dense}(128)\to\texttt{dense}(10)$ & $\mathbf{98.89\%}$ \\
 \bottomrule
 \end{tabular}
 \end{table}
@@ -622,13 +691,82 @@ Because the construction makes depth free, we used it as an instrument to
 search architectures (\Cref{tab:arch}): a second convolution layer beats both
 a wider single convolution and a deeper fully-connected stack --- spatial
 depth is what MNIST rewards, and the construction supplies it at no
-cryptographic cost. The chosen two-convolution model attains $98.05\%$ on the
+cryptographic cost. The chosen two-convolution model attains $98.89\%$ on the
 $10{,}000$-image test set. The Rust integer forward pass agrees with an
 independent numpy reference digit-for-digit, and the \emph{encrypted}
 pipeline reproduces the plaintext prediction on every real digit tested, at
 zero bootstraps. Because the hybrid is bit-exact, the encrypted accuracy
-\emph{equals} the plaintext accuracy of $98.05\%$: privacy costs nothing in
+\emph{equals} the plaintext accuracy of $98.89\%$: privacy costs nothing in
 accuracy, demonstrated on real inputs rather than asserted.
+
+\subsection{Private diagnosis: real medical images end to end}\label{sec:diagnosis}
+
+Handwritten digits are a correctness and cost instrument, not an application.
+The setting this construction is actually for --- both the input \emph{and}
+the model encrypted --- is one where neither party may see the other's asset:
+a hospital holding patient images and a vendor holding a proprietary
+diagnostic model. We therefore run the identical pipeline, unchanged, on
+MedMNIST v2~\cite{MedMNIST}, which distributes biomedical images at
+$28\times28$: \texttt{PneumoniaMNIST} (pediatric chest X-ray, pneumonia
+vs.\ normal) and \texttt{OrganAMNIST} ($11$-way organ classification from
+abdominal CT). We use the two grayscale sets, since the convolution packing
+assumes a single input channel.
+
+\Cref{tab:diagnosis} reports the deployed integer model's accuracy and the
+cost of one encrypted diagnosis. Because the hybrid is bit-exact, the
+encrypted diagnosis \emph{equals} the plaintext one on every image tested, so
+the accuracy column is simultaneously the encrypted accuracy: privacy costs
+nothing in diagnostic quality. What it costs is $4.9$ s per chest X-ray, of
+which $84\%$ is FHE arithmetic and $0.8$ s is the entire MPC segment
+(import $0.02$ s, ReLU $0.51$ s, max-pool $0.21$ s, argmax $0.02$ s), over
+$27.4$ MB of party-to-party traffic and zero bootstraps.
+
+\begin{table}[t]
+\centering
+\caption{Private diagnosis on MedMNIST v2. Accuracy is the deployed
+\emph{integer} model on the full official test split; the encrypted pipeline
+reproduces it bit-exactly, so it is also the encrypted accuracy. Latency is
+one encrypted diagnosis with garbled nonlinearities, single-threaded, no GPU.}
+\label{tab:diagnosis}
+\begin{tabular}{@{}lrr@{}}
+\toprule
+ & \texttt{PneumoniaMNIST} & \texttt{OrganAMNIST} \\
+\midrule
+task & X-ray, 2 classes & CT, 11 classes \\
+test images & $624$ & $17{,}778$ \\
+majority-class baseline & $62.50\%$ & $18.48\%$ \\
+accuracy (integer $=$ encrypted) & $\mathbf{84.78\%}$ & $\mathbf{81.18\%}$ \\
+float parent of the same net & $84.78\%$ & $81.03\%$ \\
+\midrule
+latency, \texttt{a2b} nonlinearities & $5.67$ s & $5.96$ s \\
+latency, garbled nonlinearities & $\mathbf{4.94}$ s & $\mathbf{5.17}$ s \\
+\quad of which FHE & $4.15$ s & $4.18$ s \\
+\quad of which MPC & $0.76$ s & $0.97$ s \\
+FHE bootstraps & $0$ & $0$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Two things are worth reading off the table. First, \emph{quantization is
+free}: the integer network the FHE layer requires lands within $0.2$ points
+of its float parent, so the fixed-point scheme costs no accuracy and neither
+does the encryption. Second, \emph{the model, not the cryptography, is the
+accuracy ceiling}. A published ResNet-18 at $28\times28$ reaches $0.854$ and
+$0.935$ on these two sets; ours is a $24$k-parameter two-convolution
+classifier sized to the depth-one noise budget, and it is essentially at the
+published number on pneumonia while giving up $12$ points to depth on organ
+classification. Closing that gap is a capacity question, and the construction
+makes depth cryptographically free --- but each additional layer costs one
+more FHE multiplication, which \Cref{tab:diagnosis} shows is now the
+dominant term.
+
+\paragraph{Scope.} MedMNIST is downsampled and pre-processed; clinical
+imaging is $512^3$ volumes, and nothing here is a clinical claim. The claim
+is about \emph{cost structure} --- that a fully encrypted diagnosis, model
+included, costs seconds rather than minutes, and that its cost is now
+concentrated in a single primitive. Scaling past $28\times28$ is an argument
+the packing constraint has to make analytically, not one this measurement
+makes.
 
 \subsection{Positioning against prior inference systems}
 
@@ -691,9 +829,15 @@ non-secure reference and RLWE as the secure instantiation.
 
 \section{Limitations}\label{sec:limitations}
 
-The MPC nonlinearity and the conversions dominate cost: the construction
-wins on depth scaling, on encrypting the model, and on the thin-pipe regime,
-\emph{not} on a single small layer over a fast LAN, where pure MPC is faster.
+The construction wins on depth scaling, on encrypting the model, and on the
+thin-pipe regime, \emph{not} on a single small layer over a fast LAN, where
+pure MPC is faster. Absolute latency remains seconds per image and is now
+dominated by the FHE ciphertext$\times$ciphertext multiplications --- $84\%$
+of a diagnosis, four of them for a two-convolution network. Our FHE engine is
+a single-threaded schoolbook implementation with no GPU and no
+machine-specific NTT; the residual cost is therefore an engineering number,
+not an information-theoretic one, but it is the number that matters for
+deployment and we do not claim to have optimized it.
 Softmax and layer normalization (as in transformers) need additional MPC
 subprotocols (exponentiation, reciprocal, inverse square root) that we do not
 implement; deep MLP/CNN ReLU stacks are supported. Layer width per ciphertext
@@ -710,9 +854,22 @@ activation to a fresh, depth-one ciphertext. Reading the switch this way
 turns bootstrapping from a per-depth cost into an absent one, and lets the
 FHE engine be a minimal, evaluation-key-free, single-multiply primitive. We
 gave the argument precisely, instantiated it with both operands encrypted,
-built a triple-free batched MPC layer, and validated the whole pipeline
-bit-exactly --- culminating in a fully encrypted two-convolution CNN at
-$98.05\%$ on real MNIST with zero FHE bootstraps.
+built a triple-free batched MPC layer with constant-round garbled
+nonlinearities, and validated the whole pipeline bit-exactly --- culminating
+in a fully encrypted two-convolution CNN that diagnoses a real pediatric
+chest X-ray in $4.9$ seconds, model included, with zero FHE bootstraps and a
+diagnosis provably identical to the plaintext one.
+
+Getting there also cost us a wrong answer worth reporting. Having identified
+the MPC segment as the bottleneck, we spent our optimization effort on MPC
+protocols; the segment's cost turned out to be an unbatched round trip in the
+scheme-switch import --- the seam between the two representations, which a
+construction organized around switching crosses more often than anything
+else. Removing it was an $8.3\times$ end-to-end win and moved the cost center
+back onto the FHE multiplication, which is where the depth-one design says it
+should be. We suspect the seam is systematically under-measured in hybrid
+systems, because it belongs to neither of the two literatures whose
+primitives it joins.
 
 \bibliographystyle{plain}
 \bibliography{references}

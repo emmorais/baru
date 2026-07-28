@@ -45,11 +45,52 @@
 //!   (3×32×32) needs 5185 and so must split channels across ciphertexts (or
 //!   move to n=8192) — a packing question, not a limit of the no-bootstrap
 //!   construction.
-//! - With conv packing the FHE cost is nearly **flat in D** (it is `OC`
-//!   multiplications regardless), so the bottleneck moves decisively to the
-//!   MPC nonlinearities: at D=28 the ~1352 ReLUs and the max-pool
-//!   comparisons dominate. Speeding *those* up (CrypTFlow2-style comparison
-//!   and truncation protocols) is now the highest-value optimisation.
+//!
+//! # Where the time goes (measured, D=28, `--both`, 2026-07-28)
+//!
+//! Read this before optimising anything here — the answer has changed twice,
+//! and both times the intuitive answer was wrong.
+//!
+//! | | a2b | gc |
+//! |---|---|---|
+//! | total | 2614 ms | **2063 ms** |
+//! | FHE | 1355 ms | 1355 ms |
+//! | MPC | 1232 ms | 679 ms |
+//! | — import | 8 ms | 9 ms |
+//! | — ReLU∘rescale | 624 ms | 401 ms |
+//! | — max-pool | 466 ms | 154 ms |
+//! | — argmax | 125 ms | 106 ms |
+//! | wire bytes | 39.5 MB | 21.9 MB |
+//! | messages | 147 | 319 190 |
+//!
+//! (Separate `--gc` and default runs, so the two columns are two invocations;
+//! `--both` runs them back to back and prints the ratio.) Note the message
+//! *count* inverts while bytes halve — garbling ships many small messages.
+//! That costs nothing at zero RTT and, measured, little at real ones: the MPC
+//! segment stays 1.72× ahead at metro (RTT 2 ms) and 1.40× at WAN (RTT 20 ms).
+//!
+//! 1. Conv packing made the FHE cost nearly **flat in D** (`OC`
+//!    multiplications regardless of image size), which moved the bottleneck
+//!    to the MPC segment.
+//! 2. But *within* the MPC segment the cost was never the comparisons. It was
+//!    the **scheme-switch import**: reconstructing an opened layer into
+//!    shares ran three blocking input-sharing rounds *per activation*, i.e.
+//!    16 224 round trips for D=28's 5408-wide conv output. That was 19.1 s of
+//!    a 20.4 s MPC segment — 88% of end-to-end runtime — while the ReLU it
+//!    was importing values for cost 0.6 s. Batching it
+//!    ([`import_raw_batch`]) costs the same bytes in three rounds: 19.1 s →
+//!    8 ms, and end-to-end 21.8 s → 2.6 s.
+//! 3. Only *then* do the comparisons matter, and [`Nonlin::Gc`] takes the
+//!    MPC segment a further 1.7×.
+//!
+//! The cost centre is now the **FHE arithmetic** (~53% here, 84% on the
+//! trained two-conv medical model, which has four encrypted linear layers to
+//! this one's two). That is where the next optimisation belongs.
+//!
+//! The lesson worth keeping: "MPC is slow" was true of this pipeline for the
+//! wrong reason, and a protocol-level fix (garbled comparisons) was proposed
+//! for a cost that was really an unbatched round trip. The phase breakdown in
+//! [`MpcPhases`] exists so that mistake is not repeatable.
 
 use std::time::Instant;
 
@@ -480,57 +521,118 @@ fn mpc_conv_relu_pool(
     shift: u32,
     nbits: usize,
     profile: NetworkProfile,
-) -> (Vec<Vec<Fr>>, CommStats) {
+    nonlin: Nonlin,
+) -> (Vec<Vec<Fr>>, CommStats, MpcPhases) {
     let (oh, ow, oc_n) = (conv_shape.h, conv_shape.w, conv_shape.c);
-    run_parties(profile, move |me| {
+    let (out, comm) = run_parties(profile, move |me| {
         let conv_open = conv_open.clone();
         let conv_masks = conv_masks.clone();
         let cbias = cbias.clone();
         move |be: &mut TransportBackend<MpcTransport>| {
+            be.set_gc_nonlinearities(nonlin == Nonlin::Gc);
             // Reconstruct + bias every conv output locally (share_secret / add
             // are communication-free), then run the whole ReLU layer as one
             // batched a2b + one batched multiply, then max-pool.
-            let vs: Vec<ShareRef> = (0..oc_n * oh * ow)
-                .map(|j| {
-                    let raw = import_raw(be, me, &conv_open, &conv_masks, j, nbits);
+            let t = Instant::now();
+            let count = oc_n * oh * ow;
+            let raws = import_raw_batch(be, me, &conv_open, &conv_masks, count, nbits);
+            let vs: Vec<ShareRef> = raws
+                .iter()
+                .enumerate()
+                .map(|(j, raw)| {
                     let oc = j / (oh * ow);
                     let bconst = residue(cbias[oc] << shift, nbits);
                     let bsh = be.share_public(bconst, nbits);
-                    be.add(&raw, &bsh)
+                    be.add(raw, &bsh)
                 })
                 .collect();
-            let relu = fused_relu_rescale_batch(be, &vs, shift, nbits);
+            let import_ms = ms(t);
+            let t = Instant::now();
+            let relu = fused_relu_rescale(be, &vs, shift, nbits, nonlin);
+            let relu_ms = ms(t);
+            // `maxpool2d` reduces to `lt_batch`, which the backend flag above
+            // has already routed — the gadget itself is protocol-agnostic.
+            let t = Instant::now();
             let (pooled, _) = maxpool2d(be, &relu, conv_shape, POOL, POOL);
-            pooled.iter().map(|p| be.my_additive_component(p)).collect::<Vec<Fr>>()
+            let pool_ms = ms(t);
+            let comps = pooled.iter().map(|p| be.my_additive_component(p)).collect::<Vec<Fr>>();
+            (comps, MpcPhases { import_ms, relu_ms, pool_ms, ..Default::default() })
         }
-    })
+    });
+    // Every party runs the same protocol in lockstep, so party 0's split is
+    // representative; taking one avoids averaging across thread scheduling noise.
+    let phases = out[0].1;
+    (out.into_iter().map(|(c, _)| c).collect(), comm, phases)
 }
 
-/// Reconstruct this party's share of the raw matvec output `j` from the
-/// opened value and the per-party masks (party 0 also holds `y`).
-fn import_raw(
+fn ms(t: Instant) -> f64 {
+    t.elapsed().as_secs_f64() * 1000.0
+}
+
+/// Where the MPC segment's time actually goes. The segment is the pipeline's
+/// cost centre, and "MPC" is far too coarse a label to optimize against — the
+/// import loop, the nonlinearity and the pooling reduction have different
+/// round structures and respond to different fixes.
+#[derive(Default, Clone, Copy, Debug, Serialize)]
+pub struct MpcPhases {
+    /// Reconstructing the opened layer into shares and adding the bias.
+    pub import_ms: f64,
+    /// The fused ReLU∘rescale.
+    pub relu_ms: f64,
+    /// Max-pooling (`pool²−1` batched compare+select steps).
+    pub pool_ms: f64,
+    /// The final argmax over the logits.
+    pub argmax_ms: f64,
+}
+
+impl MpcPhases {
+    fn add(&mut self, o: &MpcPhases) {
+        self.import_ms += o.import_ms;
+        self.relu_ms += o.relu_ms;
+        self.pool_ms += o.pool_ms;
+        self.argmax_ms += o.argmax_ms;
+    }
+}
+
+/// Import a whole opened layer — the MPC side of one scheme switch.
+///
+/// Semantically this is [`import_raw`] for every `j`, and the resulting shares
+/// are identical. The difference is round structure: the scalar version costs
+/// three blocking input-sharing rounds *per element*, so a `28×28`
+/// convolution's 5408 outputs cost 16 224 round trips and the import dominated
+/// the entire pipeline — 19.1 s of a 20.4 s MPC segment, against 0.6 s for the
+/// ReLU it was importing values for. Batched, the same layer costs **three**
+/// rounds total (one per owner) with the same bytes on the wire.
+fn import_raw_batch(
     be: &mut TransportBackend<MpcTransport>,
     me: usize,
     opened: &[u64],
     masks: &[[u64; 3]],
-    j: usize,
+    count: usize,
     nbits: usize,
-) -> ShareRef {
-    let my_comp: Fr = if me == 0 {
-        (opened[j] as u128).wrapping_sub(masks[j][0] as u128)
-    } else {
-        0u128.wrapping_sub(masks[j][me] as u128)
-    };
-    let mut raw: Option<ShareRef> = None;
+) -> Vec<ShareRef> {
+    // Each party's additive component of the opened value; only the owner's
+    // entries are meaningful, the rest are the zeros the protocol expects.
+    let my_comps: Vec<Fr> = (0..count)
+        .map(|j| {
+            if me == 0 {
+                (opened[j] as u128).wrapping_sub(masks[j][0] as u128)
+            } else {
+                0u128.wrapping_sub(masks[j][me] as u128)
+            }
+        })
+        .collect();
+    let mut acc: Option<Vec<ShareRef>> = None;
     for owner in 0..3 {
-        let v = if me == owner { my_comp } else { 0 };
-        let sh = be.share_secret(v, nbits, owner);
-        raw = Some(match raw {
-            None => sh,
-            Some(a) => be.add(&a, &sh),
+        let vals: Vec<Fr> = if me == owner { my_comps.clone() } else { vec![0; count] };
+        let shs = be.share_secret_batch(&vals, nbits, owner);
+        acc = Some(match acc {
+            None => shs,
+            // Addition is local, so folding the three owners costs nothing.
+            Some(a) => a.iter().zip(&shs).map(|(x, y)| be.add(x, y)).collect(),
         });
     }
-    raw.unwrap()
+    acc.unwrap_or_default()
 }
 
 /// Batched fused ReLU∘rescale: `ReLU(vⱼ ≫ s)` for every input at once.
@@ -543,6 +645,24 @@ fn import_raw(
 /// Correctness is identical to the per-element version: the logical
 /// right-shift is recomposed from the high bits (`b2a`, local) and kept only
 /// on the non-negative branch (`keep = 1 − sign`).
+/// The pipeline's nonlinearity, `out = (v >= 0) ? (v >> shift) : 0`, under
+/// whichever protocol `nonlin` selects. The two branches are extensionally
+/// equal — that is what the `gc_matches_a2b_*` tests pin.
+fn fused_relu_rescale(
+    be: &mut TransportBackend<MpcTransport>,
+    vs: &[ShareRef],
+    shift: u32,
+    nbits: usize,
+    nonlin: Nonlin,
+) -> Vec<ShareRef> {
+    match nonlin {
+        Nonlin::A2b => fused_relu_rescale_batch(be, vs, shift, nbits),
+        // One garble round for the whole layer, versus ~log(nbits) rounds of
+        // decomposition plus a batched multiply for the sign gate.
+        Nonlin::Gc => be.relu_gc_batch(vs, nbits, shift as usize),
+    }
+}
+
 fn fused_relu_rescale_batch(
     be: &mut TransportBackend<MpcTransport>,
     vs: &[ShareRef],
@@ -584,6 +704,8 @@ pub struct CnnRun {
     pub total_ms: f64,
     pub fhe_ms: f64,
     pub mpc_ms: f64,
+    /// Breakdown of `mpc_ms` — see [`MpcPhases`].
+    pub phases: MpcPhases,
     pub comm: CommStats,
     pub bootstraps: u64,
     /// ct×ct multiplications the packed convolution actually performed.
@@ -598,7 +720,46 @@ pub struct CnnRun {
     pub log2_t: u32,
 }
 
+/// Which MPC protocol evaluates the nonlinearities — the pipeline's cost
+/// centre (the FHE arithmetic is a few percent of runtime, see
+/// [`run_cnn_hybrid`]'s `fhe_ms`/`mpc_ms` split).
+///
+/// Both settings compute the *same function* and are bit-exact against the
+/// plaintext reference; only rounds and bandwidth differ. `A2b` is the
+/// log-round batched bit decomposition and stays the default so it remains
+/// the control in every measurement; `Gc` routes the fused ReLU∘rescale and
+/// every batched comparison (max-pooling, argmax) through the three-party
+/// garbled circuit, which is constant-round and needs no oblivious transfer
+/// because the co-garbler delivers the input labels.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum Nonlin {
+    /// Batched bit decomposition (`a2b`), ~log(nbits) rounds per layer.
+    #[default]
+    A2b,
+    /// Three-party garbled circuits, one round per layer.
+    Gc,
+}
+
+impl Nonlin {
+    pub fn label(self) -> &'static str {
+        match self {
+            Nonlin::A2b => "a2b (batched bit decomposition)",
+            Nonlin::Gc => "gc (3-party garbled, constant-round)",
+        }
+    }
+}
+
 pub fn run_cnn_hybrid(model: &CnnModel, input: &[i64], profile: NetworkProfile) -> CnnRun {
+    run_cnn_hybrid_with(model, input, profile, Nonlin::default())
+}
+
+/// [`run_cnn_hybrid`] with an explicit choice of nonlinearity protocol.
+pub fn run_cnn_hybrid_with(
+    model: &CnnModel,
+    input: &[i64],
+    profile: NetworkProfile,
+    nonlin: Nonlin,
+) -> CnnRun {
     let (expected, max_abs) = model.forward(input);
     assert!(
         (max_abs as i128) < (1i128 << (model.nbits - 1)),
@@ -638,9 +799,12 @@ pub fn run_cnn_hybrid(model: &CnnModel, input: &[i64], profile: NetworkProfile) 
 
     // ── MPC: +cbias≪s, fused ReLU∘rescale, max-pool → pooled feature shares ──
     let t0 = Instant::now();
-    let (mut per_party_feat, conv_comm) = mpc_conv_relu_pool(
+    let mut phases = MpcPhases::default();
+    let (mut per_party_feat, conv_comm, ph) = mpc_conv_relu_pool(
         conv_open, conv_masks, model.cbias.clone(), model.conv_shape, shift, nbits, profile,
+        nonlin,
     );
+    phases.add(&ph);
     comm = CommStats { messages: comm.messages + conv_comm.messages, bytes: comm.bytes + conv_comm.bytes };
     mpc_ms += t0.elapsed().as_secs_f64() * 1000.0;
     let mut feat_shape = model.pool_shape;
@@ -658,8 +822,9 @@ pub fn run_cnn_hybrid(model: &CnnModel, input: &[i64], profile: NetworkProfile) 
 
         let tm = Instant::now();
         let out_shape = Chw { c: cl.out_c(), h: cl.out_h(), w: cl.out_w() };
-        let (feat2, comm2) =
-            mpc_conv_relu_pool(co, cm, cl.cbias.clone(), out_shape, shift, nbits, profile);
+        let (feat2, comm2, ph2) =
+            mpc_conv_relu_pool(co, cm, cl.cbias.clone(), out_shape, shift, nbits, profile, nonlin);
+        phases.add(&ph2);
         comm = CommStats {
             messages: comm.messages + comm2.messages,
             bytes: comm.bytes + comm2.bytes,
@@ -693,17 +858,29 @@ pub fn run_cnn_hybrid(model: &CnnModel, input: &[i64], profile: NetworkProfile) 
             let hidden_masks = hidden_masks.clone();
             let hidden_b = hidden_b.clone();
             move |be: &mut TransportBackend<MpcTransport>| {
-                let vs: Vec<ShareRef> = (0..h)
-                    .map(|j| {
-                        let raw = import_raw(be, me, &hidden_open, &hidden_masks, j, nbits);
+                be.set_gc_nonlinearities(nonlin == Nonlin::Gc);
+                let t = Instant::now();
+                let raws = import_raw_batch(be, me, &hidden_open, &hidden_masks, h, nbits);
+                let vs: Vec<ShareRef> = raws
+                    .iter()
+                    .enumerate()
+                    .map(|(j, raw)| {
                         let bsh = be.share_public(residue(hidden_b[j], nbits), nbits);
-                        be.add(&raw, &bsh)
+                        be.add(raw, &bsh)
                     })
                     .collect();
-                let act = fused_relu_rescale_batch(be, &vs, shift, nbits);
-                act.iter().map(|p| be.my_additive_component(p)).collect::<Vec<Fr>>()
+                let import_ms = ms(t);
+                let t = Instant::now();
+                let act = fused_relu_rescale(be, &vs, shift, nbits, nonlin);
+                let relu_ms = ms(t);
+                let comps =
+                    act.iter().map(|p| be.my_additive_component(p)).collect::<Vec<Fr>>();
+                (comps, MpcPhases { import_ms, relu_ms, ..Default::default() })
             }
         });
+        phases.add(&per_party_hidden[0].1);
+        let per_party_hidden: Vec<Vec<Fr>> =
+            per_party_hidden.into_iter().map(|(c, _)| c).collect();
         comm = CommStats {
             messages: comm.messages + hidden_comm.messages,
             bytes: comm.bytes + hidden_comm.bytes,
@@ -739,20 +916,32 @@ pub fn run_cnn_hybrid(model: &CnnModel, input: &[i64], profile: NetworkProfile) 
         let dense_masks = dense_masks.clone();
         let dense_b = dense_b.clone();
         move |be: &mut TransportBackend<MpcTransport>| {
-            let logits: Vec<ShareRef> = (0..nclasses)
-                .map(|j| {
-                    let raw = import_raw(be, me, &dense_open, &dense_masks, j, nbits);
+            // `argmax` reduces over scalar `lt`, not `lt_batch`, so the GC flag
+            // does not reach it — deliberately: it is `nclasses−1` comparisons
+            // against a layer's thousands, and the phase breakdown shows it.
+            be.set_gc_nonlinearities(nonlin == Nonlin::Gc);
+            let raws = import_raw_batch(be, me, &dense_open, &dense_masks, nclasses, nbits);
+            let logits: Vec<ShareRef> = raws
+                .iter()
+                .enumerate()
+                .map(|(j, raw)| {
                     let bsh = be.share_public(residue(dense_b[j], nbits), nbits);
-                    be.add(&raw, &bsh)
+                    be.add(raw, &bsh)
                 })
                 .collect();
+            let t = Instant::now();
             let idx = argmax(be, &logits, nbits);
-            (be.reveal(&idx, None) as u64 & (t_mask)) as usize
+            let argmax_ms = ms(t);
+            (
+                (be.reveal(&idx, None) as u64 & (t_mask)) as usize,
+                MpcPhases { argmax_ms, ..Default::default() },
+            )
         }
     });
+    phases.add(&classes[0].1);
     comm = CommStats { messages: comm.messages + argmax_comm.messages, bytes: comm.bytes + argmax_comm.bytes };
     mpc_ms += t0.elapsed().as_secs_f64() * 1000.0;
-    let class = classes[0];
+    let class = classes[0].0;
 
     CnnRun {
         correct: class == expected,
@@ -761,6 +950,7 @@ pub fn run_cnn_hybrid(model: &CnnModel, input: &[i64], profile: NetworkProfile) 
         total_ms: start.elapsed().as_secs_f64() * 1000.0,
         fhe_ms,
         mpc_ms,
+        phases,
         comm,
         bootstraps: 0,
         ring_n: s.params.n,
@@ -781,6 +971,9 @@ pub fn run_cnn_hybrid(model: &CnnModel, input: &[i64], profile: NetworkProfile) 
 #[derive(Debug, Clone, Serialize)]
 pub struct CnnPoint {
     pub d: usize,
+    /// Which protocol evaluated the nonlinearities — without it two rows of
+    /// this struct are indistinguishable, and the whole point is comparing them.
+    pub nonlin: String,
     pub class: usize,
     pub correct: bool,
     pub total_ms: f64,
@@ -794,6 +987,26 @@ pub struct CnnPoint {
     pub ring_n: usize,
     pub log2_q: u32,
     pub log2_t: u32,
+}
+
+fn cnn_point(d: usize, nonlin: Nonlin, r: &CnnRun) -> CnnPoint {
+    CnnPoint {
+        d,
+        nonlin: nonlin.label().to_string(),
+        class: r.class,
+        correct: r.correct,
+        total_ms: r.total_ms,
+        fhe_ms: r.fhe_ms,
+        mpc_ms: r.mpc_ms,
+        messages: r.comm.messages,
+        bytes: r.comm.bytes,
+        bootstraps: r.bootstraps,
+        conv_mults: r.conv_mults,
+        conv_mults_toeplitz: r.conv_mults_toeplitz,
+        ring_n: r.ring_n,
+        log2_q: r.log2_q,
+        log2_t: r.log2_t,
+    }
 }
 
 const USAGE: &str = "usage: baru bench-cnn [options]
@@ -813,6 +1026,10 @@ options:
   --rtt-ms N           round-trip latency (default 0)
   --bandwidth-mbps X   link bandwidth in Mbit/s (default: unlimited)
   --seed N             RNG seed (default 1)
+  --gc                 evaluate the nonlinearities with 3-party garbled
+                       circuits (constant-round) instead of the default
+                       batched bit decomposition; same function, bit-exact
+  --both               run both nonlinearity protocols and report the speedup
   --json               emit JSON
 ";
 
@@ -822,6 +1039,8 @@ pub fn run_cli(args: &[String]) -> Result<(), String> {
     let mut bandwidth_mbps: Option<f64> = None;
     let mut seed = 1u64;
     let mut json = false;
+    let mut nonlin = Nonlin::A2b;
+    let mut both = false;
 
     let mut i = 0;
     while i < args.len() {
@@ -831,6 +1050,8 @@ pub fn run_cli(args: &[String]) -> Result<(), String> {
                 return Ok(());
             }
             "--json" => json = true,
+            "--gc" => nonlin = Nonlin::Gc,
+            "--both" => both = true,
             "--img" => {
                 i += 1;
                 d = args.get(i).ok_or("--img needs a value")?.parse().map_err(|_| "bad img".to_string())?;
@@ -858,25 +1079,64 @@ pub fn run_cli(args: &[String]) -> Result<(), String> {
     }
 
     let (model, input) = CnnModel::random(d, seed);
-    let r = run_cnn_hybrid(&model, &input, profile);
+
+    if both {
+        // Same model, same input, same transport — the only difference is
+        // which protocol evaluates the nonlinearities, so the ratio is
+        // attributable to that and nothing else.
+        let a = run_cnn_hybrid_with(&model, &input, profile, Nonlin::A2b);
+        let g = run_cnn_hybrid_with(&model, &input, profile, Nonlin::Gc);
+        if json {
+            let pts: Vec<CnnPoint> = [(Nonlin::A2b, &a), (Nonlin::Gc, &g)]
+                .iter()
+                .map(|(n, r)| cnn_point(d, *n, r))
+                .collect();
+            println!("{}", serde_json::to_string_pretty(&pts).map_err(|e| e.to_string())?);
+            return Ok(());
+        }
+        println!("Private CNN classifier — nonlinearity protocol head-to-head");
+        println!("architecture: 1×{d}×{d} → conv({OC},{K}×{K}) → ReLU → maxpool({POOL}×{POOL}) → dense(→{NCLASSES}) → argmax");
+        println!(
+            "network: rtt={rtt_ms}ms, bandwidth={}\n",
+            bandwidth_mbps.map(|b| format!("{b}Mbps")).unwrap_or_else(|| "unlimited".into())
+        );
+        println!("  {:<34}  {:>10}  {:>10}  {:>12}  {:>10}", "nonlinearity", "total", "mpc", "wire bytes", "class");
+        for (n, r) in [(Nonlin::A2b, &a), (Nonlin::Gc, &g)] {
+            println!(
+                "  {:<34}  {:>8.0}ms  {:>8.0}ms  {:>12}  {:>10}",
+                n.label(),
+                r.total_ms,
+                r.mpc_ms,
+                r.comm.bytes,
+                format!("{}{}", r.class, if r.correct { "" } else { " WRONG" })
+            );
+        }
+        // A speedup between two runs that disagree is meaningless, so the
+        // agreement check gates the number rather than being printed beside it.
+        if !(a.correct && g.correct && a.class == g.class) {
+            return Err(format!(
+                "nonlinearity protocols disagree (a2b {} / gc {} / plaintext {}) — \
+                 the comparison is void until they are bit-exact",
+                a.class, g.class, a.expected
+            ));
+        }
+        println!(
+            "\n  both bit-exact vs plaintext (class {}), so the ratio is pure cost:",
+            a.expected
+        );
+        println!(
+            "    end-to-end  {:.2}×    mpc segment  {:.2}×    wire bytes  {:.2}×",
+            a.total_ms / g.total_ms,
+            a.mpc_ms / g.mpc_ms,
+            a.comm.bytes as f64 / g.comm.bytes as f64
+        );
+        return Ok(());
+    }
+
+    let r = run_cnn_hybrid_with(&model, &input, profile, nonlin);
 
     if json {
-        let p = CnnPoint {
-            d,
-            class: r.class,
-            correct: r.correct,
-            total_ms: r.total_ms,
-            fhe_ms: r.fhe_ms,
-            mpc_ms: r.mpc_ms,
-            messages: r.comm.messages,
-            bytes: r.comm.bytes,
-            bootstraps: r.bootstraps,
-            conv_mults: r.conv_mults,
-            conv_mults_toeplitz: r.conv_mults_toeplitz,
-            ring_n: r.ring_n,
-            log2_q: r.log2_q,
-            log2_t: r.log2_t,
-        };
+        let p = cnn_point(d, nonlin, &r);
         println!("{}", serde_json::to_string_pretty(&p).map_err(|e| e.to_string())?);
         return Ok(());
     }
@@ -903,7 +1163,12 @@ pub fn run_cli(args: &[String]) -> Result<(), String> {
         r.conv_mults_toeplitz,
         r.conv_mults_toeplitz as f64 / r.conv_mults as f64
     );
+    println!("  nonlinearity    : {}", nonlin.label());
     println!("  time            : total {:.0}ms  (fhe {:.0}ms, mpc {:.0}ms)", r.total_ms, r.fhe_ms, r.mpc_ms);
+    println!(
+        "  mpc breakdown   : import {:.0}ms, relu {:.0}ms, pool {:.0}ms, argmax {:.0}ms",
+        r.phases.import_ms, r.phases.relu_ms, r.phases.pool_ms, r.phases.argmax_ms
+    );
     println!("  MPC wire traffic: {} messages, {} bytes", r.comm.messages, r.comm.bytes);
     Ok(())
 }
@@ -953,6 +1218,58 @@ mod tests {
             assert_eq!(r.bootstraps, 0);
             assert!(r.comm.messages > 0, "must use the real MPC protocol");
         }
+    }
+
+    /// The two nonlinearity protocols must be *extensionally equal*: garbled
+    /// circuits and bit decomposition compute the same fused ReLU∘rescale and
+    /// the same max-pool, so both must reproduce the plaintext class exactly
+    /// and agree with each other.
+    ///
+    /// This is what licenses quoting a speedup between them. A faster protocol
+    /// that computed a slightly different function would look like a win and
+    /// be a bug, and at these bit widths the difference could easily be a
+    /// single boundary value that a random image never hits — hence several
+    /// seeds and both image sizes.
+    #[test]
+    #[ignore] // n=4096 secure ring — slow in debug, fast in release
+    fn gc_and_a2b_nonlinearities_agree() {
+        for (d, seed) in [(8usize, 1u64), (8, 2), (10, 5)] {
+            let (model, input) = CnnModel::random(d, seed);
+            let a = run_cnn_hybrid_with(&model, &input, NetworkProfile::INSTANT, Nonlin::A2b);
+            let g = run_cnn_hybrid_with(&model, &input, NetworkProfile::INSTANT, Nonlin::Gc);
+            assert!(a.correct, "d={d} seed={seed}: a2b class {} != plaintext {}", a.class, a.expected);
+            assert!(g.correct, "d={d} seed={seed}: gc class {} != plaintext {}", g.class, g.expected);
+            assert_eq!(a.class, g.class, "d={d} seed={seed}: protocols disagree");
+            assert_eq!(g.bootstraps, 0, "the GC route must not change the FHE side");
+        }
+    }
+
+    /// The scheme-switch import must cost a *constant* number of rounds, not
+    /// one per activation.
+    ///
+    /// This is the regression test for the pipeline's dominant cost: the
+    /// import loop used to run three blocking input-sharing rounds per
+    /// element, which at `28×28` was 94% of the MPC segment and 88% of
+    /// end-to-end runtime while the ReLU it fed was 3%. Message *count* is the
+    /// right invariant to pin rather than wall-clock: the bytes were never the
+    /// problem, the round trips were, and a wall-clock threshold would be
+    /// flaky on shared CI.
+    #[test]
+    #[ignore] // n=4096 secure ring — slow in debug, fast in release
+    fn scheme_switch_import_does_not_scale_with_layer_width() {
+        let (m8, i8v) = CnnModel::random(8, 1);
+        let (m28, i28) = CnnModel::random(28, 1);
+        let small = run_cnn_hybrid(&m8, &i8v, NetworkProfile::INSTANT);
+        let big = run_cnn_hybrid(&m28, &i28, NetworkProfile::INSTANT);
+        // 6×6×8 = 288 activations versus 26×26×8 = 5408, an 18.8× wider
+        // layer. Per-element sharing would put the message counts in that
+        // ratio; batched, they must be within a small constant.
+        assert!(
+            big.comm.messages < 2 * small.comm.messages,
+            "import looks per-element again: {} messages at d=28 vs {} at d=8",
+            big.comm.messages,
+            small.comm.messages
+        );
     }
 
     /// A **two-convolution** model (a second, multi-channel conv layer after
