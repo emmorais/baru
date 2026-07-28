@@ -37,6 +37,85 @@ use std::collections::HashSet;
 
 pub mod dh;
 
+/// What a PSI construction actually hides, so a comparison table cannot quietly
+/// put a secure and an insecure protocol in the same column.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub enum Hiding {
+    /// Hides everything but the set sizes and the intersection itself.
+    NonSharedItems,
+    /// Hides nothing useful: the digests invert under an offline dictionary
+    /// attack, so the receiver recovers the sender's whole set.
+    Nothing,
+}
+
+/// Bytes and rounds a run cost — measured, not estimated, because every
+/// implementation builds explicit messages and sums their serialized sizes.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
+pub struct Cost {
+    pub bytes: usize,
+    pub rounds: usize,
+}
+
+/// One protocol run.
+#[derive(Debug, Clone)]
+pub struct Outcome {
+    /// The receiver's view of `A ∩ B`, as a subset of its own items.
+    pub intersection: Vec<Vec<u8>>,
+    pub cost: Cost,
+}
+
+/// A private-set-intersection construction.
+///
+/// The point of the trait is that [`crate::bench::psi`] iterates over
+/// implementations rather than naming one, so adding a construction — a
+/// KKRT-style OT-based PSI, a circuit PSI — makes it appear in the comparison
+/// without touching the benchmark. Mirrors the pattern the rest of the tree
+/// already uses for backends ([`crate::fhe::FheBackend`],
+/// [`crate::mpcc::vm::ShareEngine`], [`crate::db::ResultStore`]).
+///
+/// `intersect` runs both parties in process. That is deliberate: it keeps the
+/// message sizes in [`Cost`] honest (they are serialized sizes of real messages)
+/// without a transport in the way. A networked driver would implement the same
+/// trait over the same message types.
+pub trait PsiProtocol {
+    fn name(&self) -> &'static str;
+
+    /// What the construction hides. Stated in the interface so it travels with
+    /// the numbers.
+    fn hiding(&self) -> Hiding;
+
+    /// Receiver-side output: which of `b`'s items are also in `a`.
+    fn intersect(&self, a: &[Vec<u8>], b: &[Vec<u8>]) -> Result<Outcome, String>;
+}
+
+/// Every construction implemented today, in the order a comparison should read.
+pub fn all() -> Vec<Box<dyn PsiProtocol>> {
+    vec![Box::new(NaiveHash), Box::new(dh::DhPsi)]
+}
+
+/// The insecure baseline as a [`PsiProtocol`], so it appears in comparisons
+/// with its `hiding()` attached rather than as a bare number.
+pub struct NaiveHash;
+
+impl PsiProtocol for NaiveHash {
+    fn name(&self) -> &'static str {
+        "naive-hash"
+    }
+    fn hiding(&self) -> Hiding {
+        Hiding::Nothing
+    }
+    fn intersect(&self, a: &[Vec<u8>], b: &[Vec<u8>]) -> Result<Outcome, String> {
+        Ok(Outcome {
+            intersection: naive_hash(a, b),
+            // One digest per item each way, one flight.
+            cost: Cost {
+                bytes: (a.len() + b.len()) * 32,
+                rounds: 1,
+            },
+        })
+    }
+}
+
 /// The insecure baseline: exchange `SHA-256(item)` and intersect.
 ///
 /// Included because it is the comparison that matters. It is *cheap* — one hash
@@ -83,6 +162,36 @@ mod tests {
         let want = plain_intersect(&a, &b);
         assert_eq!(want.len(), 10);
         assert_eq!(naive_hash(&a, &b), want);
+    }
+
+    /// One property against every construction — including the insecure one,
+    /// which must still be *correct*; its problem is what it leaks, not what it
+    /// computes.
+    #[test]
+    fn every_construction_computes_the_intersection() {
+        let a = items("patient-", 0..50);
+        let b = items("patient-", 30..80);
+        let want = plain_intersect(&a, &b);
+        for proto in all() {
+            let out = proto
+                .intersect(&a, &b)
+                .unwrap_or_else(|e| panic!("{}: {e}", proto.name()));
+            assert_eq!(out.intersection, want, "{}", proto.name());
+            assert!(
+                out.cost.bytes > 0 && out.cost.rounds > 0,
+                "{}",
+                proto.name()
+            );
+        }
+    }
+
+    /// The security label has to travel with the numbers, or a comparison table
+    /// silently puts a broken protocol in the same column as a real one.
+    #[test]
+    fn the_insecure_baseline_is_labelled_as_such() {
+        let labels: Vec<(&str, Hiding)> = all().iter().map(|p| (p.name(), p.hiding())).collect();
+        assert!(labels.contains(&("naive-hash", Hiding::Nothing)));
+        assert!(labels.contains(&("dh-psi", Hiding::NonSharedItems)));
     }
 
     #[test]

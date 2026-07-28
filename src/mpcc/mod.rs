@@ -34,7 +34,9 @@
 //! baru mpcc optimize  --case dot4-builtin        # backend-aware rewriting
 //! ```
 
+pub mod assign;
 pub mod cost;
+pub mod fhe_cost;
 pub mod ir;
 pub mod lower;
 pub mod opt;
@@ -51,6 +53,7 @@ use serde::Serialize;
 use crate::zkp::circuit_compiler::CircuitCompiler;
 
 pub use cost::{estimate, CostEstimate, Deployment};
+pub use fhe_cost::FheSpec;
 pub use ir::{Domain, Program};
 pub use lower::{lower, LowerConfig};
 pub use opt::{optimize, Optimized};
@@ -504,6 +507,76 @@ pub fn format_optimizations(rows: &[Optimized], source: &str) -> String {
     out
 }
 
+/// Render a per-operation protocol assignment.
+pub fn format_assignment(a: &assign::Assigned, source: &str) -> String {
+    // Long generated programs make the table unreadable; the shape is what
+    // matters, not 8 KB of s-expression.
+    let shown: String = if source.chars().count() > 96 {
+        format!(
+            "{}… ({} chars)",
+            source.chars().take(96).collect::<String>(),
+            source.chars().count()
+        )
+    } else {
+        source.to_string()
+    };
+    let mut out = format!("program   {}\n", shown);
+    out.push_str(&format!(
+        "split     {} (arithmetic) / {} (binary){}\n\n",
+        a.arith_protocol,
+        a.binary_protocol,
+        match &a.fhe_scheme {
+            Some(f) => format!(" / {f} (FHE)"),
+            None => " / no FHE".to_string(),
+        }
+    ));
+    out.push_str(&format!(
+        "{:<14} {:>8} {:>11} {:>11} {:>12} {:>10}\n",
+        "assignment", "rounds", "online", "offline", "conversions", "predicted"
+    ));
+    let row = |name: &str, c: &assign::MixedCost| {
+        format!(
+            "{:<14} {:>8} {:>11} {:>11} {:>12} {:>10}\n",
+            name,
+            c.rounds,
+            human_bytes(c.online_bytes),
+            human_bytes(c.offline_bytes),
+            c.conversions,
+            human_secs(c.secs)
+        )
+    };
+    out.push_str(&row("all-arithmetic", &a.all_arith));
+    out.push_str(&row("all-binary", &a.all_binary));
+    out.push_str(&row("mixed (best)", &a.best));
+
+    out.push('\n');
+    if a.is_mixed() {
+        out.push_str(&format!(
+            "mixed wins {:.2}x over the better pure protocol, by moving:\n",
+            a.speedup()
+        ));
+        for (kind, side) in a.assignment.deviations() {
+            out.push_str(&format!("  · {:<10} -> {}\n", kind, side.name()));
+        }
+        out.push_str(&format!(
+            "conversions land at {} dependence level(s), which is what the round count\ncharges — crossings at one level batch into a single round.\n",
+            a.best.conversion_levels
+        ));
+    } else {
+        out.push_str(
+            "no mixed assignment beat a pure one for this program — which is the right\n\
+             answer when one sharing suits every operation.  Mixing pays when a program\n\
+             contains both multiplications and comparisons, e.g.\n  \
+             --expr '(+ (* a b) (+ (> c d) (> e f)))' --wan --parties 2 --dishonest\n",
+        );
+    }
+    out.push_str(&format!(
+        "\n{} assignments priced; the search is greedy over operation kinds, so this is a\nlocal optimum (optimal assignment is NP-hard — Silph uses ILP, SING a GNN).\n",
+        a.evaluated
+    ));
+    out
+}
+
 /// Render the protocol registry as a table.
 pub fn format_registry() -> String {
     let mut out = String::new();
@@ -547,6 +620,7 @@ baru mpcc — MPC compiler and protocol comparison
   baru mpcc run     (--expr EXPR | --case NAME) --protocol ID [--input k=v ...]
   baru mpcc calibrate (--expr EXPR | --case NAME) [--input k=v ...] [deployment opts]
   baru mpcc optimize  (--expr EXPR | --case NAME) [--protocol ID] [deployment opts]
+  baru mpcc assign    (--expr EXPR | --case NAME) [--protocol ID] [deployment opts]
 
 run/calibrate opts
   --protocol ID                     dealer | shamir  (the executable protocols)
@@ -850,6 +924,41 @@ pub fn run_cli(args: &[String]) -> Result<(), String> {
             }
             if rows.iter().any(|r| !r.correct) {
                 return Err("a protocol produced the wrong answer".to_string());
+            }
+            Ok(())
+        }
+        "assign" => {
+            let a = parse_args(&args[1..])?;
+            let src = source_of(&a)?;
+            let prog = compile(&src, &a.lower)?;
+            let sched = schedule(&prog);
+            // Default pair: the dishonest-majority ring protocol and the
+            // matching binary one, i.e. the classic A/B split.
+            let arith_id = a.protocol.clone().unwrap_or_else(|| "semi2k".to_string());
+            let arith = find(&arith_id).ok_or_else(|| format!("unknown protocol `{arith_id}`"))?;
+            let binary = find("semi-bin").ok_or("semi-bin missing from the registry")?;
+            let mut pair = assign::Pair::new(arith, binary)?;
+            // FHE joins the assignment unless asked not to — this is the part
+            // HyCC / Silph / SING structurally cannot do.
+            if !a.only.iter().any(|o| o == "no-fhe") {
+                let fhe_id = a
+                    .only
+                    .iter()
+                    .find(|o| fhe_cost::find(o).is_some())
+                    .cloned()
+                    .unwrap_or_else(|| "bfv".to_string());
+                let spec = fhe_cost::find(&fhe_id)
+                    .ok_or_else(|| format!("unknown FHE scheme `{fhe_id}`"))?;
+                pair = pair.with_fhe(spec);
+            }
+            let out = assign::assign(&prog, &sched, &pair, &a.dep, a.lower.bit_width)?;
+            if a.json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&out).map_err(|e| e.to_string())?
+                );
+            } else {
+                print!("{}", format_assignment(&out, &src));
             }
             Ok(())
         }

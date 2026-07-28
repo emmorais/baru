@@ -41,6 +41,48 @@ use sha2::{Digest, Sha256};
 pub mod base;
 pub mod iknp;
 
+/// One batch of 1-out-of-2 OTs.
+#[derive(Debug, Clone)]
+pub struct Outcome {
+    /// What the receiver got, one block per OT.
+    pub received: Vec<Block>,
+    pub traffic: OtTraffic,
+}
+
+/// A 1-out-of-2 oblivious-transfer construction on `κ`-bit messages.
+///
+/// The trait exists so [`crate::bench::ot`] iterates over constructions instead
+/// of naming them, and so a future silent-OT / SoftSpoken implementation appears
+/// in the comparison for free. Same pattern as the rest of the tree
+/// ([`crate::fhe::FheBackend`], [`crate::db::ResultStore`]).
+///
+/// # The wrinkle this interface has to be honest about
+///
+/// [`base`] natively transfers *chosen* messages. [`iknp`] natively produces
+/// *random* ones — the parties end up holding correlated strings nobody chose.
+/// Presenting both as "chosen-message OT" therefore costs the extension one extra
+/// flight: the sender pads its real messages with the random outputs
+/// (`e_i = y_i ⊕ m_i`) and ships `2·κ` bits per OT. That derandomization is
+/// standard, and its cost is **included** in the reported traffic rather than
+/// quietly dropped — which is why the extension's bytes/OT under this trait are
+/// higher than the raw `κ`-bits-per-OT figure `bench-ot` reports for the
+/// random-OT form. Both numbers are real; they measure different interfaces.
+pub trait OtProtocol {
+    fn name(&self) -> &'static str;
+
+    /// Whether the construction needs a public-key operation per transfer, which
+    /// is what decides whether it can be used at scale.
+    fn public_key_per_ot(&self) -> bool;
+
+    /// Deliver `messages[i].{0,1}` according to `choices[i]`.
+    fn transfer(&self, choices: &[bool], messages: &[(Block, Block)]) -> Result<Outcome, String>;
+}
+
+/// Every construction implemented today.
+pub fn all() -> Vec<Box<dyn OtProtocol>> {
+    vec![Box::new(base::ChouOrlandi), Box::new(iknp::Iknp)]
+}
+
 /// Security parameter: OT-extension seed count and string width, in bits.
 pub const KAPPA: usize = 128;
 /// `KAPPA` in bytes.
@@ -192,6 +234,47 @@ mod tests {
         let d = [7u8; 32];
         assert_ne!(hash_block(b"a", 0, &d), hash_block(b"a", 1, &d));
         assert_ne!(hash_block(b"a", 0, &d), hash_block(b"b", 0, &d));
+    }
+
+    /// The payoff of the trait: one property, asserted against *every*
+    /// construction. A new OT implementation is correct-by-this-test or it does
+    /// not ship, and the benchmark picks it up without being edited.
+    #[test]
+    fn every_construction_delivers_the_chosen_message() {
+        let mut rng = rand::thread_rng();
+        let n = 64;
+        let choices: Vec<bool> = (0..n).map(|_| rand::Rng::gen::<bool>(&mut rng)).collect();
+        let msgs: Vec<(Block, Block)> = (0..n)
+            .map(|_| (random_block(&mut rng), random_block(&mut rng)))
+            .collect();
+
+        for proto in all() {
+            let out = proto
+                .transfer(&choices, &msgs)
+                .unwrap_or_else(|e| panic!("{}: {e}", proto.name()));
+            assert_eq!(out.received.len(), n, "{}", proto.name());
+            for (i, (&c, m)) in choices.iter().zip(&msgs).enumerate() {
+                let want = if c { m.1 } else { m.0 };
+                assert_eq!(
+                    out.received[i],
+                    want,
+                    "{} returned the wrong message at {i}",
+                    proto.name()
+                );
+            }
+            assert!(out.traffic.total() > 0, "{}", proto.name());
+        }
+    }
+
+    /// And the trait must carry the fact that decides usability at scale.
+    #[test]
+    fn only_the_base_protocol_needs_public_key_operations_per_ot() {
+        let pk: Vec<(&str, bool)> = all()
+            .iter()
+            .map(|p| (p.name(), p.public_key_per_ot()))
+            .collect();
+        assert!(pk.contains(&("base", true)));
+        assert!(pk.contains(&("extension", false)));
     }
 
     #[test]

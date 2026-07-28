@@ -1656,9 +1656,16 @@ docs/
                        model, related work, experiments, limitations
   research-agenda.md— private AI for healthcare: the workflow, the admission
                        rule for new primitives, measured cross-layer results
+  gadget-costs.md   — curated cost table (comparator/adder/multiplier/argmax,
+                       OT, PSI, PIR) with per-row provenance
+  related-work.md   — what SING (USENIX Sec'26) and CirC (S&P'22) say, what Baru
+                       took from each, and what it deliberately did not
 tools/
   train_medmnist.py — trains + quantises the CNN and the linear discriminator
                        for `bench-medmnist` / `--example mnist --pneumonia`
+.claude/skills/
+  mpcc-rewrite-rule/— how to add a backend-aware rewrite rule to `mpcc::opt`
+                       (the model proposes; the differential oracle disposes)
 tests/
   features.rs       — unit/integration tests for the interpreter + MPC
   tcp_integration.rs — spawns 3 tcp_party processes over TCP

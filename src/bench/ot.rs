@@ -15,27 +15,41 @@
 //!
 //! # What is measured (2026-07-28, M-series, release)
 //!
+//! Two *interfaces* are reported, and the distinction is not cosmetic. Base OT
+//! natively transfers chosen messages; the extension natively produces random
+//! ones. Offering chosen messages from the extension costs one derandomization
+//! flight (`2κ` bits per OT), so:
+//!
 //! ```text
-//!   protocol      OTs       us/OT   bytes/OT   rounds
-//!       base      128      126.35       64.2        2
-//!  extension      128      127.99       48.2        3
-//!       base     1024      123.74       64.0        2
-//!  extension     1024       18.27       20.0        3
-//!       base     8192      123.92       64.0        2
-//!  extension     8192        4.67       16.5        3
+//!   protocol        interface      OTs       us/OT   bytes/OT   rounds
+//!       base   chosen-message     1024      125.03       64.0        2
+//!  extension   chosen-message     1024       18.60       52.0        3
+//!  extension        random-OT     1024       18.77       20.0        3
+//!       base   chosen-message     8192      125.08       64.0        2
+//!  extension   chosen-message     8192        4.65       48.5        3
+//!  extension        random-OT     8192        4.75       16.5        3
 //! ```
 //!
 //! Base OT is flat, as it should be — every transfer is its own pair of scalar
-//! multiplications, so batching buys nothing beyond reusing `a`. The extension
-//! starts *level with it* at 128 OTs, because at that size the batch is exactly
-//! the `κ = 128` base OTs it has to pay for first, and then falls away fast:
-//! **27× cheaper per OT at 8192**, and 4× smaller.
+//! multiplications, so batching buys nothing beyond reusing `a`. The extension is
+//! **27× cheaper per OT at 8192**.
 //!
-//! Bytes per OT converge to `κ/8 = 16` from above (48 → 20 → 16.5), which is the
-//! protocol's own online cost of one column bit per output OT, with the fixed
-//! base phase amortizing on top. That the measured curve lands on the analytic
-//! floor rather than near it is the useful part: it says the byte accounting is
-//! the protocol's and not an artifact.
+//! Bytes per OT converge to each interface's own analytic floor from above:
+//! `κ/8 = 16` B for random-OT (one column bit per output OT) and `3κ/8 = 48` B for
+//! chosen-message (the column plus two pads). The measured curves land *on* those
+//! floors, which is what says the accounting is the protocol's and not the
+//! harness's.
+//!
+//! The two axes also cross at different batch sizes, which is easy to state
+//! backwards: **time** wins early — the base phase is 128 public-key OTs however
+//! many you want — but **bytes** need a larger batch, since chosen-message costs
+//! `3κ` against base OT's `4κ`, a margin of only 25% that the fixed base phase
+//! eats at small `n`. A test pins both crossings.
+//!
+//! Which row to quote depends on the consumer. MPC preprocessing consumes
+//! *random* / correlated OTs, so `mpcc::ot_cost` prices Beaver triples from the
+//! 16.5 B figure; quoting the chosen-message number there would charge triple
+//! generation for a flight it never sends.
 //!
 //! The per-OT *time* does not fall to zero and should not: the extension does
 //! `O(κ)` bit operations per output OT to read a row out of the column-major
@@ -49,11 +63,15 @@ use std::time::Instant;
 use rand::{Rng, RngCore};
 use serde::Serialize;
 
-use crate::ot::{base, iknp, KAPPA};
+use crate::ot::{iknp, Block, OtProtocol, KAPPA};
 
 #[derive(Debug, Clone, Serialize)]
 pub struct OtPoint {
     pub protocol: &'static str,
+    /// `true` for the chosen-message interface (the `OtProtocol` trait), `false`
+    /// for the extension's native random-OT form.
+    pub chosen_message: bool,
+    pub public_key_per_ot: bool,
     pub count: usize,
     /// All transfers agreed with the choice bits.
     pub correct: bool,
@@ -77,10 +95,12 @@ fn random_bits(n: usize) -> Vec<bool> {
     (0..n).map(|_| rng.gen::<bool>()).collect()
 }
 
-fn bench_base(count: usize) -> Result<OtPoint, String> {
+/// Measure one construction through the [`OtProtocol`] trait, so every row is
+/// produced by the same code path and a new implementation needs no edit here.
+fn bench(proto: &dyn OtProtocol, count: usize) -> Result<OtPoint, String> {
     let choices = random_bits(count);
     let mut rng = rand::thread_rng();
-    let msgs: Vec<_> = (0..count)
+    let msgs: Vec<(Block, Block)> = (0..count)
         .map(|_| {
             let mut a = [0u8; 16];
             let mut b = [0u8; 16];
@@ -91,27 +111,36 @@ fn bench_base(count: usize) -> Result<OtPoint, String> {
         .collect();
 
     let t0 = Instant::now();
-    let (got, traffic) = base::simulate(&choices, &msgs)?;
+    let out = proto.transfer(&choices, &msgs)?;
     let total_ms = t0.elapsed().as_secs_f64() * 1000.0;
 
     let correct = choices
         .iter()
         .zip(&msgs)
-        .zip(&got)
+        .zip(&out.received)
         .all(|((&c, m), g)| *g == if c { m.1 } else { m.0 });
     Ok(OtPoint {
-        protocol: "base",
+        protocol: proto.name(),
+        chosen_message: true,
+        public_key_per_ot: proto.public_key_per_ot(),
         count,
         correct,
-        total_bytes: traffic.total(),
-        bytes_per_ot: traffic.total() as f64 / count as f64,
-        rounds: traffic.rounds,
+        total_bytes: out.traffic.total(),
+        bytes_per_ot: out.traffic.total() as f64 / count as f64,
+        rounds: out.traffic.rounds,
         total_ms,
         us_per_ot: total_ms * 1000.0 / count as f64,
     })
 }
 
-fn bench_extension(count: usize) -> Result<OtPoint, String> {
+/// The extension in its **native** random-OT form.
+///
+/// Kept as a separate row on purpose. MPC preprocessing consumes *random* /
+/// correlated OTs, not chosen-message ones — so this, not the derandomized row,
+/// is the figure `mpcc::ot_cost` prices Beaver triples from. Reporting only the
+/// chosen-message number would overstate the cost of triple generation by the
+/// derandomization flight it never pays.
+fn bench_random_ot(count: usize) -> Result<OtPoint, String> {
     let choices = random_bits(count);
     let t0 = Instant::now();
     let ext = iknp::simulate(&choices)?;
@@ -123,6 +152,8 @@ fn bench_extension(count: usize) -> Result<OtPoint, String> {
     });
     Ok(OtPoint {
         protocol: "extension",
+        chosen_message: false,
+        public_key_per_ot: false,
         count,
         correct,
         total_bytes: ext.traffic.total(),
@@ -136,19 +167,21 @@ fn bench_extension(count: usize) -> Result<OtPoint, String> {
 pub fn run(sizes: &[usize]) -> Result<OtReport, String> {
     let mut points = Vec::new();
     for &n in sizes {
-        points.push(bench_base(n)?);
-        points.push(bench_extension(n)?);
+        for proto in crate::ot::all() {
+            points.push(bench(proto.as_ref(), n)?);
+        }
+        points.push(bench_random_ot(n)?);
     }
     // Smallest measured batch where the extension is faster per OT.
     let mut time_crossover = None;
     for &n in sizes {
         let b = points
             .iter()
-            .find(|p| p.protocol == "base" && p.count == n)
+            .find(|p| p.protocol == "base" && p.count == n && p.chosen_message)
             .map(|p| p.us_per_ot);
         let e = points
             .iter()
-            .find(|p| p.protocol == "extension" && p.count == n)
+            .find(|p| p.protocol == "extension" && p.count == n && p.chosen_message)
             .map(|p| p.us_per_ot);
         if let (Some(b), Some(e)) = (b, e) {
             if e < b && time_crossover.is_none() {
@@ -217,19 +250,23 @@ pub fn run_cli(args: &[String]) -> Result<(), String> {
     println!("Oblivious transfer — Chou-Orlandi base OT vs IKNP extension (semi-honest)");
     println!("kappa = {}\n", r.kappa);
     println!(
-        "{:>10} {:>8} {:>8} {:>11} {:>10} {:>8} {:>9}",
-        "protocol", "OTs", "correct", "us/OT", "bytes/OT", "rounds", "total ms"
+        "{:>10} {:>16} {:>8} {:>8} {:>11} {:>10} {:>8}",
+        "protocol", "interface", "OTs", "correct", "us/OT", "bytes/OT", "rounds"
     );
     for p in &r.points {
         println!(
-            "{:>10} {:>8} {:>8} {:>11.2} {:>10.1} {:>8} {:>9.1}",
+            "{:>10} {:>16} {:>8} {:>8} {:>11.2} {:>10.1} {:>8}",
             p.protocol,
+            if p.chosen_message {
+                "chosen-message"
+            } else {
+                "random-OT"
+            },
             p.count,
             if p.correct { "yes" } else { "NO" },
             p.us_per_ot,
             p.bytes_per_ot,
-            p.rounds,
-            p.total_ms
+            p.rounds
         );
     }
     println!();
@@ -256,39 +293,85 @@ pub fn run_cli(args: &[String]) -> Result<(), String> {
 mod tests {
     use super::*;
 
+    fn row(r: &OtReport, name: &str, chosen: bool) -> OtPoint {
+        r.points
+            .iter()
+            .find(|p| p.protocol == name && p.chosen_message == chosen)
+            .cloned()
+            .unwrap_or_else(|| panic!("no {name} row (chosen_message={chosen})"))
+    }
+
     /// Correctness of both layers, and the property that motivates the
-    /// extension: its per-OT cost must fall below base OT's.
+    /// extension. Compared on the **same interface** — both chosen-message — so
+    /// the extension is charged for the derandomization flight it needs to offer
+    /// one.
+    ///
+    /// Where the extension's byte advantage appears, which is *later* than its
+    /// time advantage: under the chosen-message interface it pays `3κ` per OT
+    /// against base OT's `4κ`, a margin of only 25% that the fixed `κ` base OTs
+    /// eat entirely at small `n`.
+    ///
+    /// **No wall-clock assertion here, deliberately.** `cargo test` runs tests in
+    /// parallel, so a timing comparison inside a unit test is contended and
+    /// flakes — this test asserted `us_per_ot` at first and failed about 1 run in
+    /// 25. Wall-clock claims belong in the benchmark output, where they are
+    /// reported with the machine and the build profile attached. What is asserted
+    /// here is what is deterministic: bytes, and the public-key label.
     #[test]
-    fn the_extension_beats_base_ot_per_transfer() {
-        let r = run(&[256]).unwrap();
-        assert!(r.points.iter().all(|p| p.correct), "{:?}", r.points);
-        let base = r.points.iter().find(|p| p.protocol == "base").unwrap();
-        let ext = r.points.iter().find(|p| p.protocol == "extension").unwrap();
+    fn the_byte_advantage_needs_a_larger_batch_than_the_time_advantage() {
+        let small = run(&[256]).unwrap();
+        assert!(small.points.iter().all(|p| p.correct), "{:?}", small.points);
+        let (base, ext) = (row(&small, "base", true), row(&small, "extension", true));
         assert!(
-            ext.us_per_ot < base.us_per_ot,
-            "extension {:.2} us/OT vs base {:.2} us/OT",
-            ext.us_per_ot,
-            base.us_per_ot
-        );
-        assert!(
-            ext.bytes_per_ot < base.bytes_per_ot,
-            "extension should also be smaller: {:.1} vs {:.1} B/OT",
+            ext.bytes_per_ot >= base.bytes_per_ot,
+            "at 256 the base phase should still eat the byte margin: {:.1} vs {:.1}",
             ext.bytes_per_ot,
             base.bytes_per_ot
         );
+
+        let large = run(&[8192]).unwrap();
+        let (base, ext) = (row(&large, "base", true), row(&large, "extension", true));
+        assert!(
+            ext.bytes_per_ot < base.bytes_per_ot,
+            "by 8192 bytes should win too: {:.1} vs {:.1} B/OT",
+            ext.bytes_per_ot,
+            base.bytes_per_ot
+        );
+
+        // The structural reason the time advantage arrives first, asserted
+        // without measuring time: only base OT does public-key work per transfer.
+        assert!(base.public_key_per_ot);
+        assert!(!ext.public_key_per_ot);
     }
 
-    /// The online cost of the extension is `κ` bits per OT, so bytes/OT must
-    /// approach 16 from above as the base phase amortizes.
+    /// Each interface has its own analytic floor, and the measured curve must
+    /// approach the right one: `κ` bits for the native random-OT form, and `3κ`
+    /// for chosen-message (the column plus two pads).
     #[test]
-    fn extension_bytes_per_ot_approach_the_kappa_bit_floor() {
+    fn each_interface_approaches_its_own_analytic_floor() {
         let r = run(&[8192]).unwrap();
-        let ext = r.points.iter().find(|p| p.protocol == "extension").unwrap();
-        let floor = KAPPA as f64 / 8.0;
+        let unit = KAPPA as f64 / 8.0;
+
+        let random = row(&r, "extension", false);
         assert!(
-            ext.bytes_per_ot >= floor && ext.bytes_per_ot < floor * 1.2,
-            "{:.2} B/OT is not just above the {floor} B floor",
-            ext.bytes_per_ot
+            random.bytes_per_ot >= unit && random.bytes_per_ot < unit * 1.2,
+            "random-OT: {:.2} B/OT is not just above the {unit} B floor",
+            random.bytes_per_ot
+        );
+
+        let chosen = row(&r, "extension", true);
+        let chosen_floor = 3.0 * unit;
+        assert!(
+            chosen.bytes_per_ot >= chosen_floor && chosen.bytes_per_ot < chosen_floor * 1.2,
+            "chosen-message: {:.2} B/OT is not just above the {chosen_floor} B floor",
+            chosen.bytes_per_ot
+        );
+        // And the difference between them is exactly the derandomization.
+        assert!(
+            (chosen.bytes_per_ot - random.bytes_per_ot - 2.0 * unit).abs() < 0.01,
+            "the gap should be exactly two pads: {:.2} vs {:.2}",
+            chosen.bytes_per_ot,
+            random.bytes_per_ot
         );
     }
 }

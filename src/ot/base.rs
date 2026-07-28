@@ -199,6 +199,26 @@ impl Receiver {
     }
 }
 
+/// Chou-Orlandi base OT as an [`super::OtProtocol`].
+pub struct ChouOrlandi;
+
+impl super::OtProtocol for ChouOrlandi {
+    fn name(&self) -> &'static str {
+        "base"
+    }
+    fn public_key_per_ot(&self) -> bool {
+        true
+    }
+    fn transfer(
+        &self,
+        choices: &[bool],
+        messages: &[(Block, Block)],
+    ) -> Result<super::Outcome, String> {
+        let (received, traffic) = simulate(choices, messages)?;
+        Ok(super::Outcome { received, traffic })
+    }
+}
+
 /// Run a batch of base OTs in process. Returns what the receiver got and the
 /// traffic it took.
 pub fn simulate(

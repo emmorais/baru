@@ -270,7 +270,12 @@ stack pays for itself.
 **P4 — binary protocols and the full matrix.** Tinier, SemiBin, BMR; Yao folded
 into the same VM interface.
 
-**P5 — the recommender as a result.** Given an arbitrary Baru program and a
+**P5 — the recommender as a result.** *Per-operation assignment landed
+2026-07-28* — `src/mpcc/assign.rs`, prompted by SING (USENIX Sec'26); see
+`docs/related-work.md`. Note that `mpcc::select` never existed; the whole-program
+ranking was `mpcc compare`. Assignment is per operation *kind* and MPC-only so
+far.
+ Given an arbitrary Baru program and a
 deployment description (party count, threat model, LAN/WAN profile), output a
 ranked backend list with predicted cost and a confidence interval from the
 calibration data. Validate on programs *outside* the training suite — that is the

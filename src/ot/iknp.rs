@@ -263,6 +263,54 @@ pub fn simulate(choices: &[bool]) -> Result<Extended, String> {
     })
 }
 
+/// The IKNP extension as an [`super::OtProtocol`].
+///
+/// The extension produces *random* OTs, so serving chosen messages needs one
+/// extra flight: the sender pads each message with the random output it holds and
+/// sends both, `2·κ` bits per OT. That cost is added to the reported traffic —
+/// see the note on [`super::OtProtocol`] for why the number is therefore higher
+/// than the random-OT figure.
+pub struct Iknp;
+
+impl super::OtProtocol for Iknp {
+    fn name(&self) -> &'static str {
+        "extension"
+    }
+    fn public_key_per_ot(&self) -> bool {
+        false // κ base OTs total, then symmetric-key only
+    }
+    fn transfer(
+        &self,
+        choices: &[bool],
+        messages: &[(Block, Block)],
+    ) -> Result<super::Outcome, String> {
+        if choices.len() != messages.len() {
+            return Err(format!(
+                "{} choices for {} message pairs",
+                choices.len(),
+                messages.len()
+            ));
+        }
+        let ext = simulate(choices)?;
+        // Derandomize: e_b = y_b XOR m_b, and the receiver opens the one it can.
+        let received = ext
+            .sender
+            .iter()
+            .zip(messages)
+            .zip(&ext.receiver)
+            .zip(choices)
+            .map(|((((y0, y1), (m0, m1)), got), &c)| {
+                let (e0, e1) = (xor_block(y0, m0), xor_block(y1, m1));
+                xor_block(got, if c { &e1 } else { &e0 })
+            })
+            .collect();
+        let mut traffic = ext.traffic;
+        // The pads: two κ-bit blocks per OT, sender to receiver.
+        traffic.sender_to_receiver += 2 * messages.len() * KAPPA_BYTES;
+        Ok(super::Outcome { received, traffic })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

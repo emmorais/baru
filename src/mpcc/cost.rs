@@ -122,25 +122,25 @@ pub struct CostEstimate {
 
 /// Running totals while walking the program.
 #[derive(Default, Clone, Copy)]
-struct Acc {
-    bytes: f64,
-    triples: f64,
-    and_triples: f64,
-    muls: f64,
-    random_bits: f64,
-    edabits: f64,
-    dabits: f64,
-    and_gates: f64,
-    local_ns: f64,
+pub(crate) struct Acc {
+    pub(crate) bytes: f64,
+    pub(crate) triples: f64,
+    pub(crate) and_triples: f64,
+    pub(crate) muls: f64,
+    pub(crate) random_bits: f64,
+    pub(crate) edabits: f64,
+    pub(crate) dabits: f64,
+    pub(crate) and_gates: f64,
+    pub(crate) local_ns: f64,
 }
 
 /// Per-instruction cost in one protocol.
 #[derive(Default, Clone, Copy)]
-struct OpCost {
+pub(crate) struct OpCost {
     /// Internal rounds — a bit-decomposition is log-depth *inside* one
     /// dependence level, so a schedule level costs the max over its members.
-    rounds: u32,
-    acc: Acc,
+    pub(crate) rounds: u32,
+    pub(crate) acc: Acc,
 }
 
 /// Decide whether `spec` may be used for `dep`, and why not if it may not.
@@ -227,7 +227,7 @@ fn ceil_log2(n: u32) -> u32 {
 }
 
 /// Cost of one instruction under an *arithmetic* (ring or field) protocol.
-fn arith_op_cost(
+pub(crate) fn arith_op_cost(
     op: &Op,
     lanes: f64,
     spec: &ProtocolSpec,
@@ -361,7 +361,7 @@ fn arith_op_cost(
 /// Cost of one instruction under a *binary* protocol, which must evaluate the
 /// arithmetic program as a boolean circuit.  Gate counts are the textbook
 /// constructions: ripple-carry addition, schoolbook multiplication.
-fn binary_op_cost(
+pub(crate) fn binary_op_cost(
     op: &Op,
     lanes: f64,
     spec: &ProtocolSpec,

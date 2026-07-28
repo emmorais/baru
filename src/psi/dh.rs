@@ -179,6 +179,28 @@ impl PsiTraffic {
     }
 }
 
+/// DH-PSI as a [`crate::psi::PsiProtocol`].
+pub struct DhPsi;
+
+impl crate::psi::PsiProtocol for DhPsi {
+    fn name(&self) -> &'static str {
+        "dh-psi"
+    }
+    fn hiding(&self) -> crate::psi::Hiding {
+        crate::psi::Hiding::NonSharedItems
+    }
+    fn intersect(&self, a: &[Vec<u8>], b: &[Vec<u8>]) -> Result<crate::psi::Outcome, String> {
+        let (intersection, traffic) = simulate(a, b)?;
+        Ok(crate::psi::Outcome {
+            intersection,
+            cost: crate::psi::Cost {
+                bytes: traffic.total(),
+                rounds: traffic.rounds,
+            },
+        })
+    }
+}
+
 /// Run the protocol in process. Returns the receiver's intersection.
 pub fn simulate(a: &[Vec<u8>], b: &[Vec<u8>]) -> Result<(Vec<Vec<u8>>, PsiTraffic), String> {
     let mut rng = rand::thread_rng();

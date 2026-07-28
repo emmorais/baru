@@ -55,7 +55,7 @@ use std::time::Instant;
 use serde::Serialize;
 
 use crate::mpcc::ot_cost;
-use crate::psi::{dh, naive_hash, plain_intersect};
+use crate::psi::plain_intersect;
 
 /// OPRF code width in bits for a KKRT-style batched OPRF. A literature figure,
 /// not a measurement — the projection below is only as good as this.
@@ -63,6 +63,12 @@ pub const OPRF_CODE_BITS: f64 = 448.0;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct PsiPoint {
+    /// Which construction — from `PsiProtocol::name`, so a new implementation
+    /// appears here without this file changing.
+    pub protocol: &'static str,
+    /// What it hides, carried alongside the numbers so the table cannot put a
+    /// broken protocol in the same column as a real one.
+    pub hiding: crate::psi::Hiding,
     pub items: usize,
     pub intersection: usize,
     /// The protocol's output matched the plaintext intersection.
@@ -72,9 +78,6 @@ pub struct PsiPoint {
     pub rounds: usize,
     pub total_ms: f64,
     pub us_per_item: f64,
-    /// Bytes/item for the insecure hash-exchange baseline.
-    pub naive_bytes_per_item: f64,
-    pub naive_us_per_item: f64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -117,27 +120,25 @@ pub fn run(sizes: &[usize]) -> Result<PsiReport, String> {
         let b = synthetic(n, overlap, "bob");
         let want = plain_intersect(&a, &b);
 
-        let t0 = Instant::now();
-        let (got, traffic) = dh::simulate(&a, &b)?;
-        let total_ms = t0.elapsed().as_secs_f64() * 1000.0;
-
-        let t0 = Instant::now();
-        let naive = naive_hash(&a, &b);
-        let naive_ms = t0.elapsed().as_secs_f64() * 1000.0;
-
-        points.push(PsiPoint {
-            items: n,
-            intersection: got.len(),
-            correct: got == want && naive == want,
-            total_bytes: traffic.total(),
-            bytes_per_item: traffic.total() as f64 / n as f64,
-            rounds: traffic.rounds,
-            total_ms,
-            us_per_item: total_ms * 1000.0 / n as f64,
-            // The insecure baseline moves one digest per item, each way.
-            naive_bytes_per_item: 32.0,
-            naive_us_per_item: naive_ms * 1000.0 / n as f64,
-        });
+        // Every construction the crate implements, measured identically. Adding
+        // one to `psi::all()` adds a row here.
+        for proto in crate::psi::all() {
+            let t0 = Instant::now();
+            let out = proto.intersect(&a, &b)?;
+            let total_ms = t0.elapsed().as_secs_f64() * 1000.0;
+            points.push(PsiPoint {
+                protocol: proto.name(),
+                hiding: proto.hiding(),
+                items: n,
+                intersection: out.intersection.len(),
+                correct: out.intersection == want,
+                total_bytes: out.cost.bytes,
+                bytes_per_item: out.cost.bytes as f64 / n as f64,
+                rounds: out.cost.rounds,
+                total_ms,
+                us_per_item: total_ms * 1000.0 / n as f64,
+            });
+        }
     }
     Ok(PsiReport {
         points,
@@ -199,19 +200,23 @@ pub fn run_cli(args: &[String]) -> Result<(), String> {
 
     println!("Private set intersection — DH-based (Ristretto255), semi-honest, one-sided\n");
     println!(
-        "{:>8} {:>7} {:>8} {:>12} {:>10} {:>8}  naive us/item",
-        "items", "shared", "correct", "bytes/item", "us/item", "rounds"
+        "{:>11} {:>8} {:>7} {:>8} {:>12} {:>10} {:>7}  hides",
+        "protocol", "items", "shared", "correct", "bytes/item", "us/item", "rounds"
     );
     for p in &r.points {
         println!(
-            "{:>8} {:>7} {:>8} {:>12.1} {:>10.2} {:>8}  {:.2}",
+            "{:>11} {:>8} {:>7} {:>8} {:>12.1} {:>10.2} {:>7}  {}",
+            p.protocol,
             p.items,
             p.intersection,
             if p.correct { "yes" } else { "NO" },
             p.bytes_per_item,
             p.us_per_item,
             p.rounds,
-            p.naive_us_per_item
+            match p.hiding {
+                crate::psi::Hiding::NonSharedItems => "non-shared items",
+                crate::psi::Hiding::Nothing => "NOTHING (insecure)",
+            }
         );
     }
     println!();
@@ -225,8 +230,15 @@ pub fn run_cli(args: &[String]) -> Result<(), String> {
         "code: ~{:.0} B/item, with no public-key operation at all.",
         r.projected_ot_bytes_per_item
     );
-    let dh_bytes = r.points.last().map(|p| p.bytes_per_item).unwrap_or(0.0);
-    let dh_us = r.points.last().map(|p| p.us_per_item).unwrap_or(0.0);
+    let pick = |name: &str, f: fn(&PsiPoint) -> f64| -> f64 {
+        r.points
+            .iter()
+            .rfind(|p| p.protocol == name)
+            .map(f)
+            .unwrap_or(0.0)
+    };
+    let dh_bytes = pick("dh-psi", |p| p.bytes_per_item);
+    let dh_us = pick("dh-psi", |p| p.us_per_item);
     println!(
         "So the OT route should win ~{:.1}x on bytes — and far more on time, since {:.0} us/item",
         dh_bytes / r.projected_ot_bytes_per_item.max(1e-9),
@@ -241,7 +253,7 @@ pub fn run_cli(args: &[String]) -> Result<(), String> {
     );
     println!("code width), not a measured PSI.  And DH-PSI stays preferable for small sets,");
     println!("where 100 lines needing no OT infrastructure beats a constant factor.");
-    let naive_us = r.points.last().map(|p| p.naive_us_per_item).unwrap_or(0.0);
+    let naive_us = pick("naive-hash", |p| p.us_per_item);
     println!(
         "The naive column is the INSECURE baseline, and it is ~{:.0}x faster — which is why",
         dh_us / naive_us.max(1e-9)
@@ -259,19 +271,51 @@ pub fn run_cli(args: &[String]) -> Result<(), String> {
 mod tests {
     use super::*;
 
+    fn row(r: &PsiReport, name: &str, items: usize) -> PsiPoint {
+        r.points
+            .iter()
+            .find(|p| p.protocol == name && p.items == items)
+            .cloned()
+            .unwrap_or_else(|| panic!("no {name} row at {items} items"))
+    }
+
     #[test]
-    fn dh_psi_is_correct_and_flat_per_item() {
+    fn every_construction_is_correct_and_flat_per_item() {
         let r = run(&[128, 512]).unwrap();
         assert!(r.points.iter().all(|p| p.correct), "{:?}", r.points);
-        // Half-overlapping sets.
-        assert_eq!(r.points[0].intersection, 64);
-        // Per-item bytes must not depend on set size.
-        let (a, b) = (r.points[0].bytes_per_item, r.points[1].bytes_per_item);
-        assert!((a - b).abs() < 1e-9, "{a} vs {b} bytes/item");
+        // Half-overlapping sets, for every protocol.
+        assert!(r.points.iter().all(|p| p.intersection == p.items / 2));
+
+        // Per-item bytes must not depend on set size, for any construction.
+        for name in ["dh-psi", "naive-hash"] {
+            let (a, b) = (
+                row(&r, name, 128).bytes_per_item,
+                row(&r, name, 512).bytes_per_item,
+            );
+            assert!((a - b).abs() < 1e-9, "{name}: {a} vs {b} bytes/item");
+        }
+        let dh = row(&r, "dh-psi", 128).bytes_per_item;
         assert!(
-            (a - 96.0).abs() < 1e-9,
-            "three 32-byte flights per item, got {a}"
+            (dh - 96.0).abs() < 1e-9,
+            "three 32-byte flights per item, got {dh}"
         );
+        // Both directions of the digest exchange, so 2 x 32 B.
+        let naive = row(&r, "naive-hash", 128).bytes_per_item;
+        assert!((naive - 64.0).abs() < 1e-9, "got {naive}");
+    }
+
+    /// The benchmark must be driven by the trait, not by a hard-coded list — so
+    /// every construction the crate implements has to show up.
+    #[test]
+    fn the_table_covers_every_implemented_construction() {
+        let r = run(&[64]).unwrap();
+        for proto in crate::psi::all() {
+            assert!(
+                r.points.iter().any(|p| p.protocol == proto.name()),
+                "{} is implemented but missing from the comparison",
+                proto.name()
+            );
+        }
     }
 
     /// The projection is the argument for building the OT route, so pin it: it
@@ -280,7 +324,7 @@ mod tests {
     #[test]
     fn the_ot_projection_undercuts_dh_psi() {
         let r = run(&[256]).unwrap();
-        let dh = r.points[0].bytes_per_item;
+        let dh = row(&r, "dh-psi", 256).bytes_per_item;
         assert!(
             r.projected_ot_bytes_per_item < dh,
             "projected OT PSI {:.1} B/item should undercut DH-PSI's {dh:.1}",

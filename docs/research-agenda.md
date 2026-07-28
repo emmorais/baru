@@ -299,6 +299,74 @@ no OT infrastructure is worth more than a constant factor.
 
 ---
 
+## 3c. Next: the database makes a *composed* image-recognition result possible
+
+Agreed 2026-07-28. Every stage measured so far is measured *alone*: stage 1 is a
+cohort query, stage 4 is an encrypted classification, and the striking table in §2
+sets ≈1.0× against 10³–10⁶×. That is a good argument and it is also the easy one.
+The next contribution is to **compose two stages**, which is what a reviewer asks
+for and what no single-technology system can do:
+
+> **Cohort-conditioned private evaluation.** "What is this model's accuracy on
+> patients aged 40–60 with HbA1c > 7?" — answered without decrypting the cohort,
+> the images, or the per-patient predictions.
+
+### Why this is worth doing rather than more single-stage benchmarks
+
+* **It is a real requirement, not a demo.** Regulators and clinicians do not accept
+  one aggregate accuracy; they require performance broken down by subgroup, and
+  subgroup membership is exactly the sensitive attribute. Today that analysis is
+  done by putting demographics, labels and predictions in the clear together.
+* **It needs the whole stack at once**: BaruDB's ORE/DET cohort selection (stage 1)
+  to pick the subgroup, the encrypted CNN (stage 4) to produce predictions, and
+  the result store to accumulate runs. Each already works; nothing new has to be
+  invented, which is why this is the *next* step and not a research project.
+* **It produces a number nobody else can produce**: per-cohort accuracy with cost
+  attributed per stage, under one cost model. That is Thesis (S) applied to a
+  pipeline rather than to a single program.
+
+### The first deliverable
+
+`baru bench-cohort-eval`: attach records to the MedMNIST test images, select a
+cohort with an encrypted predicate, run the encrypted classifier over exactly
+that cohort, and report per-cohort accuracy — checked against the plaintext
+computation, like every other benchmark here. Report cost attributed per stage
+(selection vs inference), because the interesting result is almost certainly that
+**selection is free and inference is everything**, which is the §2 table showing
+up *inside* one query.
+
+### The honest problem, stated before the work starts
+
+**MedMNIST has no demographics.** Cohort-conditioned evaluation therefore needs
+synthetic patient attributes attached to real images. That is defensible for a
+*cost-structure* claim — the encrypted selection does the same work whether the
+ages are real or generated — and it is **not** defensible for any clinical or
+fairness claim, because a subgroup gap measured on synthetic demographics is an
+artifact of the generator. So:
+
+* the benchmark must label the attributes synthetic in its own output, not just in
+  a doc;
+* the claim is "this composition is possible and this is what it costs", never
+  "the model underperforms on subgroup X";
+* a real clinical claim needs a dataset carrying genuine demographics (CheXpert
+  and MIMIC-CXR do; both need credentialed access), and that is the upgrade path
+  to note rather than to fake.
+
+### Also on the list, in priority order
+
+1. **Cross-institution private benchmarking.** Two hospitals evaluate the same
+   model on their own patients and learn only the *pooled* metric — PSI for
+   deduplicating shared patients (stage 3, built), then an aggregate. This is the
+   federated-evaluation story and it reuses everything.
+2. **Longitudinal accumulation.** `baru bench --store barudb:<path>` already
+   persists runs; the unrealised half is generating the paper's tables *from
+   queries* rather than transcription. Cheap, and it removes a whole class of
+   copy-paste error this session has already made more than once.
+3. **Multi-channel MedMNIST** (PathMNIST, DermaMNIST) — see the wish list; a
+   packing question.
+
+---
+
 ## 4. Backend-aware circuit optimization — the novel contribution
 
 Implemented as a first slice in [`src/mpcc/opt.rs`](../src/mpcc/opt.rs).
@@ -371,6 +439,95 @@ a rewrite that changes semantics cannot survive.
 That gives the paper a clean table: one program, N backends, and the observation
 that the optimized circuits are *different circuits*.
 
+### Per-operation protocol assignment (2026-07-28, from SING)
+
+Reading SING (USENIX Sec'26) exposed a real gap: Baru ranked **whole-program**
+protocol choices, while the state of the art (HyCC → Silph → SING) assigns
+**per operation** with conversion costs — and the `mpcc::select` recommender both
+this document and the roadmap referred to *did not exist*. `src/mpcc/assign.rs`
+and `baru mpcc assign` now do the per-operation-kind version, reproducing the
+classic result (multiplications arithmetic, comparisons binary) from Baru's own
+cost model, with a measured 1.25× on a mixed program and a 9.5 KiB → 41 B drop in
+online traffic.
+
+The argument worth carrying into the paper: **Baru needs neither Silph's ILP nor
+SING's GNN**, because its cost model is non-separable in the assignment variables
+(a level costs the max over its members; conversions batch per level) *and* cheap
+to evaluate exactly. ILP cannot express that objective and a learned surrogate is
+not needed to approximate it. Full analysis, including what was deliberately not
+adopted, in [related-work.md](related-work.md).
+
+### FHE in the assignment — the result the two papers share (2026-07-28)
+
+`src/mpcc/fhe_cost.rs` puts FHE into the assignment, which HyCC, Silph and SING
+structurally cannot do. The model gets **only measured inputs**: BFV ct×ct
+multiply 20.7 ms and ct 128 KB (`bench-fhe-innerprod`), TFHE 0.2–0.5 s/gate
+(`baru bench`), Beaver-triple cost derived from measured OT (§3b), plus two
+*structural* facts — BFV is arithmetic-only (no comparison at any price) and has a
+depth-1 budget.
+
+Given that, on one NN layer — 256 secret×secret products (encrypted weights *and*
+encrypted input) followed by a comparison, WAN, 2 parties:
+
+```
+assignment       rounds      online     offline  conversions  predicted
+all-arithmetic       12     8.8 KiB     1.7 MiB            0  740.96 ms
+all-binary           17    66.0 KiB   808.6 MiB            0    68.69 s
+mixed (best)         11   128.0 KiB   101.1 KiB          771  589.47 ms
+
+mixed wins 1.26x, by moving:  cmp-lt -> binary,  mul -> fhe
+```
+
+**The model derives the hybrid architecture.** Linear layer on FHE, nonlinearity
+on MPC — Gazelle/Delphi/Cheetah's design, and the one `src/hybrid/` implements by
+hand. Nothing told it to; it followed measured costs. A test pins it, so a change
+to any cost input that would overturn the claim fails the suite instead of
+quietly rewriting the paper.
+
+The mechanism is specific and worth stating: **MPC's Beaver-triple preprocessing
+grows linearly with layer width while FHE's packed ciphertext is flat and needs
+none.** Offline drops 1.7 MiB → 101 KiB. And there is a genuine crossover — the
+model keeps a *narrow* layer on MPC, because 8 multiplications batch into one
+round that FHE cannot amortize a switch against:
+
+| layer width | assignment | speed-up |
+|---|---|---|
+| 8 muls | stays arithmetic | — |
+| 64 muls | stays arithmetic | — |
+| 256 muls | **mul → fhe** | 1.18× |
+| 512 muls | **mul → fhe** | 1.54× |
+
+This is where the two papers meet. Thesis (S) says the cheapest technology is a
+property of the program; here the *same* program shape switches technology at a
+width the model predicts. And `paper-outline.md`'s switch-as-bootstrap claim is
+what makes the FHE side legal at all: the depth-1 budget means a second
+multiplication would be infeasible, and the switch to MPC for the nonlinearity
+*is* the refresh. Depth being free is not an add-on to this result — it is the
+precondition.
+
+#### Two modelling errors found by disagreeing with a measurement
+
+Worth recording, because the process is the point. The first version of the FHE
+cost model concluded **"never use FHE"** — which contradicts `bench-cnn`, where a
+working hybrid puts FHE at ~5% of runtime. Two terms were missing:
+
+1. **SIMD packing.** FHE was charged per scalar operation. But `src/fhe/conv_pack.rs`
+   packs a whole convolution channel into *one* ct×ct multiply, so per-lane
+   charging is the wrong unit. Fixed by tallying operations per (level, kind) and
+   charging `ceil(count / slots)` — the same batching shape MPC's rounds have, and
+   a second non-linearity an ILP could not express.
+2. **Preprocessing.** The objective ignored offline cost entirely, so MPC's triples
+   were free. They are not, and pricing them from measured OT is what creates the
+   crossover above.
+
+A third error was subtler: the switch was charged **one ciphertext per crossing
+edge**, re-encrypting the same value once per use and making FHE look 16× worse on
+a wide layer. Crossings pack too.
+
+Still not done: assignment is per operation *kind*, and CKKS is excluded because
+its SEAL implementation is not timing-comparable with Baru's schoolbook-NTT BFV —
+so the FHE side is priced at BFV's speed, which is conservative *against* FHE.
+
 ---
 
 ## 5. On RAG vs. a Claude skill for circuit optimization
@@ -399,6 +556,24 @@ The skill is worth writing after `opt.rs` has enough rules that "add a rule" is
 a well-defined shape to imitate. Writing it first would mean asking a model to
 generate into a target that does not exist yet.
 
+**Done 2026-07-28**, once that precondition was met (five rules, per-site search,
+a differential oracle):
+
+* `.claude/skills/mpcc-rewrite-rule/SKILL.md` — the generator. It documents the
+  `FlatOp` invariants a rewrite must preserve, the per-site-vs-whole-circuit
+  decision, the oracle, the protocol-family table that predicts *who will take a
+  rule*, and the repo conventions (including "never write a results table you
+  have not run"). Every symbol, `FlatOp` variant and protocol id it names was
+  checked to resolve against the tree — a skill describing an API wrongly is
+  worse than no skill.
+* `docs/gadget-costs.md` — point 3, the curated table, deliberately a small
+  checked-in file rather than retrieval. Each row carries **provenance**:
+  *standard* (textbook), *Baru's model* (what `cost.rs` charges), or *measured*
+  (with the command). Writing it surfaced a modelling choice worth knowing:
+  Baru charges a **ripple** adder's gate count at a **prefix** adder's depth, so
+  binary-protocol latency estimates are optimistic — which matters for
+  `semi-bin`/`tinier` and not at all for the constant-round protocols.
+
 ---
 
 ## 6. Sequence
@@ -411,13 +586,21 @@ Ordered by value per unit of work, with the dependency structure respected.
    *multi-channel* one (PathMNIST, DermaMNIST), which needs the conv packing to
    split RGB channels across ciphertexts — a packing question, not a
    construction one.
-2. **Backend-aware optimizer** (§4). Started. Extend the rule set; add
-   reassociation-for-depth; report per-backend optimized circuits.
-3. **P2 of the MPC roadmap** — random bits and edaBits, so comparisons *run* and
-   not merely cost. Everything in stages 4–6 is comparison-heavy; this is the
-   binding constraint on the whole agenda.
-4. **Cohort queries in BaruDB** (stage 1). Mostly a schema and a query-shape
-   question; BaruDB already has ORE.
+2. ~~**Backend-aware optimizer** (§4)~~ — **done 2026-07-28**: reassociation-for-
+   depth added (the sharpest form of the claim — it moves *only* depth), plus
+   **per-site search**, which replaced the whole-circuit bundling that had been
+   the pass's main weakness. Backends now diverge within a rule and not merely
+   over which rules they accept. Getting reassociation right also required fixing
+   a real cost-model bug in binary-protocol depth accounting (§4). Still open and
+   worth doing: the search is greedy with a fixed rule order and evaluates sites
+   independently, so a pair of rewrites that only pays *together* is missed.
+3. ~~**P2 of the MPC roadmap** — random bits and edaBits, so comparisons *run*~~ —
+   **done 2026-07-27**: `vm::bit_decompose_batch` (masked opening + Kogge–Stone
+   prefix borrow, log depth); `relu`/`max` execute under Dealer and Shamir and
+   agree with the plain interpreter, at 0% model error. Secret division is still
+   refused, by design, with an error naming its phase.
+4. ~~**Cohort queries in BaruDB** (stage 1)~~ — **done 2026-07-27**: `baru
+   bench-cohort`, query overhead ≈1.0×, ingest 5.05× (§2).
 5. ~~**PIR** (stage 2), textbook single-server over the existing BFV~~ — **done
    2026-07-28, with a negative result** (§3a): correct, but ~13× *worse* than
    downloading the database at every size, because ciphertext expansion exceeds
@@ -433,15 +616,73 @@ Ordered by value per unit of work, with the dependency structure respected.
    on time, and it is the compute axis that decides), and KOS-style consistency
    checks if malicious security is wanted. Both are optional — stage 3 is served
    today.
-7. **ORAM** (stage 6). Path ORAM over the storage layer. Largest of these; do it
-   last, and only if stage 6 is still in the story by then.
-8. **Circuit-optimization skill** (§5).
+7. **ORAM** (stage 6) — **wish list, not scheduled** (2026-07-28 decision). Path
+   ORAM over the storage layer. Deliberately parked: see the wish list at the end
+   of this document for the condition under which it comes back.
+8. ~~**Circuit-optimization skill** (§5)~~ — **done 2026-07-28**, together with the
+   curated gadget-cost table it depends on.
 
 Items 5–7 are the criptolandia items. Note that each one is *also* infrastructure
 for the compiler: PIR reuses BFV, OT unlocks two MPC protocols, ORAM gives the
 cost model a data-dependent-addressing entry. That is the test they pass.
 
-## 7. What to cut, or at least defer
+**Status as of 2026-07-28: items 1–6 and 8 are done; item 7 (ORAM) is parked.**
+
+---
+
+## 7. Wish list — wanted, not scheduled
+
+Things that are genuinely interesting and deliberately not being built. Parking
+them here rather than leaving them as open to-dos is the point: an agenda where
+everything is "planned" cannot express priority.
+
+* **Secret-index array access, priced** — *ahead of ORAM, and cheap.* CirC
+  (`docs/related-work.md` §2) implements exactly the two cases either side of the
+  ORAM line: a public index compiles away, a secret index becomes an `n`-way mux
+  tree. `FlatOp` can already express that with `ICmpEq` + `Mux`. Doing it gives
+  `mpcc::cost` the data-dependent-addressing entry that ORAM was supposed to
+  provide, for a fraction of the work — and then the cost model, not a guess, says
+  whether ORAM is ever needed.
+
+* **ORAM (stage 6).** Path ORAM over the storage layer, to hide the access
+  pattern of a training loop over a private index.
+
+  *Why parked:* the admission rule says a primitive enters when it is the
+  cheapest way to serve a stage, and §3a is a cautionary precedent — PIR turned
+  out ~13× worse than reading the whole database, for a structural reason. The
+  prior for ORAM is similar: it only pays when the dataset is large enough that
+  `O(log² n)` bandwidth per access beats a linear scan, *and* the data is too big
+  to stream once per epoch. For MedMNIST-scale training (tens of thousands of
+  28×28 images, ~40 MB) streaming the whole set per epoch is trivially cheap, so
+  ORAM would lose on exactly the axis PIR lost on.
+
+  *Also:* CirC does not implement ORAM either — it implements the linear scan and
+  stops there, which is a stronger endorsement of this decision than the reasoning
+  alone was.
+
+  *The condition that would revive it:* a stage-6 workload where the private
+  index is over data that genuinely cannot be streamed — a hospital-scale imaging
+  archive, or a training loop whose access pattern is itself the sensitive thing
+  (e.g. active learning selecting which patients to label). Price it with the cost
+  model before writing a line of it.
+
+* **KKRT-style OT-based PSI.** The projection in §3b says ~100× on time over
+  DH-PSI. Wanted; not urgent, because stage 3 is served today.
+
+* **SealPIR-style recursion + query expansion.** What would make PIR competitive
+  (§3a). Needs Galois automorphisms and a substitution op `src/fhe/bfv.rs` lacks.
+
+* **KOS-style consistency checks** for the OT extension, if any claim needs
+  malicious security.
+
+* **A LAN/WAN measurement harness** so `mpcc`'s latency and bandwidth terms are
+  calibrated against a real network rather than a profile (roadmap P1).
+
+* **Multi-channel MedMNIST** (PathMNIST, DermaMNIST). Needs the conv packing to
+  split RGB channels across ciphertexts — a packing question, not a construction
+  one.
+
+## 8. What to cut, or at least defer
 
 * **Private RAG / encrypted LLM inference.** Fashionable, enormous, and a
   different paper. The non-private RAG for circuit construction (§5) is a *tool*,
