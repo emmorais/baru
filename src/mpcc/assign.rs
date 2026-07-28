@@ -800,6 +800,58 @@ mod tests {
         );
     }
 
+    /// **The threat model decides whether FHE is wanted at all.**
+    ///
+    /// Under an *honest majority* (ABY3 multiplies from correlated randomness —
+    /// `triples_per_mul: 0`), multiplication is nearly free and MPC wins at every
+    /// layer width. Under a *dishonest majority* (Semi2k needs a Beaver triple per
+    /// multiplication, ~3.1 KB from measured OT), triple cost grows linearly with
+    /// width while a packed ciphertext is flat, so FHE takes the layer.
+    ///
+    /// This is why the hybrid FHE+MPC literature is 2-party: Gazelle, Delphi and
+    /// Cheetah are dishonest-majority settings, which is exactly the regime where
+    /// the model says the hybrid pays. `bench-hybrid-nn` measures the
+    /// honest-majority arm (ABY3, ~775 ms flat in width at WAN) and confirms the
+    /// prediction that FHE is *not* wanted there.
+    #[test]
+    fn the_threat_model_decides_whether_the_layer_goes_to_fhe() {
+        let mut dot = "(* a0 b0)".to_string();
+        for i in 1..256 {
+            dot = format!("(+ {dot} (* a{i} b{i}))");
+        }
+        let (prog, sched) = program(&format!("(if (> {dot} 0) 1 0)"));
+        let bfv = crate::mpcc::fhe_cost::find("bfv").unwrap();
+
+        // Dishonest majority: triples cost money, so the layer leaves for FHE.
+        let dishonest = Pair::new(find("semi2k").unwrap(), find("semi-bin").unwrap())
+            .unwrap()
+            .with_fhe(bfv);
+        let out = assign(&prog, &sched, &dishonest, &Deployment::wan(2), 32).unwrap();
+        assert_eq!(
+            out.assignment.by_kind.get("mul"),
+            Some(&Side::Fhe),
+            "with per-multiplication triples the layer should go to FHE: {:?}",
+            out.assignment.deviations()
+        );
+
+        // Honest majority: multiplication is free, so it stays put — and this is
+        // the arm `bench-hybrid-nn` measures.
+        let honest = Pair::new(find("aby3").unwrap(), find("semi-bin").unwrap())
+            .unwrap()
+            .with_fhe(bfv);
+        let out = assign(&prog, &sched, &honest, &Deployment::wan(3), 32).unwrap();
+        assert_ne!(
+            out.assignment.by_kind.get("mul"),
+            Some(&Side::Fhe),
+            "ABY3 multiplies from correlated randomness, so FHE cannot pay: {:?}",
+            out.assignment.deviations()
+        );
+        assert_eq!(
+            out.best.offline_bytes, 0,
+            "an honest-majority protocol has no triple bill at all"
+        );
+    }
+
     /// ...and the crossover is real: a *narrow* layer stays on MPC, because one
     /// batched multiply round beats a round-trip through FHE.
     #[test]

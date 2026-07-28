@@ -478,11 +478,58 @@ mixed (best)         11   128.0 KiB   101.1 KiB          771  589.47 ms
 mixed wins 1.26x, by moving:  cmp-lt -> binary,  mul -> fhe
 ```
 
-**The model derives the hybrid architecture.** Linear layer on FHE, nonlinearity
-on MPC — Gazelle/Delphi/Cheetah's design, and the one `src/hybrid/` implements by
-hand. Nothing told it to; it followed measured costs. A test pins it, so a change
-to any cost input that would overturn the claim fails the suite instead of
-quietly rewriting the paper.
+**The model derives the hybrid architecture** — for a *dishonest majority*.
+Linear layer on FHE, nonlinearity on MPC: Gazelle/Delphi/Cheetah's design, and the
+one `src/hybrid/` implements by hand. Nothing told it to; it followed measured
+costs. A test pins it, so a change to any cost input that would overturn the claim
+fails the suite instead of quietly rewriting the paper.
+
+**The threat model is part of the answer, and this is the sharper claim.** The run
+above uses Semi2k, which needs a Beaver triple per multiplication (~3.1 KB, priced
+from measured OT). Re-run it against **ABY3** — honest majority, multiplication
+from correlated randomness, `triples_per_mul = 0` — and the layer **stays on MPC**:
+
+```
+assignment       rounds      online     offline  conversions  predicted
+all-arithmetic       12     4.4 KiB         0 B            0  600.36 ms
+mixed (best)         11     2.0 KiB         0 B            3  550.17 ms
+mixed wins 1.09x, by moving:  cmp-lt -> binary        (mul stays arithmetic)
+```
+
+So the same program flips technology on the *deployment's threat model*, not just
+on its shape. And that explains something about the literature: **the hybrid
+FHE+MPC systems are all 2-party** — Gazelle, Delphi, Cheetah — which is exactly the
+dishonest-majority regime where the model says the hybrid pays. Under an honest
+majority the hybrid is not merely unnecessary, it is a loss.
+
+#### Checked against measurement, and it needed a correction
+
+`bench-hybrid-nn` measures one dense layer end to end under six strategies, so the
+prediction is testable. At WAN settings matching the model (RTT 100 ms, 100 Mbit/s),
+sweeping layer width with `--out 1`:
+
+| multiplies | measured pure MPC (ABY3) | measured hybrid-BFV |
+|---|---|---|
+| 8 | **775 ms** | 1338 ms |
+| 32 | **775 ms** | 1335 ms |
+| 128 | **766 ms** | 1343 ms |
+| 512 | **778 ms** | 1331 ms |
+
+MPC wins at every width and is **flat in width** — the layer's cost is rounds, and
+rounds do not grow with width. The model predicts the same decision (mul stays
+arithmetic) and the same order of magnitude (600 ms predicted vs 775 ms measured).
+
+My first reading of this was that the model was wrong, because I had compared a
+Semi2k *prediction* against an ABY3 *measurement* — two different threat models.
+`bench-hybrid-nn` implements ABY3 only. Once matched, model and measurement agree
+on the decision. The lesson is worth keeping: a prediction and a measurement must
+name the same protocol before they can disagree.
+
+**The honest gap:** the dishonest-majority arm — the one where the model says FHE
+wins — is **not measured**, because no dishonest-majority MPC baseline exists in
+the artifact (Semi2k is P1-planned, `mpcc::RUNNABLE` is Dealer and Shamir only).
+That experiment is the highest-value thing left for this claim, and until it exists
+the FHE-wins half is a prediction, not a result.
 
 The mechanism is specific and worth stating: **MPC's Beaver-triple preprocessing
 grows linearly with layer width while FHE's packed ciphertext is flat and needs
@@ -635,6 +682,14 @@ cost model a data-dependent-addressing entry. That is the test they pass.
 Things that are genuinely interesting and deliberately not being built. Parking
 them here rather than leaving them as open to-dos is the point: an agenda where
 everything is "planned" cannot express priority.
+
+* **A dishonest-majority MPC baseline for `bench-hybrid-nn`** — *the highest-value
+  experiment left, and it validates a live claim.* §4's FHE-wins result is a
+  prediction: the artifact measures only ABY3 (honest majority), so the regime
+  where the model says FHE takes the layer has never been measured. Semi2k is
+  roadmap P1 and shares Dealer's online phase, so the work is OT-generated triples
+  plus a `ShareEngine` — and `src/ot/` already provides the OT. Until this exists,
+  the hybrid-pays half of §4 must be stated as a prediction.
 
 * **Secret-index array access, priced** — *ahead of ORAM, and cheap.* CirC
   (`docs/related-work.md` §2) implements exactly the two cases either side of the
