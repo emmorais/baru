@@ -53,15 +53,15 @@
 //!
 //! | | a2b | gc |
 //! |---|---|---|
-//! | total | 2614 ms | **2063 ms** |
-//! | FHE | 1355 ms | 1355 ms |
-//! | MPC | 1232 ms | 679 ms |
-//! | — import | 8 ms | 9 ms |
-//! | — ReLU∘rescale | 624 ms | 401 ms |
-//! | — max-pool | 466 ms | 154 ms |
-//! | — argmax | 125 ms | 106 ms |
-//! | wire bytes | 39.5 MB | 21.9 MB |
-//! | messages | 147 | 319 190 |
+//! | total | 2535 ms | **1986 ms** |
+//! | FHE | 1356 ms | 1351 ms |
+//! | MPC | 1153 ms | 609 ms |
+//! | — import | 9 ms | 11 ms |
+//! | — ReLU∘rescale | 615 ms | 407 ms |
+//! | — max-pool | 467 ms | 155 ms |
+//! | — argmax | 55 ms | 27 ms |
+//! | wire bytes | 39.5 MB | 21.8 MB |
+//! | messages | 88 | 319 139 |
 //!
 //! (Separate `--gc` and default runs, so the two columns are two invocations;
 //! `--both` runs them back to back and prints the ratio.) Note the message
@@ -81,9 +81,13 @@
 //!    ([`import_raw_batch`]) costs the same bytes in three rounds: 19.1 s →
 //!    8 ms, and end-to-end 21.8 s → 2.6 s.
 //! 3. Only *then* do the comparisons matter, and [`Nonlin::Gc`] takes the
-//!    MPC segment a further 1.7×.
+//!    MPC segment a further 1.9×.
+//! 4. The last unbatched phase was [`crate::gadgets::argmax`], whose left
+//!    fold made `nclasses−1` *dependent* comparisons. Reassociating it into a
+//!    tournament (`⌈log₂ n⌉` batched levels) cut it 2.4× at RTT 20 ms, where
+//!    it had been the single largest phase.
 //!
-//! The cost centre is now the **FHE arithmetic** (~53% here, 84% on the
+//! The cost centre is now the **FHE arithmetic** (~68% here, 84% on the
 //! trained two-conv medical model, which has four encrypted linear layers to
 //! this one's two). That is where the next optimisation belongs.
 //!

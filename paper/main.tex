@@ -541,8 +541,10 @@ $8$ ms and the end-to-end pipeline from $21.8$ s to $2.6$ s.
 \centering
 \caption{MPC segment of the $28\times28$ CNN across protocol revisions. Every
 row is bit-exact against the plaintext reference; only privacy and cost
-differ. The final row changes no protocol --- only how many round trips carry
-the same bytes.}
+differ. The last two rows change no protocol --- only how many round trips
+carry the same bytes. Measured at zero latency, which is where the tournament
+\bt{argmax} looks least impressive: its win is in rounds, and at RTT $20$ ms
+it is $2.4\times$ on that phase (\Cref{sec:gc}).}
 \label{tab:mpc}
 \begin{tabular}{@{}lrr@{}}
 \toprule
@@ -553,7 +555,8 @@ correct bit decomposition, Beaver triples & $76.9$ s & $159.4$ MB \\
 \quad + triple-free PRF resharing & $40.8$ s & $10.4$ MB \\
 \quad + batched ReLU decomposition & $20.7$ s & $10.2$ MB \\
 \quad + batched max-pooling & $6.1$ s & $10.0$ MB \\
-\quad + batched scheme-switch import & $\mathbf{1.2}$ s & $10.0$ MB \\
+\quad + batched scheme-switch import & $1.2$ s & $10.0$ MB \\
+\quad + tournament \bt{argmax} & $\mathbf{1.15}$ s & $10.0$ MB \\
 \bottomrule
 \end{tabular}
 \end{table}
@@ -622,14 +625,29 @@ one can deploy.
 
 Integrated into the pipeline --- so that the fused ReLU, and through the same
 mechanism every batched max-pool comparison, takes the Yao leg --- it takes
-the MPC segment of the $28\times28$ CNN from $1.20$ s to $0.68$ s
-($1.7\times$, matching the isolated measurement) and halves party-to-party
-traffic from $39.5$ to $21.9$ MB. The gain survives real networks: the
-segment stays $1.72\times$ ahead at RTT $2$ ms and $1.40\times$ at RTT
-$20$ ms, even though garbling inverts the message \emph{count} (147 messages
-becomes $319{,}190$ small ones while bytes halve). Both routes are bit-exact
-against the plaintext reference and against each other, which is what
-licenses reading the ratio as pure cost.
+the MPC segment of the $28\times28$ CNN from $1.15$ s to $0.61$ s
+($1.9\times$) and halves party-to-party traffic from $39.5$ to $21.8$ MB. The
+gain survives real networks: on the trained medical model at RTT $20$ ms it
+is $2.0\times$ on the segment ($3.39$ s to $1.70$ s), even though garbling
+inverts the message \emph{count} ($88$ messages becomes $319{,}139$ small
+ones while bytes halve). Both routes are bit-exact against the plaintext
+reference and against each other, which is what licenses reading the ratio as
+pure cost.
+
+\paragraph{The last dependent reduction.} Batching a layer requires its
+operations to be independent, and one gadget was not: \bt{argmax} folded
+$\text{classes}-1$ comparisons left to right, each waiting on the previous
+winner. It did less work than any other phase and, under WAN latency,
+took the most time --- $1.31$ s of a $2.03$ s MPC segment at RTT $20$ ms.
+Reassociating the fold into a \emph{tournament} --- pair adjacent candidates,
+decide a whole level with one batched comparison, select value and index with
+one batched multiplication --- makes it $\lceil\log_2 n\rceil$ batched levels
+instead of $n-1$ sequential ones, for $2.4\times$ at RTT $20$ ms. The
+transformation must preserve tie-breaking (the first maximum wins, as in the
+plaintext reference), which it does because the bracket pairs adjacent
+elements in index order; we verify it exhaustively over small alphabets
+rather than on sampled inputs, since a tie split across sibling subtrees is
+exactly the case random logits never produce.
 
 \subsection{Convolution packing}
 
@@ -642,8 +660,8 @@ $0.26$ s ($294\times$), and the FHE share of runtime falls to a few percent
 \Cref{sec:mpc}.
 
 That is no longer where it sits. With the segment's import batched and its
-nonlinearities garbled, the same $28\times28$ classifier spends $1.36$ s of
-its $2.06$ s in FHE and $0.68$ s in MPC, and the trained two-convolution
+nonlinearities garbled, the same $28\times28$ classifier spends $1.35$ s of
+its $1.99$ s in FHE and $0.61$ s in MPC, and the trained two-convolution
 medical model of \Cref{sec:diagnosis} --- four encrypted linear layers to
 this one's two --- spends $84\%$ of a diagnosis in FHE. The cost center has
 crossed back. We note this in favor of the construction rather than against
@@ -717,9 +735,12 @@ cost of one encrypted diagnosis. Because the hybrid is bit-exact, the
 encrypted diagnosis \emph{equals} the plaintext one on every image tested, so
 the accuracy column is simultaneously the encrypted accuracy: privacy costs
 nothing in diagnostic quality. What it costs is $4.9$ s per chest X-ray, of
-which $84\%$ is FHE arithmetic and $0.8$ s is the entire MPC segment
-(import $0.02$ s, ReLU $0.51$ s, max-pool $0.21$ s, argmax $0.02$ s), over
-$27.4$ MB of party-to-party traffic and zero bootstraps.
+which $84\%$ is FHE arithmetic and $0.77$ s is the entire MPC segment
+(import $0.02$ s, ReLU $0.51$ s, max-pool $0.22$ s, argmax $0.01$ s), over
+$27.4$ MB of party-to-party traffic and zero bootstraps. Placing the three
+parties on a wide-area link (RTT $20$ ms, $1$ Gbps) costs $2.1$ s more, of
+which the MPC segment is $0.9$ s: the pipeline is not round-bound, which is
+what the constant-round nonlinearities buy.
 
 \begin{table}[t]
 \centering
@@ -738,10 +759,12 @@ majority-class baseline & $62.50\%$ & $18.48\%$ \\
 accuracy (integer $=$ encrypted) & $\mathbf{84.78\%}$ & $\mathbf{81.18\%}$ \\
 float parent of the same net & $84.78\%$ & $81.03\%$ \\
 \midrule
-latency, \texttt{a2b} nonlinearities & $5.67$ s & $5.96$ s \\
-latency, garbled nonlinearities & $\mathbf{4.94}$ s & $\mathbf{5.17}$ s \\
-\quad of which FHE & $4.15$ s & $4.18$ s \\
-\quad of which MPC & $0.76$ s & $0.97$ s \\
+latency, \texttt{a2b} nonlinearities & $5.71$ s & $5.95$ s \\
+latency, garbled nonlinearities & $\mathbf{4.94}$ s & $\mathbf{5.05}$ s \\
+\quad of which FHE & $4.15$ s & $4.15$ s \\
+\quad of which MPC & $0.77$ s & $0.87$ s \\
+same, WAN (RTT $20$ ms, $1$ Gbps) & $7.00$ s & $7.34$ s \\
+\quad of which MPC & $1.70$ s & $2.01$ s \\
 FHE bootstraps & $0$ & $0$ \\
 \bottomrule
 \end{tabular}

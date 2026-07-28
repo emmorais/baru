@@ -279,7 +279,8 @@ a level-batched fold. Both are bit-exact against the per-element versions.
 | + ABY3 resharing (no triples) | 40.8 s | 29 211 | 10.4 MB |
 | + batched ReLU | 20.7 s | 15 701 | 10.2 MB |
 | + batched max-pool | 6.1 s | 5 591 | 10.0 MB |
-| + batched scheme-switch import | **1.2 s** | **147** | 10.0 MB |
+| + batched scheme-switch import | 1.2 s | 147 | 10.0 MB |
+| + tournament `argmax` | **1.15 s** | **88** | 10.0 MB |
 
 Batching alone was 40.8 → 6.1 s (6.7×) and cut messages 5.2×. The endpoint is
 the payoff: the **private, triple-free** pipeline is now far **faster than the
@@ -301,6 +302,19 @@ MPC protocols are the bottleneck"* did not follow. The cost was in the plumbing
 between the two representations — the part a switch-based construction crosses
 most often, and the part neither the FHE nor the MPC literature owns. The
 per-phase split that `bench-cnn` now prints exists so this is not repeatable.
+
+**The last row is the last *dependent* reduction.** Batching needs independent
+operations, and `gadgets::argmax` folded `nclasses−1` comparisons left to
+right, each waiting on the previous winner. It did the least work of any phase
+and, under latency, took the most time — **1.31 s of a 2.03 s MPC segment at
+RTT 20 ms**. Reassociating the fold into a **tournament** (pair adjacent
+candidates; one `lt_batch` decides a whole level, one `mul_batch` selects both
+value and index) makes it `⌈log₂ n⌉` batched levels instead of `n−1` serial
+ones: **2.4× at RTT 20 ms**, and `bench-cnn --img 8 --rtt-ms 20` as a whole
+3.31 s → 2.45 s. Tie-breaking (first maximum wins) is preserved because the
+bracket pairs adjacent elements in index order — verified **exhaustively** over
+small alphabets, since a tie split across sibling subtrees is precisely what
+random logits never generate.
 
 While batching, one latent bug surfaced and was fixed: the α re-randomiser
 counter (`op_id + i`) could repeat across multiplication rounds once a batch
@@ -1088,8 +1102,9 @@ baru bench-medmnist --dataset all --hybrid 3 --both
 | published ResNet-18 (28×28) | 0.854 | 0.935 |
 | encrypted == plaintext diagnosis | 3/3 | 3/3 |
 | FHE bootstraps | 0 | 0 |
-| latency/diagnosis, `a2b` | 5.67 s | 5.96 s |
-| latency/diagnosis, `--gc` | **4.94 s** | **5.17 s** |
+| latency/diagnosis, `a2b` | 5.71 s | 5.95 s |
+| latency/diagnosis, `--gc` | **4.94 s** | **5.05 s** |
+| same at WAN (`--rtt-ms 20 --bandwidth-mbps 1000`) | 7.00 s | 7.34 s |
 
 Three readings. **Quantisation and encryption are both free**: the integer net
 tracks its float parent to within 0.2 points (agreeing on 99.7% / 98.7% of test
@@ -1099,11 +1114,13 @@ bit-exactly — privacy costs wall-clock, not accuracy.
 sized to fit the depth-1 noise budget, which is enough to match published
 ResNet-18 on pneumonia and 12 points short of it on the 11-class organ task.
 And **the cost centre is now FHE**: of the 4.94 s chest-X-ray diagnosis,
-**4.15 s (84%) is FHE arithmetic** and 0.76 s is the whole MPC segment
-(import 0.02 s, ReLU 0.51 s, pool 0.21 s, argmax 0.02 s). A diagnosis used to
-take ~33 s; the batched scheme-switch import above took it to 5.67 s and
+**4.15 s (84%) is FHE arithmetic** and 0.77 s is the whole MPC segment
+(import 0.02 s, ReLU 0.51 s, pool 0.22 s, argmax 0.01 s). A diagnosis used to
+take ~33 s; the batched scheme-switch import above took it to 5.71 s and
 garbled nonlinearities (`--gc`) to 4.94 s. Anyone optimising this further
-should go to `fhe::bfv`, not to the MPC layer.
+should go to `fhe::bfv`, not to the MPC layer. On a wide-area link
+(RTT 20 ms, 1 Gbps) a diagnosis is 7.00 s — the pipeline is not round-bound,
+and garbling is worth 2.0× on the MPC segment there (3.39 s → 1.70 s).
 
 The same swap applies to the linear-discriminator demo, where the medical
 version runs on every FHE scheme:
@@ -1456,17 +1473,16 @@ pair and prints the ratio, and every run prints the MPC **phase breakdown**
 
 | network | class | bootstraps | total | fhe | mpc | breakdown |
 |---|---|---|---|---|---|---|
-| D=8, rtt=0 | exact ✓ | **0** | 1.21 s | 955 ms | 228 ms | import 6 / relu 42 / pool 46 / argmax 127 ms |
-| D=8, rtt=20 ms | exact ✓ | **0** | 3.31 s | 1.25 s | 2.03 s | import 42 / relu 174 / pool 414 / argmax 1309 ms |
-| D=28, rtt=0 | exact ✓ | **0** | 2.61 s | 1.36 s | 1.23 s | import 8 / relu 624 / pool 466 / argmax 125 ms |
-| D=28, rtt=0, `--gc` | exact ✓ | **0** | **2.06 s** | 1.36 s | 679 ms | import 9 / relu 401 / pool 154 / argmax 106 ms |
+| D=8, rtt=0 | exact ✓ | **0** | 1.17 s | 957 ms | 184 ms | import 8 / relu 47 / pool 59 / argmax 60 ms |
+| D=8, rtt=20 ms | exact ✓ | **0** | 2.45 s | 1.19 s | 1.24 s | import 40 / relu 176 / pool 420 / argmax 546 ms |
+| D=28, rtt=0 | exact ✓ | **0** | 2.54 s | 1.36 s | 1.15 s | import 9 / relu 615 / pool 467 / argmax 55 ms |
+| D=28, rtt=0, `--gc` | exact ✓ | **0** | **1.99 s** | 1.35 s | 609 ms | import 11 / relu 407 / pool 155 / argmax 27 ms |
 
-Two things to read off it. At **rtt=0 the FHE side is now the majority** of
-the run — the reverse of what this section used to claim. And under **WAN
-latency the round-serial `argmax` becomes the single largest phase** (1.3 s
-of 2.0 s at D=8): it folds `nclasses−1` comparisons through scalar `lt`, so
-unlike every other phase it is *not* batched. That is the next obvious fix,
-and the breakdown is what makes it obvious. **Correctness is
+At **rtt=0 the FHE side is now the majority** of the run — the reverse of what
+this section used to claim. The breakdown is also what surfaced the two
+optimizations above: the import row (once 19.1 s) and the argmax row (once
+1.31 s at rtt=20) were both invisible in a segment-level `mpc` total.
+**Correctness is
 exact; accuracy** on a real dataset is the orthogonal ML step — see
 `bench-mnist` (98.89%) and `bench-medmnist` (private diagnosis) above.
 Coefficient packing bounds this to small D; CIFAR-scale needs SIMD-slot conv

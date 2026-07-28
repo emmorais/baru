@@ -79,31 +79,35 @@
 \newlabel{sec:eval@cref}{{[section][8][]8}{[1][7][]7}}
 \citation{FreeXOR}
 \citation{HalfGates}
-\@writefile{lot}{\contentsline {table}{\numberline {2}{\ignorespaces MPC segment of the $28\times 28$ CNN across protocol revisions. Every row is bit-exact against the plaintext reference; only privacy and cost differ. The final row changes no protocol --- only how many round trips carry the same bytes.}}{8}{table.2}\protected@file@percent }
-\newlabel{tab:mpc}{{2}{8}{MPC segment of the $28\times 28$ CNN across protocol revisions. Every row is bit-exact against the plaintext reference; only privacy and cost differ. The final row changes no protocol --- only how many round trips carry the same bytes}{table.2}{}}
+\@writefile{lot}{\contentsline {table}{\numberline {2}{\ignorespaces MPC segment of the $28\times 28$ CNN across protocol revisions. Every row is bit-exact against the plaintext reference; only privacy and cost differ. The last two rows change no protocol --- only how many round trips carry the same bytes. Measured at zero latency, which is where the tournament \texttt  {argmax} looks least impressive: its win is in rounds, and at RTT $20$ ms it is $2.4\times $ on that phase (\Cref  {sec:gc}).}}{8}{table.2}\protected@file@percent }
+\newlabel{tab:mpc}{{2}{8}{MPC segment of the $28\times 28$ CNN across protocol revisions. Every row is bit-exact against the plaintext reference; only privacy and cost differ. The last two rows change no protocol --- only how many round trips carry the same bytes. Measured at zero latency, which is where the tournament \bt {argmax} looks least impressive: its win is in rounds, and at RTT $20$ ms it is $2.4\times $ on that phase (\Cref {sec:gc})}{table.2}{}}
 \newlabel{tab:mpc@cref}{{[table][2][]2}{[1][8][]8}}
 \@writefile{toc}{\contentsline {subsection}{\numberline {8.1}Correctness and the zero-bootstrap invariant}{8}{subsection.8.1}\protected@file@percent }
 \@writefile{toc}{\contentsline {subsection}{\numberline {8.2}The MPC segment: making it private, then fast}{8}{subsection.8.2}\protected@file@percent }
-\@writefile{toc}{\contentsline {subsection}{\numberline {8.3}Comparisons: garbled circuits vs.\ bit decomposition}{8}{subsection.8.3}\protected@file@percent }
-\newlabel{sec:gc}{{8.3}{8}{Comparisons: garbled circuits vs.\ bit decomposition}{subsection.8.3}{}}
-\newlabel{sec:gc@cref}{{[subsection][3][8]8.3}{[1][8][]8}}
 \citation{ASTRA}
 \citation{Yao}
 \@writefile{lot}{\contentsline {table}{\numberline {3}{\ignorespaces One layer of $1352$ comparisons at $20$ bits: garbled circuit vs.\ batched bit decomposition, measured through the identical transport. Both bit-exact.}}{9}{table.3}\protected@file@percent }
 \newlabel{tab:gc}{{3}{9}{One layer of $1352$ comparisons at $20$ bits: garbled circuit vs.\^^Mbatched bit decomposition, measured through the identical transport. Both bit-exact}{table.3}{}}
 \newlabel{tab:gc@cref}{{[table][3][]3}{[1][9][]9}}
-\@writefile{toc}{\contentsline {subsection}{\numberline {8.4}Convolution packing}{9}{subsection.8.4}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {8.3}Comparisons: garbled circuits vs.\ bit decomposition}{9}{subsection.8.3}\protected@file@percent }
+\newlabel{sec:gc}{{8.3}{9}{Comparisons: garbled circuits vs.\ bit decomposition}{subsection.8.3}{}}
+\newlabel{sec:gc@cref}{{[subsection][3][8]8.3}{[1][8][]9}}
+\@writefile{toc}{\contentsline {paragraph}{The last dependent reduction.}{9}{section*.10}\protected@file@percent }
 \citation{MNIST}
-\citation{MedMNIST}
 \@writefile{lot}{\contentsline {table}{\numberline {4}{\ignorespaces Full-test-set accuracy of the deployed integer model, by architecture. All fit the depth-one noise budget ($\text  {nbits}\le 30$). The selected architecture (last row) was subsequently retrained for longer under the same recipe, which is the $98.89\%$ reported; the other rows are from the original sweep, so the column is a comparison of architectures, not of training budgets.}}{10}{table.4}\protected@file@percent }
 \newlabel{tab:arch}{{4}{10}{Full-test-set accuracy of the deployed integer model, by architecture. All fit the depth-one noise budget ($\text {nbits}\le 30$). The selected architecture (last row) was subsequently retrained for longer under the same recipe, which is the $98.89\%$ reported; the other rows are from the original sweep, so the column is a comparison of architectures, not of training budgets}{table.4}{}}
 \newlabel{tab:arch@cref}{{[table][4][]4}{[1][10][]10}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {8.4}Convolution packing}{10}{subsection.8.4}\protected@file@percent }
 \@writefile{toc}{\contentsline {subsection}{\numberline {8.5}Real MNIST: a fully encrypted two-convolution CNN}{10}{subsection.8.5}\protected@file@percent }
 \newlabel{sec:mnist}{{8.5}{10}{Real MNIST: a fully encrypted two-convolution CNN}{subsection.8.5}{}}
 \newlabel{sec:mnist@cref}{{[subsection][5][8]8.5}{[1][10][]10}}
-\@writefile{toc}{\contentsline {subsection}{\numberline {8.6}Private diagnosis: real medical images end to end}{10}{subsection.8.6}\protected@file@percent }
-\newlabel{sec:diagnosis}{{8.6}{10}{Private diagnosis: real medical images end to end}{subsection.8.6}{}}
-\newlabel{sec:diagnosis@cref}{{[subsection][6][8]8.6}{[1][10][]10}}
+\citation{MedMNIST}
+\@writefile{lot}{\contentsline {table}{\numberline {5}{\ignorespaces Private diagnosis on MedMNIST v2. Accuracy is the deployed \emph  {integer} model on the full official test split; the encrypted pipeline reproduces it bit-exactly, so it is also the encrypted accuracy. Latency is one encrypted diagnosis with garbled nonlinearities, single-threaded, no GPU.}}{11}{table.5}\protected@file@percent }
+\newlabel{tab:diagnosis}{{5}{11}{Private diagnosis on MedMNIST v2. Accuracy is the deployed \emph {integer} model on the full official test split; the encrypted pipeline reproduces it bit-exactly, so it is also the encrypted accuracy. Latency is one encrypted diagnosis with garbled nonlinearities, single-threaded, no GPU}{table.5}{}}
+\newlabel{tab:diagnosis@cref}{{[table][5][]5}{[1][11][]11}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {8.6}Private diagnosis: real medical images end to end}{11}{subsection.8.6}\protected@file@percent }
+\newlabel{sec:diagnosis}{{8.6}{11}{Private diagnosis: real medical images end to end}{subsection.8.6}{}}
+\newlabel{sec:diagnosis@cref}{{[subsection][6][8]8.6}{[1][11][]11}}
 \citation{Gazelle}
 \citation{Delphi}
 \citation{CrypTFlow2}
@@ -113,15 +117,6 @@
 \citation{Delphi}
 \citation{Cheetah}
 \citation{CrypTFlow2}
-\@writefile{lot}{\contentsline {table}{\numberline {5}{\ignorespaces Private diagnosis on MedMNIST v2. Accuracy is the deployed \emph  {integer} model on the full official test split; the encrypted pipeline reproduces it bit-exactly, so it is also the encrypted accuracy. Latency is one encrypted diagnosis with garbled nonlinearities, single-threaded, no GPU.}}{11}{table.5}\protected@file@percent }
-\newlabel{tab:diagnosis}{{5}{11}{Private diagnosis on MedMNIST v2. Accuracy is the deployed \emph {integer} model on the full official test split; the encrypted pipeline reproduces it bit-exactly, so it is also the encrypted accuracy. Latency is one encrypted diagnosis with garbled nonlinearities, single-threaded, no GPU}{table.5}{}}
-\newlabel{tab:diagnosis@cref}{{[table][5][]5}{[1][10][]11}}
-\@writefile{toc}{\contentsline {paragraph}{Scope.}{11}{section*.10}\protected@file@percent }
-\@writefile{toc}{\contentsline {subsection}{\numberline {8.7}Positioning against prior inference systems}{11}{subsection.8.7}\protected@file@percent }
-\@writefile{toc}{\contentsline {section}{\numberline {9}Related Work}{11}{section.9}\protected@file@percent }
-\newlabel{sec:related}{{9}{11}{Related Work}{section.9}{}}
-\newlabel{sec:related@cref}{{[section][9][]9}{[1][11][]11}}
-\@writefile{toc}{\contentsline {paragraph}{Hybrid linear-FHE / nonlinear-MPC inference.}{11}{section*.11}\protected@file@percent }
 \citation{Delphi}
 \citation{CHIMERA}
 \citation{PEGASUS}
@@ -135,14 +130,17 @@
 \citation{DucasvanWoerden}
 \@writefile{lot}{\contentsline {table}{\numberline {6}{\ignorespaces Positioning on MNIST. The comparison axis is \emph  {what is hidden}, not accuracy.}}{12}{table.6}\protected@file@percent }
 \newlabel{tab:sota}{{6}{12}{Positioning on MNIST. The comparison axis is \emph {what is hidden}, not accuracy}{table.6}{}}
-\newlabel{tab:sota@cref}{{[table][6][]6}{[1][11][]12}}
-\@writefile{toc}{\contentsline {paragraph}{Preprocessing.}{12}{section*.12}\protected@file@percent }
-\@writefile{toc}{\contentsline {paragraph}{Scheme switching between FHE schemes.}{12}{section*.13}\protected@file@percent }
-\@writefile{toc}{\contentsline {paragraph}{Leveled and bootstrapped FHE.}{12}{section*.14}\protected@file@percent }
-\@writefile{toc}{\contentsline {paragraph}{Overstretched NTRU.}{12}{section*.15}\protected@file@percent }
-\@writefile{toc}{\contentsline {section}{\numberline {10}Limitations}{12}{section.10}\protected@file@percent }
-\newlabel{sec:limitations}{{10}{12}{Limitations}{section.10}{}}
-\newlabel{sec:limitations@cref}{{[section][10][]10}{[1][12][]12}}
+\newlabel{tab:sota@cref}{{[table][6][]6}{[1][12][]12}}
+\@writefile{toc}{\contentsline {paragraph}{Scope.}{12}{section*.11}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {8.7}Positioning against prior inference systems}{12}{subsection.8.7}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {9}Related Work}{12}{section.9}\protected@file@percent }
+\newlabel{sec:related}{{9}{12}{Related Work}{section.9}{}}
+\newlabel{sec:related@cref}{{[section][9][]9}{[1][12][]12}}
+\@writefile{toc}{\contentsline {paragraph}{Hybrid linear-FHE / nonlinear-MPC inference.}{12}{section*.12}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Preprocessing.}{12}{section*.13}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Scheme switching between FHE schemes.}{12}{section*.14}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Leveled and bootstrapped FHE.}{12}{section*.15}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Overstretched NTRU.}{12}{section*.16}\protected@file@percent }
 \bibstyle{plain}
 \bibdata{references}
 \bibcite{HEStandard}{1}
@@ -150,15 +148,18 @@
 \bibcite{AsharovMHE}{3}
 \bibcite{Beaver}{4}
 \bibcite{YASHE}{5}
+\@writefile{toc}{\contentsline {section}{\numberline {10}Limitations}{13}{section.10}\protected@file@percent }
+\newlabel{sec:limitations}{{10}{13}{Limitations}{section.10}{}}
+\newlabel{sec:limitations@cref}{{[section][10][]10}{[1][12][]13}}
+\@writefile{toc}{\contentsline {section}{\numberline {11}Conclusion}{13}{section.11}\protected@file@percent }
+\newlabel{sec:conclusion}{{11}{13}{Conclusion}{section.11}{}}
+\newlabel{sec:conclusion@cref}{{[section][11][]11}{[1][13][]13}}
 \bibcite{CHIMERA}{6}
 \bibcite{BGV}{7}
 \bibcite{Canetti}{8}
 \bibcite{ASTRA}{9}
 \bibcite{CKKS}{10}
 \bibcite{TFHE}{11}
-\@writefile{toc}{\contentsline {section}{\numberline {11}Conclusion}{13}{section.11}\protected@file@percent }
-\newlabel{sec:conclusion}{{11}{13}{Conclusion}{section.11}{}}
-\newlabel{sec:conclusion@cref}{{[section][11][]11}{[1][12][]13}}
 \bibcite{DamgardNielsen}{12}
 \bibcite{SPDZ}{13}
 \bibcite{DucasvanWoerden}{14}

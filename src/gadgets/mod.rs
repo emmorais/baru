@@ -95,21 +95,69 @@ pub fn relu_ref(xs: &[i64]) -> Vec<i64> {
 /// maximum element, at bit width `nbits`. The caller reveals it to learn
 /// the predicted class — nothing else about the logits leaks.
 ///
-/// Scans left to right tracking `(best_value, best_index)` as shares; at
-/// each step a single comparison decides whether to adopt the new element
-/// (strictly greater ⇒ adopt, so ties keep the earlier index, matching
-/// [`argmax_ref`]). `n − 1` comparisons for `n` classes.
+/// Reduces as a **tournament**: pair adjacent `(value, index)` candidates,
+/// decide every pair of a level with one [`Backend::lt_batch`], and select
+/// both the surviving value and its index with one [`Backend::mul_batch`].
+/// That is `⌈log₂ n⌉` levels of two batched operations each, against the
+/// `n − 1` sequential comparisons a left fold costs.
+///
+/// The round count is why. A left fold's comparisons are *dependent* — each
+/// needs the previous winner — so they cannot batch, and at `n = 10` classes
+/// this gadget was the single largest phase of the MPC segment under WAN
+/// latency (1.31 s of a 2.03 s segment at RTT 20 ms), despite doing less work
+/// than any other. Every other layer of the pipeline had been batched; this
+/// one could not be, until the reduction was reassociated into a tree.
+/// Measured after: `1309 ms → 546 ms` at RTT 20 ms (2.4×), `127 ms → 60 ms`
+/// at zero latency, and the `bench-cnn --img 8 --rtt-ms 20` run as a whole
+/// `3309 ms → 2453 ms`.
+///
+/// **Ties keep the earlier index**, matching [`argmax_ref`]: a pair adopts
+/// the right element only on `left < right` (strict), and the bracket pairs
+/// adjacent elements in order, so every element of a left subtree has a
+/// smaller index than every element of its right sibling. An odd element at
+/// the end of a level carries forward unpaired, which preserves that order.
 pub fn argmax(be: &mut dyn Backend, xs: &[ShareRef], nbits: usize) -> ShareRef {
     assert!(!xs.is_empty(), "argmax: empty input");
-    let mut best_val = xs[0].clone();
-    let mut best_idx = be.share_public(0, nbits);
-    for (i, x) in xs.iter().enumerate().skip(1) {
-        let adopt = be.lt(&best_val, x); // 1 iff best_val < x
-        best_val = mux(be, &adopt, x, &best_val);
-        let idx_i = be.share_public(i as u128, nbits);
-        best_idx = mux(be, &adopt, &idx_i, &best_idx);
+    if xs.len() == 1 {
+        return be.share_public(0, nbits);
     }
-    best_idx
+    let mut vals: Vec<ShareRef> = xs.to_vec();
+    let mut idxs: Vec<ShareRef> =
+        (0..xs.len()).map(|i| be.share_public(i as u128, nbits)).collect();
+
+    while vals.len() > 1 {
+        let m = vals.len() / 2; // pairs this level; a trailing odd element carries
+        let pairs: Vec<(ShareRef, ShareRef)> =
+            (0..m).map(|k| (vals[2 * k].clone(), vals[2 * k + 1].clone())).collect();
+        // adoptₖ = 1 iff left < right, i.e. the right element wins the pair.
+        let adopt = be.lt_batch(&pairs);
+
+        // Select value and index off the *same* condition bit. Both muxes go
+        // into one `mul_batch`, so a level costs one comparison round plus one
+        // multiplication round no matter how wide it is.
+        let mut mul_pairs: Vec<(ShareRef, ShareRef)> = Vec::with_capacity(2 * m);
+        for (k, cond) in adopt.iter().enumerate() {
+            let dv = be.sub(&vals[2 * k + 1], &vals[2 * k]);
+            let di = be.sub(&idxs[2 * k + 1], &idxs[2 * k]);
+            mul_pairs.push((cond.clone(), dv));
+            mul_pairs.push((cond.clone(), di));
+        }
+        let sels = be.mul_batch(&mul_pairs);
+
+        let mut next_vals = Vec::with_capacity(m + 1);
+        let mut next_idxs = Vec::with_capacity(m + 1);
+        for k in 0..m {
+            next_vals.push(be.add(&vals[2 * k], &sels[2 * k]));
+            next_idxs.push(be.add(&idxs[2 * k], &sels[2 * k + 1]));
+        }
+        if vals.len() % 2 == 1 {
+            next_vals.push(vals[vals.len() - 1].clone());
+            next_idxs.push(idxs[idxs.len() - 1].clone());
+        }
+        vals = next_vals;
+        idxs = next_idxs;
+    }
+    idxs.pop().expect("argmax: tournament must leave one candidate")
 }
 
 pub fn argmax_ref(xs: &[i64]) -> usize {
@@ -419,6 +467,51 @@ mod tests {
         }
     }
 
+    /// The tournament reduction must break ties to the *first* maximum, like
+    /// [`argmax_ref`] and like the left fold it replaced. Exhaustive over
+    /// small alphabets, because tie-breaking is exactly the property a tree
+    /// reassociation can silently get wrong, and it only shows up when the
+    /// same maximum appears in two different subtrees. Odd lengths are
+    /// included on purpose: they exercise the unpaired element that carries
+    /// forward a level.
+    #[test]
+    fn argmax_breaks_ties_to_first_over_every_small_input() {
+        fn all_vectors(len: usize, alphabet: &[i64], out: &mut Vec<Vec<i64>>) {
+            let mut v = vec![alphabet[0]; len];
+            loop {
+                out.push(v.clone());
+                let mut i = 0;
+                loop {
+                    if i == len {
+                        return;
+                    }
+                    let pos = alphabet.iter().position(|&a| a == v[i]).unwrap();
+                    if pos + 1 < alphabet.len() {
+                        v[i] = alphabet[pos + 1];
+                        break;
+                    }
+                    v[i] = alphabet[0];
+                    i += 1;
+                }
+            }
+        }
+
+        let mut cases: Vec<Vec<i64>> = Vec::new();
+        for len in 1..=8 {
+            all_vectors(len, &[0, 1], &mut cases);
+        }
+        for len in 1..=5 {
+            all_vectors(len, &[-1, 0, 2], &mut cases);
+        }
+        for xs in &cases {
+            let mut be = Aby3Backend::new();
+            let shares = share_vec(&mut be, xs);
+            let idx = argmax(&mut be, &shares, NBITS);
+            let got = to_signed(be.reveal(&idx, None)) as usize;
+            assert_eq!(got, argmax_ref(xs), "argmax {xs:?}");
+        }
+    }
+
     #[test]
     fn argmax_matches_reference_and_breaks_ties_to_first() {
         let cases: &[&[i64]] = &[
@@ -427,6 +520,9 @@ mod tests {
             &[10, 20, 30, 25],
             &[7, 7, 7],       // all equal -> index 0
             &[1],
+            &[9, 1, 2, 3, 4, 5, 6, 7, 8],  // odd length, max first
+            &[1, 2, 3, 4, 5, 6, 7, 8, 9],  // odd length, max last
+            &[5, 1, 5, 1, 5],              // ties across sibling subtrees
         ];
         for xs in cases {
             let mut be = Aby3Backend::new();

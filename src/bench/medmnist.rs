@@ -48,13 +48,16 @@
 //! | encrypted == plaintext diagnosis | 3/3 | 3/3 |
 //! | FHE bootstraps | 0 | 0 |
 //! | plaintext modulus | 2^20 | 2^22 |
-//! | latency/diagnosis, `a2b` | 5.67 s | 5.96 s |
-//! | latency/diagnosis, `--gc` | **4.94 s** | **5.17 s** |
+//! | latency/diagnosis, `a2b` | 5.71 s | 5.95 s |
+//! | latency/diagnosis, `--gc` | **4.94 s** | **5.05 s** |
+//! | same, WAN (`--rtt-ms 20 --bandwidth-mbps 1000`) | 7.00 s | 7.34 s |
 //!
 //! Cost of one encrypted pneumonia diagnosis under `--gc`: **4.94 s**, of
-//! which FHE is 4.15 s (**84%**) and the whole MPC segment 0.76 s (import
-//! 0.02 s, ReLU 0.51 s, pool 0.21 s, argmax 0.02 s), over 27.4 MB of
-//! party-to-party traffic.
+//! which FHE is 4.15 s (**84%**) and the whole MPC segment 0.77 s (import
+//! 0.02 s, ReLU 0.51 s, pool 0.22 s, argmax 0.01 s), over 27.4 MB of
+//! party-to-party traffic. At RTT 20 ms / 1 Gbit/s the diagnosis is 7.00 s
+//! and the MPC segment 1.70 s, so garbling is worth 2.0× there against
+//! `a2b`'s 3.39 s — latency is where the constant-round protocol pays.
 //!
 //! Two things to read off that table. **Quantisation is free**: the integer
 //! net matches its float parent to within 0.2 points, agreeing with it on
@@ -342,6 +345,8 @@ options:
                   circuits instead of batched bit decomposition (same
                   function, bit-exact; constant-round)
   --both          report both nonlinearity protocols
+  --rtt-ms N            round-trip latency between parties (default 0)
+  --bandwidth-mbps X    link bandwidth in Mbit/s (default: unlimited)
   --json          machine-readable output
   -h, --help      this message
 ";
@@ -405,6 +410,8 @@ pub fn run_cli(args: &[String]) -> Result<(), String> {
     let mut json = false;
     let mut nonlin = Nonlin::A2b;
     let mut both = false;
+    let mut rtt_ms = 0u64;
+    let mut bandwidth_mbps: Option<f64> = None;
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -419,6 +426,21 @@ pub fn run_cli(args: &[String]) -> Result<(), String> {
             "--json" => json = true,
             "--gc" => nonlin = Nonlin::Gc,
             "--both" => both = true,
+            "--rtt-ms" => {
+                rtt_ms = it
+                    .next()
+                    .ok_or("--rtt-ms needs a value")?
+                    .parse()
+                    .map_err(|_| "bad --rtt-ms")?;
+            }
+            "--bandwidth-mbps" => {
+                bandwidth_mbps = Some(
+                    it.next()
+                        .ok_or("--bandwidth-mbps needs a value")?
+                        .parse()
+                        .map_err(|_| "bad --bandwidth-mbps")?,
+                );
+            }
             "-h" | "--help" => {
                 println!("{USAGE}");
                 return Ok(());
@@ -438,10 +460,14 @@ pub fn run_cli(args: &[String]) -> Result<(), String> {
     } else {
         vec![nonlin]
     };
+    let mut profile = NetworkProfile::fixed_latency(std::time::Duration::from_micros(rtt_ms * 500));
+    if let Some(mbps) = bandwidth_mbps {
+        profile = profile.with_bandwidth(mbps * 1e6 / 8.0);
+    }
     let mut reports = Vec::new();
     for n in &names {
         for p in &protocols {
-            reports.push(run(n, hybrid_n, NetworkProfile::INSTANT, *p)?);
+            reports.push(run(n, hybrid_n, profile, *p)?);
         }
     }
 
