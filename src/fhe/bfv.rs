@@ -274,6 +274,36 @@ impl Bfv {
         BfvCt { c }
     }
 
+    /// Multiply a ciphertext by a **plaintext** polynomial: every component
+    /// times `m`, no rescaling and no relinearization.
+    ///
+    /// Decryption computes `round(t/q · Σ cᵢ sⁱ)`, so scaling the whole
+    /// ciphertext by an unscaled `m` scales the message: `Δ·m₀ · m ⇒ m₀·m`.
+    /// The ciphertext degree is untouched, so unlike [`Bfv::mul`] this does not
+    /// consume the one multiplication the depth-1 parameters allow — it is what
+    /// makes single-server PIR ([`crate::pir`]) a depth-0 operation.
+    ///
+    /// The plaintext is **centered** into `(−t/2, t/2]` first. That is exact
+    /// rather than merely convenient: `q = Δ·t` here, so `Δ·m₀·t ≡ 0 (mod q)`
+    /// and subtracting `t` from a coefficient changes nothing mod `q` — while
+    /// halving the coefficient magnitude that noise growth is proportional to.
+    pub fn mul_plain_poly(&self, ct: &BfvCt, m: &[u64]) -> BfvCt {
+        let p = &self.params;
+        let mask = p.q_mask();
+        let t = p.t();
+        let half_t = (t >> 1) as i128;
+        let mp: Poly = (0..p.n)
+            .map(|i| {
+                let v = (*m.get(i).unwrap_or(&0) & (t - 1)) as i128;
+                let centered = if v > half_t { v - t as i128 } else { v };
+                (centered as u128) & mask
+            })
+            .collect();
+        BfvCt {
+            c: ct.c.iter().map(|ci| poly_mul_mod(ci, &mp, p)).collect(),
+        }
+    }
+
     pub fn add(&self, a: &BfvCt, b: &BfvCt) -> BfvCt {
         let mask = self.params.q_mask();
         let n = a.c.len().max(b.c.len());

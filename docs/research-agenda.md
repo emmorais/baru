@@ -46,7 +46,7 @@ Two hospitals and a model owner; nobody trusts the others with raw data.
 | # | Stage | The privacy problem | Layer in Baru | Status |
 |---|---|---|---|---|
 | 1 | *"How many patients aged 40–60 with HbA1c > 7?"* | cohort selection over records at rest | BaruDB (DET + ORE) | ✅ measured — `baru bench-cohort` |
-| 2 | *Fetch record `r` for review* | the **access pattern** leaks who is interesting | **PIR** | 🔨 |
+| 2 | *Fetch record `r` for review* | the **access pattern** leaks who is interesting | **PIR** | ⚠️ built + measured (`baru bench-pir`), and it **loses to downloading the database** — §3a |
 | 3 | *Which patients appear at both hospitals?* | linkage without disclosure | **PSI** (from OT) | 🔨 |
 | 4 | *Classify this scan* | image + model both private | MPC / FHE / hybrid | ✅ measured on real biomedical images — `baru bench-medmnist` (§3) |
 | 5 | *Train on the union of both cohorts* | cross-institution learning | MPC (Shamir / SPDZ2k) | partial (`bench/train`) |
@@ -162,6 +162,60 @@ Honest caveat to state in the paper: MedMNIST is pre-processed and small;
 clinical-grade imaging is 512³ volumes. The claim is about *cost structure*, and
 the scaling argument has to be made analytically — which is what the cost model
 is for.
+
+---
+
+## 3a. Stage 2: PIR is built, measured, and not yet worth using
+
+Done 2026-07-28: `src/pir/` implements the textbook single-server scheme over
+the BFV already in the tree, and `baru bench-pir` measures it. The database is
+one plaintext polynomial per shard, the query is an encrypted monomial, and
+because `xⁿ = −1` a single plaintext-ciphertext multiply drops the wanted record
+into the low coefficients. One round, `O(1)` query, no server key, and **zero
+multiplicative depth** — so it composes with the depth-1 pipeline without a
+bootstrap.
+
+And it is the wrong tool, which is worth reporting rather than hiding. Measured
+at n=4096, q=2^100, t=2^20, 256-byte records:
+
+| records | shards | query | answer | whole-db download | PIR ÷ whole-db |
+|---|---|---|---|---|---|
+| 32 | 1 | 104 KB | 104 KB | 8 KB | 0.04× |
+| 256 | 8 | 104 KB | 832 KB | 64 KB | 0.07× |
+| 2048 | 64 | 104 KB | 6.5 MB | 512 KB | 0.08× |
+
+Retrieval is correct at every size (checked against the plaintext database), and
+the ratio is converging to `1/13`, not improving with scale. The reason is
+structural:
+
+```text
+expansion = 2·⌈log₂q/8⌉ / ⌊log₂t/8⌋ = 13×
+```
+
+One response ciphertext costs 13× the *entire plaintext content* of the shard
+that produced it, and the scheme returns one response per shard. So its traffic
+is ~13× a whole-database download **regardless of N** — there is no crossover to
+find, and no parameter choice inside this construction finds one, because the
+expansion factor is a property of the ciphertext, not of the database.
+
+**By the admission rule in this document, PIR has therefore not earned stage 2.**
+A primitive enters when it is the cheapest way to serve a stage; here the
+cheapest way to hide the access pattern is still to download the shard. Keeping
+the code is justified by what it *does* establish — a correct implementation, a
+measured baseline, and a specific next step — but the workflow table says ⚠️,
+not ✅, and the paper should say so too.
+
+The specific next step is **recursion with server-side query expansion**
+(SealPIR): fold the shard dimension on the server so the response is `O(1)`
+ciphertexts while `N` grows. That needs Galois automorphisms and a substitution
+operation `src/fhe/bfv.rs` does not have, and it is real work rather than the
+"few hundred lines" this document previously estimated for the whole item.
+
+There is a second, cheaper lever worth measuring first: the expansion factor is
+`2·log₂q / log₂t`, so raising `t` shrinks it directly. At `t = 2^40` it would be
+5×, still above 1. That confirms expansion alone cannot rescue the scheme and
+recursion is doing the essential work — which is the sort of thing the cost model
+should be used to check *before* writing the automorphisms.
 
 ---
 
@@ -284,8 +338,14 @@ Ordered by value per unit of work, with the dependency structure respected.
    binding constraint on the whole agenda.
 4. **Cohort queries in BaruDB** (stage 1). Mostly a schema and a query-shape
    question; BaruDB already has ORE.
-5. **PIR** (stage 2). Start with the textbook single-server lattice PIR over the
-   existing BFV — it reuses `src/fhe/bfv.rs` and is a few hundred lines.
+5. ~~**PIR** (stage 2), textbook single-server over the existing BFV~~ — **done
+   2026-07-28, with a negative result** (§3a): correct, but ~13× *worse* than
+   downloading the database at every size, because ciphertext expansion exceeds
+   the database-to-response ratio. The follow-on is SealPIR-style recursion with
+   server-side query expansion (Galois automorphisms + substitution in
+   `src/fhe/bfv.rs`) — and the estimate for *that* is not a few hundred lines.
+   Worth doing only if stage 2 stays in the story; the cost model now says the
+   dull answer wins today.
 6. **OT + PSI** (stage 3). OT is also what Semi2k/MASCOT preprocessing needs, so
    it pays twice.
 7. **ORAM** (stage 6). Path ORAM over the storage layer. Largest of these; do it

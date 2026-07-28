@@ -39,3 +39,6 @@ pub mod mpcc;
 
 /// Encrypted experiment store (BaruDB client + local JSONL fallback).
 pub mod db;
+
+/// Private information retrieval — fetch a record without revealing which.
+pub mod pir;
