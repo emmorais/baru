@@ -1599,6 +1599,33 @@ MNIST scores bit-identical, all 18 FHE differential tests pass (real TFHE and
 SEAL CKKS included). At TFHE's ~0.2–0.5 s/gate, those 601 gates are minutes
 per run.
 
+### The same program, a different circuit per backend (`baru bench-backend-aware`)
+
+The claim nobody else makes. MP-SPDZ optimizes rounds and is blind to FHE; FHE
+compilers optimize multiplicative depth and are blind to MPC; HyCC → Silph →
+SING assign *protocols* to parts of a program but do not rewrite the circuit
+differently per target.
+
+One program, optimized once per backend, then every circuit priced under every
+backend (WAN, 3 parties, n=8, all differentially verified):
+
+```
+max-fold        as shamir  as semi-bin     as bmr    rules kept
+  shamir       1453.010ms*  3761.043ms   281.564ms   reassociate-reduction
+  semi-bin     1453.010ms   3761.043ms*  281.564ms   reassociate-reduction
+  bmr          3253.010ms   8761.043ms   281.564ms*  -
+```
+
+`*` marks each circuit under the backend it was optimized for. **The same
+rewrite is a 2.24× win under Shamir and worth nothing under BMR** — depth is
+the round count for an interactive protocol and free for a constant-round
+garbled one — so the optimizer keeps it for one and declines it for the other.
+Running BMR's circuit under Shamir costs 2.24×.
+
+Across `relu-layer`, `max-fold` and `dot-const`: **2, 2 and 3 distinct
+circuits from one program**, worst wrong-circuit penalties 1.66× / 2.33× /
+1.81×. The command fails if the diagonal is ever beaten.
+
 ### A whole network: hand-written vs compiled (`baru bench-compiled-nn`)
 
 The question the circuit-optimization paper is actually about. Same network —

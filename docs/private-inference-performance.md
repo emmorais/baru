@@ -445,6 +445,8 @@ Key tests to keep green when touching any of this:
 | `compiled_and_hand_written_agree_on_the_whole_network` | the compiled route computes the network |
 | `compound_reduction_rebalances_and_stays_exact` | the reduction rewrite is exact and cuts depth |
 | `a_non_associative_reduction_is_left_alone` | it refuses non-associative operators |
+| `each_backend_prefers_its_own_circuit` | the cross-application diagonal wins |
+| `some_workload_produces_genuinely_different_circuits` | divergence is real, not nominal |
 | `batched_input_sharing_matches_the_scalar_protocol` | batched == scalar sharing |
 
 ---
@@ -462,6 +464,7 @@ Key tests to keep green when touching any of this:
 | abstraction-cost bench | `bench::abstraction` (`baru bench-abstraction`) |
 | circuit-quality bench | `bench::circuit` (`baru bench-circuit`) |
 | compiled-vs-handwritten NN | `bench::compiled_nn` (`baru bench-compiled-nn`) |
+| backend-aware divergence | `bench::backend_aware` (`baru bench-backend-aware`) |
 | level-batched circuit executor | `mpcc::exec::run_flat` |
 | interactive-call counter | `TransportBackend::interactive_calls` |
 | shared FlatOp passes | `zkp::circuit_compiler::{cse, rename}`, `CircuitCompiler::fold_constants` |

@@ -263,7 +263,45 @@ honestly where it is parity.
 does auto-batching contribute, what does CSE contribute, what does
 reassociation contribute, what does assignment contribute.
 
-### Phase 3 — the novel claim (backend-aware divergence)
+### ~~Phase 3 — the novel claim~~ DONE 2026-07-28
+
+`baru bench-backend-aware` builds the **cross-application matrix**: optimize
+one program once per backend, then price *every* resulting circuit under
+*every* backend. Divergence alone would be unconvincing (circuits could differ
+in ways nobody pays for); the matrix shows the diagonal winning its own
+column, and the command **fails** if it ever does not.
+
+WAN, 3 parties, n=8, every optimized circuit differentially verified:
+
+```
+max-fold        as shamir  as semi-bin     as bmr    rules kept
+  shamir       1453.010ms*  3761.043ms   281.564ms   reassociate-reduction
+  semi-bin     1453.010ms   3761.043ms*  281.564ms   reassociate-reduction
+  bmr          3253.010ms   8761.043ms   281.564ms*  -
+```
+
+**This single row is the paper's figure.** The *same* rewrite —
+`reassociate-reduction` — is a **2.24× win under Shamir and worth exactly
+nothing under BMR**, so the optimizer keeps it for one and declines it for the
+other. Running BMR's circuit under Shamir costs 2.24×. Depth is the round
+count for an interactive protocol and free for a constant-round garbled one;
+the search does not need to be told this, `objective` prices it.
+
+Across the three workloads: **2, 2 and 3 distinct circuits from one program**,
+with worst wrong-circuit penalties of 1.66×, 2.33× and 1.81×. `dot-const`
+diverges fully — three backends, three different circuits — because strength
+reduction pays per AND gate for binary/garbled backends and is a loss for an
+arithmetic one where multiplying by a constant is already local.
+
+Two details worth keeping in the paper:
+
+- **Declining is a result.** Where a row keeps no rules, that backend wanted
+  the original circuit. An optimizer that always rewrites is not being
+  selective, it is being busy.
+- **Op count is a bad divergence metric** — reassociation changes shape while
+  preserving count — so distinct circuits are counted by content fingerprint.
+
+### Phase 3 (original notes)
 
 Thesis S's last clause is the part nobody else does: *the same program is
 optimized differently depending on which backend it targets.* MP-SPDZ

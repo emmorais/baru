@@ -901,6 +901,7 @@ mod tests {
 }
 
 pub mod abstraction;
+pub mod backend_aware;
 pub mod circuit;
 pub mod compiled_nn;
 pub mod ckks_compare;

@@ -81,7 +81,13 @@ impl Net {
         let hidden: Vec<i64> = self
             .w1
             .iter()
-            .map(|row| row.iter().zip(&self.x).map(|(w, x)| w * x).sum::<i64>().max(0))
+            .map(|row| {
+                row.iter()
+                    .zip(&self.x)
+                    .map(|(w, x)| w * x)
+                    .sum::<i64>()
+                    .max(0)
+            })
             .collect();
         self.w2
             .iter()
@@ -263,7 +269,14 @@ pub fn run(n: usize, h: usize, c: usize, nbits: usize, rtts: &[u64]) -> Result<R
         routes.push(route(name, body, expected, nbits, rtts, Some(ops)));
     }
 
-    Ok(Report { n, hidden: h, classes: c, nbits, expected, routes })
+    Ok(Report {
+        n,
+        hidden: h,
+        classes: c,
+        nbits,
+        expected,
+        routes,
+    })
 }
 
 fn route<F>(
@@ -342,7 +355,11 @@ pub fn run_cli(args: &[String]) -> Result<(), String> {
                     .next()
                     .ok_or("--rtt-ms needs a value")?
                     .split(',')
-                    .map(|s| s.trim().parse::<u64>().map_err(|_| "bad --rtt-ms".to_string()))
+                    .map(|s| {
+                        s.trim()
+                            .parse::<u64>()
+                            .map_err(|_| "bad --rtt-ms".to_string())
+                    })
                     .collect::<Result<_, _>>()?
             }
             "--json" => json = true,
@@ -356,7 +373,10 @@ pub fn run_cli(args: &[String]) -> Result<(), String> {
 
     let r = run(n, h, c, nbits, &rtts)?;
     if json {
-        println!("{}", serde_json::to_string_pretty(&r).map_err(|e| e.to_string())?);
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&r).map_err(|e| e.to_string())?
+        );
         return Ok(());
     }
 
@@ -385,7 +405,9 @@ pub fn run_cli(args: &[String]) -> Result<(), String> {
             "  {:<18} {:>7} {:>12} {:>10} {:>12}",
             p.route,
             p.ops.map(|o| o.to_string()).unwrap_or_else(|| "-".into()),
-            p.rounds.map(|o| o.to_string()).unwrap_or_else(|| "-".into()),
+            p.rounds
+                .map(|o| o.to_string())
+                .unwrap_or_else(|| "-".into()),
             p.messages,
             p.bytes
         );
@@ -394,7 +416,10 @@ pub fn run_cli(args: &[String]) -> Result<(), String> {
         }
         println!();
     }
-    println!("\n  all routes reproduce the plaintext reference ({})", r.expected);
+    println!(
+        "\n  all routes reproduce the plaintext reference ({})",
+        r.expected
+    );
     let g = &r.routes[0];
     let rtt = g.ms_by_rtt.last().unwrap().0;
     for p in r.routes.iter().skip(1) {
@@ -421,7 +446,11 @@ mod tests {
     fn compiled_and_hand_written_agree_on_the_whole_network() {
         let r = run(8, 4, 3, 32, &[0]).unwrap();
         for p in &r.routes {
-            assert!(p.correct, "route `{}` disagrees with the reference", p.route);
+            assert!(
+                p.correct,
+                "route `{}` disagrees with the reference",
+                p.route
+            );
         }
     }
 }
