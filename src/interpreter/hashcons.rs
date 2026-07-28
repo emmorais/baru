@@ -1,4 +1,4 @@
-//! Content-addressed hash-consing store (Lurk-style).
+//! Content-addressed hash-consing store.
 //!
 //! Every value — runtime datum, AST node, environment — is interned into a
 //! tagged node keyed by the hash of its canonical content.  Two things follow:
