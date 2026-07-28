@@ -229,8 +229,14 @@ validates the Gilboa derivation. Note `engine_supports`: the protocol is n-party
 but this implementation is 2-party, because Gilboa OLE is pairwise, and the registry
 describes the protocol while `engine_supports` describes what is built.
 
-Remaining: the existing ABY3 transport backend re-expressed as a `ShareEngine`, a
-LAN/WAN measurement harness so the latency and bandwidth terms get calibrated too,
+**The measurement harness landed 2026-07-28** (`baru bench-net`): the cost formula
+`rounds × latency + bytes / bandwidth` validated against a real loopback TCP socket
+to within 13.6% worst case and under 1% mid-range, with the link's own constants
+measured rather than assumed. So the *shape* of the model is no longer an
+assumption. What remains is that the constants are loopback's, not a WAN's.
+
+Remaining: the existing ABY3 transport backend re-expressed as a `ShareEngine`,
+WAN-link constants measured on a real WAN,
 a CPU term for preprocessing (`ot_cost::US_PER_OT` is measured and recorded but
 unused), and an n-party Semi2k (n(n−1) cross terms).
 

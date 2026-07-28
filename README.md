@@ -1644,6 +1644,10 @@ src/
                        bytes/OT (the input the MPC offline cost model needs)
     layer.rs        — `baru bench-layer`: the measured MPC<->FHE crossover for one
                        private layer (hybrid wins from width 64 vs Semi2k)
+    net.rs          — `baru bench-net`: validates the cost formula (rounds x
+                       latency + bytes/bw) against a real TCP socket
+    cohort_eval.rs  — `baru bench-cohort-eval`: cohort-conditioned private
+                       evaluation — stage 1 composed with stage 4
     psi.rs          — `baru bench-psi`: DH-PSI measured, the insecure hash
                        baseline, and the OT route priced from measured OT cost
     fhe_innerprod.rs— `baru bench-fhe-innerprod`: BFV (secure) vs SI-NTRU

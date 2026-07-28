@@ -51,6 +51,9 @@ fn main() -> Result<(), Box<dyn Error>> {
     if args.first().map(String::as_str) == Some("bench-mnist") {
         return baru::bench::mnist::run_cli(&args[1..]).map_err(|e| e.into());
     }
+    if args.first().map(String::as_str) == Some("bench-net") {
+        return baru::bench::net::run_cli(&args[1..]).map_err(|e| e.into());
+    }
     if args.first().map(String::as_str) == Some("bench-layer") {
         return baru::bench::layer::run_cli(&args[1..]).map_err(|e| e.into());
     }
@@ -74,6 +77,9 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
     if args.first().map(String::as_str) == Some("bench-train") {
         return baru::bench::train::run_cli(&args[1..]).map_err(|e| e.into());
+    }
+    if args.first().map(String::as_str) == Some("bench-cohort-eval") {
+        return baru::bench::cohort_eval::run_cli(&args[1..]).map_err(|e| e.into());
     }
     if args.first().map(String::as_str) == Some("bench-cohort") {
         return baru::bench::cohort::run_cli(&args[1..]).map_err(|e| e.into());

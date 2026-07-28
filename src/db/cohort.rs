@@ -152,10 +152,50 @@ impl CohortDb {
         ))
     }
 
+    /// Which rows match `predicate`.
+    ///
+    /// A strictly larger disclosure than [`CohortDb::cohort_count`], and only
+    /// appropriate where the caller is the data owner. The deployment this serves
+    /// is `bench-cohort-eval`: the **hospital** selects a cohort out of its own
+    /// records — so learning which of its own patients matched reveals nothing it
+    /// did not already know — and the encrypted store learns nothing either way.
+    /// The *model owner* never sees ids, only the cohort size, which is what makes
+    /// the downstream private inference meaningful.
+    ///
+    /// Do not reach for this where the querier is not the data owner; that is what
+    /// `cohort_count` is for.
+    pub fn cohort_ids(&self, table: &str, predicate: &str) -> Result<(Vec<u64>, Timing), String> {
+        let args = vec![
+            "cohort".to_string(),
+            "--table".to_string(),
+            table.to_string(),
+            "--where".to_string(),
+            predicate.to_string(),
+            "--ids".to_string(),
+            "--timing".to_string(),
+        ];
+        let out = self.cli.run(&args, None)?;
+        let v = self.cli.json(&out, "cohort")?;
+        let ids = v
+            .get("ids")
+            .and_then(Value::as_array)
+            .ok_or_else(|| format!("barudb cohort --ids returned no ids: {}", out))?
+            .iter()
+            .map(|x| {
+                // BaruDB returns row ordinals in insertion order, which is what
+                // lets a caller line them up against its own records.
+                x.as_u64()
+                    .ok_or_else(|| format!("cohort id was not an integer: {x}"))
+            })
+            .collect::<Result<Vec<u64>, String>>()?;
+        Ok((ids, Timing::parse(&v)))
+    }
+
     /// How many rows match `predicate`.
     ///
-    /// Only a count — returning row ids is a larger disclosure, and the
-    /// benchmark has no need of it.
+    /// Only a count — returning row ids is a larger disclosure; use
+    /// [`CohortDb::cohort_ids`] where the caller is the data owner and genuinely
+    /// needs them.
     pub fn cohort_count(&self, table: &str, predicate: &str) -> Result<(u64, Timing), String> {
         let args = vec![
             "cohort".to_string(),

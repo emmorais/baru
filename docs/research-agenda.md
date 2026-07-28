@@ -325,20 +325,51 @@ for and what no single-technology system can do:
   attributed per stage, under one cost model. That is Thesis (S) applied to a
   pipeline rather than to a single program.
 
-### The first deliverable
+### Done 2026-07-28 — `baru bench-cohort-eval`
 
-`baru bench-cohort-eval`: attach records to the MedMNIST test images, select a
-cohort with an encrypted predicate, run the encrypted classifier over exactly
-that cohort, and report per-cohort accuracy — checked against the plaintext
-computation, like every other benchmark here. Report cost attributed per stage
-(selection vs inference), because the interesting result is almost certainly that
-**selection is free and inference is everything**, which is the §2 table showing
-up *inside* one query.
+```
+predicate            : age>=40 and age<=60 and hba1c>7.00  (over ENCRYPTED attributes)
+records / cohort     : 300 / 66  (22.0% selected)
+cohorts agree        : yes  (encrypted == plaintext BaruDB == local filter)
+
+accuracy on cohort   : 52/66 = 78.79%
+accuracy overall     : 85.00%
+cohort std. error    : ±5.0 points on 66 patients — the gap is 1.2 SE, i.e. noise
+
+cost, by stage:
+  stage 1 ingest     : 126.7 ms for 300 records
+  stage 1 selection  : 16.5 ms
+  stage 4 inference  : 32626 ms per image, encrypted  (1/1 matched plaintext, 0 bootstraps)
+```
+
+**Selecting the entire cohort costs ~1900× less than classifying one member of
+it.** The §2 headline — that the price of privacy is wildly non-uniform across a
+pipeline — is now visible *inside a single query* rather than only across separate
+benchmarks. That is the composed result the agenda was missing.
+
+The cohort is computed **three ways** — encrypted BaruDB, plaintext BaruDB, and a
+local filter — and all three must agree or the command fails, so this is a
+differential test of the encrypted query path as well as a measurement. The
+encrypted classification matched the plaintext prediction with zero bootstraps.
+
+Two deliberate design points:
+
+* It uses `cohort_ids`, not `cohort_count`, and the threat model is what licenses
+  that: the **hospital** selects out of its own records (learning which of its own
+  patients matched discloses nothing), the **storage provider** sees only
+  ciphertext and ORE tokens, and the **model owner** learns only the cohort size.
+  `cohort_ids` is documented as inappropriate wherever the querier is not the data
+  owner.
+* The accuracy gap is reported **with its standard error**. ±5.0 points on 66
+  patients makes the 6-point gap 1.2 SE — noise. Printing the SE is what turns
+  "this is not a clinical finding" from an assertion into something a reader can
+  check.
 
 ### The honest problem, stated before the work starts
 
-**MedMNIST has no demographics.** Cohort-conditioned evaluation therefore needs
-synthetic patient attributes attached to real images. That is defensible for a
+**MedMNIST has no demographics** — confirmed while building this, and handled as
+below. Cohort-conditioned evaluation therefore needs synthetic patient attributes
+attached to real images. That is defensible for a
 *cost-structure* claim — the encrypted selection does the same work whether the
 ages are real or generated — and it is **not** defensible for any clinical or
 fairness claim, because a subgroup gap measured on synthetic demographics is an
@@ -598,9 +629,42 @@ things that are not the same computation:
    `dealer`, i.e. asking whether FHE beats free preprocessing. It does not, and the
    question is meaningless. Deployable protocols only.
 
-**Still open:** an end-to-end wall-clock measurement over a real network. Every
-number here is a measured *count* put through a latency/bandwidth model — roadmap
-P1's remaining item.
+#### The formula itself is now validated (`baru bench-net`)
+
+Every wall-clock number above is a measured *count* put through
+`rounds × latency + bytes / bandwidth`. That formula had never been checked. It is
+now, against a real loopback TCP socket, measuring the link's own constants and
+sweeping each term independently:
+
+| | measured | predicted | error |
+|---|---|---|---|
+| 500 rounds, 8 B | 12.27 ms | 11.53 ms | −6.1% |
+| 1000 rounds, 8 B | 22.94 ms | 23.06 ms | **+0.5%** |
+| 4000 rounds, 8 B | 92.01 ms | 92.22 ms | **+0.2%** |
+| 16 rounds, 64 KiB | 0.78 ms | 0.74 ms | −5.2% |
+| 16 rounds, 256 KiB | 1.86 ms | 1.84 ms | **−1.0%** |
+| 16 rounds, 1 MiB | 7.24 ms | 6.25 ms | −13.6% |
+
+**Worst case 13.6%, under 1% through the middle of both ranges.** Cost is linear in
+rounds and linear in bytes with no missing cross-term — which is what justifies
+computing wall-clock from measured counts everywhere else.
+
+Two methodology errors, both mine, both worth recording because the first run
+reported 36% error and blamed the model:
+
+1. **Probing cold and sweeping warm.** The first socket in a process is slower than
+   the tenth, which inflated the measured RTT by 36%. There is now a warm-up phase.
+2. **Measuring a constant in one regime and applying it in another.** Throughput
+   from a single 4 MiB transfer beats what the sweep's 16×256 KiB shape achieves,
+   biasing the bandwidth constant high and predictions low. The residual −13.6% at
+   1 MiB is that same effect not fully gone — throughput degrades with payload size
+   — and is left as the honest error rather than tuned away.
+
+**Still open, and narrower now:** the constants are loopback's (RTT 23 µs), not a
+WAN's. The formula's *shape* is validated and transfers; a WAN deployment needs its
+own two constants measured on that link. Also, this measures a socket rather than a
+multi-party protocol — whether a protocol's *rounds* are counted correctly is
+`baru mpcc calibrate`, which reports 0% error.
 
 The mechanism is specific and worth stating: **MPC's Beaver-triple preprocessing
 grows linearly with layer width while FHE's packed ciphertext is flat and needs
