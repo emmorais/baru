@@ -57,6 +57,21 @@ pub struct ExecStats {
     pub interactive_ops: usize,
 }
 
+/// How the executor issues interactive operations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Batching {
+    /// Group by ASAP level and issue one batched primitive per kind per level.
+    #[default]
+    Level,
+    /// One operation at a time, in program order.
+    ///
+    /// This is the control the level-batched mode is measured against, and it
+    /// is what an executor written the obvious way does — walk the circuit and
+    /// call the backend for each op. Nothing about the *circuit* differs; only
+    /// how many times the parties stop and talk.
+    Serial,
+}
+
 /// Evaluate `flat` on `be`, given shares for its free wires.
 ///
 /// `inputs` must supply every wire the circuit reads and does not define.
@@ -68,6 +83,21 @@ pub fn run_flat(
     output_wire: &str,
     nbits: usize,
 ) -> Result<(ShareRef, ExecStats), String> {
+    run_flat_with(be, flat, inputs, output_wire, nbits, Batching::Level)
+}
+
+/// [`run_flat`] with an explicit batching mode.
+pub fn run_flat_with(
+    be: &mut dyn Backend,
+    flat: &[FlatOp],
+    inputs: &HashMap<String, ShareRef>,
+    output_wire: &str,
+    nbits: usize,
+    batching: Batching,
+) -> Result<(ShareRef, ExecStats), String> {
+    if batching == Batching::Serial {
+        return run_serial(be, flat, inputs, output_wire, nbits);
+    }
     // ── ASAP levels ──
     let mut level: HashMap<&str, usize> = HashMap::new();
     for w in inputs.keys() {
@@ -221,4 +251,52 @@ fn eval_local(
             ))
         }
     })
+}
+
+/// One interactive operation at a time, in program order — the control.
+fn run_serial(
+    be: &mut dyn Backend,
+    flat: &[FlatOp],
+    inputs: &HashMap<String, ShareRef>,
+    output_wire: &str,
+    nbits: usize,
+) -> Result<(ShareRef, ExecStats), String> {
+    let mut env: HashMap<String, ShareRef> = inputs.clone();
+    let mut stats = ExecStats::default();
+    for op in flat {
+        let v = if is_interactive(op) {
+            stats.rounds += 1;
+            stats.batch_calls += 1;
+            stats.interactive_ops += 1;
+            let ins = op.inputs();
+            match op {
+                FlatOp::IMul { .. } => {
+                    let (a, b) = (get(&env, ins[0])?, get(&env, ins[1])?);
+                    let mut r = be.mul(&a, &b);
+                    r.nbits = nbits;
+                    r
+                }
+                FlatOp::ICmpSlt { .. } | FlatOp::ICmpUlt { .. } => {
+                    let (a, b) = (get(&env, ins[0])?, get(&env, ins[1])?);
+                    let mut r = be.lt(&a, &b);
+                    r.nbits = nbits;
+                    r
+                }
+                FlatOp::Mux { .. } => {
+                    let (c, t, e) = (get(&env, ins[0])?, get(&env, ins[1])?, get(&env, ins[2])?);
+                    let d = be.sub(&t, &e);
+                    let sel = be.mul(&c, &d);
+                    let mut r = be.add(&e, &sel);
+                    r.nbits = nbits;
+                    r
+                }
+                other => return Err(format!("mpcc::exec: unsupported interactive op {other:?}")),
+            }
+        } else {
+            eval_local(be, op, &env, nbits)?
+        };
+        env.insert(op.dst().to_string(), v);
+    }
+    let out = get(&env, output_wire)?;
+    Ok((out, stats))
 }

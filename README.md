@@ -1648,7 +1648,11 @@ ReLU and a left-fold `max`. n=32, h=16, c=8, RTT 20 ms:
 | `compiled+reassoc` | 1317 | **15** | **47** | 663 ms |
 
 **0.38× the interactive calls and 0.49× the messages of expert hand-written
-code**, at parity on wall-clock. The advantage *grows with width*: the
+code**, at parity on wall-clock. The command also prints an **ablation
+ladder** attributing each pass — ASAP batching is 285× on interactive calls,
+CSE is 68× on circuit size and 30× on bytes, reassociation is 1.25× on
+rounds. The passes act on different axes and none substitutes for another,
+which is why the ladder is reported rather than one number. The advantage *grows with width*: the
 compiled route stays at 15 interactive calls while the expert route goes
 31 → 39, because ASAP scheduling batches every independent operation however
 many there are.

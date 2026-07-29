@@ -244,7 +244,40 @@ Decide the scope question in §6 first, then:
   but a 5408-activation conv layer is a different scale. Measure before
   committing to the full model; fall back to one conv block if needed and say so.
 
-### Phase 2 — build the real comparison (closes Gap C)
+### ~~Phase 2 — the ablation~~ DONE 2026-07-28
+
+`baru bench-compiled-nn` reports a ladder in which each rung adds exactly one
+compiler pass, against the expert gadget baseline. n=8, h=4, c=4, RTT 0:
+
+| route | ops | interactive | messages | bytes | wall-clock |
+|---|---|---|---|---|---|
+| `gadget` (expert) | — | 20 | 53 | 56.0 k | 44 ms |
+| `compiled: serial` | 7419 | 4280 | 5859 | 1798 k | 6839 ms |
+| `  + ASAP batching` | 7419 | 15 | 47 | 1682 k | 111 ms |
+| `  + CSE` | 109 | 15 | 47 | 55.7 k | 65 ms |
+| `  + reassociation` | 109 | **12** | **37** | 55.5 k | 49 ms |
+
+Contribution of each pass:
+
+| pass | ops | interactive | bytes |
+|---|---|---|---|
+| ASAP batching | 1.00× | **285.33×** | 1.07× |
+| CSE | **68.06×** | 1.00× | **30.18×** |
+| reassociation | 1.00× | 1.25× | 1.00× |
+
+**The passes act on different axes and none substitutes for another.**
+Batching collapses rounds and leaves circuit size untouched; CSE collapses
+circuit size and bandwidth and changes no round count; reassociation collapses
+depth. Report the ladder, never a single number — a one-column summary makes
+CSE look worthless at 1.00× when it is a 30× bandwidth win.
+
+The `serial` row is the honest floor: an executor written the obvious way,
+walking the circuit and calling the backend per operation. It is 285× the
+interactive calls of the same circuit under ASAP levelling, on identical
+bytes — the round-structure finding again, now inside the compiler's own
+executor.
+
+### Phase 2 (original notes)
 
 The headline table. Same network, same backends, same transport, three
 implementations:

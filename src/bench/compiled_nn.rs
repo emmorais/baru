@@ -38,9 +38,9 @@ use crate::gadgets;
 use crate::interpreter::backend::{Backend, ShareRef};
 use crate::interpreter::parse;
 use crate::interpreter::transport_backend::TransportBackend;
-use crate::mpcc::exec::run_flat;
+use crate::mpcc::exec::{run_flat_with, Batching};
 use crate::mpcc::opt::reassociate_reductions;
-use crate::zkp::circuit_compiler::CircuitCompiler;
+use crate::zkp::circuit_compiler::{CircuitCompiler, FlatOp};
 
 fn residue(v: i64, nbits: usize) -> Fr {
     (v as i128).rem_euclid(1i128 << nbits) as Fr
@@ -218,12 +218,19 @@ pub fn run(n: usize, h: usize, c: usize, nbits: usize, rtts: &[u64]) -> Result<R
     order.sort();
 
     // ── The compiled circuit, built once outside the measurement ──
+    // Compiled twice: with and without CSE, so the ablation can attribute the
+    // pass rather than assert it.
     let src = net.source();
     let expr = parse(&src).map_err(|e| format!("parse error: {e}"))?;
     let circuit = CircuitCompiler::new()
         .compile_fhe(&expr)
         .map_err(|e| format!("compile error: {e}"))?;
+    let raw = CircuitCompiler::new()
+        .without_cse()
+        .compile_fhe(&expr)
+        .map_err(|e| format!("compile error: {e}"))?;
     let flat = circuit.flat_ops.clone();
+    let flat_no_cse = raw.flat_ops.clone();
     let out_wire = circuit.output_wire.clone();
     let flat_opt = reassociate_reductions(&flat, &out_wire);
 
@@ -256,14 +263,25 @@ pub fn run(n: usize, h: usize, c: usize, nbits: usize, rtts: &[u64]) -> Result<R
         routes.push(route("gadget", body, expected, nbits, rtts, None));
     }
 
-    // ── Routes 2 and 3: the compiled circuit ──
-    for (name, prog) in [("compiled", &flat), ("compiled+reassoc", &flat_opt)] {
+    // ── The ablation ladder: each rung adds exactly one compiler pass ──
+    let ladder: Vec<(&str, &Vec<FlatOp>, Batching)> = vec![
+        // The obvious executor: walk the circuit, call the backend per op.
+        ("compiled: serial", &flat_no_cse, Batching::Serial),
+        // ASAP levelling — the parallelism the schedule finds for free.
+        ("  + ASAP batching", &flat_no_cse, Batching::Level),
+        // Common subexpression elimination, in the compile pipeline.
+        ("  + CSE", &flat, Batching::Level),
+        // Rebalancing the dependent reduction.
+        ("  + reassociation", &flat_opt, Batching::Level),
+    ];
+    for (name, prog, batching) in ladder {
         let (prog, out_wire, binds, order) =
             (prog.clone(), out_wire.clone(), binds.clone(), order.clone());
         let ops = prog.len();
         let body = move |be: &mut TransportBackend<MpcTransport>, me: usize| {
             let env = share_inputs(be, me, &binds, &order, nbits);
-            let (r, _st) = run_flat(be, &prog, &env, &out_wire, nbits).expect("circuit executes");
+            let (r, _st) = run_flat_with(be, &prog, &env, &out_wire, nbits, batching)
+                .expect("circuit executes");
             (r, Some(be.interactive_calls()))
         };
         routes.push(route(name, body, expected, nbits, rtts, Some(ops)));
@@ -324,19 +342,26 @@ transport. Architecture: x(n) -> dense(h) -> ReLU -> dense(c) -> max, secret
 weights throughout. Every route must reproduce the plaintext integer
 reference; the command fails if any does not.
 
+The ladder attributes each compiler pass. NOTE: the `serial` control issues one
+round trip per interactive operation, so raising --rtt-ms or the widths makes it
+take minutes; that is the point of the row, but scale it deliberately.
+
 options:
-  --n N            input width (default 16)
-  --hidden H       hidden width (default 8)
+  --n N            input width (default 8)
+  --hidden H       hidden width (default 4)
   --classes C      output width (default 4)
   --nbits B        share bit width (default 32)
-  --rtt-ms A,B     round-trip times to probe (default 0,2,20)
+  --rtt-ms A,B     round-trip times to probe (default 0; see note above)
   --json           machine-readable output
   -h, --help       this message
 ";
 
 pub fn run_cli(args: &[String]) -> Result<(), String> {
-    let (mut n, mut h, mut c, mut nbits) = (16usize, 8usize, 4usize, 32usize);
-    let mut rtts: Vec<u64> = vec![0, 2, 20];
+    let (mut n, mut h, mut c, mut nbits) = (8usize, 4usize, 4usize, 32usize);
+    // Default to zero latency: the `serial` control performs one round trip
+    // per interactive operation (thousands of them), so at RTT 20 ms it takes
+    // minutes. That is the finding, not a bug — but it should be opt-in.
+    let mut rtts: Vec<u64> = vec![0];
     let mut json = false;
     let mut it = args.iter();
     let num = |s: Option<&String>, what: &str| -> Result<usize, String> {
@@ -421,18 +446,55 @@ pub fn run_cli(args: &[String]) -> Result<(), String> {
         r.expected
     );
     let g = &r.routes[0];
+    let full = r.routes.last().expect("ladder is non-empty");
     let rtt = g.ms_by_rtt.last().unwrap().0;
+    println!(
+        "\n  full compiler vs hand-written expert, at rtt {rtt}ms:\n    \
+         {:.2}x interactive calls, {:.2}x messages, {:.2}x wall-clock  (lower is better)",
+        full.rounds.unwrap_or(0) as f64 / g.rounds.unwrap_or(1).max(1) as f64,
+        full.messages as f64 / g.messages.max(1) as f64,
+        full.ms_by_rtt.last().unwrap().1 / g.ms_by_rtt.last().unwrap().1.max(0.001),
+    );
+    // What each pass contributed. Reported on every axis, because the passes
+    // do not compete: batching buys rounds, CSE buys circuit size and
+    // bandwidth, reassociation buys depth. A single-column summary would make
+    // CSE look worthless (it changes no round counts) when it is a large win.
+    println!("\n  what each pass contributed:");
+    println!(
+        "    {:<20} {:>18} {:>18} {:>18}",
+        "pass", "ops", "interactive", "bytes"
+    );
+    let mut prev: Option<&RoutePoint> = None;
     for p in r.routes.iter().skip(1) {
-        println!(
-            "  {:<18} vs hand-written: {:.2}x interactive calls, {:.2}x messages, {:.2}x wall-clock at rtt {}ms",
-            p.route,
-            p.rounds.unwrap_or(0) as f64 / g.rounds.unwrap_or(1).max(1) as f64,
-            p.messages as f64 / g.messages.max(1) as f64,
-            p.ms_by_rtt.last().unwrap().1 / g.ms_by_rtt.last().unwrap().1.max(0.001),
-            rtt
-        );
+        if let Some(q) = prev {
+            let ratio = |a: f64, b: f64| {
+                if b <= 0.0 {
+                    "-".to_string()
+                } else {
+                    format!("{:.2}x", a / b)
+                }
+            };
+            let (oa, ob) = (q.ops.unwrap_or(0), p.ops.unwrap_or(0));
+            let (ia, ib) = (q.rounds.unwrap_or(0), p.rounds.unwrap_or(0));
+            let (ba, bb) = (q.bytes, p.bytes);
+            println!(
+                "    {:<20} {:>8} {:>9} {:>8} {:>9} {:>8} {:>9}",
+                p.route.trim(),
+                format!("{oa}->{ob}"),
+                ratio(oa as f64, ob as f64),
+                format!("{ia}->{ib}"),
+                ratio(ia as f64, ib as f64),
+                format!("{:.0}k->{:.0}k", ba as f64 / 1000.0, bb as f64 / 1000.0),
+                ratio(ba as f64, bb as f64),
+            );
+        }
+        prev = Some(p);
     }
-    println!("  (lower is better in every column)");
+    println!(
+        "\n  The passes act on different axes: batching collapses rounds, CSE collapses\n  \
+         circuit size and bandwidth, reassociation collapses depth. None substitutes\n  \
+         for another, which is why the ladder is reported rather than a single number."
+    );
     Ok(())
 }
 
