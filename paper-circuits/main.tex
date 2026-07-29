@@ -1,0 +1,443 @@
+\documentclass[11pt]{article}
+
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{lmodern}
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{microtype}
+\usepackage{xcolor}
+\usepackage[hidelinks]{hyperref}
+\usepackage[capitalize,noabbrev]{cleveref}
+
+\newcommand{\bt}[1]{\texttt{#1}}
+\newcommand{\TODO}[1]{{\color{red}\textbf{[TODO: #1]}}}
+
+\title{\bfseries One Program, Many Circuits:\\
+Backend-Aware Circuit Optimization for Private AI}
+
+\author{(author names elided for review)}
+\date{}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+Privacy-preserving machine learning is written by experts, by hand, against a
+chosen cryptographic backend. We argue it should be compiled, and that a
+compiler can do better than the expert --- not because it is cleverer, but
+because batching independent work is a property of a schedule rather than of
+an author's attention. We present Baru, a language whose programs compile to
+a single circuit IR and are then optimized \emph{differently depending on
+which privacy backend they target}. On a neural network with secret weights,
+compiled code issues $0.38\times$ the interactive protocol invocations and
+$0.49\times$ the messages of a hand-written, hand-batched expert baseline,
+while computing a bit-identical result; the source says nothing about
+batching. We report an ablation in which each compiler pass acts on a
+different axis --- scheduling collapses rounds $285\times$, common
+subexpression elimination collapses circuit size $68\times$ and bandwidth
+$30\times$, and rebalancing dependent reductions turns a fold's $2n-1$ rounds
+into $2\lceil\log_2 n\rceil+1$. Finally we show the property that motivates
+the design: the \emph{same} rewrite is a $2.24\times$ win under one protocol
+and worth exactly nothing under another, so a single optimized circuit cannot
+serve both. Optimizing one program per backend yields up to three distinct
+circuits, and running a circuit under the backend it was not optimized for
+costs up to $2.33\times$.
+\end{abstract}
+
+\section{Introduction}\label{sec:intro}
+
+Systems for private machine learning --- secure multi-party computation (MPC),
+homomorphic encryption (FHE), and hybrids of the two --- are overwhelmingly
+written by hand. The reason is not ignorance of compilers; it is that the
+performance of these systems depends on details a general-purpose compiler is
+not aware of. Under a secret-sharing protocol the dominant online cost is not
+work but \emph{communication rounds}, and the difference between a layer that
+costs one round and one that costs $n$ is invisible to the source text.
+
+This paper starts from an observation about our own code.
+
+\paragraph{Experts serialize layers, and do not notice.} Our hand-written
+private-inference pipeline contained a scheme-switch import that issued three
+blocking communication rounds \emph{per activation} --- $16\,224$ sequential
+round trips for a single convolution. It accounted for $88\%$ of end-to-end
+runtime. It survived review, survived benchmarking, and a draft of a
+companion paper had already concluded in print that the bottleneck lay
+elsewhere. It was found only by per-phase instrumentation.
+
+That was not an isolated slip. In the same codebase, the composable gadget
+library --- the API a user is meant to write against --- issued one comparison
+and one multiplication \emph{per element} for ReLU, and one multiplication
+\emph{per weight} for a dense layer. Measured over a real transport on a
+$64$-wide layer, this cost $5$--$14\times$ the messages and $9$--$45\times$
+the wall-clock of the same computation issued through batched primitives, with
+byte counts within $5\%$ and outputs bit-identical. The defect is invisible to
+a security argument, invisible to a correctness test, and invisible at zero
+latency. Only a round count exposes it.
+
+\paragraph{The claim.} A compiler does not have this failure mode. An
+as-soon-as-possible schedule over the dependence graph batches
+\emph{everything} that is independent, uniformly, without being asked. We show
+that compiled code therefore matches and then beats expert hand-written code
+on a real network, and --- the part we believe is new --- that the right
+circuit \emph{depends on the backend}, so a compiler that optimizes once and
+emits one circuit is leaving a measurable amount on the table.
+
+\paragraph{Contributions.}
+\begin{enumerate}
+\item \textbf{Parity, then advantage (\Cref{sec:eval-network}).} Compiled code
+matches hand-batched code message for message at the layer level, and on a
+whole network with secret weights issues $0.38\times$ the interactive protocol
+invocations and $0.49\times$ the messages of the expert baseline.
+
+\item \textbf{An ablation with separable axes (\Cref{sec:ablation}).} Each
+pass contributes on a different metric: scheduling $285\times$ on rounds, CSE
+$68\times$ on circuit size and $30\times$ on bandwidth, reduction rebalancing
+$1.25\times$ on rounds. None substitutes for another.
+
+\item \textbf{Rebalancing \emph{compound} reductions (\Cref{sec:reassoc}).}
+Classical reassociation handles chains of a single associative primitive. The
+reductions an AI workload contains are not primitives --- a maximum is
+$\mathrm{acc} + (x>\mathrm{acc})\cdot(x-\mathrm{acc})$, four instructions with
+two entry wires. We recognise an associative reduction by repeated subgraph
+shape, verify associativity by evaluation, and rebalance: $2n-1$ rounds become
+$2\lceil\log_2 n\rceil+1$.
+
+\item \textbf{Backend-aware optimization, measured
+(\Cref{sec:backend-aware}).} We optimize one program once per backend and
+price every resulting circuit under every backend. The diagonal wins every
+column; the off-diagonal entries are what a backend-blind compiler loses.
+\end{enumerate}
+
+\section{Background and setting}\label{sec:background}
+
+\paragraph{Rounds, not operations.} In secret-sharing MPC, local arithmetic is
+free and every multiplication or comparison requires interaction. Because
+independent interactive operations can be merged into one round, the cost of a
+program is governed by the \emph{depth} of its dependence graph, not its size.
+A layer of $512$ independent multiplications costs one round; a chain of $512$
+dependent ones costs $512$.
+
+\paragraph{Backends differ in what they charge for.} An arithmetic
+secret-sharing protocol pays per round and treats addition as free. A binary
+protocol pays per AND gate and has real depth inside an adder. A
+constant-round garbled protocol pays for gates but not for depth at all. A
+rewrite that trades depth for nothing is therefore a large win for the first,
+a moderate one for the second, and worthless for the third --- from one rule.
+
+\paragraph{Threat model and scope.} All results are semi-honest. Protocol
+availability follows the deployment (party count, majority assumption); the
+comparisons in \Cref{sec:eval} use the protocols named in each table. Our
+executed measurements use a three-party honest-majority replicated protocol~\cite{ABY3};
+the analytic cost model spans a wider registry and is the basis of
+\Cref{sec:backend-aware}. \Cref{sec:limitations} states which numbers are
+measured and which are modelled.
+
+\section{Baru}\label{sec:design}
+
+Baru is a small expression language. A program is compiled to a static
+single-assignment circuit IR (\bt{FlatOp}) shared by every backend, then
+lowered to a per-protocol instruction program, scheduled, and either costed or
+executed.
+
+\[
+\text{Expr} \;\to\; \text{FlatOp (SSA)} \;\to\; \text{lower} \;\to\;
+\text{schedule} \;\to\; \{\text{cost},\ \text{execute}\}
+\]
+
+\paragraph{Scheduling is where batching comes from.} The schedule is ASAP over
+the dependence DAG: a local instruction inherits the level of its latest
+operand; an interactive instruction sits one level later, and every
+interactive instruction at a level executes in one round. ASAP is optimal for
+depth, and depth is the round count, so this is the minimum-round schedule
+\emph{for a fixed lowering}. Crucially, no vectorized IR is required:
+independent scalar operations land at the same level and are issued through
+one batched primitive.
+
+\paragraph{Optimization is search plus a cost model.} Rewrites are proposed
+per site and accepted when the backend's cost model says they pay. The rules
+used here are algebraic identities, common subexpression elimination, shift
+fusion, strength reduction, classical reassociation, and reduction
+rebalancing (\Cref{sec:reassoc}). Rules whose sign depends on the operand are
+searched site by site, so a rewrite can be taken at one site and declined at
+another within the same circuit.
+
+\subsection{Rebalancing compound reductions}\label{sec:reassoc}
+
+Classical reassociation rebuilds $((a\cdot b)\cdot c)\cdot d$ into
+$(a\cdot b)\cdot(c\cdot d)$ for a single associative operator. AI reductions
+are not single operators. A maximum-fold step is
+\[
+\mathrm{acc}' \;=\; \mathrm{acc} + (x > \mathrm{acc})\cdot(x - \mathrm{acc}),
+\]
+four instructions forming a subgraph with two entry wires. Our rule peels a
+\emph{step region} --- the instructions between the accumulator wire and the
+step's result --- requiring that every instruction inside is private to the
+region and that exactly two wires enter it. Steps are canonicalised to a shape
+key; a chain of equal-keyed steps is a reduction, and its leaves are
+rebalanced into a tournament preserving left-to-right order, so the rewrite
+needs associativity and never commutativity.
+
+\paragraph{Associativity is tested, not assumed.} The search accepts
+candidates on \emph{cost}, not on semantics, so a rule cannot rely on it to
+reject an unsound rewrite. Before offering the rewrite we evaluate the step
+operator on edge values and random triples, checking $f(f(a,b),c) = f(a,f(b,c))$;
+a subtraction fold is correctly left alone. The optimizer additionally
+differentially checks the whole resulting circuit.
+
+Three implementation subtleties determined whether the rule worked at all, and
+we record them because each produced a plausible wrong answer rather than a
+failure. (i) The accumulator is read three times \emph{inside its own step},
+so ``used once'' is the wrong privacy test; the correct condition is that
+every use lies inside the step that consumes it. (ii) A fold's inner roots are
+also valid chains, so taking the first match rebalances a prefix and leaves
+the tail serial. (iii) A rebalanced tree still \emph{contains} chains --- every
+root-to-leaf path is one --- so a fixpoint pass will happily rebuild a
+balanced path into a deeper one; the rule must refuse any rewrite that does
+not strictly reduce depth.
+
+\section{Evaluation}\label{sec:eval}
+
+Every figure is produced by a command in the artifact, and every route in
+every comparison is checked against a plaintext integer reference --- a cost
+comparison between routes computing different things is meaningless, and our
+harnesses fail rather than report one. Wall-clock is single-threaded on
+commodity hardware; ratios transfer, absolute times do not.
+
+\subsection{Scheduling batches without being asked}\label{sec:eval-sched}
+
+\Cref{tab:flat} compiles layer-shaped programs and reports the ASAP round
+count. Interactive operations grow by more than two orders of magnitude while
+the round count does not move.
+
+\begin{table}[t]
+\centering
+\caption{Round count is flat in layer width. No vectorized IR, no
+annotation.}
+\label{tab:flat}
+\begin{tabular}{@{}lrrr@{}}
+\toprule
+program & $n$ & interactive ops & rounds \\
+\midrule
+\bt{relu-layer} & $1$ & $3$ & $3$ \\
+\bt{relu-layer} & $64$ & $129$ & $3$ \\
+\bt{relu-layer} & $512$ & $1025$ & $3$ \\
+\bt{dot} & $512$ & $513$ & $2$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{A whole network against an expert}\label{sec:eval-network}
+
+The network is $x(n) \to \mathrm{dense}(h) \to \mathrm{ReLU} \to
+\mathrm{dense}(c) \to \max$, with \emph{secret weights} throughout, so every
+multiplication is a real interactive operation. Two routes evaluate it over
+the same three-party transport:
+
+\begin{itemize}
+\item \textbf{gadget} --- hand-written code calling a batched gadget library.
+This is the honest expert baseline: those gadgets match hand-tuned code
+message for message.
+\item \textbf{compiled} --- the same network as a Baru expression, through the
+circuit compiler and a level-batched executor. The source is scalar
+arithmetic, a mux-style ReLU and a left-fold maximum. It says nothing about
+batching.
+\end{itemize}
+
+At $n{=}32$, $h{=}16$, $c{=}8$, RTT $20$ ms: the expert route issues $39$
+interactive protocol invocations and $95$ messages; the fully optimized
+compiled route issues $\mathbf{15}$ and $\mathbf{47}$ --- $0.38\times$ and
+$0.49\times$ --- at parity on wall-clock. The advantage \emph{grows with
+width}: the compiled route stays at $15$ invocations while the expert route
+grows from $31$ at $n{=}16$ to $39$ at $n{=}32$.
+
+\paragraph{Two things we do not claim.} Without reduction rebalancing the
+compiled route \emph{loses} ($1.88\times$ wall-clock), because the expert's
+maximum is a hand-written tournament; that ablation is reported rather than
+hidden. And the wall-clock is parity, not a win: both routes perform the same
+number of comparison layers, which dominate latency under a secret-sharing
+protocol. The compiler's gain is in multiplications and sharing.
+
+\subsection{What each pass contributes}\label{sec:ablation}
+
+\Cref{tab:ablation} adds one pass per row, starting from an executor written
+the obvious way: walk the circuit, call the backend per operation.
+
+\begin{table}[t]
+\centering
+\caption{Ablation, $n{=}8$, $h{=}4$, $c{=}4$, zero latency. Every row computes
+the same value.}
+\label{tab:ablation}
+\begin{tabular}{@{}lrrrr@{}}
+\toprule
+route & ops & interactive & messages & bytes \\
+\midrule
+\bt{gadget} (expert) & --- & $20$ & $53$ & $56$\,k \\
+\midrule
+\bt{compiled: serial} & $7419$ & $4280$ & $5859$ & $1798$\,k \\
+\quad $+$ ASAP batching & $7419$ & $15$ & $47$ & $1682$\,k \\
+\quad $+$ CSE & $109$ & $15$ & $47$ & $55.7$\,k \\
+\quad $+$ reassociation & $109$ & $\mathbf{12}$ & $\mathbf{37}$ & $55.5$\,k \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The passes act on \emph{different axes}: scheduling is $285\times$ on
+interactive invocations and $1.00\times$ on circuit size; CSE is $68\times$ on
+circuit size and $30\times$ on bytes while changing no round count;
+reassociation is $1.25\times$ on rounds and nothing else. A single-column
+summary would report CSE as a $1.00\times$ no-op, which is why we report the
+ladder.
+
+The \bt{serial} row deserves emphasis. It is $285\times$ the interactive
+invocations of the \emph{same circuit} under ASAP levelling, on essentially
+identical bytes. The round-structure defect that our human experts shipped
+(\Cref{sec:intro}) reappears inside a naively written executor, and is removed
+by scheduling alone.
+
+\subsection{Circuit quality on a real workload}
+
+Common subexpression elimination is a textbook pass, but its absence from the
+path that feeds a backend is easy to miss: in our system it existed only
+behind an explicit optimizer entry point, so every circuit handed to the FHE
+and ZKP backends carried whatever redundancy the source contained. A fold
+written the obvious way repeats its accumulator subtree at each step and
+flattens \emph{exponentially}: $4372$ operations at $n{=}8$, collapsing to
+$28$. On a real trained image classifier the same pass takes the emitted
+circuit from $2365$ to $1764$ gates ($-25\%$) with bit-identical outputs.
+
+\subsection{The same program, a different circuit per
+backend}\label{sec:backend-aware}
+
+Divergence on its own proves nothing: two circuits can differ in ways nobody
+pays for. We therefore optimize one program once per backend and price
+\emph{every} resulting circuit under \emph{every} backend
+(\Cref{tab:crossapply}).
+
+\begin{table}[t]
+\centering
+\caption{Cross-application, \bt{max-fold}, $n{=}8$, WAN, three parties.
+Predicted milliseconds; $*$ marks each circuit under the backend it was
+optimized for. Every circuit was differentially verified.}
+\label{tab:crossapply}
+\begin{tabular}{@{}lrrrl@{}}
+\toprule
+circuit optimized for & as \bt{shamir} & as \bt{semi-bin} & as \bt{bmr} & rules kept \\
+\midrule
+\bt{shamir} & $1453^{*}$ & $3761$ & $282$ & reassociate-reduction \\
+\bt{semi-bin} & $1453$ & $3761^{*}$ & $282$ & reassociate-reduction \\
+\bt{bmr} & $3253$ & $8761$ & $282^{*}$ & --- \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The diagonal wins every column. The mechanism is visible in the last column:
+the \emph{same} rewrite is kept for the two interactive protocols and declined
+for the constant-round garbled one, because depth is the round count for the
+former and free for the latter. Running the garbled backend's circuit under
+\bt{shamir} costs $2.24\times$. Nothing told the search this; the cost model
+priced it.
+
+Across three workloads --- an independent layer, a dependent reduction, and a
+dot product against public constants --- one program yields $2$, $2$ and $3$
+distinct circuits, with worst wrong-circuit penalties of $1.66\times$,
+$2.33\times$ and $1.81\times$. Where a backend keeps no rules it genuinely
+wanted the original circuit; an optimizer that always rewrites is not being
+selective.
+
+\paragraph{Protocol assignment.} The same cost model assigns operation kinds
+to protocols. On a dense layer with a comparison it returns
+$\text{cmp-lt} \to \text{binary}$ with multiplications left arithmetic ---
+the classical hybrid-MPC split, derived rather than annotated --- worth
+$2.03\times$ over the better pure protocol on a $32$-wide layer.
+
+\section{Related work}\label{sec:related}
+
+\paragraph{Protocol assignment.} HyCC~\cite{HyCC}, Silph~\cite{Silph} and SING~\cite{SING} assign MPC protocols to
+parts of a program and pay for the conversions. Silph solves the assignment
+with integer linear programming~\cite{Silph}, which forces a linear cost model; SING~\cite{SING}
+replaces the solver with a graph neural network, reporting large speedups at
+comparable quality and supporting non-linear costs. Our objective is
+non-separable for two structural reasons --- a dependence level costs the
+\emph{maximum} over its members, and conversions batch per level --- so an ILP
+formulation does not apply, and the exact model is cheap enough to evaluate
+that a learned surrogate is not yet needed. We assign per operation
+\emph{kind} rather than per instruction: a coarser space, but an interpretable
+answer. \emph{These systems are MPC-only.}
+
+\paragraph{Circuit compiler infrastructure.} CirC~\cite{CirC} shares our
+one-IR-many-backends structure, with frontends and backends over a typed
+term IR, and includes oblivious and linear-scan array elimination. Its
+independent arrival at the same architecture is reassuring. CirC optimizes for
+a target but does not, to our knowledge, report circuits that \emph{diverge}
+per backend under a shared cost model.
+
+\paragraph{Hand-built private inference.} Gazelle~\cite{Gazelle},
+Delphi~\cite{Delphi}, Cheetah~\cite{Cheetah} and CrypTFlow2~\cite{CrypTFlow2}
+are hand-designed systems that split linear layers and
+nonlinearities across FHE and MPC. They are the expert artefacts this paper
+argues a compiler should be able to derive; our assignment reproduces the
+shape of that split from a cost model, though see \Cref{sec:limitations}.
+
+\paragraph{MPC compilers.} MP-SPDZ~\cite{MPSPDZ} optimizes rounds by merging independent
+openings --- the same insight our scheduler implements --- and is blind to
+FHE. FHE compilers optimize multiplicative depth and are blind to MPC. Neither
+can ask whether a computation should be an FHE program at all, because neither
+has a cost model spanning the alternatives.
+
+\section{Limitations}\label{sec:limitations}
+
+\paragraph{Measured versus modelled.} \Cref{sec:eval-network} and
+\Cref{sec:ablation} are executed: real serialization, real message passing,
+real byte counting, verified against a plaintext reference.
+\Cref{tab:crossapply} and the assignment results are \emph{predictions} from
+the analytic cost model. The model's online round and volume terms are exact
+for the lowering; its offline volume and local-work constants are literature
+estimates, and we do not quote them as measurements.
+
+\paragraph{Metric.} ``Interactive invocations'' counts batched protocol calls
+at the backend interface, which is exactly comparable between routes but is a
+proxy for rounds rather than a round count: one batched comparison runs
+several rounds internally.
+
+\paragraph{Scope of the compiled path.} The compiled network is MPC. Our
+FHE/MPC hybrid remains orchestration outside the language --- the language does
+not express scheme switching --- so the expert baseline in
+\Cref{sec:eval-network} is the batched gadget library rather than the more
+heavily tuned hybrid pipeline. Extending the language to express switching is
+future work and would strengthen the backend-aware claim, since the compiler
+could then choose where to switch.
+
+\paragraph{Assignment with FHE.} A previously recorded result placed
+multiplications on FHE for wide layers. It did \emph{not} reproduce in the
+configuration we re-ran for this paper, which returned the binary comparison
+split only. We therefore do not claim it. \TODO{re-derive or retract; do not
+cite the earlier number}
+
+\paragraph{Workload scale.} The compiled networks here are small MLPs.
+Convolutional models at image scale are compiled and costed but not executed
+end-to-end through the compiled path. \TODO{scale the compiled path to the
+convolutional model, or state the ceiling analytically}
+
+\paragraph{Optimality.} The rewrite search is greedy and site-independent; a
+pair of rewrites that only pays jointly is missed. Assignment is greedy over
+operation kinds and optimal assignment is NP-hard.
+
+\section{Conclusion}
+
+Private machine learning is written by hand against a chosen backend, and the
+choice is usually made before the program is. We have argued that both
+decisions should be compiled: that a schedule batches independent work more
+reliably than an author does, and that the circuit worth emitting depends on
+the backend it is headed for. The evidence for the first is that compiled code
+beat our own experts on their own network, and that the defect it removes is
+one those experts shipped three times in one codebase. The evidence for the
+second is that a single rewrite is a $2.24\times$ win under one protocol and
+declined under another, from one rule and one cost model.
+
+\bibliographystyle{plain}
+\bibliography{references}
+
+\end{document}

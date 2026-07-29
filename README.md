@@ -9,9 +9,9 @@ A Lisp-like language interpreter with built-in **three-party secure computation*
 > — current measured state, the method that produced it, the prioritized next
 > steps, and the traps. It is written to be read cold.
 >
-> **Working on the circuit-optimization paper?** See
-> [`docs/paper-circuit-optimization.md`](docs/paper-circuit-optimization.md) —
-> what the evidence supports, the three gaps, and the phased plan.
+> **Working on the circuit-optimization paper?** Draft in
+> [`paper-circuits/`](paper-circuits/); plan, gaps and provenance in
+> [`docs/paper-circuit-optimization.md`](docs/paper-circuit-optimization.md).
 
 ---
 

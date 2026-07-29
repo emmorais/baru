@@ -1,0 +1,64 @@
+\begin{thebibliography}{10}
+
+\bibitem{SING}
+Bl{\"u}ml, Huppert, Khayata, Schmidt, and Schneider.
+\newblock {SING}: Hybrid {MPC} protocol assignment with graph neural networks.
+\newblock Cryptology ePrint Archive, Paper 2026/1237; USENIX Security 2026,
+  2026.
+\newblock \url{https://eprint.iacr.org/2026/1237}.
+
+\bibitem{HyCC}
+Niklas B{\"u}scher, Daniel Demmler, Stefan Katzenbeisser, David Kretzmer, and
+  Thomas Schneider.
+\newblock {HyCC}: Compilation of hybrid protocols for practical secure
+  computation.
+\newblock In {\em ACM CCS}, 2018.
+
+\bibitem{Silph}
+Edward Chen, Jinhao Zhu, Alex Ozdemir, Riad~S. Wahby, Fraser Brown, and Wenting
+  Zheng.
+\newblock Silph: A framework for scalable and accurate generation of hybrid
+  {MPC} protocols.
+\newblock In {\em IEEE Symposium on Security and Privacy}, 2023.
+
+\bibitem{Cheetah}
+Zhicong Huang, Wen jie Lu, Cheng Hong, and Jiansheng Ding.
+\newblock {Cheetah}: Lean and fast secure two-party deep neural network
+  inference.
+\newblock In {\em 31st USENIX Security Symposium}, pages 809--826, 2022.
+
+\bibitem{Gazelle}
+Chiraag Juvekar, Vinod Vaikuntanathan, and Anantha Chandrakasan.
+\newblock {GAZELLE}: A low latency framework for secure neural network
+  inference.
+\newblock In {\em 27th USENIX Security Symposium}, pages 1651--1669, 2018.
+
+\bibitem{MPSPDZ}
+Marcel Keller.
+\newblock {MP-SPDZ}: A versatile framework for multi-party computation.
+\newblock In {\em ACM CCS}, 2020.
+
+\bibitem{Delphi}
+Pratyush Mishra, Ryan Lehmkuhl, Akshayaram Srinivasan, Wenting Zheng, and
+  Raluca~Ada Popa.
+\newblock {DELPHI}: A cryptographic inference service for neural networks.
+\newblock In {\em 29th USENIX Security Symposium}, pages 2505--2522, 2020.
+
+\bibitem{ABY3}
+Payman Mohassel and Peter Rindal.
+\newblock {ABY3}: A mixed protocol framework for machine learning.
+\newblock In {\em ACM CCS}, pages 35--52, 2018.
+
+\bibitem{CirC}
+Alex Ozdemir, Fraser Brown, and Riad~S. Wahby.
+\newblock {CirC}: Compiler infrastructure for proof systems, software
+  verification, and more.
+\newblock In {\em IEEE Symposium on Security and Privacy}, 2022.
+
+\bibitem{CrypTFlow2}
+Deevashwer Rathee, Mayank Rathee, Nishant Kumar, Nishanth Chandran, Divya
+  Gupta, Aseem Rastogi, and Rahul Sharma.
+\newblock {CrypTFlow2}: Practical 2-party secure inference.
+\newblock In {\em ACM CCS}, pages 325--342, 2020.
+
+\end{thebibliography}

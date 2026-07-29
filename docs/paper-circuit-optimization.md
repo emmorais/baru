@@ -1,7 +1,8 @@
 # Paper plan: Baru as a language for private AI
 
-**Status: plan, not results.** Written 2026-07-28 after auditing what the repo
-actually measures. Numbers below were re-verified against the current tree
+**Status: Phases 0–4 done; draft paper in `../paper-circuits/`.** Written
+2026-07-28 after auditing what the repo actually measures, then updated as each
+phase landed. Numbers below were re-verified against the current tree
 unless marked otherwise. Companion to
 [`private-inference-performance.md`](private-inference-performance.md) (the
 engineering state) and [`research-agenda.md`](research-agenda.md) (Thesis S).
@@ -349,7 +350,45 @@ Yao is worthless under ABY3, with `Reassociate` inverting by protocol family.
 backend* and that using the wrong backend's circuit costs measurably. That is
 the figure the paper is built around.
 
-### Phase 4 — assembly
+### ~~Phase 4 — assembly~~ DRAFTED 2026-07-28
+
+`paper-circuits/main.tex` — *One Program, Many Circuits: Backend-Aware Circuit
+Optimization for Private AI*. 8 pages, builds clean, citations resolve.
+`paper-circuits/README.md` maps every claim to the command that produces it.
+
+Structure: the motivating story is our own experts serializing a layer (§1);
+parity → advantage on a whole network (§4.2); the separable-axes ablation
+(§4.3); the cross-application matrix as the central figure (§4.5); related
+work positioned against HyCC/Silph/SING (MPC-only assignment) and CirC
+(one-IR-many-backends, but no per-backend divergence under a shared cost
+model).
+
+**Two `\TODO` markers are left in the text deliberately** — see the
+non-reproduction below and the workload-scale limitation. They are in
+§Limitations where a reader will find them, not hidden.
+
+#### A recorded claim that did NOT reproduce — do not cite it
+
+`research-agenda.md` and `related-work.md` both record that protocol
+assignment places **`mul → fhe`** for a 256-wide encrypted layer, reproducing
+the Gazelle/Delphi hybrid split from measured costs. Re-run for this paper:
+
+```sh
+baru mpcc assign --expr '<256-wide dot + relu>' --parties 2 --dishonest
+# => mixed wins 1.57x, moving:  cmp-lt -> binary      (no mul -> fhe)
+```
+
+The FHE target *is* in the search space (`semi2k / semi-bin / bfv`), but the
+assignment returns the binary comparison split only. Either the original used
+a different expression shape or parameters, or something regressed. **The
+paper does not claim it**, and §Limitations says so explicitly.
+
+This matters beyond one number: it is the single most quotable result in the
+repo's notes — "the compiler derives Gazelle" — and it is the one that failed
+to reproduce. Re-derive it from a recorded command, or retract it from
+`research-agenda.md` §4 and `related-work.md`.
+
+### Phase 4 (original notes)
 
 - Positioning against HyCC → Silph (ILP) → SING (GNN) for assignment, and CirC
   for one-IR-many-backends. See [`related-work.md`](related-work.md).
