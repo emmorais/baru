@@ -899,28 +899,23 @@ checks the hand-written NTT against NTL at **n = 4096 with ±2⁹⁹
 coefficients**, and at SI-NTRU's ±2¹¹⁹ / n = 2048 corner, where the O(n²)
 oracle is impractical. They agree exactly.
 
-It also produces a result we did not want. `baru bench-polymul
---schoolbook-max 4096` (per product, 20 reps, marshalling included, this
-machine, NTL 11.5.1 / GMP 6.3.0):
+It first produced a result we did not want, and then — after acting on it — the
+opposite one. `baru bench-polymul --schoolbook-max 4096` (per product, 20 reps,
+marshalling included, this machine, NTL 11.5.1 / GMP 6.3.0):
 
-| n | schoolbook | multi-modular NTT | NTL+GMP | NTT vs schoolbook | NTL vs NTT |
+| n | schoolbook | multi-modular NTT | NTL+GMP | NTT vs schoolbook | **NTT vs NTL** |
 |---|---|---|---|---|---|
-| 256 | 0.281 ms | 0.378 ms | **0.198 ms** | 0.7× | 1.9× |
-| 512 | 1.111 ms | 0.813 ms | **0.376 ms** | 1.4× | 2.2× |
-| 1024 | 4.441 ms | 1.770 ms | **0.756 ms** | 2.5× | 2.3× |
-| 2048 | 17.662 ms | 3.799 ms | **1.539 ms** | 4.6× | 2.5× |
-| 4096 | 71.713 ms | 8.232 ms | **3.162 ms** | 8.7× | 2.6× |
+| 256 | 0.280 ms | **0.101 ms** | 0.188 ms | 2.8× | 1.9× |
+| 512 | 1.125 ms | **0.203 ms** | 0.375 ms | 5.5× | 1.8× |
+| 1024 | 4.500 ms | **0.422 ms** | 0.754 ms | 10.7× | 1.8× |
+| 2048 | 17.979 ms | **0.865 ms** | 1.555 ms | 20.8× | 1.8× |
+| 4096 | 71.859 ms | **1.771 ms** | 3.146 ms | 40.6× | 1.8× |
 
-**NTL is ~2.5× faster than our NTT at every size, including the FFI and
-limb-marshalling cost it pays and the NTT does not.** Two things follow.
-First, the hand-written transform is not a tuned one: its `mulmod` is a
-`u128 %` per butterfly, and Barrett or Montgomery reduction is the obvious
-missing optimization — the gap is ours to close, not evidence that
-multi-modular NTT is the wrong shape. Second, our NTT is *slower* than
-schoolbook at n = 256 and only breaks even between 256 and 512; the
-schemes here all run at n ≥ 2048, where it is 4.6–8.7×, so the swap was
-right — but the crossover is much later than "NTT beats schoolbook"
-suggests, and any future small-ring use should measure rather than assume.
+**The hand-written NTT is now ~1.8× faster than NTL at every size.** It did not
+start that way: it was 8.232 ms at n=4096 and *lost* to NTL by 2.6×. Profiling
+NTL showed exactly where the gap was, and closing it gave **4.65× on our own
+transform** — which is also why the NTT now beats schoolbook at every size,
+including n=256 where it previously lost.
 
 NTL is not a *different* algorithm, which is worth stating precisely because
 it changes what the gap means. Probing the linked library directly (`NTL
@@ -941,9 +936,32 @@ rest on GMP bignum↔residue conversion. Two consequences:
    make `reduce_mod` and Garner CRT cheap, where NTL pays generic bignum costs
    for the same step. That is why NTL wins by only 2.5× and not by 13×.
 
-So a Shoup/Montgomery butterfly in `ntt.rs` should beat NTL rather than merely
-match it — keeping the cheap fixed-width conversion *and* getting the fast
-transform. That work is written down, not done.
+So a Shoup butterfly in `ntt.rs` should *beat* NTL rather than merely match it —
+keeping the cheap fixed-width conversion **and** getting the fast transform.
+
+**That work is now done, and the prediction held.** Two changes to
+[ntt.rs](src/fhe/ntt.rs), both licensed by the primes being `< 2^63`:
+
+1. **Precomputed twiddle tables.** The old inner loop spent one `mulmod` on the
+   butterfly and a *second* walking `wn` forward. Twiddles are fixed per level,
+   so they are now built once per plan.
+2. **Shoup-preconditioned multiplication.** For a fixed multiplier `w`, cache
+   `w' = ⌊w·2^64/p⌋`; then `w·x mod p` is a multiply-high, a multiply, a
+   subtract and one conditional subtract — **no division at all**. The inverse
+   transform's `n^{-1}` scale and `ψ^{-i}` untwist were two `mulmod`s and are
+   now one fused Shoup multiply.
+
+`8.232 → 1.771 ms` at n=4096 (**4.65×**), and the schemes follow: a BFV ct×ct
+multiply went **20.7 → 5.4 ms**. Two guard tests pin the preconditions —
+`primes_admit_shoup` (the `p < 2^63` bound the prime search must keep supplying,
+or every transform silently corrupts) and `shoup_multiplication_matches_mulmod`
+(the fast path against the straightforward one, boundaries included).
+
+**So NTL is no longer a performance option — it is an oracle.**
+`poly::use_fastest()` now returns `Ntt` unconditionally, and the C++ toolchain
+buys correctness assurance rather than speed. That is a better outcome than
+adopting NTL would have been: the default build stays pure Rust *and* is the
+fast one. The NTL differential tests are what made the rewrite safe to do.
 
 The NTL path is wired in as a **runtime-selectable backend**
 ([src/fhe/poly.rs](src/fhe/poly.rs)) rather than a replacement, so a single
@@ -972,9 +990,9 @@ operands encrypted):
 
 | scheme | secure | n | multiply (NTT) | multiply (NTL) | ct bytes |
 |---|---|---|---|---|---|
-| BFV | yes | 4096 | 20.7 ms | 11.5 ms | 131072 |
-| **BGV** | **yes** | 4096 | **20.7 ms** | **11.0 ms** | 131072 |
-| SI-NTRU | **NO** | 2048 | 4.1 ms | 1.7 ms | 32772 |
+| BFV | yes | 4096 | 5.4 ms | 11.2 ms | 131072 |
+| **BGV** | **yes** | 4096 | **5.3 ms** | **11.1 ms** | 131072 |
+| SI-NTRU | **NO** | 2048 | 1.0 ms | 1.7 ms | 32772 |
 
 Two results, both against the hypothesis that motivated the work:
 
@@ -1088,18 +1106,22 @@ Corrected picture (256→8, medians of 8, separate processes, alternating order)
 
 | strategy | poly | total | FHE | MPC seg | msgs |
 |---|---|---|---|---|---|
-| mpc (control) | ntl | 35.3 ms | 6.1 ms | 13.2 ms | 9276 |
-| hybrid-ntru | ntl | 62.1 ms | 40.2 ms | 21.9 ms | 13 |
-| **hybrid-bfv** | ntl | **97.8 ms** | 75.6 ms | 21.7 ms | **15** |
-| hybrid-bfv | ntt | 217.1 ms | 189.0 ms | 27.8 ms | 15 |
+| mpc (control) | ntt | 34.1 ms | 6.1 ms | 13.9 ms | 9276 |
+| hybrid-ntru | ntt | 47.4 ms | 25.5 ms | 21.8 ms | 13 |
+| **hybrid-bfv** | **ntt** | **71.5 ms** | 45.9 ms | 25.4 ms | **15** |
+| hybrid-bfv | ntl | 100.1 ms | 75.4 ms | 24.4 ms | 15 |
 
-The secure hybrid is now **2.77× pure MPC** (was 3.80× before these fixes, and
-1.85× when the benchmark's own round-structure bug was inflating both sides).
-FHE is **77–87%** of it, so the earlier conclusion holds and strengthens: the
-remaining cost is FHE arithmetic, not MPC.
+The secure hybrid is **2.09× pure MPC** on the pure-Rust backend (now the
+fastest — see the Shoup butterfly above). That figure has moved a lot as
+measurement errors were removed and real work landed: 1.85× (benchmark's own
+round-structure bug inflating both sides) → 3.80× (bug fixed on one side) →
+2.77× (imports batched) → **2.09×** (Shoup butterfly). Only the last was a
+genuine speedup; the others were corrections.
 
-And the communication story is now stark — **15 messages against 9276**. That,
-not speed, is the hybrid's actual case, and it is what pays on a WAN.
+FHE is now **64%** of the hybrid, down from 87%, so the two halves are finally
+comparable. And the communication story is stark — **15 messages against
+9276**. That, not speed, is the hybrid's actual case, and it is what pays on a
+WAN.
 
 ### SHE as an MPC building block: LowGear triples, measured (`baru bench-triples`)
 
@@ -1128,8 +1150,8 @@ Measured, two parties, semi-honest, 4096 triples:
 
 | route | domain | B/triple | triples/s | rounds | ok |
 |---|---|---|---|---|---|
-| **lowgear (SHE)** | `F_114689` | **104** | 46 400 | 2 | ✓ |
-| semi2k (OT) | `Z_2^64` | 3074 | 2 600 | 3 | ✓ |
+| **lowgear (SHE)** | `F_114689` | **104** | 197 600 | 2 | ✓ |
+| semi2k (OT) | `Z_2^64` | 3074 | 2 620 | 3 | ✓ |
 
 The two work over different structures, so the honest comparison is at **equal
 field width**: LowGear's ~17-bit prime needs 4 CRT limbs to reach 64 bits ⇒
@@ -1139,9 +1161,11 @@ field width**: LowGear's ~17-bit prime needs 4 CRT limbs to reach 64 bits ⇒
 **The surprise, and a correction to our own model.** `mpcc::cost` asserted that
 *"LowGear trades bandwidth for CPU: its preprocessing is compute-bound."* That
 note was never measured, and it is **wrong** here: LowGear generates triples
-**~4.5× faster** than the OT route at equal field width (17.8× at its native
-width). There is no trade at these parameters — SHE wins on bytes *and* on CPU.
-The note has been replaced with the measurement.
+**~19× faster** than the OT route at equal field width (197 600 vs 2 624
+triples/s, divided by the 4 CRT limbs). There is no trade at these parameters —
+SHE wins on bytes *and* on CPU, and by a wide margin. The note has been replaced
+with the measurement. (It was ~4.5× when first measured; the Shoup butterfly
+below sped the SHE side up again, since LowGear rides the same NTT.)
 
 **Scope, stated plainly.** Semi-honest only: no MACs, no sacrifice, and **no
 zero-knowledge proofs of plaintext knowledge**. A malicious party can send a

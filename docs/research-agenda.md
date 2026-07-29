@@ -272,8 +272,8 @@ sacrifice both beat naive Gilboa).
 and one of them came out the other way round. Running the protocol — BGV over
 CRT slots, one ciphertext×plaintext multiply per cross term — gives **416 B per
 triple at a 64-bit field** (104 B at its native 17-bit field, ×4 CRT limbs),
-within 8% of the 384 B estimate. But LowGear is also **~4.5× faster per triple
-than the OT route**, not slower. The "bandwidth-for-CPU trade LowGear exists to
+within 8% of the 384 B estimate. But LowGear is also **~19× faster per triple
+than the OT route** at equal field width, not slower. The "bandwidth-for-CPU trade LowGear exists to
 make" was never measured and does not appear at these parameters: SHE wins on
 bytes *and* on CPU, so the OT route's remaining advantage is neither, it is
 that it works over `Z_2^k` directly and needs no noise-flooding budget.

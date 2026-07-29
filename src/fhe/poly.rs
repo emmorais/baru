@@ -117,11 +117,23 @@ pub fn set_backend(b: Backend) -> Result<(), String> {
     Ok(())
 }
 
-/// Select the fastest backend this build has, and report it.
+/// Select the fastest backend, and report it.
+///
+/// That is now **always [`Backend::Ntt`]**. It used to be NTL by ~2.5×, and
+/// this function used to prefer it; then `ntt.rs`'s butterfly was rewritten to
+/// use Shoup-preconditioned multiplication (the thing profiling NTL revealed it
+/// was doing and we were not), and the hand-written transform became ~1.8×
+/// *faster* than NTL — it keeps this crate's cheap fixed-width CRT conversion
+/// **and** has the fast butterfly, where NTL pays generic GMP bignum costs for
+/// the conversion. `baru bench-polymul` is the measurement.
+///
+/// The NTL backend is kept because it is a genuinely independent implementation
+/// and therefore a differential oracle for the one we rely on — see
+/// [`tests::backends_agree`] and `fhe::ntl`. It is no longer a performance
+/// option.
 pub fn use_fastest() -> Backend {
-    let b = if is_available(Backend::Ntl) { Backend::Ntl } else { Backend::Ntt };
-    set_backend(b).expect("availability just checked");
-    b
+    set_backend(Backend::Ntt).expect("the NTT backend is always available");
+    Backend::Ntt
 }
 
 // ─── Dispatched operations ───────────────────────────────────────────────────

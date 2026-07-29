@@ -160,46 +160,119 @@ fn primes() -> &'static Primes {
 
 // ─── Negacyclic NTT plan (per prime, per ring dimension) ─────────────────────
 
+/// A multiplier with its Shoup precomputation, for repeated use against many
+/// operands under a fixed modulus.
+///
+/// [`mulmod`] costs a `u128 %`, which on aarch64 is a `__umodti3` **library
+/// call** — tens of cycles. When one operand is fixed and known in advance (as
+/// every twiddle factor and twist is), Shoup's trick replaces the division with
+/// a multiply-high: precompute `w' = ⌊w·2^64 / p⌋` once, then
+///
+/// ```text
+/// q = ⌊w'·x / 2^64⌋      (the high half of a 64×64 product)
+/// r = w·x − q·p          (mod 2^64, wrapping)
+/// r ∈ [0, 2p)  ⇒  one conditional subtraction finishes it
+/// ```
+///
+/// Valid for `w, x < p < 2^63` — the `2p < 2^64` bound is why [`primes`]
+/// searching *downward* from `2^63` matters, and [`tests::primes_admit_shoup`]
+/// pins it.
+///
+/// This is what NTL does (its `FFTPrimeInfo` carries `mulmod_precon_t` tables),
+/// and probing NTL showed its transforms running ~13× ours — the entire gap was
+/// here, not in the algorithm. See the README section on `bench-polymul`.
+#[derive(Clone, Copy)]
+struct Shoup {
+    w: u64,
+    /// `⌊w·2^64 / p⌋`
+    q: u64,
+}
+
+impl Shoup {
+    #[inline]
+    fn new(w: u64, p: u64) -> Shoup {
+        debug_assert!(w < p && p < (1u64 << 63));
+        Shoup { w, q: (((w as u128) << 64) / p as u128) as u64 }
+    }
+
+    /// `w · x mod p`, for `x < p`.
+    #[inline(always)]
+    fn mul(self, x: u64, p: u64) -> u64 {
+        let hi = ((self.q as u128 * x as u128) >> 64) as u64;
+        let r = self.w.wrapping_mul(x).wrapping_sub(hi.wrapping_mul(p));
+        if r >= p {
+            r - p
+        } else {
+            r
+        }
+    }
+}
+
 struct Plan {
     p: u64,
-    /// ψ^i and ψ^-i for the negacyclic twist (ψ a primitive 2n-th root).
-    psi: Vec<u64>,
-    psi_inv: Vec<u64>,
-    /// ω = ψ² (primitive n-th root) and its inverse, plus n^{-1}.
-    w: u64,
-    w_inv: u64,
-    n_inv: u64,
+    /// Forward/inverse twiddles for every level, concatenated: level `len` uses
+    /// `tw[len/2 − 1 .. len/2 − 1 + len/2]`. Precomputing these removes the
+    /// second `mulmod` the old inner loop spent walking `wn` forward.
+    tw: Vec<Shoup>,
+    tw_inv: Vec<Shoup>,
+    /// ψ^i for the negacyclic twist (ψ a primitive 2n-th root).
+    psi: Vec<Shoup>,
+    /// `n^{-1}·ψ^{-i}`, **fused** — the inverse transform's scale and untwist
+    /// were two separate `mulmod`s and are now one.
+    psi_inv_scaled: Vec<Shoup>,
+}
+
+/// Twiddles for one direction, laid out by level.
+fn build_twiddles(p: u64, root: u64, n: usize) -> Vec<Shoup> {
+    let mut tw = vec![Shoup { w: 0, q: 0 }; n.max(1)];
+    let mut len = 2usize;
+    while len <= n {
+        let half = len / 2;
+        let wlen = powmod(root, (n / len) as u64, p);
+        let off = half - 1;
+        let mut w = 1u64;
+        for k in 0..half {
+            tw[off + k] = Shoup::new(w, p);
+            w = mulmod(w, wlen, p);
+        }
+        len <<= 1;
+    }
+    tw
 }
 
 impl Plan {
     fn new(p: u64, root_max: u64, n: usize) -> Plan {
         assert!(n.is_power_of_two() && n <= MAX_N);
+        assert!(p < (1u64 << 63), "Shoup multiplication needs p < 2^63, got {p}");
         // ψ = root^(ROOT_ORDER / 2n) is a primitive 2n-th root of unity.
         let psi_g = powmod(root_max, ROOT_ORDER / (2 * n as u64), p);
         let psi_inv_g = invmod(psi_g, p);
+        let n_inv = invmod(n as u64, p);
         let mut psi = Vec::with_capacity(n);
-        let mut psi_inv = Vec::with_capacity(n);
+        let mut psi_inv_scaled = Vec::with_capacity(n);
         let (mut a, mut b) = (1u64, 1u64);
         for _ in 0..n {
-            psi.push(a);
-            psi_inv.push(b);
+            psi.push(Shoup::new(a, p));
+            psi_inv_scaled.push(Shoup::new(mulmod(b, n_inv, p), p));
             a = mulmod(a, psi_g, p);
             b = mulmod(b, psi_inv_g, p);
         }
         let w = mulmod(psi_g, psi_g, p);
         Plan {
             p,
+            tw: build_twiddles(p, w, n),
+            tw_inv: build_twiddles(p, invmod(w, p), n),
             psi,
-            psi_inv,
-            w,
-            w_inv: invmod(w, p),
-            n_inv: invmod(n as u64, p),
+            psi_inv_scaled,
         }
     }
 
-    /// In-place iterative Cooley–Tukey NTT with `root` a primitive n-th
-    /// root of unity.
-    fn ntt(&self, a: &mut [u64], root: u64) {
+    /// In-place iterative Cooley–Tukey NTT against a precomputed twiddle table.
+    ///
+    /// One Shoup multiply per butterfly. The old form did two `mulmod`s — one
+    /// for the twiddle and one to advance it — so this is ~2 library calls
+    /// replaced by ~1 multiply-high.
+    fn ntt(&self, a: &mut [u64], tw: &[Shoup]) {
         let n = a.len();
         let p = self.p;
         // bit-reversal permutation
@@ -217,16 +290,15 @@ impl Plan {
         }
         let mut len = 2usize;
         while len <= n {
-            let wlen = powmod(root, (n / len) as u64, p);
+            let half = len / 2;
+            let level = &tw[half - 1..half - 1 + half];
             for chunk in a.chunks_mut(len) {
-                let mut wn = 1u64;
-                let half = len / 2;
+                let (lo, hi) = chunk.split_at_mut(half);
                 for k in 0..half {
-                    let u = chunk[k];
-                    let v = mulmod(chunk[k + half], wn, p);
-                    chunk[k] = addmod(u, v, p);
-                    chunk[k + half] = submod(u, v, p);
-                    wn = mulmod(wn, wlen, p);
+                    let u = lo[k];
+                    let v = level[k].mul(hi[k], p);
+                    lo[k] = addmod(u, v, p);
+                    hi[k] = submod(u, v, p);
                 }
             }
             len <<= 1;
@@ -235,17 +307,18 @@ impl Plan {
 
     /// Forward negacyclic transform: twist by ψ^i, then NTT.
     fn forward(&self, a: &mut [u64]) {
-        for (ai, &psi) in a.iter_mut().zip(&self.psi) {
-            *ai = mulmod(*ai, psi, self.p);
+        for (ai, psi) in a.iter_mut().zip(&self.psi) {
+            *ai = psi.mul(*ai, self.p);
         }
-        self.ntt(a, self.w);
+        self.ntt(a, &self.tw);
     }
 
-    /// Inverse negacyclic transform: inverse NTT, scale by n^{-1}, untwist.
+    /// Inverse negacyclic transform: inverse NTT, then the fused
+    /// `n^{-1}·ψ^{-i}` scale-and-untwist.
     fn inverse(&self, a: &mut [u64]) {
-        self.ntt(a, self.w_inv);
-        for (ai, &psi_inv) in a.iter_mut().zip(&self.psi_inv) {
-            *ai = mulmod(mulmod(*ai, self.n_inv, self.p), psi_inv, self.p);
+        self.ntt(a, &self.tw_inv);
+        for (ai, s) in a.iter_mut().zip(&self.psi_inv_scaled) {
+            *ai = s.mul(*ai, self.p);
         }
     }
 }
@@ -580,6 +653,44 @@ mod tests {
             // r must have order exactly ROOT_ORDER.
             assert_eq!(powmod(r, ROOT_ORDER, p), 1);
             assert_ne!(powmod(r, ROOT_ORDER / 2, p), 1);
+        }
+    }
+
+    /// [`Shoup::mul`] is only valid for `p < 2^63` (it needs `2p < 2^64` so the
+    /// wrapping subtraction lands in `[0, 2p)`). The prime search runs *down*
+    /// from `2^63` precisely to guarantee this; if it ever changes, every
+    /// transform in the crate silently corrupts.
+    #[test]
+    fn primes_admit_shoup() {
+        for &p in &primes().p {
+            assert!(p < (1u64 << 63), "p = {p} is too large for Shoup multiplication");
+            assert!(p.checked_mul(2).is_some(), "2p must not overflow u64 (p = {p})");
+        }
+    }
+
+    /// The Shoup path must agree with the straightforward `mulmod` it replaced,
+    /// over the whole operand range — including the boundary values where the
+    /// conditional subtraction decides the answer.
+    #[test]
+    fn shoup_multiplication_matches_mulmod() {
+        for &p in &primes().p {
+            let mut s = 0x243F_6A88_85A3_08D3u64;
+            let mut next = || {
+                s ^= s << 13;
+                s ^= s >> 7;
+                s ^= s << 17;
+                s % p
+            };
+            for _ in 0..2000 {
+                let (w, x) = (next(), next());
+                assert_eq!(Shoup::new(w, p).mul(x, p), mulmod(w, x, p), "p={p} w={w} x={x}");
+            }
+            // Boundaries: 0, 1, p−1 in both positions.
+            for &w in &[0u64, 1, p - 1] {
+                for &x in &[0u64, 1, p - 1] {
+                    assert_eq!(Shoup::new(w, p).mul(x, p), mulmod(w, x, p), "p={p} w={w} x={x}");
+                }
+            }
         }
     }
 

@@ -88,14 +88,16 @@
 //!
 //! | scheme | n | multiply (NTT) | multiply (NTL) | ct bytes |
 //! |---|---|---|---|---|
-//! | BFV | 4096 | 20.7 ms | 11.5 ms | 131072 |
-//! | **BGV** | 4096 | **20.7 ms** | **11.0 ms** | 131072 |
-//! | SI-NTRU | 2048 | 4.1 ms | 1.7 ms | 32772 |
+//! | BFV | 4096 | 5.4 ms | 11.2 ms | 131072 |
+//! | **BGV** | 4096 | **5.3 ms** | **11.1 ms** | 131072 |
+//! | SI-NTRU | 2048 | 1.0 ms | 1.7 ms | 32772 |
 //!
 //! **BGV's multiply is indistinguishable from BFV's.** Across repeated runs
 //! the gap is +0.5%, +0.5%, −0.1% — inside the ~1–2% run-to-run spread. The
 //! rescale really is removed, but it is `3n = 12288` shifts against 28
 //! size-4096 transforms, so it does not survive contact with the measurement.
+//! (These were 20.7 ms until `ntt.rs`'s butterfly moved to Shoup-preconditioned
+//! multiplication; the ratio between the two schemes did not move.)
 //! *The encoding is not where the money is*, and this module is the evidence
 //! for that rather than a speedup.
 //!
