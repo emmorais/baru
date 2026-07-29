@@ -263,12 +263,26 @@ MASCOT's offline parameters were literature constants; `mpcc::ot_cost` now
 derives their offline volume from the measured OT cost above times a
 protocol-level OT count, and `baru mpcc compare` labels those rows "derived from
 MEASURED OT cost" rather than disclaiming an estimate. It moved a ranking:
-LowGear's BFV preprocessing moves ~384 B per triple against 9.2 / 24.4 / 48.8 KiB
+LowGear's SHE preprocessing moves ~384 B per triple against 9.2 / 24.4 / 48.8 KiB
 for Semi2k / SPDZ2k / MASCOT, a gap the old constants understated by an order of
-magnitude and exactly the bandwidth-for-CPU trade LowGear exists to make. Treat
-it as an upper bound on the OT side (vector OLE and batched sacrifice both beat
-naive Gilboa), and note that the CPU half of LowGear's trade is still missing, so
-its total is still flattering.
+magnitude. Treat it as an upper bound on the OT side (vector OLE and batched
+sacrifice both beat naive Gilboa).
+
+**Both halves are now measured** (`baru bench-triples`, `src/mpcc/lowgear.rs`),
+and one of them came out the other way round. Running the protocol — BGV over
+CRT slots, one ciphertext×plaintext multiply per cross term — gives **416 B per
+triple at a 64-bit field** (104 B at its native 17-bit field, ×4 CRT limbs),
+within 8% of the 384 B estimate. But LowGear is also **~4.5× faster per triple
+than the OT route**, not slower. The "bandwidth-for-CPU trade LowGear exists to
+make" was never measured and does not appear at these parameters: SHE wins on
+bytes *and* on CPU, so the OT route's remaining advantage is neither, it is
+that it works over `Z_2^k` directly and needs no noise-flooding budget.
+
+Two caveats bound the claim. The implemented engine is **semi-honest** — no
+MACs, no ZKPoPK, so it is the LowGear analogue of Semi2k rather than of SPDZ.
+And the ~17-bit native field is forced by the flooding budget at this crate's
+`u128`-capped `q ≤ 2^127`, where Overdrive runs 250–350-bit `q`; the 64-bit
+figure comes from CRT over 4 such primes.
 
 ### PSI: built the baseline, then asked the cost model which construction to keep
 

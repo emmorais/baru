@@ -158,21 +158,27 @@ Marked ✅ = implemented in Baru today, 🔨 = planned, in roughly the order bel
 | ABY3 / Replicated | ring 2^k | 3 | honest | semi-honest | ✅ `crypto/aby3_protocol.rs` |
 | Yao GC | binary | 2 | dishonest | semi-honest | ✅ `interpreter/gc_backend.rs` |
 | Dealer | ring 2^k | n≥2 | — (trusted dealer) | semi-honest | ✅ `mpcc/sim.rs` — the online-cost lower bound |
-| Semi2k | ring 2^k | n≥2 | dishonest | semi-honest | 🔨 P1 (same online phase as Dealer; needs OT triples) |
+| Semi2k | ring 2^k | n≥2 | dishonest | semi-honest | ✅ `mpcc/semi2k.rs` — Dealer's online phase, triples from real OT (2-party) |
 | Shamir | field p | n≥3 | honest | semi-honest | ✅ `mpcc/sim.rs` (GRR degree reduction) |
 
 | Replicated (field) | field p | 3 | honest | semi-honest | 🔨 P2 |
 | ATLAS | field p | n≥3 | honest | semi-honest | 🔨 P2 |
 | SPDZ2k | ring 2^k | n≥2 | dishonest | malicious | 🔨 P2 |
 | MASCOT | field p | n≥2 | dishonest | malicious | 🔨 P3 (OT-based triples) |
-| LowGear / HighGear | field p | n≥2 | dishonest | malicious | 🔨 P3 — **reuses our BFV** (`src/fhe/bfv.rs`) |
+| LowGear | field p | n≥2 | dishonest | **semi-honest** | ✅ `mpcc/lowgear.rs` — triples from real BGV over CRT slots (2-party, no ZKPoPK) |
+| HighGear | field p | n≥2 | dishonest | malicious | 🔨 P3 — shared threshold key + ZKPoPK |
 | Rep4 | ring 2^k | 4 | honest | malicious | 🔨 P3 |
 | Tinier / SemiBin | binary | n≥2 | dishonest | mal / semi | 🔨 P4 |
 | BMR | binary | n≥2 | dishonest | semi-honest | 🔨 P4 |
 
-Two of these are near-free for us: **Dealer** (no crypto, pure lower bound — and
+Two of these were near-free for us: **Dealer** (no crypto, pure lower bound — and
 the single most useful baseline for a cost-model paper) and **LowGear**, whose
-somewhat-homomorphic preprocessing is exactly what `src/fhe/bfv.rs` already does.
+somewhat-homomorphic preprocessing is what the FHE stack already does. LowGear
+turned out to need one genuinely new piece — **CRT slot packing**
+(`src/fhe/slots.rs`), because an OLE needs `n` *independent* products and every
+other packing in the repo is coefficient-based, i.e. a convolution. It also
+prefers BGV over BFV: with the message in the low bits there is no `Δ = q/t`, so
+the plaintext modulus is free to be the prime that slots require.
 
 ---
 
@@ -213,13 +219,29 @@ SPDZ2k's `s` bits). `estimate` now says "derived from MEASURED OT cost" for thos
 rows instead of disclaiming a literature estimate.
 
 That changed a **ranking**, in the direction the literature predicts: on a
-3-multiply program LowGear's BFV preprocessing moves ~384 B per triple against
+3-multiply program LowGear's SHE preprocessing moves ~384 B per triple against
 9.2 KiB (Semi2k), 24.4 KiB (SPDZ2k) and 48.8 KiB (MASCOT) — a gap the old
-constants understated by an order of magnitude, and precisely LowGear's selling
-point. A test pins it. Two things this is *not*: it is the naive Gilboa route, so
-it is an upper bound (vector OLE and batched sacrifice both do better), and the
-offline *time* is still volume ÷ bandwidth, so the CPU half of LowGear's trade is
-still missing and its total remains flattering.
+constants understated by an order of magnitude. A test pins it. Note this is the
+naive Gilboa route on the OT side, so it is an upper bound (vector OLE and
+batched sacrifice both do better).
+
+**LowGear landed 2026-07-29** (`src/mpcc/lowgear.rs`, `baru bench-triples`), and
+the CPU half that "remains flattering" above was measured and came out the *other
+way*. Running the protocol — BGV over CRT slots, one ciphertext×plaintext
+multiply per cross term — gives **416 B/triple at a 64-bit field** (104 B at its
+native 17-bit field × 4 CRT limbs), within 8% of the 384 B estimate, **and ~4.5×
+faster per triple than the OT route**. `mpcc::cost` used to assert "LowGear trades
+bandwidth for CPU: its preprocessing is compute-bound"; that note was never
+measured and is wrong at these parameters. It has been replaced by the
+measurement. Both `semi2k` and `lowgear` are now in `RUNNABLE` and calibrate at
+**0% on rounds and online bytes**.
+
+Two limits bound the LowGear claim. The engine is **semi-honest** — no MACs, no
+sacrifice, no ZKPoPK — so it is the LowGear analogue of Semi2k, not of SPDZ. And
+its field is ~17 bits, forced by the noise-flooding budget at this crate's
+`u128`-capped `q ≤ 2^127` (Overdrive uses 250–350-bit `q` at `n = 16384–32768`);
+that is too small for masked bit-decomposition, so comparison-shaped programs are
+refused rather than run wrong (`mpcc::engine_can_run_program`).
 
 **Semi2k landed 2026-07-28** (`src/mpcc/semi2k.rs`): Dealer's online phase with
 triples from real OT (Gilboa OLE over `ot::iknp::correlated`). It is in `RUNNABLE`
@@ -277,9 +299,11 @@ machinery — still refused by the VM, with an error naming this phase), SPDZ2k
 MACs, replicated field, ATLAS, and daBit-based `Convert` for arithmetic↔binary
 mixed circuits.
 
-**P3 — preprocessing back-ends.** MASCOT (OT), LowGear (BFV). Split offline/online
-measurement in the harness (MP-SPDZ's `-v`). This is where Baru's existing FHE
-stack pays for itself.
+**P3 — preprocessing back-ends.** *LowGear landed 2026-07-29* (`mpcc/lowgear.rs`,
+`baru bench-triples`) — see P1 below for the measurement, including the modelling
+assumption it falsified. Remaining here: MASCOT (OT-based, malicious), HighGear,
+and the malicious layer LowGear deliberately omits (MACs, sacrifice, ZKPoPK).
+Split offline/online measurement in the harness (MP-SPDZ's `-v`) is still open.
 
 **P4 — binary protocols and the full matrix.** Tinier, SemiBin, BMR; Yao folded
 into the same VM interface.

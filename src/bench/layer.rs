@@ -37,7 +37,10 @@ use std::collections::HashMap;
 use serde::Serialize;
 
 use crate::mpcc::cost::{native_domain, Deployment};
-use crate::mpcc::{compile, engine_supports, fhe_cost, find, run_protocol, schedule, LowerConfig};
+use crate::mpcc::{
+    compile, engine_can_run_program, engine_supports, fhe_cost, find, run_protocol, schedule,
+    LowerConfig,
+};
 
 /// One protocol at one layer width.
 #[derive(Debug, Clone, Serialize)]
@@ -183,6 +186,12 @@ pub fn run(widths: &[usize], dep: &Deployment, bit_width: u32) -> Result<LayerRe
                 public_vars: Vec::new(),
             };
             let prog = compile(&src, &cfg)?;
+            // A layer contains a ReLU, so protocols that cannot bit-decompose
+            // (lowgear's ~17-bit field) are skipped with the rest of the sweep
+            // intact, exactly as an unsupported party count would be.
+            if engine_can_run_program(id, &prog).is_err() {
+                continue;
+            }
             let sched = schedule(&prog);
             let m = run_protocol(id, dep.parties, &prog, &sched, &inputs)?;
 
@@ -217,6 +226,9 @@ pub fn run(widths: &[usize], dep: &Deployment, bit_width: u32) -> Result<LayerRe
                     public_vars: Vec::new(),
                 };
                 let prog = compile(&relu_src(), &cfg)?;
+                if engine_can_run_program(id, &prog).is_err() {
+                    continue;
+                }
                 let sched = schedule(&prog);
                 let mut ri: HashMap<String, i64> = HashMap::new();
                 ri.insert("x".to_string(), 5);

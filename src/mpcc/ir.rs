@@ -269,6 +269,7 @@ pub struct Instr {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct Program {
+    /// Registers, in SSA order.
     pub regs: Vec<RegInfo>,
     pub code: Vec<Instr>,
     /// `(variable, register)` for each secret input, in declaration order.
@@ -288,6 +289,30 @@ pub struct Program {
 impl Program {
     pub fn new(domain: Domain) -> Self {
         Program::with_bit_width(domain, domain.element_bits())
+    }
+
+    /// Does this program need **masked bit-decomposition**?
+    ///
+    /// Every comparison-shaped operation reduces to one, and masked opening
+    /// costs [`crate::mpcc::vm::KAPPA`] bits of statistical headroom *above*
+    /// the value width. A protocol whose modulus is too small to supply that
+    /// headroom can still run arithmetic, so this is the predicate that
+    /// separates "cannot run this program" from "cannot run at all" — see
+    /// [`crate::mpcc::lowgear::LowGearEngine`].
+    pub fn needs_bit_decomposition(&self) -> bool {
+        self.code.iter().any(|i| {
+            matches!(
+                i.op,
+                Op::BitDecomp { .. }
+                    | Op::BitComp { .. }
+                    | Op::LtS
+                    | Op::LtU
+                    | Op::EqZ
+                    | Op::TruncPr { .. }
+                    | Op::Div
+                    | Op::PopCount { .. }
+            )
+        })
     }
 
     pub fn with_bit_width(domain: Domain, bit_width: u32) -> Self {

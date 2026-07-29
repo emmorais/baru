@@ -204,42 +204,68 @@ fn mpc_relu_rescale_layer(
         let masks = masks.clone();
         let bias = bias.clone();
         move |be: &mut TransportBackend<MpcTransport>| {
-            (0..width)
+            // Three phases, so the two interactive steps are issued ONCE for
+            // the whole layer instead of once per neuron. The elements are
+            // independent, so a per-element loop here would serialise the
+            // layer into O(width) rounds for bit-identical output — the same
+            // round-structure tax `gadgets::relu` exists to avoid, and the one
+            // `bench-hybrid-nn` was paying until it adopted the batched gadget.
+
+            // 1. Import + bias, **batched**: three sharings for the whole
+            //    layer (one per owner) plus one for the bias, rather than
+            //    `4 * width` interactive calls. Folding is local addition.
+            //    Reconstruct this party's component of the masked matvec
+            //    output first (party 0 also holds the opened value).
+            let my_comps: Vec<Fr> = (0..width)
                 .map(|j| {
-                    // Reconstruct the raw matvec output share from this
-                    // party's mask component (party 0 also holds y).
-                    let my_comp: Fr = if me == 0 {
+                    if me == 0 {
                         (opened[j] as u128).wrapping_sub(masks[j][0] as u128)
                     } else {
                         0u128.wrapping_sub(masks[j][me] as u128)
-                    };
-                    let mut raw: Option<ShareRef> = None;
-                    for owner in 0..3 {
-                        let v = if me == owner { my_comp } else { 0 };
-                        let s = be.share_secret(v, nbits, owner);
-                        raw = Some(match raw {
-                            None => s,
-                            Some(a) => be.add(&a, &s),
-                        });
                     }
-                    let raw = raw.unwrap();
-                    // + public (bias ≪ shift)
-                    let bconst = residue(bias[j] << shift, nbits);
-                    let bshare =
-                        be.share_secret(if me == 0 { bconst } else { 0 }, nbits, 0);
-                    let v = be.add(&raw, &bshare);
-
-                    // Fused ReLU∘rescale from ONE a2b:
-                    //   bits = a2b(v);  shifted = b2a(bits[s..]) = v≫s;
-                    //   keep = 1 - sign;  out = shifted · keep.
-                    let bits = be.a2b(&v, nbits);
-                    let shifted = be.b2a(&bits[shift as usize..]);
-                    let sign = bits[nbits - 1].clone();
-                    let one = be.share_secret(if me == 0 { 1 } else { 0 }, 1, 0);
-                    let keep = be.sub(&one, &sign);
-                    let act = be.mul(&shifted, &keep);
-                    be.my_additive_component(&act)
                 })
+                .collect();
+            let mut raws: Option<Vec<ShareRef>> = None;
+            for owner in 0..3 {
+                let vals: Vec<Fr> =
+                    if me == owner { my_comps.clone() } else { vec![0; width] };
+                let shs = be.share_secret_batch(&vals, nbits, owner);
+                raws = Some(match raws {
+                    None => shs,
+                    Some(a) => a.iter().zip(&shs).map(|(x, y)| be.add(x, y)).collect(),
+                });
+            }
+            let bvals: Vec<Fr> = (0..width)
+                .map(|j| if me == 0 { residue(bias[j] << shift, nbits) } else { 0 })
+                .collect();
+            let bshares = be.share_secret_batch(&bvals, nbits, 0);
+            let vs: Vec<ShareRef> = raws
+                .unwrap_or_default()
+                .iter()
+                .zip(&bshares)
+                .map(|(raw, b)| be.add(raw, b))
+                .collect();
+
+            // 2. Fused ReLU∘rescale from ONE **batched** a2b:
+            //      bits = a2b(v);  shifted = b2a(bits[s..]) = v≫s;
+            //      keep = 1 - sign;  out = shifted · keep.
+            //    `a2b_batch` runs the same ~9 rounds as a single decomposition,
+            //    just wider; `b2a` is local (Σ bitᵢ·2ⁱ), so it stays per element.
+            let all_bits = be.a2b_batch(&vs, nbits);
+            let one = be.share_secret(if me == 0 { 1 } else { 0 }, 1, 0);
+            let mul_pairs: Vec<(ShareRef, ShareRef)> = all_bits
+                .iter()
+                .map(|bits| {
+                    let shifted = be.b2a(&bits[shift as usize..]);
+                    let keep = be.sub(&one, &bits[nbits - 1]);
+                    (shifted, keep)
+                })
+                .collect();
+
+            // 3. One batched multiply for the whole layer.
+            be.mul_batch(&mul_pairs)
+                .iter()
+                .map(|act| be.my_additive_component(act))
                 .collect::<Vec<Fr>>()
         }
     })

@@ -66,6 +66,8 @@ use crate::crypto::net::InprocHandle;
 use crate::crypto::types::Fr;
 use crate::fhe::ckks_compare::{relu_approx_plain, CkksCompareBackend};
 use crate::fhe::bfv::{Bfv, BfvAdapter, BfvCt, BfvParams};
+// `Backend` is already taken by the MPC interpreter's trait, below.
+use crate::fhe::poly::{self, Backend as PolyBackend};
 use crate::fhe::si_ntru::{NtruCt, SiNtru, SiNtruAdapter, SiNtruParams};
 use crate::fhe::{CkksBackend, FheBackend, MockFheBackend, RealFheBackend, TfheBackend};
 use crate::hybrid::{shares_to_fhe, FheAdapter, IntFhe, RealFhe};
@@ -233,6 +235,33 @@ pub fn sleep_link(profile: &NetworkProfile, bytes: usize, half_rtts: u32) {
 
 /// Mux-style ReLU on shares (`bench-nn`'s Layer pattern), over whatever
 /// backend — for this benchmark, always the real transport.
+/// Import an FHE→MPC masked opening into shares, **batched per owner**.
+///
+/// Each of the three parties contributes one component of the masked value, so
+/// the import is three sharings — of the whole vector, not of each element.
+/// The per-element form costs `3 * len` interactive calls for identical output;
+/// `share_secret_batch` has existed on `TransportBackend` all along (see
+/// `bench-cnn`, which uses exactly this shape).
+fn import_batched(
+    be: &mut TransportBackend<MpcTransport>,
+    my_comps: &[Fr],
+    me: usize,
+    nbits: usize,
+) -> Vec<ShareRef> {
+    let count = my_comps.len();
+    let mut acc: Option<Vec<ShareRef>> = None;
+    for owner in 0..3 {
+        let vals: Vec<Fr> = if me == owner { my_comps.to_vec() } else { vec![0; count] };
+        let shs = be.share_secret_batch(&vals, nbits, owner);
+        acc = Some(match acc {
+            // Folding the three owners is local addition — free.
+            None => shs,
+            Some(a) => a.iter().zip(&shs).map(|(x, y)| be.add(x, y)).collect(),
+        });
+    }
+    acc.unwrap_or_default()
+}
+
 pub fn mpc_relu(be: &mut dyn Backend, z: &ShareRef) -> ShareRef {
     let zero = be.sub(z, z);
     let mask = be.lt(&zero, z);
@@ -276,9 +305,10 @@ fn run_mpc_only(data: &LayerData, profile: NetworkProfile) -> StrategyReport {
                     .map(|(o, b)| be.add(o, b))
                     .collect::<Vec<_>>()
             });
-            let relu = t.phase("relu", || {
-                pre.iter().map(|z| mpc_relu(be, z)).collect::<Vec<_>>()
-            });
+            // Batched: one `lt_batch` + one `mul_batch` for the whole layer.
+            // The elements are independent, so the per-element form below
+            // ([`mpc_relu`]) costs O(out_dim) rounds for identical output.
+            let relu = t.phase("relu", || crate::gadgets::relu(be, &pre));
             let out = t.phase("reveal", || {
                 relu.iter()
                     .map(|s| to_signed_n(be.reveal(s, None) as u64, NBITS))
@@ -358,27 +388,21 @@ fn hybrid_mpc_relu<A: FheAdapter>(
                 // Import: each party shares ITS component (y−r₀ for party
                 // 0, −rᵢ otherwise) via the real input-sharing protocol,
                 // then the three shares are added locally.
-                let shares: Vec<ShareRef> = (0..opened.len())
+                // Import, batched per owner: 3 rounds for the whole vector
+                // instead of 3 per element. Folding the three owners is local.
+                let my_comps: Vec<Fr> = (0..opened.len())
                     .map(|j| {
-                        let my_comp: Fr = if me == 0 {
+                        if me == 0 {
                             (opened[j] as u128).wrapping_sub(my_masks[j] as u128)
                         } else {
                             0u128.wrapping_sub(my_masks[j] as u128)
-                        };
-                        let mut acc: Option<ShareRef> = None;
-                        for owner in 0..3 {
-                            let v = if me == owner { my_comp } else { 0 };
-                            let s = be.share_secret(v, nbits, owner);
-                            acc = Some(match acc {
-                                None => s,
-                                Some(a) => be.add(&a, &s),
-                            });
                         }
-                        acc.unwrap()
                     })
                     .collect();
-                let relu: Vec<ShareRef> =
-                    shares.iter().map(|z| mpc_relu(be, z)).collect();
+                let shares: Vec<ShareRef> = import_batched(be, &my_comps, me, nbits);
+                // Batched over the whole output vector: one comparison round
+                // and one multiply round, not one of each per element.
+                let relu: Vec<ShareRef> = crate::gadgets::relu(be, &shares);
                 // Export: this party's canonical additive component —
                 // local, zero communication.
                 relu.iter()
@@ -777,27 +801,19 @@ fn run_hybrid_ntru(data: &LayerData, profile: NetworkProfile) -> StrategyReport 
             let my_masks: Vec<u64> = flat_masks.iter().map(|m| m[me]).collect();
             let y = flat_opened.clone();
             move |be: &mut TransportBackend<MpcTransport>| {
-                let shares: Vec<ShareRef> = (0..y.len())
+                let my_comps: Vec<Fr> = (0..y.len())
                     .map(|j| {
-                        let my_comp: Fr = if me == 0 {
+                        if me == 0 {
                             (y[j] as u128).wrapping_sub(my_masks[j] as u128)
                         } else {
                             0u128.wrapping_sub(my_masks[j] as u128)
-                        };
-                        let mut acc: Option<ShareRef> = None;
-                        for owner in 0..3 {
-                            let v = if me == owner { my_comp } else { 0 };
-                            let sref = be.share_secret(v, nbits, owner);
-                            acc = Some(match acc {
-                                None => sref,
-                                Some(a) => be.add(&a, &sref),
-                            });
                         }
-                        acc.unwrap()
                     })
                     .collect();
-                let relu: Vec<ShareRef> =
-                    shares.iter().map(|z| mpc_relu(be, z)).collect();
+                let shares: Vec<ShareRef> = import_batched(be, &my_comps, me, nbits);
+                // Batched over every chunk's outputs at once — the flattening
+                // above exists precisely so this is one batch, not one per chunk.
+                let relu: Vec<ShareRef> = crate::gadgets::relu(be, &shares);
                 relu.iter()
                     .map(|sref| be.my_additive_component(sref))
                     .collect::<Vec<Fr>>()
@@ -1003,28 +1019,32 @@ fn run_hybrid_bfv(data: &LayerData, profile: NetworkProfile) -> StrategyReport {
             let y = flat_opened.clone();
             let bias = bias.clone();
             move |be: &mut TransportBackend<MpcTransport>| {
-                (0..y.len())
+                // Import + bias for every output first, so the nonlinearity
+                // can be issued as ONE batch. Interleaving the ReLU into this
+                // loop would serialise the comparisons and cost O(len) rounds.
+                let my_comps: Vec<Fr> = (0..y.len())
                     .map(|j| {
-                        let my_comp: Fr = if me == 0 {
+                        if me == 0 {
                             (y[j] as u128).wrapping_sub(my_masks[j] as u128)
                         } else {
                             0u128.wrapping_sub(my_masks[j] as u128)
-                        };
-                        let mut acc: Option<ShareRef> = None;
-                        for owner in 0..3 {
-                            let v = if me == owner { my_comp } else { 0 };
-                            let sref = be.share_secret(v, nbits, owner);
-                            acc = Some(match acc {
-                                None => sref,
-                                Some(a) => be.add(&a, &sref),
-                            });
                         }
-                        let raw = acc.unwrap();
-                        let b = be.share_secret(if me == 0 { residue(bias[j], nbits) } else { 0 }, nbits, 0);
-                        let z = be.add(&raw, &b);
-                        let relu = mpc_relu(be, &z);
-                        be.my_additive_component(&relu)
                     })
+                    .collect();
+                let raws = import_batched(be, &my_comps, me, nbits);
+                // The bias is public-to-party-0, so it is ONE batched sharing.
+                let bvals: Vec<Fr> = (0..y.len())
+                    .map(|j| if me == 0 { residue(bias[j], nbits) } else { 0 })
+                    .collect();
+                let bshares = be.share_secret_batch(&bvals, nbits, 0);
+                let zs: Vec<ShareRef> = raws
+                    .iter()
+                    .zip(&bshares)
+                    .map(|(raw, b)| be.add(raw, b))
+                    .collect();
+                crate::gadgets::relu(be, &zs)
+                    .iter()
+                    .map(|relu| be.my_additive_component(relu))
                     .collect::<Vec<Fr>>()
             }
         })
@@ -1157,6 +1177,22 @@ pub enum Strategy {
 }
 
 impl Strategy {
+    /// The inverse of [`Strategy::parse`], and the same string each strategy
+    /// reports as `StrategyReport::strategy` — which is what lets the
+    /// cross-backend summary match rows up.
+    fn name(self) -> &'static str {
+        match self {
+            Strategy::Mpc => "mpc",
+            Strategy::Tfhe => "tfhe",
+            Strategy::Ckks => "ckks",
+            Strategy::HybridTfhe => "hybrid-tfhe",
+            Strategy::HybridCkks => "hybrid-ckks",
+            Strategy::HybridNtru => "hybrid-ntru",
+            Strategy::HybridBfv => "hybrid-bfv",
+            Strategy::HybridMock => "hybrid-mock",
+        }
+    }
+
     fn parse(s: &str) -> Result<Strategy, String> {
         match s {
             "mpc" => Ok(Strategy::Mpc),
@@ -1210,6 +1246,12 @@ options:
   --relu-iterations K  Newton iterations for the ckks strategy (default 2)
   --rtt-ms N           round-trip latency between any two machines (default 0)
   --bandwidth-mbps X   link bandwidth in Mbit/s (default: unlimited)
+  --poly B             polynomial backend for the Rust FHE schemes: ntt
+                       (default), ntl, or `all` to sweep both. Moves only the
+                       hybrid-bfv and hybrid-ntru rows — ckks/tfhe use SEAL
+                       and tfhe-rs, which have their own arithmetic, and mpc
+                       has no polynomials at all. Flat rows there are the
+                       expected result, not a bug. (ntl needs --features ntl)
   --json               emit reports as JSON
 ";
 
@@ -1231,6 +1273,7 @@ pub fn run_cli(args: &[String]) -> Result<(), String> {
     let mut rtt_ms: u64 = 0;
     let mut bandwidth_mbps: Option<f64> = None;
     let mut json = false;
+    let mut poly_sweep: Vec<PolyBackend> = vec![PolyBackend::Ntt];
     let mut strategies = vec![
         Strategy::Mpc,
         Strategy::HybridNtru,
@@ -1298,6 +1341,21 @@ pub fn run_cli(args: &[String]) -> Result<(), String> {
                     .map(Strategy::parse)
                     .collect::<Result<Vec<_>, _>>()?;
             }
+            "--poly" => {
+                i += 1;
+                let v = args.get(i).ok_or("--poly needs a value")?;
+                poly_sweep = if v == "all" {
+                    poly::available()
+                } else {
+                    let b = PolyBackend::parse(v)?;
+                    if !poly::is_available(b) {
+                        return Err(format!(
+                            "polynomial backend {v:?} is not in this build (rebuild with --features ntl)"
+                        ));
+                    }
+                    vec![b]
+                };
+            }
             other => return Err(format!("unknown option '{other}'\n{USAGE}")),
         }
         i += 1;
@@ -1335,8 +1393,13 @@ pub fn run_cli(args: &[String]) -> Result<(), String> {
     }
 
     let mut reports = Vec::new();
+    let sweeping = poly_sweep.len() > 1;
+    for &pb in &poly_sweep {
+    if !json && sweeping {
+        println!("── polynomial backend: {} ──\n", pb.name());
+    }
     for &s in &strategies {
-        let r = run_strategy(s, &data, relu_iterations, profile);
+        let r = poly::with_backend(pb, || run_strategy(s, &data, relu_iterations, profile))?;
         if !json {
             let phases: Vec<String> = r
                 .phases
@@ -1367,14 +1430,44 @@ pub fn run_cli(args: &[String]) -> Result<(), String> {
             }
             println!();
         }
-        reports.push(r);
+        reports.push((pb, r));
+    }
     }
 
     if json {
+        let payload: Vec<_> = reports
+            .iter()
+            .map(|(b, r)| serde_json::json!({ "poly_backend": b.name(), "report": r }))
+            .collect();
         println!(
             "{}",
-            serde_json::to_string_pretty(&reports).map_err(|e| e.to_string())?
+            serde_json::to_string_pretty(&payload).map_err(|e| e.to_string())?
         );
+        return Ok(());
+    }
+
+    // Same strategy, same layer, only the ring arithmetic swapped.
+    if sweeping {
+        let base = poly_sweep[0];
+        println!("total-time speedup vs {}:", base.name());
+        for &pb in poly_sweep.iter().skip(1) {
+            let line: Vec<String> = strategies
+                .iter()
+                .filter_map(|s| {
+                    let f = |b: PolyBackend| {
+                        reports
+                            .iter()
+                            .find(|(rb, r)| *rb == b && r.strategy == s.name())
+                            .map(|(_, r)| r.total_ms)
+                    };
+                    match (f(base), f(pb)) {
+                        (Some(a), Some(c)) if c > 0.0 => Some(format!("{}={:.2}x", s.name(), a / c)),
+                        _ => None,
+                    }
+                })
+                .collect();
+            println!("  {:<4} {}", pb.name(), line.join("  "));
+        }
     }
     Ok(())
 }

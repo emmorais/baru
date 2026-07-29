@@ -41,6 +41,9 @@ pub mod cost;
 pub mod fhe_cost;
 pub mod ir;
 pub mod lower;
+/// LowGear — Beaver triples from SHE, the measured counterpart to
+/// [`semi2k`]'s OT-based preprocessing.
+pub mod lowgear;
 pub mod opt;
 pub mod ot_cost;
 pub mod protocols;
@@ -68,7 +71,7 @@ pub use vm::{execute, Measured};
 
 /// Protocols the VM can actually execute today.  Everything else in the
 /// registry is analysis-only until its roadmap phase lands.
-pub const RUNNABLE: &[&str] = &["dealer", "shamir", "semi2k"];
+pub const RUNNABLE: &[&str] = &["dealer", "shamir", "semi2k", "lowgear"];
 
 /// Whether the *implementation* can run `id` at `parties`, which is not the same
 /// question as whether the *protocol* supports it.
@@ -83,8 +86,40 @@ pub fn engine_supports(id: &str, parties: usize) -> bool {
         "dealer" => parties >= 2,
         "shamir" => parties >= 3,
         "semi2k" => parties == 2,
+        // Same pairwise limit as semi2k, for the same reason: the OLE is
+        // two-party. Its *field* is a further limit — see `run_protocol`.
+        "lowgear" => parties == 2,
         _ => false,
     }
+}
+
+/// Whether the engine for `id` can run *this particular program*.
+///
+/// [`engine_supports`] answers the party-count question, which is a property of
+/// the deployment. This answers the capability question, which is a property of
+/// the **program**: `lowgear`'s field is fixed at ~17 bits by its SHE noise
+/// budget, so it can multiply and open but cannot do masked bit-decomposition,
+/// and every comparison reduces to one.
+///
+/// Callers that enumerate [`RUNNABLE`] should use this to *skip a row with a
+/// reason* rather than fail the whole sweep — the same convention
+/// `engine_supports` exists for. [`run_protocol`] enforces it too, so a direct
+/// caller cannot bypass the check.
+pub fn engine_can_run_program(id: &str, prog: &Program) -> Result<(), String> {
+    if id == "lowgear" && prog.needs_bit_decomposition() {
+        let params = lowgear::LowGearParams::default_params();
+        return Err(format!(
+            "lowgear cannot run comparison-shaped programs: masked bit-decomposition needs \
+             KAPPA = {} bits of headroom above the value, and its {}-bit field (t = {}, fixed \
+             by the SHE noise-flooding budget at q = 2^{}) has none. Arithmetic-only programs \
+             run fine.",
+            vm::KAPPA,
+            params.field_bits(),
+            params.t,
+            params.log2_q
+        ));
+    }
+    Ok(())
 }
 
 /// Execute `prog` under the named protocol.
@@ -128,6 +163,37 @@ pub fn run_protocol(
                 }
             };
             let mut e = semi2k::Semi2kEngine::new(parties, bits)?;
+            execute(prog, sched, &mut e, id, inputs)
+        }
+        "lowgear" => {
+            let params = lowgear::LowGearParams::default_params();
+            // The flooding budget caps the plaintext field at ~17 bits, which
+            // is below the masking headroom `vm::bit_decompose` needs. Reject
+            // such programs here rather than let the engine panic mid-run: a
+            // clear refusal is the honest form of a capability limit.
+            let field_bits = params.field_bits();
+            // The domain a program must be lowered for is the registry's
+            // *wire* width (byte-aligned), not the modulus width.
+            let wire_bits = find("lowgear").expect("lowgear is in the registry").cost.field_bits;
+            match prog.domain {
+                Domain::Field { bits } if bits == wire_bits => {}
+                Domain::Field { bits } => {
+                    return Err(format!(
+                        "lowgear runs in F_{} ({field_bits}-bit modulus, {wire_bits}-bit wire \
+                         element), but the program was lowered for a {bits}-bit field. That \
+                         size is fixed by the SHE noise-flooding budget at q = 2^{}; see \
+                         `mpcc::lowgear`.",
+                        params.t, params.log2_q
+                    ))
+                }
+                other => {
+                    return Err(format!(
+                        "lowgear computes in a prime field, but the program was lowered for {other}"
+                    ))
+                }
+            }
+            engine_can_run_program(id, prog)?;
+            let mut e = lowgear::LowGearEngine::new(parties, params)?;
             execute(prog, sched, &mut e, id, inputs)
         }
         other => Err(format!(
@@ -666,7 +732,8 @@ baru mpcc — MPC compiler and protocol comparison
   baru mpcc assign    (--expr EXPR | --case NAME) [--protocol ID] [deployment opts]
 
 run/calibrate opts
-  --protocol ID                     dealer | shamir  (the executable protocols)
+  --protocol ID                     dealer | shamir | semi2k | lowgear
+                                    (the executable protocols)
   --input NAME=VAL                  input binding, repeatable; implied by --case
 
 lowering opts

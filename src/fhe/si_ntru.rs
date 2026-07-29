@@ -192,7 +192,7 @@ fn poly_mul_mod(a: &[u128], b: &[u128], params: &SiNtruParams) -> Poly {
     let mask = params.q_mask();
     let ac: Vec<i128> = a.iter().map(|&c| center(c, params)).collect();
     let bc: Vec<i128> = b.iter().map(|&c| center(c, params)).collect();
-    crate::fhe::ntt::exact_negacyclic_product(&ac, &bc, params.n)
+    crate::fhe::poly::negacyclic_product(&ac, &bc, params.n)
         .into_iter()
         .map(|c| c.lo & mask)
         .collect()
@@ -215,7 +215,7 @@ fn poly_mul_rescale(a: &[u128], b: &[u128], params: &SiNtruParams) -> Poly {
     let bc: Vec<i128> = b.iter().map(|&c| center(c, params)).collect();
     // Exact integer negacyclic product via multi-modular NTT (O(n log n));
     // see `crate::fhe::ntt` for why a power-of-two q needs the CRT detour.
-    let acc = crate::fhe::ntt::exact_negacyclic_product(&ac, &bc, n);
+    let acc = crate::fhe::poly::negacyclic_product(&ac, &bc, n);
     let mask = params.q_mask();
     let shift = params.delta_shift();
     acc.into_iter()

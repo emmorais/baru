@@ -49,6 +49,7 @@
 
 pub mod backend;
 pub mod bfv;
+pub mod bgv;
 pub mod circuit_emitter;
 pub mod conv_pack;
 pub mod ckks_backend;
@@ -56,7 +57,18 @@ pub mod ckks_compare;
 pub mod lifecycle;
 pub mod market;
 pub mod mock_backend;
+/// NTL+GMP polynomial multiplication — a second implementation of what
+/// [`ntt`] computes, and the differential oracle for it. Opt-in: needs a C++
+/// toolchain plus NTL and GMP (`cargo test --features ntl`).
+#[cfg(feature = "ntl")]
+pub mod ntl;
 pub mod ntt;
+/// CRT slot packing — `n` independent values per ciphertext, for the
+/// elementwise products [`crate::mpcc::lowgear`] needs.
+pub mod slots;
+/// Runtime switch choosing which implementation computes the ring products
+/// every FHE scheme here depends on ([`ntt`], or [`ntl`] when built in).
+pub mod poly;
 pub mod si_ntru;
 pub mod tfhe_backend;
 

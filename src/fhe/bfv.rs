@@ -40,7 +40,8 @@
 
 use rand::Rng;
 
-use crate::fhe::ntt::{self, I256};
+use crate::fhe::ntt::I256;
+use crate::fhe::poly;
 
 // ─── Parameters ───────────────────────────────────────────────────────────────
 
@@ -89,7 +90,7 @@ fn poly_mul_mod(a: &[u128], b: &[u128], p: &BfvParams) -> Poly {
     let mask = p.q_mask();
     let ac: Vec<i128> = a.iter().map(|&c| center(c, p)).collect();
     let bc: Vec<i128> = b.iter().map(|&c| center(c, p)).collect();
-    crate::fhe::ntt::exact_negacyclic_product(&ac, &bc, p.n)
+    poly::negacyclic_product(&ac, &bc, p.n)
         .into_iter()
         .map(|c| c.lo & mask)
         .collect()
@@ -158,8 +159,7 @@ impl BfvCt {
 /// A fresh ciphertext held in the NTT domain, ready to be multiplied
 /// against many others without re-transforming.
 pub struct BfvCtNtt {
-    t0: ntt::Transformed,
-    t1: ntt::Transformed,
+    pre: poly::PreparedPair,
 }
 
 pub struct Bfv {
@@ -335,8 +335,7 @@ impl Bfv {
         let p = &self.params;
         let cen = |v: &[u128]| -> Vec<i128> { v.iter().map(|&c| center(c, p)).collect() };
         BfvCtNtt {
-            t0: ntt::forward_transform(&cen(&ct.c[0]), p.n),
-            t1: ntt::forward_transform(&cen(&ct.c[1]), p.n),
+            pre: poly::prepare_pair(&cen(&ct.c[0]), &cen(&ct.c[1]), p.n),
         }
     }
 
@@ -347,7 +346,7 @@ impl Bfv {
         let p = &self.params;
         let cen = |v: &[u128]| -> Vec<i128> { v.iter().map(|&c| center(c, p)).collect() };
         let (b0, b1) = (cen(&b.c[0]), cen(&b.c[1]));
-        let (t0, t1, t2) = ntt::exact_bfv_tensor_pre(&a.t0, &a.t1, &b0, &b1, p.n);
+        let (t0, t1, t2) = poly::rlwe_tensor_pre(&a.pre, &b0, &b1, p.n);
         BfvCt {
             c: vec![rescale(t0, p), rescale(t1, p), rescale(t2, p)],
         }

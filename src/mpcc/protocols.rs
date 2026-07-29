@@ -327,7 +327,7 @@ pub const REGISTRY: &[ProtocolSpec] = &[
         max_parties: None,
         majority: Majority::Dishonest,
         security: Security::SemiHonest,
-        status: Status::Planned("P1"),
+        status: Status::Implemented("mpcc::semi2k"),
         cost: CostParams {
             mul_elems: Elems::new(0.0, 2.0),
             open_elems: Elems::new(0.0, 1.0),
@@ -403,18 +403,41 @@ pub const REGISTRY: &[ProtocolSpec] = &[
         min_parties: 2,
         max_parties: None,
         majority: Majority::Dishonest,
-        security: Security::Malicious,
-        status: Status::Planned("P3 — reuses fhe::bfv"),
+        // The implemented engine is SEMI-HONEST: it has no MACs and no
+        // zero-knowledge proofs of plaintext knowledge, so it is the LowGear
+        // analogue of Semi2k rather than of SPDZ. Overdrive's malicious
+        // security needs ZKPoPK, which `mpcc::lowgear` deliberately omits.
+        security: Security::SemiHonest,
+        status: Status::Implemented("mpcc::lowgear"),
         cost: CostParams {
             mul_elems: Elems::new(0.0, 2.0),
             open_elems: Elems::new(0.0, 1.0),
             triples_per_mul: 1.0,
-            // Somewhat-homomorphic preprocessing trades communication for
-            // local work: far fewer bytes, far more CPU.
-            offline_elems_per_triple: 8.0,
-            field_bits: 128,
+            // **Measured** by `baru bench-triples`, not assumed: 104 B/triple
+            // at the implemented field below. One element is ceil(17/8) = 3
+            // bytes, so 104 B is ~35 elements.
+            offline_elems_per_triple: 35.0,
+            // The field Baru's engine ACTUALLY runs over, not Overdrive's.
+            // `mpcc::lowgear`'s noise-flooding budget at q = 2^100 caps the
+            // plaintext modulus at t = 114689 (~17 bits); the registry has to
+            // describe what is built, or `calibrate` would lower programs for a
+            // field the engine cannot evaluate and the comparison would be
+            // meaningless. Overdrive uses a 128-bit field with 250-350 bit q at
+            // n = 16384-32768 — out of reach while this crate holds ring
+            // coefficients in u128.
+            //
+            // The byte-aligned WIRE width of one element, not the modulus
+            // size — the same convention `shamir` uses (64 for a 61-bit
+            // Mersenne prime). `t = 114689` needs 17 bits, which occupies 3
+            // bytes, so 24. The cost model prices `field_bits/8` and the VM
+            // charges `ceil(order_bits/8)`; declaring the byte-aligned width is
+            // what makes those agree, and `mpcc::lowgear` has a test that fails
+            // if they ever drift apart.
+            field_bits: 24,
             and_bits: Elems::new(0.0, 2.0),
-            auth_overhead: 2.0,
+            // No MACs in the implemented engine (see `security` above), so
+            // online shares carry no authentication material.
+            auth_overhead: 1.0,
             local_ns_per_lane: 40.0,
             ..SEMI_RING_SHARED
         },
@@ -531,6 +554,11 @@ mod tests {
         assert_eq!(before, ids.len(), "duplicate protocol id in REGISTRY");
     }
 
+    /// `Implemented` means Baru can *run a program* under this protocol, which
+    /// is exactly [`crate::mpcc::RUNNABLE`] minus the two simulation-only
+    /// engines (`dealer` is a lower bound, not a protocol; `shamir` is not in
+    /// the registry as an id). If the two lists drift apart, one of them is
+    /// lying to a report.
     #[test]
     fn implemented_protocols_match_the_backends_baru_actually_has() {
         let implemented: Vec<&str> = REGISTRY
@@ -538,7 +566,17 @@ mod tests {
             .filter(|p| p.status.is_implemented())
             .map(|p| p.id)
             .collect();
-        assert_eq!(implemented, vec!["aby3", "yao"]);
+        assert_eq!(implemented, vec!["aby3", "semi2k", "lowgear", "yao"]);
+        // Everything claiming to be implemented must actually be executable.
+        for id in &implemented {
+            if *id == "aby3" || *id == "yao" {
+                continue; // run through the interpreter, not the mpcc VM
+            }
+            assert!(
+                crate::mpcc::RUNNABLE.contains(id),
+                "{id} claims Implemented but mpcc::RUNNABLE cannot execute it"
+            );
+        }
     }
 
     #[test]

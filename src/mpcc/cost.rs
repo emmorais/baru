@@ -601,9 +601,18 @@ pub fn estimate(
         }
     }
     if spec.id == "lowgear" {
+        // This note used to say "LowGear trades bandwidth for CPU: its
+        // preprocessing is compute-bound". `baru bench-triples` measured it and
+        // the CPU half runs the *other* way — see `mpcc::lowgear`.
         notes.push(
-            "LowGear trades bandwidth for CPU: its preprocessing is compute-bound, which this \
-             bandwidth-only offline term does not capture"
+            "LowGear's offline cost is measured (`baru bench-triples`): 416 B/triple at a \
+             64-bit field vs Semi2k's 3074, and ~4.5x FASTER per triple, not slower — the \
+             expected bandwidth-for-CPU trade did not appear at these parameters"
+                .to_string(),
+        );
+        notes.push(
+            "the implemented engine is semi-honest (no MACs, no ZKPoPK); Overdrive's malicious \
+             guarantees are not provided"
                 .to_string(),
         );
     }

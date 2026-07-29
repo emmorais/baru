@@ -883,6 +883,319 @@ BFV multiply is ~5× SI-NTRU's, reflecting its 2× ring dimension and
 3-component tensor — the honest, isolated price of security. All outputs
 remain bit-exact.
 
+### A second implementation: NTL + GMP (`src/fhe/ntl.rs`, `baru bench-polymul`)
+
+The multi-modular NTT above is ~200 lines of hand-written modular
+arithmetic on the hottest path in the repo, validated against a schoolbook
+reference that is too slow to run at the sizes that matter. Both of those
+are worth a second opinion, so the same operation is now also implemented
+against **NTL** (arbitrary-precision `ZZX` multiplication, GMP underneath)
+through a small C++ shim (`cpp/ntl_polymul.cpp`) wrapped in Rust. NTL picks
+its own strategy by operand size — plain, Karatsuba, or homomorphic imaging
+— so it is an independent answer to the same question.
+
+That buys a much stronger correctness argument: `cargo test --features ntl`
+checks the hand-written NTT against NTL at **n = 4096 with ±2⁹⁹
+coefficients**, and at SI-NTRU's ±2¹¹⁹ / n = 2048 corner, where the O(n²)
+oracle is impractical. They agree exactly.
+
+It also produces a result we did not want. `baru bench-polymul
+--schoolbook-max 4096` (per product, 20 reps, marshalling included, this
+machine, NTL 11.5.1 / GMP 6.3.0):
+
+| n | schoolbook | multi-modular NTT | NTL+GMP | NTT vs schoolbook | NTL vs NTT |
+|---|---|---|---|---|---|
+| 256 | 0.281 ms | 0.378 ms | **0.198 ms** | 0.7× | 1.9× |
+| 512 | 1.111 ms | 0.813 ms | **0.376 ms** | 1.4× | 2.2× |
+| 1024 | 4.441 ms | 1.770 ms | **0.756 ms** | 2.5× | 2.3× |
+| 2048 | 17.662 ms | 3.799 ms | **1.539 ms** | 4.6× | 2.5× |
+| 4096 | 71.713 ms | 8.232 ms | **3.162 ms** | 8.7× | 2.6× |
+
+**NTL is ~2.5× faster than our NTT at every size, including the FFI and
+limb-marshalling cost it pays and the NTT does not.** Two things follow.
+First, the hand-written transform is not a tuned one: its `mulmod` is a
+`u128 %` per butterfly, and Barrett or Montgomery reduction is the obvious
+missing optimization — the gap is ours to close, not evidence that
+multi-modular NTT is the wrong shape. Second, our NTT is *slower* than
+schoolbook at n = 256 and only breaks even between 256 and 512; the
+schemes here all run at n ≥ 2048, where it is 4.6–8.7×, so the swap was
+right — but the crossover is much later than "NTT beats schoolbook"
+suggests, and any future small-ring use should measure rather than assume.
+
+NTL is not a *different* algorithm, which is worth stating precisely because
+it changes what the gap means. Probing the linked library directly (`NTL
+11.5.1 / GMP 6.3.0`, `NTL_SP_NBITS = 60`): a single-FFT-prime `zz_pX`
+multiply at n=4096 takes **0.151 ms**, and the 99-bit `ZZX` multiply takes
+1.763 ms — a ratio of 11.7 where the coefficient bound needs only
+`(2·99 + 12 + 1)/60 = 3.5` primes. So NTL is doing exactly what `ntt.rs`
+does — multi-modular FFT over ~60-bit primes plus CRT — and spending the
+rest on GMP bignum↔residue conversion. Two consequences:
+
+1. **Our transforms are the slow part, by ~13×.** Four primes × (2 forward +
+   1 inverse) is 12 transforms; NTL runs those in ~0.60 ms, we take 8.2 ms.
+   The cause is visible in [ntt.rs:214-224](src/fhe/ntt.rs#L214-L224): the
+   butterfly does **two** `mulmod`s, each a `u128 %` — a `__umodti3` libcall
+   on aarch64 — where NTL uses a precomputed root table and Shoup-preconditioned
+   multiplication with no division at all.
+2. **Our conversion is the fast part.** Fixed-width `i128`/`I256` coefficients
+   make `reduce_mod` and Garner CRT cheap, where NTL pays generic bignum costs
+   for the same step. That is why NTL wins by only 2.5× and not by 13×.
+
+So a Shoup/Montgomery butterfly in `ntt.rs` should beat NTL rather than merely
+match it — keeping the cheap fixed-width conversion *and* getting the fast
+transform. That work is written down, not done.
+
+The NTL path is wired in as a **runtime-selectable backend**
+([src/fhe/poly.rs](src/fhe/poly.rs)) rather than a replacement, so a single
+binary can measure either. Every FHE scheme here (BFV, BGV, SI-NTRU, PIR)
+routes through it, and `tests/fhe_poly_backends.rs` checks that all of them
+encrypt→multiply→decrypt identically under both, at deployed parameters.
+
+### BGV: the same construction, a third time (`src/fhe/bgv.rs`)
+
+SI-NTRU established the *construction* — reversed-coefficient packing so one
+ct×ct multiply is a whole matvec, decryption under the **squared key** so
+relinearization is deleted, depth 1 so bootstrapping never happens — and BFV
+showed it runs on a secure RLWE lattice. `bgv.rs` is the third instantiation
+of exactly that construction, at **BFV's exact parameters** (n=4096, q=2^100,
+t=2^20) so the comparison isolates the encoding:
+
+```text
+BFV:  c(s) = Δ·m + e      message in the HIGH bits  ⇒ tensor needs a t/q rescale
+BGV:  c(s) = m + t·e      message in the LOW bits   ⇒ tensor is reduced mod q, full stop
+```
+
+BGV's multiply is therefore BFV's multiply *minus* the rescale, and its
+decrypt is a mask rather than a rounded divide. Measured
+(`baru bench-fhe-innerprod --poly all --reps 15`, packed 8×4 matvec, both
+operands encrypted):
+
+| scheme | secure | n | multiply (NTT) | multiply (NTL) | ct bytes |
+|---|---|---|---|---|---|
+| BFV | yes | 4096 | 20.7 ms | 11.5 ms | 131072 |
+| **BGV** | **yes** | 4096 | **20.7 ms** | **11.0 ms** | 131072 |
+| SI-NTRU | **NO** | 2048 | 4.1 ms | 1.7 ms | 32772 |
+
+Two results, both against the hypothesis that motivated the work:
+
+- **BGV is indistinguishable from BFV.** Repeated runs put the multiply gap at
+  +0.5%, +0.5%, −0.1% — inside the 1–2% run-to-run spread. The rescale is
+  genuinely removed; it is just `3n = 12288` shifts against 28 size-4096
+  transforms. *The encoding is not where the cost is.*
+- **BGV is ~5× SI-NTRU, and that is structural.** SI-NTRU's ciphertext is
+  **one** ring element at n=2048, so a ct×ct is one ring multiply; RLWE's is
+  **two** at n=4096, so it is a three-component tensor. ~2× from the dimension
+  and ~2.3× from the tensor. No choice of RLWE encoding closes that, and the
+  single-ring-element structure that buys SI-NTRU the 5× is the same structure
+  that makes it overstretched and insecure.
+
+BGV's noise behaves differently from BFV's in one way worth having: the
+dominant term is `t·e·e'`, so the budget is **message-independent**. Measured
+at n=4096, `|m·m' + t·E| ≈ 2^60.2` against a `q/2 = 2^99` bound — **38.8 bits
+of slack** — and sweeping the plaintext magnitude 8× moves it by 0.1 bits.
+(The worst-case analytic bound is 2^79, so the ternary convolutions concentrate
+about 19 bits better than the bound assumes.)
+
+So the practical answer to "which secure scheme for the depth-1 product" is
+that BFV and BGV are interchangeable on cost, and the lever that actually
+moves FHE toward MPC is the ring arithmetic — `--poly ntl` buys 1.8–2.1× on
+multiply and ~2.6× on encrypt/decrypt across *all three* schemes.
+
+### Does faster ring arithmetic bring FHE closer to MPC? No — and finding out exposed a benchmark bug
+
+`baru bench-hybrid-nn --poly all` runs the whole private-layer pipeline
+(matvec + bias + ReLU, weights *and* input private) with only the polynomial
+arithmetic swapped. Two measurement traps had to be cleared first, and both are
+worth recording because each one produced a confident wrong answer.
+
+**Trap 1: process warm-up.** Running both backends in one process gave the
+polynomial-free `mpc` row a spurious 1.21× "speedup". Every number below is
+medians of 8, each backend in its **own process, alternating order**, with `mpc`
+as a control that must read 1.00×.
+
+**Trap 2 (the expensive one): the benchmark's ReLU was not batched.**
+`bench-hybrid-nn` applied a per-element `mpc_relu` in a `.map()` loop, costing
+`O(out_dim)` communication rounds — while [gadgets::relu](src/gadgets/mod.rs#L102)
+has done one `lt_batch` + one `mul_batch` for the whole slice all along, and its
+own docstring records that the per-element form costs "5× the messages and 9× the
+wall-clock". The benchmark simply never adopted its own gadget. Fixing the four
+call sites, for **bit-identical output**:
+
+| | ReLU, per-element | ReLU, batched | speedup |
+|---|---|---|---|
+| pure MPC, out=8 | 95.7 ms | 14.3 ms | 6.7× |
+| pure MPC, out=32 | 451.8 ms | 19.0 ms | 23.8× |
+| pure MPC, out=64 | 802.4 ms | 23.3 ms | **34.4×** |
+
+The batched ReLU is nearly **flat in layer width** (14.3 → 23.3 ms for 8× the
+outputs) because independent comparisons cost a constant number of rounds. The
+per-element version was linear. This is the round-structure tax the repo keeps
+rediscovering: the arithmetic was never the problem, the round *structure* was.
+
+With both traps cleared (one layer, 256→8):
+
+| strategy | poly | total | FHE work | MPC segment |
+|---|---|---|---|---|
+| mpc (control) | ntt | 37.6 ms | 6.1 ms | 14.4 ms |
+| mpc (control) | ntl | 36.6 ms | 6.4 ms | 15.3 ms |
+| hybrid-ntru | ntt | 166.6 ms | 115.5 ms | 51.0 ms |
+| hybrid-ntru | ntl | 94.6 ms | 44.4 ms | 48.9 ms |
+| **hybrid-bfv** | ntt | 254.0 ms | 207.3 ms | 52.1 ms |
+| **hybrid-bfv** | ntl | **139.1 ms** | **86.1 ms** | 53.5 ms |
+
+- **NTL speeds the FHE work up 2.41×**, reproducing `bench-polymul`'s isolated
+  2.5× end-to-end through a completely different code path. The `mpc` control
+  reads **0.97×**, as it must.
+- **FHE is still the bottleneck: 62% (NTL) to 82% (NTT) of the secure hybrid.**
+  An earlier version of this section claimed the opposite — that the MPC ReLU had
+  become 67% — which was entirely an artifact of the unbatched ReLU inflating the
+  MPC segment. Fixing the benchmark moved the bottleneck back to FHE.
+- **The gap to pure MPC widened, it did not close.** The secure hybrid is
+  **3.8× pure MPC** on the NTL backend (6.75× on NTT). Before the ReLU fix it
+  looked like 1.85×, because both sides were paying the same inflated MPC tax,
+  which compressed the ratio.
+
+So the honest answer to "will faster polynomials bring FHE close to MPC" is
+**no**. Faster ring arithmetic is real and worth having — 2.4× on the FHE work,
+1.8× on the whole secure layer — but pure ABY3 does this layer in 37 ms and the
+secure hybrid needs 139 ms. FHE's case here was never raw speed; it is the
+*communication* profile (36 KB and 75 messages against MPC's 350 KB and 9276),
+which is what pays on a WAN and what `bench-layer` measures.
+
+**The same defect was in `bench-deep-nn`**, whose `mpc_relu_rescale_layer` ran
+`a2b`/`b2a`/`mul` inside a per-element `.map`, and in **both benchmarks' FHE→MPC
+import**, which called `share_secret` three times per output. Fixing all of them
+— `a2b_batch` + one `mul_batch` for the nonlinearity (`b2a` is local, so it
+stays per element), and `share_secret_batch` per owner for the import:
+
+| | messages before | after | MPC segment before | after |
+|---|---|---|---|---|
+| `bench-deep-nn`, depth 4, width 16 | 1412 | **76** | 1273 ms | **102 ms** |
+| `bench-deep-nn`, depth 4, width 32 | 2820 | **76** | 2372 ms | **100 ms** |
+| `bench-hybrid-nn`, out=8 | 145 | **15** | 158 ms | **21 ms** |
+| `bench-hybrid-nn`, out=64 | 1153 | **15** | 1186 ms | **30 ms** |
+
+Bit-exact throughout, 0 bootstraps unchanged. The number to look at is not the
+speedup, it is that **message count is now constant in width** — 76 at both
+deep-nn widths, 15 at every hybrid-nn width. The round structure no longer
+depends on the size of the layer, which is what it should have been all along.
+`share_secret_batch` had existed on `TransportBackend` the whole time; `cnn.rs`,
+`compiled_nn.rs`, `abstraction.rs` and `mixed_layer.rs` all use it. These two
+benchmarks simply never adopted it — the same story as `gadgets::relu`, and now
+four instances of one defect.
+
+Corrected picture (256→8, medians of 8, separate processes, alternating order):
+
+| strategy | poly | total | FHE | MPC seg | msgs |
+|---|---|---|---|---|---|
+| mpc (control) | ntl | 35.3 ms | 6.1 ms | 13.2 ms | 9276 |
+| hybrid-ntru | ntl | 62.1 ms | 40.2 ms | 21.9 ms | 13 |
+| **hybrid-bfv** | ntl | **97.8 ms** | 75.6 ms | 21.7 ms | **15** |
+| hybrid-bfv | ntt | 217.1 ms | 189.0 ms | 27.8 ms | 15 |
+
+The secure hybrid is now **2.77× pure MPC** (was 3.80× before these fixes, and
+1.85× when the benchmark's own round-structure bug was inflating both sides).
+FHE is **77–87%** of it, so the earlier conclusion holds and strengthens: the
+remaining cost is FHE arithmetic, not MPC.
+
+And the communication story is now stark — **15 messages against 9276**. That,
+not speed, is the hybrid's actual case, and it is what pays on a WAN.
+
+### SHE as an MPC building block: LowGear triples, measured (`baru bench-triples`)
+
+MP-SPDZ builds its offline phase on somewhat-homomorphic encryption
+(Overdrive/LowGear/HighGear). Baru's cost model already carried that protocol —
+as an *estimate*: `Status::Planned("P3 — reuses fhe::bfv")`, ~384 B/triple from
+the literature, plus an explicit disclaimer that its CPU cost was not modelled.
+[src/mpcc/lowgear.rs](src/mpcc/lowgear.rs) runs it instead.
+
+The protocol is structurally identical to [semi2k](src/mpcc/semi2k.rs) — both
+compute `c = a₀b₀ + a₁b₁ + a₀b₁ + a₁b₀` and need the two cross terms from an
+OLE. Only the OLE differs: Semi2k uses `2k` correlated OTs; LowGear uses one
+**ciphertext × plaintext** multiply over `n` CRT slots (depth 0 — no relin, no
+bootstrap, no eval keys, and not even a ct×ct multiply).
+
+**What made it possible now:** [src/fhe/slots.rs](src/fhe/slots.rs). Every other
+packing in this repo is coefficient-based, where a ring product is a
+*convolution*; an OLE needs `n` **independent** products. CRT slot packing under
+a prime `t ≡ 1 (mod 2n)` gives that — which is why `BgvParams::t` had to stop
+being a power of two, and why BGV rather than BFV is the natural host (no
+`Δ = q/t` to divide, so `t` need not divide `q`). Without slots one ciphertext
+pair yields *one* product, i.e. ~131 KB/triple: **40× worse than the OT it
+replaces.** Slots are the difference between winning by 7× and losing by 40×.
+
+Measured, two parties, semi-honest, 4096 triples:
+
+| route | domain | B/triple | triples/s | rounds | ok |
+|---|---|---|---|---|---|
+| **lowgear (SHE)** | `F_114689` | **104** | 46 400 | 2 | ✓ |
+| semi2k (OT) | `Z_2^64` | 3074 | 2 600 | 3 | ✓ |
+
+The two work over different structures, so the honest comparison is at **equal
+field width**: LowGear's ~17-bit prime needs 4 CRT limbs to reach 64 bits ⇒
+**416 B/triple against OT's 3074 — a 7.4× communication advantage**, and within
+8% of the literature's 384 B, which is a good sign for both numbers.
+
+**The surprise, and a correction to our own model.** `mpcc::cost` asserted that
+*"LowGear trades bandwidth for CPU: its preprocessing is compute-bound."* That
+note was never measured, and it is **wrong** here: LowGear generates triples
+**~4.5× faster** than the OT route at equal field width (17.8× at its native
+width). There is no trade at these parameters — SHE wins on bytes *and* on CPU.
+The note has been replaced with the measurement.
+
+**Scope, stated plainly.** Semi-honest only: no MACs, no sacrifice, and **no
+zero-knowledge proofs of plaintext knowledge**. A malicious party can send a
+malformed ciphertext and learn about the other's input from decryption
+behaviour. ZKPoPK is the bulk of the Overdrive paper and is deliberately absent
+— this is the LowGear analogue of Semi2k, not of SPDZ. The ~17-bit field is
+also a real limit, forced by the noise-flooding budget at this crate's
+`u128`-capped `q ≤ 2^127` (Overdrive uses 250–350-bit `q` at `n = 16384–32768`);
+the 4-limb CRT extension is how the 64-bit figure is reached.
+
+### Both are now executable protocols, not just cost rows
+
+`Semi2k` and `LowGear` are wired into the `mpcc` VM, so `baru mpcc run` and
+`baru mpcc calibrate` drive them like any other protocol — and both flip from
+`planned` to `impl` in `baru mpcc protocols`. The point of doing this is the
+calibration loop: a protocol you can only *cost* is a protocol whose cost model
+nobody has checked.
+
+```text
+baru mpcc calibrate --expr '(+ (* a b) (* c d))' --parties 2 ...
+
+protocol   parties  rounds pred/meas  online bytes pred/meas   result
+dealer          2        3/3                     72/72         42 ✓
+semi2k          2        3/3                     72/72         42 ✓
+lowgear         2        3/3                     27/27         42 ✓
+
+  dealer   rounds +0.0%  bytes +0.0%
+  semi2k   rounds +0.0%  bytes +0.0%
+  lowgear  rounds +0.0%  bytes +0.0%
+```
+
+All three at **0% on rounds and bytes**. The online phase is Beaver's in every
+case, which is exactly why this is a useful check: with the online phase held
+constant against two already-validated protocols, any disagreement would have
+to come from the part that differs — where the triples come from.
+
+Getting there caught a real accounting bug. LowGear is Baru's first protocol
+whose field is not byte-aligned (17-bit modulus), and `cost.rs` prices
+`field_bits / 8` while the VM charges `ceil(order_bits / 8)` — for every
+previous protocol those agree, so nothing had ever exercised the difference. It
+showed up as a −33% byte error. The fix follows Shamir's existing convention:
+the registry's `field_bits` is the **byte-aligned wire width** (24 for a 17-bit
+element, as Shamir declares 64 for a 61-bit prime), and a test in
+`mpcc::lowgear` now fails if the model's bytes-per-element and the VM's ever
+drift apart again.
+
+**LowGear's capability boundary is enforced, not documented-and-hoped.** Its
+~17-bit field cannot supply the `KAPPA = 26` bits of masking headroom that
+bit-decomposition needs, so comparison-shaped programs are **refused** rather
+than run and silently wrong. `mpcc::engine_can_run_program` is the predicate;
+sweeps that enumerate `RUNNABLE` (like `bench-layer`, whose layer contains a
+ReLU) skip that row and keep going, the same way an unsupported party count is
+handled. Arithmetic-only programs run fine.
+
 ### Offline/online split for the scheme switch
 
 With the multiply cheap, the *conversions* became the bottleneck (149 ms +
@@ -1845,6 +2158,17 @@ src/
                        reference — overstretched; see its docs)
     bfv.rs          — BFV: the SECURE RLWE instantiation of the same one-mult
                        inner product (no relin, decrypt under s²); n=4096
+    bgv.rs          — BGV: the same construction with the message in the LOW
+                       bits (no t/q rescale); same lattice+params as BFV, and
+                       measured indistinguishable from it
+    ntt.rs          — multi-modular NTT: exact negacyclic products over a
+                       power-of-two q, via NTT-friendly primes + Garner CRT
+    poly.rs         — runtime switch picking who computes the ring products
+                       (ntt or ntl) for every scheme above
+    slots.rs        — CRT slot packing (prime t): n INDEPENDENT values per
+                       ciphertext, what LowGear's OLE needs
+    ntl.rs          — the same product via NTL+GMP (C++ shim in `cpp/`),
+                       `--features ntl`: differential oracle for ntt.rs
   bench/
     ckks_compare.rs — `baru bench-ckks-compare`: measures the above
   hybrid/
@@ -1878,6 +2202,10 @@ src/
                        baseline, and the OT route priced from measured OT cost
     fhe_innerprod.rs— `baru bench-fhe-innerprod`: BFV (secure) vs SI-NTRU
                        (reference) on the minimal-FHE inner product
+    polymul.rs      — `baru bench-polymul`: exact negacyclic product —
+                       schoolbook vs our multi-modular NTT vs NTL+GMP
+    triples.rs      — `baru bench-triples`: Beaver triples from SHE (LowGear)
+                       vs from OT (Semi2k), bytes AND cpu, both measured
     train.rs        — `baru bench-train`: private SGD training (MSE loss),
                        gadget-composed, bit-exact, then private inference
   demo/

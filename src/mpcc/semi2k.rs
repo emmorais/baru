@@ -139,6 +139,24 @@ impl Semi2kEngine {
         Ok(out)
     }
 
+    /// Run the offline phase for `count` triples in **one** batched OT
+    /// extension, so the base-OT phase amortizes exactly as it does in
+    /// production. Traffic lands in `counters().offline_bytes`.
+    ///
+    /// This is the entry point [`crate::bench::triples`] measures: the engine
+    /// normally refills lazily when a multiplication runs dry, which is the
+    /// wrong shape for isolating preprocessing cost.
+    pub fn preprocess(&mut self, count: usize) -> Result<(), String> {
+        if count == 0 {
+            return Err("preprocess needs a positive triple count".into());
+        }
+        let previous = self.batch;
+        self.batch = count;
+        let r = self.refill();
+        self.batch = previous;
+        r
+    }
+
     /// Generate `self.batch` triples, all their OTs in one extension call.
     fn refill(&mut self) -> Result<(), String> {
         let mask = self.mask();
