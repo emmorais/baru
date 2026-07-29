@@ -240,12 +240,42 @@ fn fhe_op_cost(
     op: &Op,
     spec: &crate::mpcc::fhe_cost::FheSpec,
     bit_width: u32,
+    parties: usize,
+    ring_bits: u32,
 ) -> Result<(f64, u32), String> {
     use crate::mpcc::fhe_cost::Comparison;
     let k = f64::from(bit_width);
     Ok(match op {
-        // Ciphertext x ciphertext: the one operation that consumes depth.
-        Op::Mul => (spec.mul_ns, 1),
+        // Ciphertext x ciphertext: the one operation that consumes depth — and
+        // the one the plaintext modulus can make impossible.
+        //
+        // The operands are *secret-shared*, so what the engine multiplies is
+        // the un-reduced sum of share components: `parties · 2^bits` per
+        // factor. Their product needs twice that many bits before any
+        // summation. If the scheme's plaintext modulus cannot hold it the
+        // result wraps silently, so this is a feasibility gate and not a cost.
+        // See `FheSpec::log2_plaintext`.
+        Op::Mul => {
+            // The magnitude that crosses is the **share**, not the value. A
+            // secret sharing of a 10-bit value over Z_2^64 has components
+            // uniform over the whole 64-bit ring, so the un-reduced sum is
+            // `parties · 2^ring_bits`. Using the value width here would let
+            // the model approve a crossing that cannot be performed —
+            // exactly the failure this gate exists to prevent.
+            let per_factor = ring_bits + parties.max(1).next_power_of_two().trailing_zeros();
+            let needed = 2 * per_factor;
+            if needed > spec.log2_plaintext {
+                return Err(format!(
+                    "{} cannot hold a ciphertext×ciphertext product of shares over a \
+                     {}-bit ring across {} parties: share components are uniform over the \
+                     ring, so the un-reduced product needs a plaintext modulus of 2^{} \
+                     while the parameters provide 2^{}. Encrypting BOTH operands is what \
+                     costs this — a plaintext-weight layer is unaffected.",
+                    spec.id, ring_bits, parties, needed, spec.log2_plaintext
+                ));
+            }
+            (spec.mul_ns, 1)
+        }
         // A public constant is a plaintext multiply — cheaper, and depth-free in
         // the sense that matters here (no ct x ct).
         Op::MulC(_) => (spec.mul_plain_ns, 0),
@@ -350,7 +380,7 @@ pub fn evaluate(
                 .fhe
                 .ok_or("an operation was assigned to FHE but no FHE scheme was given")?;
             if secret {
-                let (ns, mul_depth) = fhe_op_cost(&instr.op, spec, bit_width)?;
+                let (ns, mul_depth) = fhe_op_cost(&instr.op, spec, bit_width, dep.parties, (elem_bytes * 8.0) as u32)?;
                 // Packing: independent operations of the same kind at the same
                 // dependence level share a ciphertext, so they are tallied and
                 // charged `ceil(count / slots)` operations below — not one each.
@@ -476,7 +506,22 @@ pub fn evaluate(
             *per_level.entry(*level).or_insert(0.0) += 1.0;
         }
         for count in per_level.values() {
-            bytes += spec.ct_bytes * (count / spec.slots).ceil().max(1.0);
+            // One packed ciphertext per `slots` values crossing at this
+            // level — times the **party count**.
+            //
+            // A scheme switch does not move one ciphertext. Going in, each
+            // party encrypts its own share component and the evaluator sums
+            // them; coming out, each party contributes an encrypted mask
+            // before the masked value is opened. Both directions therefore
+            // carry `parties` ciphertexts, not one.
+            //
+            // Omitting this factor made the FHE side look cheaper than it is:
+            // executing the matched comparison (`bench-mixed-layer
+            // --deployed`) has semi2k moving 5.8x fewer bytes than the FHE
+            // route it was predicted to lose to. Packing the crossing per
+            // level was right; packing away the party dimension was not.
+            let packed = (count / spec.slots).ceil().max(1.0);
+            bytes += spec.ct_bytes * packed * dep.parties.max(1) as f64;
         }
     }
 
@@ -755,105 +800,72 @@ mod tests {
         );
     }
 
-    /// **The headline claim.** Given only measured inputs — OT-derived Beaver
-    /// triple cost, BFV timings, ciphertext sizes — the cost model must derive the
-    /// hybrid architecture that `src/hybrid/` implements by hand and that Gazelle,
-    /// Delphi and Cheetah are built on: **a wide encrypted linear layer on FHE,
-    /// its nonlinearity on MPC**.
+    /// **A negative result, and the one the measurements support.** A layer
+    /// with *both* operands secret does not go to FHE — at any ring width,
+    /// for two independent reasons.
     ///
-    /// Nothing here tells it to do that. If this test fails, either a cost input
-    /// changed or the claim in `docs/paper-outline.md` needs revisiting — which is
-    /// exactly what a test should be for.
+    /// *Feasibility.* Share components are uniform over the whole ring, so a
+    /// ct×ct product of shares over `Z_2^k` needs a plaintext modulus of
+    /// `2^(2(k+log2 parties))` — `2^130` at a 64-bit ring, against the `2^32`
+    /// depth-1 BFV provides. The assignment refuses rather than returning
+    /// something that silently computes the wrong value, which is what
+    /// `bench-mixed-layer --deployed --share-bits 16` did before this gate
+    /// existed.
+    ///
+    /// *Cost.* At a narrow ring where the crossing **is** feasible (ring10),
+    /// FHE is priced and simply not chosen — matching execution, where semi2k
+    /// beat the FHE route on both wall-clock and bytes.
+    ///
+    /// Earlier versions of this test asserted the opposite. They passed
+    /// because the model had no plaintext-modulus budget and could rank an
+    /// assignment it was unable to perform.
     #[test]
-    fn the_model_derives_the_hybrid_split_for_a_neural_layer() {
-        // 256 secret x secret products (encrypted weights *and* encrypted input),
-        // then a comparison — one NN layer with its ReLU.
+    fn a_both_operands_secret_layer_does_not_go_to_fhe() {
         let mut dot = "(* a0 b0)".to_string();
         for i in 1..256 {
             dot = format!("(+ {dot} (* a{i} b{i}))");
         }
         let (prog, sched) = program(&format!("(if (> {dot} 0) 1 0)"));
-        let dep = Deployment::wan(2);
         let pair = pair().with_fhe(crate::mpcc::fhe_cost::find("bfv").unwrap());
-
-        let out = assign(&prog, &sched, &pair, &dep, 32).unwrap();
-        let by_kind = &out.assignment.by_kind;
-        assert_eq!(
-            by_kind.get("mul"),
+        let out = assign(&prog, &sched, &pair, &Deployment::wan(2), 32).unwrap();
+        assert_ne!(
+            out.assignment.by_kind.get("mul"),
             Some(&Side::Fhe),
-            "a wide encrypted linear layer should go to FHE: {:?}",
+            "a ct×ct product of 64-bit-ring shares needs 2^130 of plaintext modulus: {:?}",
             out.assignment.deviations()
         );
+        // The comparison still moves — that part of the hybrid split holds.
         assert_eq!(
-            by_kind.get("cmp-lt"),
+            out.assignment.by_kind.get("cmp-lt"),
             Some(&Side::Binary),
-            "the nonlinearity should go to the binary sharing: {:?}",
+            "the nonlinearity should still go to the binary sharing: {:?}",
             out.assignment.deviations()
-        );
-        assert!(out.speedup() > 1.0, "{:?}", out.best);
-        // The mechanism: FHE needs no preprocessing, and that is what pays.
-        assert!(
-            out.best.offline_bytes < out.all_arith.offline_bytes / 4,
-            "moving the layer to FHE should gut the triple bill: {} vs {}",
-            out.best.offline_bytes,
-            out.all_arith.offline_bytes
         );
     }
 
-    /// **The threat model decides whether FHE is wanted at all.**
-    ///
-    /// Under an *honest majority* (ABY3 multiplies from correlated randomness —
-    /// `triples_per_mul: 0`), multiplication is nearly free and MPC wins at every
-    /// layer width. Under a *dishonest majority* (Semi2k needs a Beaver triple per
-    /// multiplication, ~3.1 KB from measured OT), triple cost grows linearly with
-    /// width while a packed ciphertext is flat, so FHE takes the layer.
-    ///
-    /// This is why the hybrid FHE+MPC literature is 2-party: Gazelle, Delphi and
-    /// Cheetah are dishonest-majority settings, which is exactly the regime where
-    /// the model says the hybrid pays. `bench-hybrid-nn` measures the
-    /// honest-majority arm (ABY3, ~775 ms flat in width at WAN) and confirms the
-    /// prediction that FHE is *not* wanted there.
+    /// The threat model still decides where the *comparison* goes, which is
+    /// the part of the hybrid split that survives.
     #[test]
-    fn the_threat_model_decides_whether_the_layer_goes_to_fhe() {
+    fn the_threat_model_still_decides_the_comparison() {
         let mut dot = "(* a0 b0)".to_string();
-        for i in 1..256 {
+        for i in 1..64 {
             dot = format!("(+ {dot} (* a{i} b{i}))");
         }
         let (prog, sched) = program(&format!("(if (> {dot} 0) 1 0)"));
         let bfv = crate::mpcc::fhe_cost::find("bfv").unwrap();
-
-        // Dishonest majority: triples cost money, so the layer leaves for FHE.
         let dishonest = Pair::new(find("semi2k").unwrap(), find("semi-bin").unwrap())
             .unwrap()
             .with_fhe(bfv);
         let out = assign(&prog, &sched, &dishonest, &Deployment::wan(2), 32).unwrap();
         assert_eq!(
-            out.assignment.by_kind.get("mul"),
-            Some(&Side::Fhe),
-            "with per-multiplication triples the layer should go to FHE: {:?}",
+            out.assignment.by_kind.get("cmp-lt"),
+            Some(&Side::Binary),
+            "comparisons belong on a binary sharing: {:?}",
             out.assignment.deviations()
         );
-
-        // Honest majority: multiplication is free, so it stays put — and this is
-        // the arm `bench-hybrid-nn` measures.
-        let honest = Pair::new(find("aby3").unwrap(), find("semi-bin").unwrap())
-            .unwrap()
-            .with_fhe(bfv);
-        let out = assign(&prog, &sched, &honest, &Deployment::wan(3), 32).unwrap();
-        assert_ne!(
-            out.assignment.by_kind.get("mul"),
-            Some(&Side::Fhe),
-            "ABY3 multiplies from correlated randomness, so FHE cannot pay: {:?}",
-            out.assignment.deviations()
-        );
-        assert_eq!(
-            out.best.offline_bytes, 0,
-            "an honest-majority protocol has no triple bill at all"
-        );
+        assert!(out.speedup() > 1.0, "{:?}", out.best);
     }
 
-    /// ...and the crossover is real: a *narrow* layer stays on MPC, because one
-    /// batched multiply round beats a round-trip through FHE.
     #[test]
     fn a_narrow_layer_stays_on_mpc() {
         let mut dot = "(* a0 b0)".to_string();

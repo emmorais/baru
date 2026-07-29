@@ -1,13 +1,13 @@
 # Fdb version 4
-["bibtex main"] 1785283810.35753 "main.aux" "main.bbl" "main" 1785283811.39212 0
+["bibtex main"] 1785319196.46499 "main.aux" "main.bbl" "main" 1785321486.33013 0
   "./references.bib" 1785283808.08827 2897 aded0f6b211743a1adfa55bb986f64b8 ""
   "/opt/homebrew/Cellar/texlive/20240312_3/share/texmf-dist/bibtex/bst/base/plain.bst" 1710106625 20613 bd3fbfa9f64872b81ac57a0dd2ed855f ""
-  "main.aux" 1785283811.14227 7349 533c8eab96d28f0ecba5149e589e42fe "pdflatex"
+  "main.aux" 1785321486.09047 8037 761b978f5def80c40350dd770f8bf07d "pdflatex"
   (generated)
   "main.bbl"
   "main.blg"
   (rewritten before read)
-["pdflatex"] 1785283810.42809 "main.tex" "main.pdf" "main" 1785283811.39225 0
+["pdflatex"] 1785321485.2822 "main.tex" "main.pdf" "main" 1785321486.33025 0
   "/opt/homebrew/Cellar/texlive/20240312_3/share/texmf-dist/fonts/enc/dvips/lm/lm-ec.enc" 1710106625 2375 baa924870cfb487815765f9094cf3728 ""
   "/opt/homebrew/Cellar/texlive/20240312_3/share/texmf-dist/fonts/enc/dvips/lm/lm-mathit.enc" 1710106625 2405 5dcf2c1b967ee25cc46c58cd52244aed ""
   "/opt/homebrew/Cellar/texlive/20240312_3/share/texmf-dist/fonts/enc/dvips/lm/lm-mathsy.enc" 1710106625 2840 216e6e45ad352e2456e1149f28885bee ""
@@ -55,12 +55,15 @@
   "/opt/homebrew/Cellar/texlive/20240312_3/share/texmf-dist/fonts/tfm/public/lm/rm-lmr7.tfm" 1710106625 11852 5a9022f105fd1ee2797df861e79ae9a0 ""
   "/opt/homebrew/Cellar/texlive/20240312_3/share/texmf-dist/fonts/tfm/public/lm/rm-lmr8.tfm" 1710106625 11864 309fd7f43e4a0ba39f6f7644d76e8edf ""
   "/opt/homebrew/Cellar/texlive/20240312_3/share/texmf-dist/fonts/tfm/public/lm/ts1-lmr10.tfm" 1710106625 1556 b86d923e6b2f9aab2e313098a95cb0b8 ""
+  "/opt/homebrew/Cellar/texlive/20240312_3/share/texmf-dist/fonts/type1/public/amsfonts/symbols/msbm10.pfb" 1710106625 34694 ad62b13721ee8eda1dcc8993c8bd7041 ""
   "/opt/homebrew/Cellar/texlive/20240312_3/share/texmf-dist/fonts/type1/public/lm/lmbx10.pfb" 1710106625 121021 1bf809ce4a594679006bd72263eba59b ""
   "/opt/homebrew/Cellar/texlive/20240312_3/share/texmf-dist/fonts/type1/public/lm/lmbx12.pfb" 1710106625 116908 1fca96723793882c2e0160350c192fc8 ""
   "/opt/homebrew/Cellar/texlive/20240312_3/share/texmf-dist/fonts/type1/public/lm/lmbxi10.pfb" 1710106625 112766 bdd4fa8b13a0d7dd137624085bd31d40 ""
   "/opt/homebrew/Cellar/texlive/20240312_3/share/texmf-dist/fonts/type1/public/lm/lmmi10.pfb" 1710106625 30388 702fae6a5f0e6e9c48a1d872b442ffcf ""
+  "/opt/homebrew/Cellar/texlive/20240312_3/share/texmf-dist/fonts/type1/public/lm/lmmi8.pfb" 1710106625 30635 833ec815d446ec453a4913fc26d24cbc ""
   "/opt/homebrew/Cellar/texlive/20240312_3/share/texmf-dist/fonts/type1/public/lm/lmr10.pfb" 1710106625 119235 f35b44530a1d90eb90fe15d9cba67ea0 ""
   "/opt/homebrew/Cellar/texlive/20240312_3/share/texmf-dist/fonts/type1/public/lm/lmr12.pfb" 1710106625 113634 f99c44d58bae0863375faf0e1d74d612 ""
+  "/opt/homebrew/Cellar/texlive/20240312_3/share/texmf-dist/fonts/type1/public/lm/lmr6.pfb" 1710106625 123394 d390152bb30feeb496aaaa93299ee9ba ""
   "/opt/homebrew/Cellar/texlive/20240312_3/share/texmf-dist/fonts/type1/public/lm/lmr7.pfb" 1710106625 121145 68312a933e2c689ed40ec0aba373e279 ""
   "/opt/homebrew/Cellar/texlive/20240312_3/share/texmf-dist/fonts/type1/public/lm/lmr8.pfb" 1710106625 122174 a7a08406857c9530a0320a2517f60370 ""
   "/opt/homebrew/Cellar/texlive/20240312_3/share/texmf-dist/fonts/type1/public/lm/lmri10.pfb" 1710106625 112593 fda2373ba4420af33949610de4c28fe8 ""
@@ -136,10 +139,10 @@
   "/opt/homebrew/Cellar/texlive/20240312_3/share/texmf-dist/tex/latex/xcolor/xcolor.sty" 1710106625 55487 80a65caedd3722f4c20a14a69e785d8f ""
   "/opt/homebrew/Cellar/texlive/20240312_3/share/texmf-dist/web2c/texmf.cnf" 1710106625 41652 e14926ab86fde7902cad99d9eeaa5ca5 ""
   "/opt/homebrew/Cellar/texlive/20240312_3/share/texmf-var/web2c/pdftex/pdflatex.fmt" 1710106625 8221850 cdd0f59d64bf272578daf4037881baee ""
-  "main.aux" 1785283811.14227 7349 533c8eab96d28f0ecba5149e589e42fe "pdflatex"
-  "main.bbl" 1785283810.42579 2350 4e2231e21489642a1fbac441144c2312 "bibtex main"
-  "main.out" 1785283811.1438 2194 6d28ffcdef4fd9e97b3fed0f1f5b62cb "pdflatex"
-  "main.tex" 1785283808.11007 22452 8854093542891663d5b04ba15ff55d8f ""
+  "main.aux" 1785321486.09047 8037 761b978f5def80c40350dd770f8bf07d "pdflatex"
+  "main.bbl" 1785319196.58403 2350 4e2231e21489642a1fbac441144c2312 "bibtex main"
+  "main.out" 1785321486.09167 2506 eedb48be4c483a4638451ee406409f16 "pdflatex"
+  "main.tex" 1785321485.17229 25289 909fa806a13de9d5f4fa5579935c9b65 ""
   (generated)
   "main.aux"
   "main.log"

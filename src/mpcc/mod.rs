@@ -35,6 +35,7 @@
 //! ```
 
 pub mod exec;
+pub mod mixed;
 pub mod assign;
 pub mod cost;
 pub mod fhe_cost;
@@ -669,7 +670,8 @@ run/calibrate opts
   --input NAME=VAL                  input binding, repeatable; implied by --case
 
 lowering opts
-  --domain ring64|ring32|field128   arithmetic domain      (default ring64)
+  --domain ringN|field128           arithmetic domain      (default ring64)
+                                    N is the ring width in bits, 2..=128
   --bits N                          comparison/decomposition width (default 32)
   --public a,b,c                    variables public to all parties
 
@@ -731,11 +733,29 @@ fn parse_args(args: &[String]) -> Result<Args, String> {
             }
             "--domain" => {
                 let v = value()?;
+                // `ringN` for any N, not just 64 and 32.
+                //
+                // Narrow rings are not a curiosity here: the executable
+                // side of this compiler (`Semi2kEngine::new(parties, bits)`,
+                // `bench-mixed-layer`) can run a 10-bit ring, and the FHE
+                // crossing is only *feasible* at such widths (see
+                // `FheSpec::log2_plaintext`). While the vocabulary stopped at
+                // 32, the one configuration that could actually be executed
+                // was one the cost model could not name — which produced
+                // several comparisons between a 64-bit prediction and a
+                // 10-bit measurement that looked like model errors and were
+                // not.
                 lower.domain = match v.as_str() {
-                    "ring64" => Domain::Ring { k: 64 },
-                    "ring32" => Domain::Ring { k: 32 },
                     "field128" => Domain::Field { bits: 128 },
-                    other => return Err(format!("unknown domain `{}`", other)),
+                    other => match other.strip_prefix("ring").map(str::parse::<u32>) {
+                        Some(Ok(k)) if k >= 2 && k <= 128 => Domain::Ring { k },
+                        _ => {
+                            return Err(format!(
+                                "unknown domain `{other}` — expected `ringN` for 2 <= N <= 128 \
+                                 (e.g. ring64, ring32, ring10) or `field128`"
+                            ))
+                        }
+                    },
                 };
                 true
             }

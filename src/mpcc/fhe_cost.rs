@@ -75,6 +75,30 @@ pub struct FheSpec {
     /// Serialized ciphertext size — the unit a scheme switch moves. **Measured.**
     pub ct_bytes: f64,
     pub comparison: Comparison,
+    /// Width of the **plaintext modulus** these parameters provide, in bits.
+    ///
+    /// The constraint this exists for is easy to miss and fails *silently*.
+    /// Switching a **secret-shared** value into FHE does not hand the engine
+    /// the value: it hands it the un-reduced sum of the parties' share
+    /// components, i.e. `a + k·2^bits` for `k < parties`. A ciphertext ×
+    /// ciphertext product of two such values is congruent to `a·b` modulo
+    /// `2^bits` — which is why the construction is correct — but as an integer
+    /// it is roughly `(parties·2^bits)^2`, and a layer sums many of them. If
+    /// the plaintext modulus cannot hold that, the result wraps and the
+    /// answer is wrong rather than slow.
+    ///
+    /// Measured envelope for `BFV_DEPTH1` (n=4096, q=2^100): 10-bit shares
+    /// work at a 256-wide layer; 12-bit shares already fail at 64-wide,
+    /// because past `t ≈ 2^32` the depth-1 noise budget is exhausted and
+    /// `fhe::ntt` caps the ring at `MAX_N = 4096`, so there is nowhere to
+    /// grow. See `baru bench-mixed-layer --deployed --share-bits W`.
+    ///
+    /// **This does not bite when the weights are plaintext.** A
+    /// ciphertext × plaintext product does not square a share magnitude, which
+    /// is why Gazelle-style hybrids — plaintext weights, only activations
+    /// crossing — are unaffected. It is encrypting *both* operands that is
+    /// expensive here.
+    pub log2_plaintext: u32,
     /// Plaintext slots one ciphertext holds, i.e. how many independent scalar
     /// operations pack into a single homomorphic operation.
     ///
@@ -104,6 +128,9 @@ pub const BFV_DEPTH1: FheSpec = FheSpec {
     mul_plain_ns: 5_000_000.0,
     ct_bytes: 131_072.0,
     comparison: Comparison::Unsupported,
+    // Measured ceiling, not a nominal parameter: past t ≈ 2^32 the depth-1
+    // noise budget at q=2^100 is gone and the product decrypts wrongly.
+    log2_plaintext: 32,
     // n = 4096 coefficient slots.  `conv_pack` needs 2·in_c·H·W ≲ n, which is
     // what makes a 28×28 image fit with room to spare.
     slots: 4096.0,
@@ -125,6 +152,9 @@ pub const TFHE: FheSpec = FheSpec {
     mul_plain_ns: 350_000_000.0,
     ct_bytes: 515_000.0,
     comparison: Comparison::PerGateNs(350_000_000.0),
+    // Boolean TFHE carries one bit per ciphertext; the plaintext-modulus
+    // constraint above is an arithmetic-scheme concern and does not apply.
+    log2_plaintext: u32::MAX,
     // Boolean TFHE evaluates one gate per ciphertext — no packing.  That is a
     // second reason it loses to MPC on nonlinearities, independent of the
     // per-gate cost.

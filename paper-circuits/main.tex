@@ -347,11 +347,62 @@ $2.33\times$ and $1.81\times$. Where a backend keeps no rules it genuinely
 wanted the original circuit; an optimizer that always rewrites is not being
 selective.
 
-\paragraph{Protocol assignment.} The same cost model assigns operation kinds
-to protocols. On a dense layer with a comparison it returns
-$\text{cmp-lt} \to \text{binary}$ with multiplications left arithmetic ---
-the classical hybrid-MPC split, derived rather than annotated --- worth
-$2.03\times$ over the better pure protocol on a $32$-wide layer.
+\subsection{A negative result: FHE does not host the layer}\label{sec:assign}
+
+The same cost model assigns operation \emph{kinds} to protocols, and because
+it spans FHE as well as MPC it can ask a question the MPC-only assignment
+literature cannot: should the linear layer be an FHE program at all? Earlier
+drafts of this work answered yes, reproducing the architecture of hand-designed
+hybrid inference systems. Executing that answer showed it was wrong, and the
+reason is worth more than the original claim.
+
+\paragraph{Feasibility, not cost.} Switching a \emph{secret-shared} value into
+FHE does not hand the engine the value. It hands it the un-reduced sum of the
+parties' share components, and those components are uniform over the entire
+ring --- a sharing of a small value over $\mathbb{Z}_{2^{64}}$ still has $64$-bit
+shares. A ciphertext$\times$ciphertext product of two such values is congruent
+to $a\cdot b$ modulo the ring, which is why the construction is correct, but as
+an integer it is about $(\text{parties}\cdot 2^{k})^2$ for a $k$-bit ring. The
+plaintext modulus must hold it: $2^{130}$ at a $64$-bit ring, against the
+$2^{32}$ our depth-one parameters provide.
+
+The model had a \emph{depth} budget but no \emph{modulus} budget, so it could
+rank an assignment it was unable to perform. It now carries both, and refuses.
+The gate's threshold agrees with the executed envelope --- the packed switch
+works at $10$-bit shares and fails at $12$ --- without having been fitted to it.
+
+\paragraph{And where it is feasible, it is not cheaper.} At a narrow ring
+where the crossing can be performed, FHE is priced and simply not selected.
+Executing the matched comparison at that width (two parties, $256$-wide layer,
+\bt{semi2k} against the FHE route) agrees: MPC is faster and moves
+$5.8\times$ fewer bytes.
+
+\paragraph{What survives.} The comparison still moves to a binary sharing ---
+the half of the classical hybrid split that concerns nonlinearities --- and
+that decision is still deployment-dependent. What does not survive is the
+linear half.
+
+\paragraph{Why this does not contradict Gazelle and its successors.} Those
+systems keep the model in \emph{plaintext}, so their linear layer is
+ciphertext$\times$plaintext: no share magnitude is squared and the modulus
+stays small. They also operate in a two-party client/server setting rather
+than assigning operations within a multiparty computation, and in the
+multiparty setting a public-constant multiply is already local, so there is
+nothing for FHE to win. Our model represents the multiparty setting, and
+within it the answer is negative. Hiding the \emph{model} as well as the input
+--- the setting that makes both-operands-secret interesting --- is precisely what
+puts the linear layer beyond a depth-one FHE engine.
+
+\paragraph{Methodological note.} Getting here took four comparisons that
+appeared to show the model wrong and instead showed two configurations being
+compared that were not the same: an \bt{aby3} measurement against a
+\bt{semi2k} prediction, and a $10$-bit-ring measurement against a $64$-bit-ring
+prediction. A cost model spanning several backends has a large configuration
+surface --- protocol, party count, threat model, network profile, value width,
+ring width --- and any one of them silently makes two numbers incomparable while
+both look reasonable. We added ring width to the model's vocabulary for this
+reason: the one configuration the FHE route could actually be executed in was
+one the model could not name.
 
 \section{Related work}\label{sec:related}
 
@@ -409,12 +460,6 @@ not express scheme switching --- so the expert baseline in
 heavily tuned hybrid pipeline. Extending the language to express switching is
 future work and would strengthen the backend-aware claim, since the compiler
 could then choose where to switch.
-
-\paragraph{Assignment with FHE.} A previously recorded result placed
-multiplications on FHE for wide layers. It did \emph{not} reproduce in the
-configuration we re-ran for this paper, which returned the binary comparison
-split only. We therefore do not claim it. \TODO{re-derive or retract; do not
-cite the earlier number}
 
 \paragraph{Workload scale.} The compiled networks here are small MLPs.
 Convolutional models at image scale are compiled and costed but not executed

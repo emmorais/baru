@@ -912,6 +912,7 @@ pub mod gc_compare;
 pub mod deep_nn;
 pub mod layer;
 pub mod medmnist;
+pub mod mixed_layer;
 pub mod net;
 pub mod ot;
 pub mod pir;

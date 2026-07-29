@@ -367,26 +367,42 @@ model).
 non-reproduction below and the workload-scale limitation. They are in
 §Limitations where a reader will find them, not hidden.
 
-#### A recorded claim that did NOT reproduce — do not cite it
+#### The `mul -> fhe` claim: RESOLVED — it reproduces, on WAN
 
-`research-agenda.md` and `related-work.md` both record that protocol
-assignment places **`mul → fhe`** for a 256-wide encrypted layer, reproducing
-the Gazelle/Delphi hybrid split from measured costs. Re-run for this paper:
+Recorded in `research-agenda.md` §4 and `related-work.md`: protocol assignment
+places **`mul -> fhe`** for a 256-wide encrypted layer, reproducing the
+hand-designed hybrid-inference architecture from measured costs.
+
+I first reported this as **not reproducing**. That was wrong: I re-ran it on
+the CLI's **default LAN** profile against a claim derived on **WAN**. On the
+identical expression:
 
 ```sh
-baru mpcc assign --expr '<256-wide dot + relu>' --parties 2 --dishonest
-# => mixed wins 1.57x, moving:  cmp-lt -> binary      (no mul -> fhe)
+E='(if (> <256-wide dot, both operands secret> 0) 1 0)'
+baru mpcc assign --expr "$E" --parties 2 --dishonest --lan
+#   cmp-lt -> binary                      1.57x   (offline 885 KiB)
+baru mpcc assign --expr "$E" --parties 2 --dishonest --wan
+#   cmp-lt -> binary,  mul -> fhe         1.26x   (offline 101 KiB)
 ```
 
-The FHE target *is* in the search space (`semi2k / semi-bin / bfv`), but the
-assignment returns the binary comparison split only. Either the original used
-a different expression shape or parameters, or something regressed. **The
-paper does not claim it**, and §Limitations says so explicitly.
+`the_model_derives_the_hybrid_split_for_a_neural_layer` in `src/mpcc/assign.rs`
+pins the WAN case and was passing the whole time — checking the test first
+would have cost one grep and saved the false alarm.
 
-This matters beyond one number: it is the single most quotable result in the
-repo's notes — "the compiler derives Gazelle" — and it is the one that failed
-to reproduce. Re-derive it from a recorded command, or retract it from
-`research-agenda.md` §4 and `related-work.md`.
+**This is a better result than the original claim, and it is now §4.6 of the
+paper.** The assignment is *deployment-dependent*: FHE needs no preprocessing,
+so moving the layer to FHE cuts the triple bill 1.7 MiB -> 101 KiB, and that
+saving buys wall-clock only when bandwidth is scarce. Same program, same
+widths, same threat model, different link -> different answer. That is the
+paper's thesis on a second axis: §4.5 shows the right *circuit* depends on the
+backend; §4.6 shows the right *backend* depends on the deployment.
+
+**The lesson, which is already in this repo's history in another form:** a
+prediction and a measurement must name the same protocol *and the same
+deployment* before they can be said to disagree. The failure mode is quiet —
+the run succeeded, produced a plausible assignment, and answered a different
+question. When a recorded claim appears not to reproduce, **find its test
+before doubting it**.
 
 ### Phase 4 (original notes)
 
@@ -400,57 +416,295 @@ to reproduce. Re-derive it from a recorded command, or retract it from
 
 ---
 
-## 6. The scope decision — **(a) chosen 2026-07-28**
+## 5b. The FHE bridge — scope (b), first step landed 2026-07-28
 
-To claim "a language for private AI", the language must compile the thing.
-Today it compiles *expressions* to circuits; the FHE/MPC hybrid orchestration
-lives in Rust. Two options:
+`src/mpcc/mixed.rs` executes **one circuit across two backends**, routing
+operations by an assignment and inserting the scheme switch at every crossing.
+This turns `mpcc::assign` from a costing result into an executable one: the
+model says `mul -> fhe`, and now that can be run and checked rather than
+believed.
 
-**(a) Scope to the compiled MPC path.** Compile the whole network to MPC,
-compare against a hand-written MPC implementation. Achievable now, honest,
-and Phase 1 is small. The paper is then about *circuit optimization*, and the
-switch-as-bootstrap hybrid stays in the other paper.
+**What works.** A dot product with both operands secret — the shape the cost
+model puts on FHE — runs its multiplications under BFV and its result back
+through mask-and-open into MPC shares. Verified: mixed == pure-MPC ==
+plaintext, bit for bit, with every multiply on FHE, **zero demotions**, and
+exactly one switch back.
 
-**(b) Extend the language to express scheme switching.** The full "language
-for private AI" claim, and it makes the backend-aware story much stronger
-(the compiler chooses where to switch). Substantially more work, and it
-overlaps the other paper's subject matter.
+**Depth-1 is enforced, not assumed.** BFV here has no relinearization, so a
+product is a degree-2 ciphertext that cannot be multiplied again. When a
+multiplication's operand is already a product the executor **demotes** that
+operation to MPC and counts it (`MixedStats::demoted_muls`), because a silent
+fallback would make the FHE assignment look better than it is. A test pins the
+demotion on `(* (* a b) (* c d))`.
 
-**Chosen: (a), with (b) named as future work.** Phase 1 is done under this
-scope (`bench-compiled-nn`). The paper is about *circuit optimization for
-private AI*; the switch-as-bootstrap hybrid stays in the other paper, and the
-language does not claim to express scheme switching.
+**Honest scope, and it is a real limit.** The MPC→FHE direction uses
+`Backend::export_additive`, which only an in-process simulator satisfies — a
+real party can produce its own share component and nobody else's. The
+cryptography is real (BFV at the configured parameters; a genuine
+mask-and-open in the other direction) but the **party separation of the bridge
+is simulated**. Conversion counts and crossing bytes are meaningful; switch
+wall-clock is not a deployment number. `bench::cnn` does the deployable
+version, with each party encrypting its own component.
 
----
+**Why this is the interesting direction.** With execution mixed, the boundary
+becomes an optimization target rather than a fixed architectural choice: the
+compiler can be asked *where* to switch, not just *what* to run where. That is
+the natural next rewrite rule, and it is not expressible while the hybrid
+lives in hand-written orchestration.
 
-## 7. Recommended framing
+**(i) and (ii) done 2026-07-28.** `mixed::from_assignment` translates the cost
+model's decision into the executor's routing, and `baru bench-mixed-layer`
+runs it under both deployments. At n=256, both exact against plaintext:
 
-Three framings compete for the same material:
+| network | model's decision | mpc ops | fhe ops | switches out/back |
+|---|---|---|---|---|
+| LAN | (all arithmetic) | 511 | 0 | 0 / 0 |
+| WAN | `mul -> fhe` (1.18×) | 0 | 511 | 512 / 1 |
 
-| framing | strength | risk |
+The loop is closed: the model decides, the executor carries the decision out,
+and the harness fails if the routing is not honoured (`mul -> fhe` with zero
+FHE operations, or FHE operations under an all-arithmetic decision). Below
+about n=64 both deployments keep the layer on MPC, which is the documented
+crossover — a batched multiply is one round, so narrow layers do not pay for
+the switch.
+
+**Two gaps this exposed, both worth having.**
+
+1. ~~**The executor converts scalar-wise; the cost model charges crossings
+   *packed*.**~~ **Closed 2026-07-28** by `mixed::packed_dot`: one vector is
+   packed forward and the other reversed, so a single polynomial
+   multiplication puts the whole dot product in coefficient `d-1`. Cost is
+   **two crossings out, one multiplication, one masked opening back —
+   independent of layer width**, against `2n` crossings and `2n-1` operations
+   scalar-wise. Verified equal to the plaintext dot product.
+
+   This surfaced a constraint worth stating in the paper, because it is easy
+   to miss and fails *silently*: **the plaintext modulus must hold un-reduced
+   share products.** Each party's share is uniform mod `2^nbits`, so the FHE
+   side does not multiply `a` and `b` but `a + k·2^nbits` and `b + m·2^nbits`.
+   The product is still congruent to `a·b` mod `2^nbits` — which is why the
+   construction is correct — but as an integer it is far larger, and summing a
+   whole layer of them overflows a modulus sized for the *values*.
+   `packed_dot` computes the bound and refuses rather than wrapping; a test
+   pins the refusal. This is a real cost of switching secret-shared data into
+   FHE and it does not appear when the operands are plaintext weights.
+2. **Seconds are still not validated.** The MPC side is an in-process
+   simulator and the bridge is party-simulated, so the model's predicted
+   *crossover in time* remains unmeasured. Counts and bytes are real.
+
+**(iii) done 2026-07-28 — `Placement::sink_to_fhe`.** The kind-level
+assignment is coarse in a way that costs crossings: an operation the FHE side
+*could* host, sitting between two FHE results, drags both back across the
+boundary purely because its *kind* was assigned to MPC. The rule refines the
+decision per operation:
+
+> An operation runs on FHE if the FHE side can host it, its depth budget
+> allows it, and **every operand is already produced on the FHE side.**
+
+The last clause is what makes it safe to apply greedily — it never forces a
+fresh value across, it only avoids dragging values back. On two dot products
+feeding one addition, the addition sinks and one masked opening disappears; a
+test pins that the value is unchanged and the crossing count falls. On the
+256-wide layer, `bench-mixed-layer` reports **255 operations sunk** and one
+switch back instead of one per partial sum.
+
+This subsumed an earlier heuristic in `from_assignment` ("if `mul` went to
+FHE, put `add` there too"), which has been **removed** — a hack sitting
+alongside the rule would mask which one did the work.
+
+**Why this is the move MPC-only compilers cannot make.** Silph and SING assign
+per instruction, but over MPC sharings only; the boundary this rule moves is
+the MPC/FHE representation boundary, and it is only expressible once execution
+is genuinely mixed. While the hybrid lives in hand-written orchestration the
+boundary is wherever the author drew it.
+
+#### Wall-clock, and a comparison that does not test what it looks like it tests
+
+`bench-mixed-layer --deployed` measures the same layer on the **real 3-party
+transport**, with the crossing done per party (`my_additive_component`), three
+encryptions per operand, and the ciphertexts charged latency and bandwidth —
+the accounting `bench::cnn` uses. At n=256, W=10:
+
+| network | route | wall-clock | mpc msgs | link bytes |
+|---|---|---|---|---|
+| rtt 0 | all-MPC (aby3) | **7.9 ms** | 8 | 0 |
+| rtt 0 | layer on FHE | 201.0 ms | 4 | 983 k |
+| rtt 20 ms | all-MPC (aby3) | **75.3 ms** | 8 | 0 |
+| rtt 20 ms | layer on FHE | 234.7 ms | 4 | 983 k |
+
+**This neither validates nor refutes the model's `mul -> fhe` prediction, and
+it would be easy to report as if it did.** The measured MPC route is ABY3:
+3-party, honest majority, **triple-free** (PRF resharing). The prediction was
+computed for semi2k: 2-party, dishonest majority, one Beaver triple per
+multiplication. FHE's entire case there is the offline bill it avoids — and
+ABY3 has no offline bill, so there is nothing to amortise against. Applied to
+ABY3 the model says *stay on MPC*, which is exactly what is measured.
+
+This is the second time this trap has been walked into in this repo; the first
+is recorded in the notes as *"a prediction and a measurement must name the
+same protocol before they can disagree."* It is worth stating in the paper as
+a methodological point rather than buried, because the failure mode is that
+both numbers look reasonable.
+
+**What the measurement does establish**, and it is worth having: against an
+honest-majority triple-free MPC baseline, hosting a layer on FHE **loses** —
+25× at zero latency, 3.1× at RTT 20 ms. That is the same reason every deployed
+FHE+MPC hybrid is 2-party.
+
+#### semi2k wired in — and it exposes a probable modelling bug
+
+`bench-mixed-layer --deployed` now runs four routes on the same layer
+(n=256, W=10, RTT 20 ms):
+
+| route | wall-clock | triples | online B | offline / crossing B |
+|---|---|---|---|---|
+| all-MPC (aby3, 3pc honest) | **54 ms** | 0 | 37 088 | 0 |
+| layer on FHE (3pc crossing) | 240 ms | — | 32 880 | 983 040 |
+| layer on FHE (2pc crossing) | 169 ms | — | 0 | 720 896 |
+| all-MPC (semi2k, 2pc dishonest) | **142 ms** | 256 | 2 050 | 125 184 |
+
+The last two are a **controlled** pair — same party count, same width, same
+layer. semi2k is faster *and* moves **5.8× fewer bytes** (125 KB of triples
+against 721 KB of ciphertext). The model predicted FHE wins by 1.18×.
+
+**Probable cause, checked by reading the code rather than guessed.**
+`assign.rs:479` charges an MPC→FHE crossing as
+`ct_bytes * ceil(registers / slots)` per level — *one packed ciphertext* —
+with no party-count factor. But switching a **secret-shared** value into FHE
+needs one ciphertext **per party**, because each party encrypts its own share
+component and the evaluator sums them. At two parties and two operands that is
+four ciphertexts, not one.
+
+This is the complement of a bug the notes already record: crossings were once
+charged *per edge* and the fix was to pack them per level. The fix appears to
+have packed away the party dimension too.
+
+**Do not act on this without closing the caveat.** The model's decision was
+computed at 32-bit and this measurement runs at 10-bit, and semi2k's triple
+cost scales with the width (measured ≈489 B/triple at W=10 against the
+recorded ≈3104 B/triple at 64-bit — consistent, but not the same point). A
+like-for-like test needs the measurement at the model's width.
+
+**This matters for the paper: §4.6's `mul -> fhe` result depends on the
+crossing charge.** If the party factor is missing, the FHE side is being
+under-charged and the WAN decision may not survive the correction. Verify
+before the claim is defended, and note it in Limitations meanwhile.
+
+#### (i) attempted: the 32-bit configuration cannot be executed at all
+
+Re-running the controlled pair at the model's 32-bit width is **not possible
+with this BFV parameter set**, and the reason is cryptographic rather than an
+implementation shortcut.
+
+Switching a *secret-shared* value into FHE means the FHE side multiplies
+un-reduced share sums: not `a·b` but `(a + k·2^W)(b + m·2^W)`. Correct modulo
+`2^W` — which is why the construction works — but as an integer it is
+`(parties·2^W)²` per term, and a layer sums `n` of them. Required plaintext
+modulus:
+
+| W | n=64 | n=256 |
 |---|---|---|
-| A. "zero abstraction overhead" | easy to prove | *"then why compile?"* |
-| B. "automatic optimization beats hand-tuning" | compelling, we have the story | needs Phase 1+2 to land |
-| C. "backend-aware circuit optimization" | genuinely novel; nobody spans MPC+FHE+ZKP | needs Phase 3 |
+| 10 | 2^29 | 2^31 |
+| 16 | 2^41 | 2^43 |
+| 24 | 2^57 | 2^59 |
+| 32 | 2^73 | 2^75 |
 
-**Recommendation: C is the thesis, B is the headline experiment, A is the
-sanity floor reported first.** That is one coherent paper: *the same private-AI
-program should become a different circuit depending on the backend, a compiler
-can decide that automatically, and doing so beats expert hand-tuning — which we
-demonstrate against our own experts, who serialized a layer without noticing.*
+Past about `t = 2^32` the depth-1 noise budget at `n=4096, q=2^100` is
+exhausted and the route returns a *wrong value* rather than failing. Growing
+the ring would buy headroom, but `fhe::ntt` caps at `MAX_N = 4096`. Measured
+envelope: **W=10 works at n=256; W=12 already fails at n=64.** The benchmark
+now refuses with that explanation instead of panicking or returning a wrong
+number.
 
----
+**Why this is a real finding and not a parameter-tuning gripe.** The blow-up
+comes specifically from **both operands being secret**. The classic hybrids
+(Gazelle, Delphi, Cheetah) keep the weights in *plaintext*, so only
+activations cross and the product is ciphertext×plaintext — no squaring of
+share magnitudes, and the modulus stays small. Encrypting the model too, which
+is the distinguishing feature of the companion switch-as-bootstrap paper, is
+exactly what makes this crossing expensive.
 
-## 8. What to do next, concretely
+**Where that leaves §4.6.** The `mul -> fhe` decision is computed at 32-bit,
+for a crossing this parameter set cannot perform on secret-shared operands. At
+the one width where it *is* implementable (W=10), semi2k beats FHE on both
+wall-clock and bytes. So the claim is now questionable on two independent
+grounds — the possibly-missing party factor in the crossing charge, and
+feasibility at the claimed width. **It should not be defended until both are
+resolved.**
 
-1. **Phase 0** — reassociation rule. Self-contained, has an oracle, closes the
-   one case where we lose.
-2. **Decide §6** — (a) or (b). Everything downstream depends on it.
-3. **Phase 1** — one real compiled network, bit-exact.
-4. **Phase 2** — the expert-vs-compiled table with ablation.
-5. **Phase 3** — per-backend circuit divergence.
+#### Resolved: the model now has a plaintext-modulus budget
 
-Do **not** start writing prose before Phase 2 produces a number. The
-switch-as-bootstrap paper twice committed conclusions to print that later
-measurement contradicted (see `private-inference-performance.md` §2); the
-discipline that fixed it was measure-then-write, and it applies here.
+`FheSpec::log2_plaintext` (measured ceiling 2^32 for `BFV_DEPTH1`) plus a
+feasibility gate in `fhe_op_cost`: a ct×ct product of secret-shared operands
+needs `2·(bits + log2 parties)` bits of plaintext modulus, and the assignment
+**refuses FHE** when the scheme cannot provide it.
+
+| network | share width | assignment | speed-up |
+|---|---|---|---|
+| LAN | 12-bit | `cmp-lt -> binary` | 1.16× |
+| LAN | 32-bit | `cmp-lt -> binary` | 1.57× |
+| WAN | 12-bit | `cmp-lt -> binary`, `mul -> fhe` | 1.10× |
+| WAN | 32-bit | `cmp-lt -> binary` | 1.19× |
+
+The gate's threshold (`W ≤ 15` at two parties) agrees with the measured
+envelope (W=10 works at 256-wide, W=12 fails at 64-wide) **without having been
+fitted to it** — the model was given the parameter ceiling, not the answer.
+
+**Two tests had to change, and they were wrong before.**
+`the_model_derives_the_hybrid_split_for_a_neural_layer` and
+`the_threat_model_decides_whether_the_layer_goes_to_fhe` both pinned
+`mul -> fhe` at 32-bit — an assignment that silently computes the wrong value.
+They now run at 12-bit (the point of the second is the *threat model*, not the
+width), and a new test
+`a_realistic_share_width_puts_the_layer_out_of_fhes_reach` pins the refusal.
+
+**The lesson worth carrying:** the model had a *depth* budget but no
+*modulus* budget, so it could rank an assignment it could not perform. A cost
+model spanning several backends needs feasibility gates per backend, not only
+prices — otherwise the cheapest option is sometimes the impossible one.
+
+#### FINAL: `mul -> fhe` is retracted; the model and execution now agree
+
+Adding **ring width** to the model's vocabulary (`--domain ringN`, 2..=128)
+was the unlock. The one configuration the FHE route could actually be executed
+in was one the model could not name — which is what produced four apparent
+model errors that were all configuration mismatches.
+
+Pointed at the same configuration at last:
+
+| ring | model (semi2k offline) | measured | agreement |
+|---|---|---|---|
+| 10-bit | 112.7 KiB | 122.3 KiB | **8%** |
+
+And the assignment answers consistently everywhere:
+
+| ring | ct×ct on FHE? | why |
+|---|---|---|
+| 10-bit | feasible, **not chosen** | priced and loses — matches execution, where semi2k beat FHE |
+| 32-bit | **refused** | needs 2^66 plaintext modulus; parameters give 2^32 |
+| 64-bit | **refused** | needs 2^130 |
+
+**`mul -> fhe` is retracted.** It only ever appeared at configurations that
+were infeasible (the gate now catches them) or mismatched. Two tests pinning
+it are rewritten to assert the refusal and its reason; they had passed for
+months because the model had no modulus budget and could rank an assignment it
+was unable to perform.
+
+**A gate bug of mine, caught the same way.** My first version gated on the
+*value* width, so `--bits 10 --domain ring64` looked feasible. Share
+components are uniform over the **ring**, so the gate must use ring width. The
+corrected gate refuses at ring32 and ring64.
+
+**What survives:** `cmp-lt -> binary` — the nonlinearity half of the classical
+hybrid split — still derived, still deployment-dependent.
+
+**Why this does not contradict Gazelle.** Those systems keep weights in
+plaintext (ct×plaintext squares no share magnitude) *and* work in a two-party
+client/server setting. In the multiparty setting this model represents, a
+public-constant multiply is already local, so FHE has nothing to win there
+either — verified directly.
+
+**§4.6 is now a negative result, and it is stronger than the positive one it
+replaces:** a cost model spanning MPC and FHE can say not only which side is
+cheaper but whether the crossing is *possible at all*, and for
+both-operands-secret layers on depth-1 BFV the answer is no.

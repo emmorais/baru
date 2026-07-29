@@ -446,6 +446,12 @@ Key tests to keep green when touching any of this:
 | `compound_reduction_rebalances_and_stays_exact` | the reduction rewrite is exact and cuts depth |
 | `a_non_associative_reduction_is_left_alone` | it refuses non-associative operators |
 | `each_backend_prefers_its_own_circuit` | the cross-application diagonal wins |
+| `a_mixed_assignment_computes_the_same_value_as_pure_mpc` | the MPC/FHE bridge is exact |
+| `a_second_multiplication_is_demoted_rather_than_attempted` | depth-1 is enforced, not assumed |
+| `the_models_decision_is_executed_and_exact` | the assignment reaches the executor and is exact |
+| `packing_the_crossing_matches_the_scalar_route` | packed switch is exact, constant in width |
+| `packed_dot_refuses_a_layer_its_modulus_cannot_hold` | the plaintext-modulus bound fails loudly |
+| `sinking_an_operation_across_the_boundary_saves_a_crossing` | the boundary rule saves a switch, value unchanged |
 | `some_workload_produces_genuinely_different_circuits` | divergence is real, not nominal |
 | `batched_input_sharing_matches_the_scalar_protocol` | batched == scalar sharing |
 
@@ -466,6 +472,10 @@ Key tests to keep green when touching any of this:
 | compiled-vs-handwritten NN | `bench::compiled_nn` (`baru bench-compiled-nn`) |
 | backend-aware divergence | `bench::backend_aware` (`baru bench-backend-aware`) |
 | level-batched circuit executor | `mpcc::exec::run_flat` |
+| mixed MPC+FHE executor | `mpcc::mixed::run_mixed`, `mpcc::mixed::FheArith` |
+| model decision -> execution | `mpcc::mixed::from_assignment`, `bench::mixed_layer` |
+| packed MPC->FHE crossing | `mpcc::mixed::packed_dot` |
+| boundary-placement rule | `mpcc::mixed::Placement::sink_to_fhe` |
 | interactive-call counter | `TransportBackend::interactive_calls` |
 | shared FlatOp passes | `zkp::circuit_compiler::{cse, rename}`, `CircuitCompiler::fold_constants` |
 | BFV / NTT | `fhe::bfv`, `fhe::ntt` |

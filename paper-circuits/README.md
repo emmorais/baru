@@ -18,7 +18,12 @@ latexmk -pdf main.tex
 | whole network vs expert, ablation ladder | `baru bench-compiled-nn` |
 | backend-aware divergence matrix | `baru bench-backend-aware` |
 | CSE on a real AI circuit (2365 → 1764 gates) | `cargo run --release --example mnist` |
-| protocol assignment | `baru mpcc assign --expr ...` |
+| protocol assignment (LAN vs WAN) | `baru mpcc assign --expr ... --parties 2 --dishonest --lan` / `--wan` |
+
+**The `--lan`/`--wan` flag changes the answer.** A 256-wide encrypted layer
+moves its multiplications to FHE on a WAN and stays arithmetic on a LAN. Quote
+the deployment with the result, always: re-running a WAN-derived claim on the
+default LAN profile once produced a false "does not reproduce".
 
 Correctness gates that must be green for any of it to mean anything:
 
