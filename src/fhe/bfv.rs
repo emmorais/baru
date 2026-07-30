@@ -355,6 +355,21 @@ impl Bfv {
         }
     }
 
+    /// Multiply two **pre-transformed** ciphertexts.
+    ///
+    /// [`Bfv::mul_pre`] still forward-transforms its second operand on every
+    /// call. When that operand is a weight ciphertext held in a session
+    /// preamble it does not change between queries, so its transforms belong
+    /// offline too — leaving only the 3 inverse transforms per prime on the
+    /// online path instead of 2 forward + 3 inverse.
+    pub fn mul_pre_pre(&self, a: &BfvCtNtt, b: &BfvCtNtt) -> BfvCt {
+        let p = &self.params;
+        let (t0, t1, t2) = poly::rlwe_tensor_pre_pre(&a.pre, &b.pre, p.n);
+        BfvCt {
+            c: vec![rescale(t0, p), rescale(t1, p), rescale(t2, p)],
+        }
+    }
+
     /// Multiply a **pre-transformed** ciphertext by a fresh one, saving the
     /// first operand's forward NTTs on every call after the transform.
     pub fn mul_pre(&self, a: &BfvCtNtt, b: &BfvCt) -> BfvCt {
@@ -503,6 +518,42 @@ mod tests {
             let pos = s.matvec_output_position(x.len(), r);
             assert_eq!(s.to_signed(out[pos]), expected, "row {r}");
         }
+    }
+
+    /// `mul_pre_pre` must agree with `mul_pre` and `mul` **exactly**, not
+    /// approximately: it is the same tensor with two forward transforms hoisted
+    /// out, so any disagreement is a bug in the hoist rather than noise.
+    ///
+    /// This is the differential check that licenses using it on the online
+    /// path. A wrong product here would not fail loudly — it would decrypt to
+    /// plausible garbage and surface as a misclassification several layers away.
+    #[test]
+    fn mul_pre_pre_agrees_with_mul_and_mul_pre() {
+        let s = Bfv::new(BfvParams::TEST_SMALL);
+        let (ck, pk) = s.keygen();
+        let x = vec![3i64, -4, 5, -1];
+        let w = vec![vec![2i64, 3, -1, 4], vec![-5i64, 1, 0, 2]];
+
+        let cx = s.encrypt_poly(&pk, &s.pack_input(&x));
+        let cw = s.encrypt_poly(&pk, &s.pack_weights(&w));
+
+        let plain = s.mul(&cx, &cw);
+        let one_pre = s.mul_pre(&s.transform(&cx), &cw);
+        let both_pre = s.mul_pre_pre(&s.transform(&cx), &s.transform(&cw));
+
+        assert_eq!(one_pre.c, plain.c, "mul_pre diverged from mul");
+        assert_eq!(both_pre.c, plain.c, "mul_pre_pre diverged from mul");
+
+        // …and the decrypted matvec is still the right answer.
+        let out = s.decrypt_poly(&ck, &both_pre);
+        let got: Vec<i64> = (0..w.len())
+            .map(|r| s.to_signed(out[s.matvec_output_position(x.len(), r)]))
+            .collect();
+        let expected: Vec<i64> = w
+            .iter()
+            .map(|row| row.iter().zip(&x).map(|(a, b)| a * b).sum())
+            .collect();
+        assert_eq!(got, expected);
     }
 
     #[test]

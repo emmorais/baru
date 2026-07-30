@@ -191,6 +191,40 @@ pub fn rlwe_tensor_pre(
     }
 }
 
+/// The RLWE tensor with **both** operands prepared — see
+/// [`crate::fhe::ntt::exact_bfv_tensor_pre_pre`]. Under the NTL backend
+/// `PreparedPair` carries raw coefficients, so this degrades to the unprepared
+/// path and the saving does not exist there; that asymmetry is the same one
+/// [`prepare_pair`] documents.
+#[allow(clippy::type_complexity)]
+pub fn rlwe_tensor_pre_pre(
+    a: &PreparedPair,
+    b: &PreparedPair,
+    n: usize,
+) -> (Vec<I256>, Vec<I256>, Vec<I256>) {
+    match (a, b) {
+        (PreparedPair::Ntt(a0, a1), PreparedPair::Ntt(b0, b1)) => {
+            ntt::exact_bfv_tensor_pre_pre(a0, a1, b0, b1, n)
+        }
+        (PreparedPair::Ntt(a0, a1), PreparedPair::Raw(b0, b1)) => {
+            ntt::exact_bfv_tensor_pre(a0, a1, b0, b1, n)
+        }
+        (PreparedPair::Raw(..), PreparedPair::Ntt(..)) => {
+            // One backend is live at a time, so the two operands are always
+            // prepared the same way. If that ever stops holding, fail loudly:
+            // there is no correct product to compute from a raw first operand
+            // and a transformed second one, and a quiet wrong answer here would
+            // surface as a misclassification several layers away.
+            panic!(
+                "rlwe_tensor_pre_pre: operands prepared under different backends \
+                 (raw × transformed) — the polynomial backend changed between \
+                 preparing the weights and using them"
+            )
+        }
+        (PreparedPair::Raw(a0, a1), PreparedPair::Raw(b0, b1)) => rlwe_tensor(a0, a1, b0, b1, n),
+    }
+}
+
 /// The three tensor components from raw coefficients.
 #[allow(clippy::type_complexity)]
 pub fn rlwe_tensor(

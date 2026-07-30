@@ -345,28 +345,46 @@ and `the_encrypted_model_is_reused_across_queries_in_a_session`.
 - The keygen trap held: `CnnSession::new` does keygen first, and everything else
   in the session is encrypted under that key.
 
-### 3.2 Store the weight ciphertexts **pre-transformed** (NTT domain)
+### 3.2 ~~Store the weight ciphertexts pre-transformed (NTT domain)~~ — DONE 2026-07-30
 
-Follows directly from 3.1, which is now done and supplies the preamble to hold
-the transformed ciphertexts.
+`EncryptedModel` now stores `BfvCtNtt`, not `BfvCt`: the session's weights are
+forward-transformed offline as well as encrypted, and `Bfv::mul_pre_pre` takes
+both operands prepared, leaving only the 3 inverse transforms per prime online.
+New path: `ntt::exact_bfv_tensor_pre_pre` → `poly::rlwe_tensor_pre_pre` →
+`Bfv::mul_pre_pre`.
 
-`mul_pre(a: &BfvCtNtt, b: &BfvCt)` takes the input pre-transformed and
-transforms `b` (the weights) inside `exact_bfv_tensor_pre`, once per output
-channel. With one input and *N* weight ciphertexts per layer, almost all the
-forward-NTT work is on the weight side — and if the weights are already
-offline, their transforms can be too.
+**Measured** (pneumonia, `--gc --precompute`):
 
-**How:** add a both-operands-transformed entry point
-(`exact_bfv_tensor_pre_pre` / `Bfv::mul_pre_pre`) and store `BfvCtNtt` in the
-preamble instead of `BfvCt`. `BfvCtNtt` is currently not `Clone`/serialisable
-— it will need to be.
+| | before 3.2 | after |
+|---|---|---|
+| `mul` phase | 172 ms | **127 ms** (−26%) |
+| online latency | 1152 ms | **1086 ms** |
+| per-session offline | 78 ms/image | 101 ms/image |
 
-**Expected:** roughly 2 of the ~5 NTTs per channel. On current code the `mul`
-phase is **173 ms** of a 1134 ms diagnosis (the 634 ms figure predates the Shoup
-butterfly, as the 670 ms in 3.1 did), so the ceiling here is ~70 ms — worth
-having, but no longer the biggest remaining item. Estimate only — **measure
-before quoting**. With `mul` and `decrypt` now comparable (173 vs 148 ms) and
-the MPC segment at 789 ms, the honest next target is §3.3.
+The synthetic control moves the same way: `mul` 57 → 42 ms, also −26%.
+
+**The estimate was 40%; the truth is 26%** — worth recording, because the
+arithmetic explains it. Removing both forward transforms takes 2 of the 5
+transforms per prime, but the tensor also does 3 pointwise `mulmod` passes and a
+Garner CRT reconstruction, and neither moved. The transforms were never the
+whole phase. Cost moves rather than vanishing: the per-session offline grew
+78 → 101 ms/image, which is the transforms now being paid there.
+
+**Verified by** `mul_pre_pre_agrees_with_mul_and_mul_pre` — a differential test
+requiring bit-identical output against both existing paths, not approximate
+agreement. This is the one place in the change where a wrong answer would be
+silent: a bad product decrypts to plausible garbage and surfaces as a
+misclassification several layers away. The end-to-end `2/2 matches plaintext
+exactly` is the second check.
+
+One asymmetry: under the NTL backend `PreparedPair` holds raw coefficients, so
+`rlwe_tensor_pre_pre` degrades to the unprepared path and the saving does not
+exist there. Mixing a raw operand with a transformed one now panics rather than
+returning a quiet wrong answer.
+
+**Where this leaves the pipeline.** FHE is 311 ms of 1086 (29%); MPC is 771 ms
+(71%), of which ReLU alone is 510 ms. Further FHE micro-optimisation has little
+left to reach — see the struck entry in §3.4 and read §3.3 next.
 
 ### 3.3 Parallelism
 

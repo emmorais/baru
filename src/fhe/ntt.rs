@@ -610,6 +610,48 @@ pub fn exact_bfv_tensor_pre(
     )
 }
 
+/// The RLWE tensor with **both** operands already forward-transformed.
+///
+/// [`exact_bfv_tensor_pre`] still pays two forward transforms per prime for the
+/// second operand. When that operand is a *weight* ciphertext held in a session
+/// preamble it never changes between queries, so its transforms can be
+/// precomputed too — removing 2 of the 5 transforms per prime on the online
+/// path (2 forward + 3 inverse become 0 + 3).
+pub fn exact_bfv_tensor_pre_pre(
+    ta0: &Transformed,
+    ta1: &Transformed,
+    tb0: &Transformed,
+    tb1: &Transformed,
+    n: usize,
+) -> (Vec<I256>, Vec<I256>, Vec<I256>) {
+    assert_eq!(ta0.n, n);
+    assert_eq!(ta1.n, n);
+    assert_eq!(tb0.n, n);
+    assert_eq!(tb1.n, n);
+    let (mut r0, mut r1, mut r2) = (Vec::new(), Vec::new(), Vec::new());
+    for (k, plan) in plans_for(n).iter().enumerate() {
+        let p = plan.p;
+        let (fa0, fa1) = (&ta0.res[k], &ta1.res[k]);
+        let (fb0, fb1) = (&tb0.res[k], &tb1.res[k]);
+        let mut d0: Vec<u64> = (0..n).map(|i| mulmod(fa0[i], fb0[i], p)).collect();
+        let mut d1: Vec<u64> = (0..n)
+            .map(|i| addmod(mulmod(fa0[i], fb1[i], p), mulmod(fa1[i], fb0[i], p), p))
+            .collect();
+        let mut d2: Vec<u64> = (0..n).map(|i| mulmod(fa1[i], fb1[i], p)).collect();
+        plan.inverse(&mut d0);
+        plan.inverse(&mut d1);
+        plan.inverse(&mut d2);
+        r0.push(d0);
+        r1.push(d1);
+        r2.push(d2);
+    }
+    (
+        crt_reconstruct(&r0, n),
+        crt_reconstruct(&r1, n),
+        crt_reconstruct(&r2, n),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

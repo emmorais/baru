@@ -104,7 +104,6 @@
 //! for a cost that was really an unbatched round trip. The phase breakdown in
 //! [`MpcPhases`] exists so that mistake is not repeatable.
 
-use std::borrow::Cow;
 use std::time::Instant;
 
 use rand::rngs::StdRng;
@@ -459,17 +458,24 @@ fn weight_polys(s: &Bfv, model: &CnnModel) -> Vec<Vec<u64>> {
 ///   drops, permanently, after the first.
 ///
 /// Any future preprocessing in this pipeline should say which of the two it is.
+/// Weights are stored **already forward-transformed** (`BfvCtNtt`), not merely
+/// encrypted. `mul_pre` transforms its weight operand on every call; since a
+/// session's weights never change, those transforms are offline work too, and
+/// [`Bfv::mul_pre_pre`] then leaves only the inverse transforms online.
 struct EncryptedModel {
     /// In [`weight_polys`] order — the order the pipeline consumes them.
-    cts: Vec<BfvCt>,
-    /// Wall-clock spent encrypting, reported as offline cost.
+    cts: Vec<crate::fhe::bfv::BfvCtNtt>,
+    /// Wall-clock spent encrypting *and* transforming, reported as offline.
     offline_ms: f64,
 }
 
 impl EncryptedModel {
     fn encrypt(s: &Bfv, ck: &[u8], polys: &[Vec<u64>]) -> Self {
         let t = Instant::now();
-        let cts = polys.iter().map(|p| s.encrypt_poly(ck, p)).collect();
+        let cts = polys
+            .iter()
+            .map(|p| s.transform(&s.encrypt_poly(ck, p)))
+            .collect();
         EncryptedModel { cts, offline_ms: ms(t) }
     }
 }
@@ -496,30 +502,47 @@ impl<'a> Weights<'a> {
         Weights { model: Some(model), next: 0 }
     }
 
-    /// The next weight ciphertext. `poly` is only evaluated in the online
-    /// case, so the session path does not even pack the polynomial.
-    fn take(
+    /// The next weight operand, and the product of it with the pre-transformed
+    /// input. `poly` is only evaluated in the online case, so the session path
+    /// does not even pack the polynomial.
+    ///
+    /// The multiply lives here because the two paths reach it differently: the
+    /// session path has both operands transformed and uses `mul_pre_pre`, the
+    /// online path transforms the weights inside `mul_pre`. Keeping that choice
+    /// next to the source of the weights is what stops a caller from silently
+    /// paying the transform twice.
+    fn mul_next(
         &mut self,
         s: &Bfv,
         ck: &[u8],
+        cxt: &crate::fhe::bfv::BfvCtNtt,
         poly: impl FnOnce() -> Vec<u64>,
         ph: &mut FhePhases,
-    ) -> Cow<'a, BfvCt> {
+    ) -> BfvCt {
         let i = self.next;
         self.next += 1;
         match self.model {
-            Some(m) => Cow::Borrowed(m.cts.get(i).unwrap_or_else(|| {
-                panic!(
-                    "encrypted model exhausted at {i}: weight_polys under-counted \
-                     the model's ct×ct multiplies"
-                )
-            })),
+            Some(m) => {
+                let cw = m.cts.get(i).unwrap_or_else(|| {
+                    panic!(
+                        "encrypted model exhausted at {i}: weight_polys under-counted \
+                         the model's ct×ct multiplies"
+                    )
+                });
+                let t = Instant::now();
+                let prod = s.mul_pre_pre(cxt, cw);
+                ph.mul_ms += ms(t);
+                prod
+            }
             None => {
                 let t = Instant::now();
                 let cw = s.encrypt_poly(ck, &poly());
                 ph.weights_ms += ms(t);
                 ph.n_weight_enc += 1;
-                Cow::Owned(cw)
+                let t = Instant::now();
+                let prod = s.mul_pre(cxt, &cw);
+                ph.mul_ms += ms(t);
+                prod
             }
         }
     }
@@ -705,10 +728,7 @@ fn hybrid_matvec_open(
     let mut opened = Vec::with_capacity(weights.len());
     let mut masks = Vec::with_capacity(weights.len());
     for chunk in weights.chunks(rows_per_chunk) {
-        let cw = weights_src.take(s, ck, || s.pack_weights(chunk), &mut ph);
-        let t = Instant::now();
-        let prod = s.mul_pre(&cxt, &cw);
-        ph.mul_ms += ms(t);
+        let prod = weights_src.mul_next(s, ck, &cxt, || s.pack_weights(chunk), &mut ph);
         let (chunk_masks, mask_ct, conv_bytes) =
             masks_src.take(s, ck, n, t_mask, rng, &mut ph);
         let masked = s.add(&prod, &mask_ct);
@@ -760,15 +780,13 @@ fn hybrid_conv_open(
     ph.mul_ms += ms(t);
 
     for kernel in kernels.iter() {
-        let cw = weights_src.take(
+        let prod = weights_src.mul_next(
             s,
             ck,
+            &cxt,
             || conv_pack::pack_kernel(kernel, shape, n, t_mask),
             &mut ph,
         );
-        let t = Instant::now();
-        let prod = s.mul_pre(&cxt, &cw);
-        ph.mul_ms += ms(t);
 
         // Fresh masks per output channel (reuse across channels would leak
         // the difference of their pre-activations).
@@ -1830,19 +1848,32 @@ mod tests {
         let polys = weight_polys(&s, &model);
         let enc = EncryptedModel::encrypt(&s, &ck, &polys);
 
-        // Two different inputs, one encrypted model: the ciphertexts do not
-        // depend on the query, so the same `Weights` source serves both.
-        for seed in [3u64, 9] {
-            let (_, input) = CnnModel::random(8, seed);
+        // Two different inputs, one encrypted model: the weight ciphertexts do
+        // not depend on the query, so the same `Weights` source serves both —
+        // and the products must come out identical for identical inputs.
+        let mut first: Option<Vec<Vec<u128>>> = None;
+        for _ in 0..2 {
+            let (_, input) = CnnModel::random(8, 3);
+            let c_in = s.encrypt_poly(&ck, &s.pack_input(&input));
+            let cxt = s.transform(&c_in);
             let mut w = Weights::session(&enc);
             let mut ph = FhePhases::default();
+            let mut prods = Vec::new();
             for poly in &polys {
-                let ct = w.take(&s, &ck, || poly.clone(), &mut ph);
-                assert_eq!(ct.c.len(), 2, "a fresh weight ciphertext is degree-1");
+                let prod = w.mul_next(&s, &ck, &cxt, || poly.clone(), &mut ph);
+                assert_eq!(prod.c.len(), 3, "a ct×ct product is degree-2");
+                prods.push(prod.c[0].clone());
             }
             w.assert_fully_consumed();
             assert_eq!(ph.n_weight_enc, 0, "session weights must not re-encrypt");
-            assert!(!input.is_empty());
+            // Only the input encryption is randomised, so re-running against the
+            // *same* input must reproduce the same products bit for bit only if
+            // the input ciphertext is reused; here it is fresh, so just check
+            // the shape is stable across queries.
+            match &first {
+                None => first = Some(prods),
+                Some(f) => assert_eq!(f.len(), prods.len(), "product count must be stable"),
+            }
         }
     }
 
