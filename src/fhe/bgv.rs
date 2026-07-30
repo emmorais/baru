@@ -1,17 +1,14 @@
 //! **BGV** — Brakerski–Gentry–Vaikuntanathan, instantiated with exactly the
-//! tricks that make [`crate::fhe::si_ntru`] cheap, on an RLWE lattice that is
-//! actually secure.
+//! tricks that make the depth-1 packed matvec cheap.
 //!
 //! # The point of this module
 //!
-//! `si_ntru` established the *construction*: reversed-coefficient packing so
-//! one ciphertext×ciphertext multiply computes a whole matvec, decryption
-//! under the **squared key** so relinearization is deleted, and depth 1 so
-//! bootstrapping never happens. That construction is scheme-agnostic; SI-NTRU
-//! is just the cheapest arithmetic to run it on, and it is **overstretched and
-//! insecure** (see its docs). [`crate::fhe::bfv`] instantiates the same
-//! construction securely. This module is the third instantiation, and it
-//! exists to answer a specific question: *how much of BFV's cost is RLWE, and
+//! The *construction* Baru relies on is scheme-agnostic: reversed-coefficient
+//! packing so one ciphertext×ciphertext multiply computes a whole matvec,
+//! decryption under the **squared key** so relinearization is deleted, and
+//! depth 1 so bootstrapping never happens. [`crate::fhe::bfv`] is the
+//! instantiation the pipelines use. This module is a second one, and it exists
+//! to answer a specific question: *how much of BFV's cost is RLWE itself, and
 //! how much is BFV's particular encoding?*
 //!
 //! # BGV vs BFV: one structural difference
@@ -72,14 +69,13 @@
 //! noise does track the plaintext.
 //!
 //! Depth 2 does not fit (a second multiply squares the noise past `q/2`), and
-//! that is by design — the same depth-1 contract as the other two schemes.
+//! that is by design — the same depth-1 contract as BFV.
 //!
 //! # Security
 //!
 //! RLWE at `n = 4096`, `q = 2^100` — inside the ~109-bit `log q` ceiling for
-//! 128-bit security at that dimension, and with **no NTRU lattice**, so none
-//! of the overstretched/fatigue analysis that sinks SI-NTRU applies. Same
-//! standing as BFV; this is a deployable instantiation, not a reference.
+//! 128-bit security at that dimension. Same standing as BFV; this is a
+//! deployable instantiation, not a reference.
 //!
 //! # What it costs, measured
 //!
@@ -90,7 +86,6 @@
 //! |---|---|---|---|---|
 //! | BFV | 4096 | 5.4 ms | 11.2 ms | 131072 |
 //! | **BGV** | 4096 | **5.3 ms** | **11.1 ms** | 131072 |
-//! | SI-NTRU | 2048 | 1.0 ms | 1.7 ms | 32772 |
 //!
 //! **BGV's multiply is indistinguishable from BFV's.** Across repeated runs
 //! the gap is +0.5%, +0.5%, −0.1% — inside the ~1–2% run-to-run spread. The
@@ -99,23 +94,9 @@
 //! (These were 20.7 ms until `ntt.rs`'s butterfly moved to Shoup-preconditioned
 //! multiplication; the ratio between the two schemes did not move.)
 //! *The encoding is not where the money is*, and this module is the evidence
-//! for that rather than a speedup.
-//!
-//! **BGV is ~5× SI-NTRU, and that gap is structural**, not something a better
-//! RLWE encoding can close:
-//!
-//! | | ring dim | ring mults per ct×ct | transforms per prime |
-//! |---|---|---|---|
-//! | SI-NTRU | 2048 | 1 (ct is **one** ring element) | 2 fwd + 1 inv |
-//! | BFV / BGV | 4096 | 3 (ct is **two** ring elements) | 4 fwd + 3 inv |
-//!
-//! ~2× from the ring dimension and ~2.3× from the tensor ⇒ ≈5×, which is what
-//! the table shows. That factor is the price of *not* being an overstretched
-//! NTRU lattice — SI-NTRU's single-ring-element ciphertext is exactly the
-//! structure that makes it insecure. So the honest reading is that RLWE costs
-//! ~5× SI-NTRU no matter which RLWE encoding is chosen, and the way to make
-//! the depth-1 product cheaper is faster ring arithmetic
-//! ([`crate::fhe::poly`]), not a different scheme.
+//! for that rather than a speedup. The way to make the depth-1 product cheaper
+//! is faster ring arithmetic ([`crate::fhe::poly`]), not a different RLWE
+//! encoding.
 
 use rand::Rng;
 
@@ -475,7 +456,7 @@ impl Bgv {
         }
     }
 
-    // ── Packing (identical to SI-NTRU and BFV — the shared construction) ──
+    // ── Packing (identical to BFV — the shared construction) ──────────────
 
     pub fn pack_input(&self, x: &[i64]) -> Vec<u64> {
         assert!(x.len() <= self.params.n);
@@ -527,7 +508,7 @@ impl Bgv {
 
 /// [`crate::hybrid::FheAdapter`] for BGV — lets it drive the generic MPC↔FHE
 /// scheme switch and the whole hybrid pipeline, exactly as `BfvAdapter` and
-/// `SiNtruAdapter` do.
+/// `BfvAdapter` does.
 pub struct BgvAdapter<'a>(pub &'a Bgv);
 
 impl crate::hybrid::FheAdapter for BgvAdapter<'_> {
@@ -581,7 +562,7 @@ mod tests {
     }
 
     /// The headline: ct×ct with NO relinearization, degree-2 result decrypted
-    /// under `s²` — the SI-NTRU construction on an RLWE lattice.
+    /// under `s²` — the depth-1, relin-free construction on an RLWE lattice.
     #[test]
     fn multiply_decrypts_under_s_squared_no_relin() {
         let s = scheme();

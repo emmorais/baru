@@ -3,10 +3,10 @@
 //! pipeline (every ReLU, max-pool and argmax is a comparison, i.e. the sign
 //! bit of a subtraction).
 //!
-//! This is not the cleartext-logic placeholder in
-//! `interpreter::gc_backend`; it produces genuine garbled tables on the wire
-//! and does genuine hashing per gate, so the reported bytes and compute time
-//! are real. The point is a head-to-head against the batched ABY3 bit
+//! It produces genuine garbled tables on the wire and does genuine hashing per
+//! gate, so the reported bytes and compute time are real. (It replaced a
+//! cleartext-logic placeholder, `interpreter::gc_backend`, which nothing ever
+//! constructed and which was deleted on 2026-07-30.) The point is a head-to-head against the batched ABY3 bit
 //! decomposition (`aby3_protocol::a2b_batch`): **garbled circuits evaluate a
 //! comparison in a constant number of rounds, whereas bit decomposition
 //! needs ~log(bitwidth) rounds** — so GC is expected to win on high-latency

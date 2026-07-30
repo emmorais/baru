@@ -12,7 +12,7 @@
 //!
 //! | profile | n | q | `|c|` bound | primes | accumulator |
 //! |---|---|---|---|---|---|
-//! | narrow (BFV, BGV, SI-NTRU) | 4096 | 2^100 | 2^210 | 4 × 63 bit | **256 bit** |
+//! | narrow (BFV, BGV) | 4096 | 2^100 | 2^210 | 4 × 63 bit | **256 bit** |
 //! | wide (LowGear's field) | 8192 | 2^190 | 2^392 | 7 × 63 bit | **512 bit** |
 //!
 //! The narrow profile was hard-coded as a bespoke `I256` (two `u128` halves).

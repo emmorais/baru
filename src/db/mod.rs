@@ -116,7 +116,7 @@ record opts
   --tag name                  repeatable
   --ok true|false
   --note TEXT
-  --artifact-root HEX         Merkle root of bulk data held in `baru::storage`
+  --artifact-root HEX         content hash of bulk data held outside the record
 
 filter opts
   --suite S  --case C  --backend B  --tag T  --commit SHA  --ok true|false

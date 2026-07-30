@@ -38,12 +38,11 @@
 //! waived) and the same [`crate::bench::comm`] instrumentation
 //! (`bench-nn --competition`), and see which one actually wins for a given
 //! shape. This is a benchmarking/leaderboard tool, not an automated
-//! reward mechanism — deliberately so. A Precompile is *compiled code*;
-//! unlike the FHE/MPC/storage markets in `crate::fhe::lifecycle` /
-//! `crate::mpc_market` / `crate::storage` (which verify a *pure data
-//! computation's result* — re-execution, co-signature, Merkle proof — fully
-//! trustlessly), there is no lightweight way to verify compiled code beyond
-//! running it and reading it. Promoting a challenger to champion is a
+//! reward mechanism — deliberately so. A Precompile is *compiled code*, and
+//! there is no lightweight way to verify compiled code beyond running it and
+//! reading it: unlike a pure data computation, whose result can be checked
+//! trustlessly by re-execution, a faster implementation could be faster because
+//! it is wrong. Promoting a challenger to champion is a
 //! reviewed, human decision informed by the benchmark, not something the
 //! benchmark result alone should trigger.
 //!
@@ -65,8 +64,8 @@ pub mod mpc_matvec;
 pub struct PrecompileMeta {
     /// Stable, unique-per-gadget identifier (e.g. "matvec-naive").
     pub id: &'static str,
-    /// Free-form attribution. A future reputation-tied submission system
-    /// would replace this with a real `crypto::identity::IdentityId`.
+    /// Free-form attribution. A submission system with real identities would
+    /// replace this with a verified key rather than a string.
     pub author: &'static str,
     pub description: &'static str,
 }

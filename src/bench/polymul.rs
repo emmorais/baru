@@ -1,7 +1,7 @@
 //! `baru bench-polymul` — the three ways this repo can compute an exact
 //! negacyclic polynomial product, timed against each other.
 //!
-//! Every FHE scheme here (`fhe::bfv`, `fhe::si_ntru`, `pir`) bottoms out in the
+//! Every FHE scheme here (`fhe::bfv`, `fhe::bgv`, `pir`) bottoms out in the
 //! same operation:
 //!
 //! ```text

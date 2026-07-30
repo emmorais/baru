@@ -481,7 +481,7 @@ pub fn maxpool2d_ref(input: &[i64], in_shape: Chw, pool: usize, stride: usize) -
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::interpreter::aby3_backend::Aby3Backend;
+    use crate::interpreter::aby3_simulator::Aby3Simulator;
 
     const NBITS: usize = 32;
 
@@ -491,7 +491,7 @@ mod tests {
     fn to_signed(v: u128) -> i64 {
         (v as u32) as i32 as i64
     }
-    fn share_vec(be: &mut Aby3Backend, xs: &[i64]) -> Vec<ShareRef> {
+    fn share_vec(be: &mut Aby3Simulator, xs: &[i64]) -> Vec<ShareRef> {
         xs.iter().map(|&v| be.share_secret(residue(v), NBITS, 0)).collect()
     }
 
@@ -499,7 +499,7 @@ mod tests {
     fn relu_matches_reference() {
         let cases: &[&[i64]] = &[&[3, -4, 0, 7, -1], &[-5, -6], &[10, 20, 30]];
         for xs in cases {
-            let mut be = Aby3Backend::new();
+            let mut be = Aby3Simulator::new();
             let shares = share_vec(&mut be, xs);
             let out = relu(&mut be, &shares);
             let got: Vec<i64> = out.iter().map(|s| to_signed(be.reveal(s, None))).collect();
@@ -510,7 +510,7 @@ mod tests {
     #[test]
     fn max2_matches_reference_including_ties_and_signs() {
         for &(a, b) in &[(3i64, 5i64), (5, 3), (4, 4), (-2, -9), (-9, -2), (0, -1)] {
-            let mut be = Aby3Backend::new();
+            let mut be = Aby3Simulator::new();
             let sa = be.share_secret(residue(a), NBITS, 0);
             let sb = be.share_secret(residue(b), NBITS, 0);
             let m = max2(&mut be, &sa, &sb);
@@ -522,7 +522,7 @@ mod tests {
     fn max_reduce_matches_reference() {
         let cases: &[&[i64]] = &[&[3, 9, 2, 9, 1], &[-5, -1, -9], &[42], &[7, 7, 7]];
         for xs in cases {
-            let mut be = Aby3Backend::new();
+            let mut be = Aby3Simulator::new();
             let shares = share_vec(&mut be, xs);
             let m = max_reduce(&mut be, &shares);
             assert_eq!(to_signed(be.reveal(&m, None)), max_reduce_ref(xs), "max_reduce {xs:?}");
@@ -566,7 +566,7 @@ mod tests {
             all_vectors(len, &[-1, 0, 2], &mut cases);
         }
         for xs in &cases {
-            let mut be = Aby3Backend::new();
+            let mut be = Aby3Simulator::new();
             let shares = share_vec(&mut be, xs);
             let idx = argmax(&mut be, &shares, NBITS);
             let got = to_signed(be.reveal(&idx, None)) as usize;
@@ -587,7 +587,7 @@ mod tests {
             &[5, 1, 5, 1, 5],              // ties across sibling subtrees
         ];
         for xs in cases {
-            let mut be = Aby3Backend::new();
+            let mut be = Aby3Simulator::new();
             let shares = share_vec(&mut be, xs);
             let idx = argmax(&mut be, &shares, NBITS);
             let got = to_signed(be.reveal(&idx, None)) as usize;
@@ -598,7 +598,7 @@ mod tests {
     #[test]
     fn arith_shr_matches_reference_signed() {
         for &(x, k) in &[(8i64, 1usize), (-8, 1), (7, 2), (-7, 2), (-1, 3), (100, 4), (-100, 4), (0, 5)] {
-            let mut be = Aby3Backend::new();
+            let mut be = Aby3Simulator::new();
             let s = be.share_secret(residue(x), NBITS, 0);
             let r = arith_shr(&mut be, &s, k, NBITS);
             assert_eq!(to_signed(be.reveal(&r, None)), arith_shr_ref(x, k), "arith_shr({x},{k})");
@@ -609,7 +609,7 @@ mod tests {
     fn arith_shr_result_is_usable_in_a_comparison() {
         // The b2a-nbits fix: the shifted value must be comparable afterwards
         // (regression for the CNN maxpool bug).
-        let mut be = Aby3Backend::new();
+        let mut be = Aby3Simulator::new();
         let a = be.share_secret(residue(40), NBITS, 0);
         let b = be.share_secret(residue(9), NBITS, 0);
         let sa = arith_shr(&mut be, &a, 2, NBITS); // 10
@@ -622,7 +622,7 @@ mod tests {
         let x = [3i64, -4, 5];
         let w = vec![vec![1i64, 2, 3], vec![-1, 0, 2]];
         let b = [1i64, -2];
-        let mut be = Aby3Backend::new();
+        let mut be = Aby3Simulator::new();
         let sx = share_vec(&mut be, &x);
         let sw: Vec<Vec<ShareRef>> = w.iter().map(|r| share_vec(&mut be, r)).collect();
         let sb = share_vec(&mut be, &b);
@@ -646,7 +646,7 @@ mod tests {
         let (ref_conv, ref_shape) = conv2d_ref(&input, in_shape, &weights, &bias, 3, 3, 1);
         let (ref_pool, _) = maxpool2d_ref(&ref_conv, ref_shape, 2, 1);
 
-        let mut be = Aby3Backend::new();
+        let mut be = Aby3Simulator::new();
         let sin = share_vec(&mut be, &input);
         let sw: Vec<Vec<ShareRef>> = weights.iter().map(|r| share_vec(&mut be, r)).collect();
         let sb = share_vec(&mut be, &bias);
@@ -694,7 +694,7 @@ mod tests {
         };
 
         // Encrypted composition.
-        let mut be = Aby3Backend::new();
+        let mut be = Aby3Simulator::new();
         let sin = share_vec(&mut be, &input);
         let scw: Vec<Vec<ShareRef>> = cw.iter().map(|r| share_vec(&mut be, r)).collect();
         let scb = share_vec(&mut be, &cb);

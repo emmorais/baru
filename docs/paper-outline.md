@@ -3,6 +3,24 @@
 > Performance state, method and next steps for the private-inference
 > pipeline: [`private-inference-performance.md`](private-inference-performance.md).
 
+> [!IMPORTANT]
+> **Stale as of 2026-07-30: SI-NTRU has been removed from the repository.**
+> Every mention of SI-NTRU / scale-invariant NTRU / LTV below — including the
+> "fast reference" framing, the `f²` decryption, and E9's and E9b's SI-NTRU
+> columns — describes an engine that no longer exists in the artifact. Our own
+> analysis (kept in
+> [`experiments.md` §VII.1](experiments.md#vii1-si-ntru-removed-as-insecure-2026-07-30))
+> concluded it is insecure at the parameters this construction needs, even at
+> depth 1, so the pipelines were ported to BFV and the scheme was deleted rather
+> than kept as a reference. Every result transferred bit-exact; only the FHE
+> column got slower. **This outline has not been rewritten** (paper work is
+> deliberately out of scope for now) — treat the SI-NTRU material as historical
+> and read the security claims in §8 as the reason for the removal rather than a
+> caveat on a live component. The one finding worth carrying forward, since it is
+> no longer reproducible in-tree, is that the ~5× RLWE-vs-NTRU gap was
+> *structural* (2 ring elements at n=4096 against 1 at n=2048), i.e. the
+> quantified price of security.
+
 Working title candidates:
 - *"The Switch Is the Bootstrap: Unbounded-Depth Private Inference without FHE
   Bootstrapping"*

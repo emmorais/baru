@@ -3,7 +3,7 @@
 //! # Why multi-modular, and not a plain NTT
 //!
 //! A textbook NTT needs a modulus with a primitive `2n`-th root of unity —
-//! i.e. a prime `q ≡ 1 (mod 2n)`. Our BFV (and SI-NTRU) deliberately use a
+//! i.e. a prime `q ≡ 1 (mod 2n)`. Our BFV and BGV deliberately use a
 //! **power-of-two `q`** (`2^100`), which has no such root: a direct NTT mod
 //! `q` is impossible. That power-of-two modulus is load-bearing, though —
 //! it makes the BFV `t/q` rescale a rounded *shift* and the ring arithmetic
@@ -42,9 +42,10 @@ pub const MAX_N: usize = 8192;
 const ROOT_ORDER: u64 = (2 * MAX_N) as u64; // 16384
 
 /// Primes for the **narrow** profile: four ~63-bit primes ⇒ product ≈ 2^252,
-/// which must both (a) exceed `2·max|c[k]|` and (b) fit in [`I256`]. That
-/// covers BFV (`q=2^100`, `n=4096` ⇒ `|c| ≤ 2^210`) *and* SI-NTRU (`q=2^120`,
-/// `n=2048` ⇒ `|c| ≤ 2^249`, needing > 2^250).
+/// which must both (a) exceed `2·max|c[k]|` and (b) fit in [`I256`]. BFV and
+/// BGV (`q=2^100`, `n=4096`) reach `|c| ≤ 2^210`, so three primes (2^189) are
+/// not enough and four are the minimum. The resulting headroom up to ~2^251 is
+/// what lets the differential tests stress the path at 119-bit coefficients.
 const NUM_PRIMES: usize = 4;
 
 /// Primes for the **wide** profile ([`exact_negacyclic_product_wide`]): seven
@@ -159,7 +160,7 @@ fn primes() -> &'static Primes {
         // Search downward from just under 2^63 in steps of ROOT_ORDER so
         // every prime satisfies p ≡ 1 (mod ROOT_ORDER). ~63-bit primes keep
         // `a+b` inside u64 and `a*b` inside u128, while four of them give a
-        // 252-bit CRT modulus (fits I256, covers the SI-NTRU bound).
+        // 252-bit CRT modulus (fits I256, covers the narrow bound).
         let mut cand = ((1u64 << 63) / ROOT_ORDER) * ROOT_ORDER + 1;
         while p.len() < NUM_PRIMES_MAX {
             if is_prime(cand) {
@@ -681,11 +682,13 @@ mod tests {
     /// These are the bounds the two prime counts were chosen from.
     #[test]
     fn crt_moduli_cover_their_profiles() {
-        // Narrow: widest case is SI-NTRU, q=2^120 at n=2048 ⇒ |c| ≤ 2^249.
+        // Narrow: the schemes reach |c| ≤ 2^210 (q=2^100 at n=4096), and the
+        // differential tests push the same path to 2^249 (119-bit coefficients
+        // at n=2048) — the widest case four primes can still represent.
         let narrow = crt_consts();
         assert_eq!(narrow.ps.len(), NUM_PRIMES);
         // half = Π p / 2 must exceed 2^249, i.e. bit 249 of `half` is set or above.
-        assert!(!narrow.half.shr(249).is_zero(), "narrow CRT modulus too small for SI-NTRU");
+        assert!(!narrow.half.shr(249).is_zero(), "narrow CRT modulus lost its headroom");
 
         // Wide: q=2^190 at n=8192 ⇒ |c| ≤ n·(q/2)² = 2^392.
         let wide = crt_consts_wide();

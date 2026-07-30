@@ -7,9 +7,7 @@ pub mod arith;
 pub mod bits;
 pub mod identity;
 pub mod net;
-pub mod party;
 pub mod protocol;
-pub mod scheduler;
 pub mod sim;
 #[cfg(feature = "pq-tls")]
 pub mod tls;
@@ -17,20 +15,16 @@ pub mod types;
 
 pub use arith::*;
 pub use net::*;
-#[allow(unused_imports)]
-pub use party::*;
 pub use protocol::{
     a2b_party, add_party, mul_party, reveal, scalar_mul_party,
     share_input, share_public, sub_party, PartyShare,
 };
-pub use scheduler::*;
 pub use sim::*;
 pub use types::*;
 
 #[cfg(test)]
 pub use arith::{
-    add_shares, eq_simulate, le_simulate, lt_simulate, mul_ab3, mul_ab3_simulate, mul_insecure,
-    reconstruct, share_secret,
+    add_shares, eq_simulate, le_simulate, lt_simulate, mul_ab3, reconstruct, share_secret,
 };
 #[cfg(test)]
 pub use bits::{

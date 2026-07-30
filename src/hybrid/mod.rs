@@ -56,7 +56,7 @@
 //! # Trust model of this in-process implementation
 //!
 //! These functions *simulate all parties in one process*, mirroring how
-//! `Aby3Backend` simulates the 3-party MPC protocol in-process: the masking
+//! `Aby3Simulator` simulates the 3-party MPC protocol in-process: the masking
 //! and reconstruction data flow is exactly the real protocol's, but the
 //! final masked decryption uses the single client key rather than a genuine
 //! threshold decryption (where the FHE secret key itself would be
@@ -75,7 +75,7 @@
 //!   residues cross the boundary as exactly-representable `f64`s.
 //! - MPC side: `Backend::export_additive` / `Backend::import_additive`
 //!   (see `crate::interpreter::backend`) — raw additive components whose
-//!   wrapping sum is the secret. Implemented for `Aby3Backend`; a
+//!   wrapping sum is the secret. Implemented for `Aby3Simulator`; a
 //!   per-party transport backend needs a round to agree which replicated
 //!   component each party contributes (future work).
 //!
@@ -295,7 +295,7 @@ pub fn fhe_to_mpc_share<A: FheAdapter>(
 mod tests {
     use super::*;
     use crate::fhe::{MockCkksBackend, MockFheBackend};
-    use crate::interpreter::aby3_backend::Aby3Backend;
+    use crate::interpreter::aby3_simulator::Aby3Simulator;
 
     const NBITS: usize = 32;
 
@@ -313,7 +313,7 @@ mod tests {
         let adapter = IntFhe(&fhe);
         let (ck, _) = fhe.keygen();
         for &v in &[0i64, 1, 42, -1, -12345, i32::MAX as i64, i32::MIN as i64] {
-            let mut be = Aby3Backend::new();
+            let mut be = Aby3Simulator::new();
             let s = be.share_secret(signed_residue(v), NBITS, 0);
             let ct = mpc_share_to_fhe(&mut be, &s, &adapter, &ck);
             let got = to_signed(reduce64(adapter.decrypt(&ck, &ct), NBITS));
@@ -327,7 +327,7 @@ mod tests {
         let adapter = IntFhe(&fhe);
         let (ck, _) = fhe.keygen();
         for &v in &[0i64, 7, -7, 99999, -99999] {
-            let mut be = Aby3Backend::new();
+            let mut be = Aby3Simulator::new();
             let ct = adapter.encrypt(&ck, signed_residue(v) as u64);
             let s = fhe_to_mpc_share(&adapter, &ck, &ct, &mut be, NBITS);
             let got = to_signed(reduce64(be.reveal(&s, None) as u64, NBITS));
@@ -366,7 +366,7 @@ mod tests {
         let fhe = MockFheBackend;
         let adapter = IntFhe(&fhe);
         let (ck, _) = fhe.keygen();
-        let mut be = Aby3Backend::new();
+        let mut be = Aby3Simulator::new();
         let s = be.share_secret(signed_residue(-5), NBITS, 0);
         let ct = mpc_share_to_fhe(&mut be, &s, &adapter, &ck);
         // (-5 * 3) + 7 = -8, computed on the carried representative.
@@ -395,12 +395,12 @@ mod tests {
         let fhe = MockCkksBackend;
         let adapter = RealFhe(&fhe);
         let (ck, _) = RealFheBackend::keygen(&fhe);
-        let mut be = Aby3Backend::new();
+        let mut be = Aby3Simulator::new();
         let s = be.share_secret(signed_residue(31337), NBITS, 0);
         let ct = mpc_share_to_fhe(&mut be, &s, &adapter, &ck);
         assert_eq!(reduce64(adapter.decrypt(&ck, &ct), NBITS), 31337);
 
-        let mut be2 = Aby3Backend::new();
+        let mut be2 = Aby3Simulator::new();
         let s2 = fhe_to_mpc_share(&adapter, &ck, &ct, &mut be2, NBITS);
         assert_eq!(reduce64(be2.reveal(&s2, None) as u64, NBITS), 31337);
     }
@@ -441,7 +441,7 @@ mod tests {
         acc = fhe.add_plain(&acc, bias);
 
         // Phase 2 — switch schemes: FHE ciphertext -> MPC share.
-        let mut be = Aby3Backend::new();
+        let mut be = Aby3Simulator::new();
         let z = fhe_to_mpc_share(&adapter, &ck, &acc, &mut be, NBITS);
 
         // Phase 3 — MPC ReLU (mux style, same as bench-nn's Layer arm).

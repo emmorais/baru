@@ -33,7 +33,7 @@ use serde::Serialize;
 use crate::bench::comm::NetworkProfile;
 use crate::crypto::types::Fr;
 use crate::fhe::bfv::{Bfv, BfvAdapter, BfvParams};
-use crate::interpreter::aby3_backend::Aby3Backend;
+use crate::interpreter::aby3_simulator::Aby3Simulator;
 use crate::interpreter::backend::{Backend, ShareRef};
 use crate::interpreter::parse;
 use crate::mpcc::assign::{assign, Pair, Side as ASide};
@@ -130,7 +130,7 @@ pub fn run(n: usize) -> Result<Vec<Point>, String> {
         decision.sort();
 
         // Execute exactly what the model decided.
-        let mut be = Aby3Backend::new();
+        let mut be = Aby3Simulator::new();
         let mut env: HashMap<String, ShareRef> = HashMap::new();
         for i in 0..n {
             let av = (a[i] as i128).rem_euclid(1i128 << NBITS) as Fr;

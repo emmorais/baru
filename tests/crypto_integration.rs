@@ -1,31 +1,27 @@
 use baru::crypto::types::Fr;
-use baru::crypto::{arith, bits, party, sim};
+use baru::crypto::{arith, bits, sim};
 
 #[test]
-fn test_share_add_mul_insecure() {
+fn test_share_add() {
     let a: Fr = 42u128;
     let b: Fr = 7u128;
     let sa = arith::share_secret(a);
     let sb = arith::share_secret(b);
     let sum = arith::add_shares(&sa, &sb);
     assert_eq!(arith::reconstruct(&sum), a.wrapping_add(b));
-    let prod = arith::mul_insecure(&sa, &sb);
-    assert_eq!(arith::reconstruct(&prod), a.wrapping_mul(b));
 }
 
 #[test]
-fn test_mul_ab3_simulate() {
+fn test_mul_ab3_matches_the_inproc_protocol() {
     let a: Fr = 5u128;
     let b: Fr = 11u128;
     let sa = arith::share_secret(a);
     let sb = arith::share_secret(b);
     let prod = arith::mul_ab3(&sa, &sb);
     assert_eq!(arith::reconstruct(&prod), a.wrapping_mul(b));
-    let prod2 = party::mul_ab3_simulate(&sa, &sb);
+    // the same product through the inproc transport-orchestrated protocol
+    let prod2 = sim::mul_ab3_with_inproc(&sa, &sb);
     assert_eq!(arith::reconstruct(&prod2), a.wrapping_mul(b));
-    // new: run the inproc transport orchestrated protocol
-    let prod3 = sim::mul_ab3_with_inproc(&sa, &sb);
-    assert_eq!(arith::reconstruct(&prod3), a.wrapping_mul(b));
 }
 
 #[test]
@@ -38,23 +34,6 @@ fn test_bits_ops() {
     assert_eq!(bits::reconstruct_bit(&orv), true | false);
     let notv = bits::not(&t);
     assert!(!bits::reconstruct_bit(&notv));
-}
-
-#[test]
-fn test_mul_with_scheduler_honest_and_corrupt() {
-    use baru::crypto::scheduler;
-    let a: Fr = 13u128;
-    let b: Fr = 17u128;
-    let sa = arith::share_secret(a);
-    let sb = arith::share_secret(b);
-    let (out, rounds) = scheduler::mul_with_scheduler(&sa, &sb, None);
-    assert_eq!(arith::reconstruct(&out), a.wrapping_mul(b));
-    // should have 6 broadcast rounds (3 for d, 3 for e)
-    assert_eq!(rounds, 6);
-
-    // corrupted party: output should differ
-    let (out_corrupt, _rounds2) = scheduler::mul_with_scheduler(&sa, &sb, Some(1));
-    assert_ne!(arith::reconstruct(&out_corrupt), a.wrapping_mul(b));
 }
 
 #[test]
@@ -95,7 +74,6 @@ fn test_a2b_and_comparisons() {
     assert_eq!(bits::reconstruct_bit(&eq_sh), a == b);
 }
 
-use baru::crypto::scheduler;
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 
@@ -109,13 +87,9 @@ fn prop_mul_randomized() {
         let sb = arith::share_secret(b);
         let p1 = arith::mul_ab3(&sa, &sb);
         assert_eq!(arith::reconstruct(&p1), a.wrapping_mul(b));
-        let p2 = party::mul_ab3_simulate(&sa, &sb);
+        // exercise the inproc transport wrapper as well
+        let p2 = sim::mul_ab3_with_inproc(&sa, &sb);
         assert_eq!(arith::reconstruct(&p2), a.wrapping_mul(b));
-        let (p3, _rounds) = scheduler::mul_with_scheduler(&sa, &sb, None);
-        assert_eq!(arith::reconstruct(&p3), a.wrapping_mul(b));
-        // exercise inproc wrapper as well
-        let p4 = sim::mul_ab3_with_inproc(&sa, &sb);
-        assert_eq!(arith::reconstruct(&p4), a.wrapping_mul(b));
     }
 }
 

@@ -154,7 +154,7 @@ fn let_wrap(expr: &str, inputs: &[(String, i64)], bind: impl Fn(&str, i64) -> St
 
 fn eval_quiet_num(src: &str) -> Result<i64, String> {
     let expr = parse(src).map_err(|e| format!("parse error: {}", e))?;
-    let p = Participant::new(0);
+    let p = Participant::new_simulated(0);
     match p.eval_quiet(&expr) {
         Types::Num(n) => Ok(n),
         other => Err(format!("expected Num, got {:?}", other)),

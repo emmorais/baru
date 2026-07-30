@@ -166,7 +166,7 @@ pub trait Backend: Send + Sync {
     /// (their wrapping sum is the value). Needed by gadgets that select on
     /// public constants (e.g. class indices in `crate::gadgets::argmax`).
     ///
-    /// Default panics; the real MPC backends (`Aby3Backend`,
+    /// Default panics; the MPC backends (`Aby3Simulator`,
     /// `TransportBackend`) implement it.
     fn share_public(&mut self, value: Fr, nbits: usize) -> ShareRef {
         let _ = (value, nbits);

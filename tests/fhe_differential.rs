@@ -143,7 +143,7 @@ fn diff_dot_product_recursion_mock() {
 fn eval_plain_raw(expr_src: &str, x: i64) -> i64 {
     let src = format!("(let ((x {})) {})", x, expr_src);
     let expr = parse(&src).expect("parse");
-    match Participant::new(0).eval_quiet(&expr) {
+    match Participant::new_simulated(0).eval_quiet(&expr) {
         Types::Num(n) => n,
         Types::Fixed(f) => f,
         other => panic!("expected Num or Fixed, got {:?}", other),
@@ -315,7 +315,7 @@ fn eval_plain_real(expr_src: &str, x: i64) -> f64 {
     let raw = eval_plain_raw(expr_src, x);
     let src = format!("(let ((x {})) {})", x, expr_src);
     let expr = parse(&src).expect("parse");
-    match Participant::new(0).eval_quiet(&expr) {
+    match Participant::new_simulated(0).eval_quiet(&expr) {
         Types::Fixed(_) => raw as f64 / 65536.0,
         _ => raw as f64,
     }

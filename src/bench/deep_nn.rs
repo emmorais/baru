@@ -3,7 +3,7 @@
 //!
 //! This is the experimental core of the paper claim. An `L`-layer
 //! fully-connected ReLU network is evaluated end to end under the hybrid
-//! construction: each layer is one SI-NTRU ciphertext×ciphertext matvec
+//! construction: each layer is one BFV ciphertext×ciphertext matvec
 //! (weights AND activations encrypted), a scheme switch to a real 3-party
 //! ABY3 session for the nonlinearity, and a switch back. The switch-back
 //! re-encrypts freshly (`hybrid::shares_to_fhe` → `key_pow = 1`, fresh
@@ -17,8 +17,8 @@
 //! exact bit-equality with the integer plaintext reference at every depth):
 //!
 //! 1. **Noise never accumulates.** Each layer's FHE ciphertext is depth-1
-//!    fresh, so the SI-NTRU depth-1 noise budget (see `fhe::si_ntru`
-//!    module docs: ~36 bits of slack) is the *only* budget that ever
+//!    fresh, so BFV's depth-1 noise budget (measured in `fhe::bfv`'s
+//!    `measures_post_multiply_noise_budget`) is the *only* budget that ever
 //!    matters, independent of `L`.
 //! 2. **Values never overflow.** Layers are fixed-point: the nonlinearity
 //!    is the fused `a_next = ReLU(v ≫ s)` with `v = W·a_prev + (b ≪ s)`,
@@ -41,10 +41,10 @@
 //!
 //! # Honesty / scope (carried from the rest of this crate)
 //!
-//! - SI-NTRU at these parameters is in the overstretched-NTRU regime
-//!   (`fhe::si_ntru`) — a research engine, not production key material. The
-//!   *construction* (switch-as-bootstrap) is scheme-agnostic; SI-NTRU is
-//!   chosen only for its cheap depth-1 multiplication.
+//! - The FHE parameters are the secure RLWE ones (`n = 4096`, `q = 2^100`,
+//!   inside the 128-bit HomomorphicEncryption.org bound — see `fhe::bfv`).
+//!   The *construction* (switch-as-bootstrap) is scheme-agnostic; BFV is
+//!   chosen for its cheap relin-free depth-1 multiplication.
 //! - The scheme switch simulates threshold decryption with a single key
 //!   (`crate::hybrid`); a full instantiation uses distributed-key
 //!   threshold FHE.
@@ -61,7 +61,7 @@ use crate::bench::comm::{CommStats, NetworkProfile};
 use crate::bench::hybrid_nn::{run_parties, sleep_link, MpcTransport};
 use crate::fhe::ckks_compare::CkksCompareBackend;
 use crate::crypto::types::Fr;
-use crate::fhe::si_ntru::{NtruCt, SiNtru, SiNtruAdapter, SiNtruParams};
+use crate::fhe::bfv::{Bfv, BfvAdapter, BfvCt, BfvParams};
 use crate::hybrid::FheAdapter;
 use crate::interpreter::backend::{Backend, ShareRef};
 use crate::interpreter::transport_backend::TransportBackend;
@@ -271,11 +271,16 @@ fn mpc_relu_rescale_layer(
     })
 }
 
-// ─── Per-layer SI-NTRU FHE steps ──────────────────────────────────────────────
+// ─── Per-layer BFV FHE steps ─────────────────────────────────────────────────
 
-/// Encrypt an activation vector as a packed SI-NTRU input polynomial
+/// Ring dimension: the secure `q = 2^100` sits inside the 128-bit RLWE bound
+/// (~109) at n=4096, and the reversed packing's `(width+1)·width ≤ n` bound
+/// then admits widths up to 63 in a single ciphertext.
+const RING_N: usize = 4096;
+
+/// Encrypt an activation vector as a packed BFV input polynomial
 /// (value j at coefficient j).
-fn pack_activation(s: &SiNtru, ck: &[u8], a: &[i64]) -> NtruCt {
+fn pack_activation(s: &Bfv, ck: &[u8], a: &[i64]) -> BfvCt {
     s.encrypt_poly(ck, &s.pack_input(a))
 }
 
@@ -307,9 +312,9 @@ pub fn run_deep_hybrid(mlp: &DeepMlp, input: &[i64], profile: NetworkProfile) ->
         mlp.nbits
     );
 
-    let s = SiNtru::new(SiNtruParams {
-        n: 2048,
-        log2_q: 120,
+    let s = Bfv::new(BfvParams {
+        n: RING_N,
+        log2_q: 100,
         log2_t: mlp.nbits as u32,
     });
     assert!(
@@ -318,7 +323,7 @@ pub fn run_deep_hybrid(mlp: &DeepMlp, input: &[i64], profile: NetworkProfile) ->
     );
     let nbits = mlp.nbits;
     let t_mask = s.params.t() - 1;
-    let adapter = SiNtruAdapter(&s);
+    let adapter = BfvAdapter(&s);
 
     let start = Instant::now();
     let (mut fhe_ms, mut switch_ms, mut mpc_ms) = (0.0, 0.0, 0.0);
@@ -379,7 +384,7 @@ pub fn run_deep_hybrid(mlp: &DeepMlp, input: &[i64], profile: NetworkProfile) ->
         // result is a FRESH key_pow-1 ciphertext, noise reset.
         let t0 = Instant::now();
         let mut bytes = 0usize;
-        let mut sum: Option<NtruCt> = None;
+        let mut sum: Option<BfvCt> = None;
         for comps in per_party.iter() {
             let m: Vec<u64> = comps.iter().map(|&c| (c as u64) & t_mask).collect();
             let enc = s.encrypt_poly(&ck, &m);
@@ -535,7 +540,7 @@ pub fn run_cli(args: &[String]) -> Result<(), String> {
     }
 
     if !json {
-        println!("Deep private inference — hybrid SI-NTRU × ABY3, ZERO FHE bootstraps");
+        println!("Deep private inference — hybrid BFV × ABY3, ZERO FHE bootstraps");
         println!(
             "width={width}, rtt={rtt_ms}ms, bandwidth={}",
             bandwidth_mbps.map(|b| format!("{b}Mbps")).unwrap_or_else(|| "unlimited".into())
@@ -625,7 +630,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // n=2048 schoolbook ring — slow in debug, fast in release
+    #[ignore] // the n=4096 ring is slow in debug, fast in release
     fn deep_hybrid_exact_at_increasing_depth() {
         for depth in [2usize, 4, 8] {
             let (mlp, input) = DeepMlp::random(depth, 16, 7);

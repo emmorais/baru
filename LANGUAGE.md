@@ -1,17 +1,23 @@
 # The Baru Language
 
 Baru is a small Lisp-like language for **privacy-preserving computation**. A single
-program can be evaluated on four different backends:
+program can be evaluated on four different backends — and on **combinations** of
+them, since values can cross between MPC shares and FHE ciphertexts
+mid-computation without being exposed:
 
 | Backend | What it provides | Where |
 |---|---|---|
 | **Plain interpreter** | Ordinary evaluation (CEK-style trampolined evaluator) — the correctness baseline | `src/interpreter/` |
-| **MPC** | 3-party secure computation with ABY3-style replicated secret sharing (plus an experimental 2-party garbled-circuits backend) | `src/crypto/`, `src/interpreter/*_backend.rs` |
+| **MPC** | 3-party secure computation with ABY3-style replicated secret sharing; triple-free multiplication, batched bit protocols, garbled-circuit nonlinearities | `src/crypto/`, `src/interpreter/*_backend.rs` |
 | **FHE** | Fully homomorphic evaluation of compiled circuits — mock, TFHE-rs (exact integers) and SEAL CKKS (approximate reals) | `src/fhe/` |
 | **ZKP** | Zero-knowledge proofs of circuit satisfaction using the Binius64 SNARK | `src/zkp/` |
+| **Hybrid** | Scheme switching in both directions (`share->fhe`, `fhe->share`), and re-encryption as an alternative to bootstrapping | `src/hybrid/` |
 
 This document describes the language surface: syntax, data types, special forms,
-every builtin, the REPL, the CLI tools, and worked examples for each backend.
+every builtin, the REPL, the CLI tools, and worked examples for each backend. For
+what the layers *cost*, measured, see
+[`docs/experiments.md`](docs/experiments.md); for the repository overview see
+[`README.md`](README.md).
 
 ---
 
@@ -20,12 +26,14 @@ every builtin, the REPL, the CLI tools, and worked examples for each backend.
 ```sh
 cargo build                 # build everything
 cargo test                  # unit + integration tests
-cargo run --bin baru        # single-process REPL (SimBackend, no networking)
+cargo run --bin baru        # single-process REPL (in-process ABY3, no networking)
 cargo run --bin baru bench  # benchmark harness (see §10)
 cargo run --release --example mnist   # MNIST private-inference demo (see §11)
 ```
 
-Multi-party TCP mode uses the `tcp_party` binary (see §6.5).
+Multi-party TCP mode uses the `tcp_party` binary (see §6.5). Optional cargo
+features: `ntl` (NTL+GMP polynomial backend, needs a C++ toolchain plus NTL and
+GMP) and `pq-tls` (post-quantum TLS transports).
 
 ---
 
@@ -220,6 +228,28 @@ The key JSON's `backend_id` selects the backend at `fhe-enc`/`fhe-dec`/`fhe-eval
 time, so the same program text runs on mock, TFHE, or CKKS by swapping the keygen
 call.
 
+### 5.6 Scheme-switching builtins
+
+The two directions of `src/hybrid/` (see §7.1), exposed as builtins so a single
+program can move a value between representations without revealing it:
+
+| Builtin | Signature | Description |
+|---|---|---|
+| `share->fhe` | `(share->fhe keys s)` | Convert an MPC share into an FHE ciphertext. Each party encrypts its own additive component under the public key and the evaluator sums them homomorphically — the value is never reconstructed. Returns a ciphertext. |
+| `fhe->share` | `(fhe->share keys ct nbits)` | Convert an FHE ciphertext into an MPC share by mask-and-open: only a uniformly-masked value is ever decrypted. Returns a `Share` of the given bit-width. |
+
+A converted ciphertext holds the value's *residue class* mod `2^nbits` (share-sum
+carries may sit above it), so `+`/`−`/`×` keep working but an FHE-side comparison
+on a converted value would see the carry. Convert back to MPC for comparisons —
+which is the point of switching in the first place.
+
+### 5.7 Model builtins
+
+| Builtin | Signature | Description |
+|---|---|---|
+| `nn-load-model` | `(nn-load-model "model.quant.json")` | Load a quantised `NetworkSpec` (produced by `baru quantize`, §10.2) as ordinary Lisp data: a list of `(weights bias activation)` triples, inspectable like any other value rather than an opaque handle. Requires `--scale-bits 16`. |
+| `nn-forward` | `(nn-forward layers input)` | Full multi-layer forward pass: matvec + bias-add + activation, chained layer to layer, reusing the `matvec` precompile. Works identically whether `input` is public (`Num`/`Fixed`) or a private `Share` vector, and whether the model is public or shared — each helper dispatches per element on the runtime type, so there is no separate "private mode". Only `relu` and `identity` activations are supported. |
+
 ---
 
 ## 6. MPC layer
@@ -237,13 +267,29 @@ shares `253`.
 | Operation | Protocol | Communication |
 |---|---|---|
 | `+`, `-`, scalar × | local on shares | none |
-| `*` | Beaver triple (dealer: party 0) | 1 broadcast round |
-| `a2b` | masked open + ripple-carry adder | 1 broadcast round |
-| `<`, `>`, `<=`, `>=`, `==` | `a2b(a−b)`, sign bit / zero test | 1 broadcast round |
-| `reconstruct` | each party sends its share | 1 round |
+| `*` | ABY3 resharing — **no Beaver triples, no dealer**. Each party forms three of the nine cross terms locally, re-randomises with zero-sum PRF randomness, and sends the result to one neighbour. | 1 ring element to 1 peer, 1 round |
+| `a2b` | binary-share the three additive components (free), carry-save reduce 3→2, then a Kogge–Stone parallel-prefix adder | `2 + 1 + ⌈log₂ nbits⌉ + 1` ≈ **9 rounds** at 20 bits |
+| `<`, `>`, `<=`, `>=`, `==` | `a2b(a−b)`, sign bit / zero test | as `a2b` |
+| `reconstruct` | each party sends its component | 1 round |
 
 Comparisons are **signed** (two's-complement MSB). Fixed-point share
 multiplication truncates by 16 bits to stay in Q16.16.
+
+Two properties are worth knowing before you tune anything:
+
+- **There is no offline phase to optimise.** Multiplication needs no precomputed
+  triples, because the correlated randomness is regenerated locally per operation
+  from pairwise PRF keys. The only preprocessing is a 32-byte key exchange per
+  party pair per session.
+- **Cost is rounds, not operations.** The backend exposes batched forms
+  (`mul_batch`, `a2b_batch`, `lt_batch`, `share_secret_batch`) that run *any*
+  number of independent lanes in the round count of one, so a wide layer costs
+  what a single element costs. Rust code that calls the per-element form in a
+  loop pays `O(n)` rounds for nothing — measured at 9–45× wall-clock on a 64-wide
+  layer. `src/gadgets/` and `src/precompile/` are written over the batched
+  primitives; the `matvec` builtin dispatches to a batched precompile. An earlier
+  `a2b` that appeared to cost 1 round was leaking its input — see
+  [`docs/experiments.md` §I.2](docs/experiments.md#i2-a2b-rebuilt-after-a-verified-privacy-break).
 
 ### 6.3 Branching on secrets
 
@@ -263,10 +309,8 @@ The evaluator dispatches all share operations through the `Backend` trait
 
 | Backend | Description |
 |---|---|
-| `SimBackend` | Single-process simulation — the REPL default. |
-| `Aby3Backend` | In-process replicated 3-party ABY3 (`src/interpreter/aby3_backend.rs`). |
-| `TransportBackend<T>` | Real distributed protocol over a `Transport` (in-process queues or TCP). |
-| `GCBackend` | Experimental 2-party garbled-circuits backend (`src/interpreter/gc_backend.rs`); library-level, not wired into a binary. |
+| `Aby3Simulator` | In-process *simulation* of replicated 3-party ABY3 (`src/interpreter/aby3_simulator.rs`) — what `Participant::new_simulated` and the REPL use. Correct on values, but **not the distributed protocol**: all three parties' shares live in one process, so its share multiplication reconstructs and reshares locally — free, and revealing everything. Never quote its timings as protocol costs; it understated one measured layer by 2.7×. (It was named `Aby3Backend` until 2026-07-30, which read as a peer of `TransportBackend` rather than a simulation of it.) |
+| `TransportBackend<T>` | The real distributed protocol over a `Transport` (in-process queues or TCP). **The only backend whose costs mean anything**, and the only one the benchmarks use. It needs all three parties running concurrently — a lone party has no peers and blocks — so it is always constructed inside a three-thread or three-process spawn. |
 
 ### 6.5 Multi-party binary
 
@@ -295,86 +339,60 @@ optimised) → `FheCircuit` → `evaluate_fhe` per-gate on an `FheBackend`.
 |---|---|---|---|
 | mock | `FheBackend` | exact u64 | plaintext stand-in; instant; use for development and differential tests |
 | `tfhe-rs-v1.6` | `FheBackend` | exact `FheUint64` | real FHE; supports comparisons (so ReLU works); slow (minutes for large circuits) |
-| `seal-ckks` | `RealFheBackend` | approximate `f64` (N=8192, 128-bit security) | only `+ − ×` — **no comparisons**, so no encrypted ReLU/argmax; errors ~1e-8; supports SIMD batching and plaintext-weight dot products with rotation keys (Rust API: `encrypt_vec`, `dot_plain`) |
+| `seal-ckks` | `RealFheBackend` | approximate `f64` (N=8192, 128-bit security) | only `+ − ×` — **no exact comparisons**, so no encrypted ReLU/argmax from the builtins; errors ~1e-8; supports SIMD batching and plaintext-weight dot products with rotation keys (Rust API: `encrypt_vec`, `dot_plain`). *Approximate* comparison via polynomial sign approximation is implemented in `fhe::ckks_compare` (Rust-level, deep context, seconds per operation — see §7.1) |
 | `ckks-mock` | `RealFheBackend` | exact `f64` | drop-in twin of `seal-ckks` for fast testing |
 
 Compile with `fhe-compile` for integer backends and `fhe-compile-ckks` for the
 CKKS pair. Fixed-point values are Q16.16 gadgets on integer backends and true
 reals on CKKS.
 
-MNIST benchmark data point (784-input linear layer, 2365 gates): TFHE eval
-≈ 2800 s; CKKS circuit form ≈ 1.6 s; CKKS batched SIMD form ≈ 92 ms with one
-393 KB ciphertext per image (see `examples/mnist.rs`).
+MNIST benchmark data point (784-input linear layer): TFHE eval ≈ 2800 s; CKKS
+circuit form ≈ 1.6 s; CKKS batched SIMD form ≈ 92 ms with one 393 KB ciphertext
+per image (see `examples/mnist.rs`). Those were measured at **2365 gates**;
+common-subexpression elimination inside `CircuitCompiler` has since brought the
+same circuit to **1764 gates (−25%)** with bit-identical scores, so the integer
+backends should be proportionally faster — at TFHE's ~0.2–0.5 s/gate those 601
+gates are minutes per run.
 
-### 7.1 Delegated computation (the FHE job market)
+### 7.1 Scheme switching: MPC <-> FHE
 
-FHE's headline use is **delegation**: a data owner hands a heavy computation to
-an untrusted worker who runs it *on ciphertexts* and never sees the plaintext.
-`src/fhe/market.rs` models this as a verifiable job, and `src/fhe/lifecycle.rs`
-wraps it in economics.
+MPC and FHE have complementary weaknesses: MPC does comparisons in milliseconds
+but pays communication for every multiplication, while FHE does a whole linear
+layer in one ciphertext operation but needs *seconds* for an approximate
+comparison. `src/hybrid/` converts values between the two representations
+mid-computation, so each phase runs where it is cheapest. From Baru that is two
+builtins (§5.6):
 
-Three roles, none of which requires trusting the others:
+```lisp
+; a secret computed under MPC crosses into FHE without being revealed
+(let ((keys (fhe-keygen)) (x (share 6 32)) (y (share -7 32)))
+  (fhe-dec keys (share->fhe keys (* x y))))          ; => -42
 
-- **Requester** holds the client key. They compile the function, encrypt their
-  private inputs, and post an [`FheJob`] carrying only the circuit, the public
-  inputs, and the ciphertext bytes — **the client key never leaves them**.
-- **Worker** runs `evaluate_job`, producing the result ciphertext plus a
-  succinct `WorkReceipt` (a commitment to the output). It needs only the
-  evaluation/server key and never decrypts.
-- **Verifier** (anyone) calls `verify_receipt`, which **re-executes the circuit
-  on the ciphertexts** and compares the output commitment. Homomorphic
-  evaluation is a deterministic function of `(circuit, inputs, keys)`, so a
-  wrong result yields a different commitment and is *provable* fraud — the
-  verifier never decrypts either.
-
-```rust
-use std::collections::HashMap;
-use baru::fhe::market::{evaluate_job, verify_receipt, FheJob, Verdict};
-use baru::fhe::{FheBackend, MockFheBackend};
-use baru::interpreter::parse;
-use baru::zkp::circuit_compiler::CircuitCompiler;
-
-// ── Requester: compile f(x,y) = x + y, encrypt private inputs, post a job ──
-let backend = MockFheBackend;              // swap for the TFHE backend in production
-let (client_key, _server_key) = backend.keygen();
-
-let mut cc = CircuitCompiler::new();
-let mut circuit = cc.compile_fhe(&parse("(+ x y)").unwrap()).unwrap();
-circuit.public_inputs.retain(|v| v != "x" && v != "y");
-circuit.encrypted_inputs = vec!["x".into(), "y".into()];
-
-let mut encrypted_inputs = HashMap::new();
-encrypted_inputs.insert("x".into(), backend.serialize_ct(&backend.encrypt(&client_key, 10)));
-encrypted_inputs.insert("y".into(), backend.serialize_ct(&backend.encrypt(&client_key, 32)));
-
-let job = FheJob {
-    circuit,
-    public_inputs: HashMap::new(),
-    encrypted_inputs,                      // ciphertext bytes only — no client key
-    backend_id: backend.backend_id().to_string(),
-};
-
-// ── Worker: evaluate homomorphically; never decrypts ──
-let (output, receipt) = evaluate_job(&job, &backend).unwrap();
-
-// ── Anyone: verify by deterministic re-execution (no key, no decryption) ──
-assert_eq!(verify_receipt(&job, &receipt, &backend), Verdict::Valid);
-
-// ── Requester: decrypt the delivered result with the client key ──
-let out_ct = backend.deserialize_ct(&output.bytes);
-assert_eq!(backend.decrypt(&client_key, &out_ct), 42);
+; a value under FHE needs a ReLU (FHE's weak spot): switch to MPC for it
+(let ((keys (fhe-keygen)))
+  (let ((z (fhe->share keys (fhe-enc keys -4) 32)))
+    (reconstruct (* z (> z 0)))))                    ; => 0
 ```
 
-**Economic wrapper.** `fhe::lifecycle` turns that objective correctness check
-into an incentive-compatible market. A job moves
-`Open → Claimed → Delivered → {Settled | Challenged → Settled}`: the reward is
-escrowed, the worker posts a claim bond, and a challenge window lets anyone
-dispute a delivered result. A dispute is adjudicated by the same re-execution —
-`verdict_to_adjudication` maps a `Verdict` to the state machine's `Adjudicated`
-event — and settlement emits `Effect`s (stake releases/slashes and reputation
-deltas) that a consensus ledger folds at each epoch boundary. Those reputation
-deltas are exactly what `tcp_party`'s `BARU_POUW` consensus weights leader
-election by, so honest delegated work compounds into consensus influence.
+Composing the two directions gives **re-encryption instead of bootstrapping**
+(`hybrid::mpc_reencrypt`): the round trip resets FHE noise and, for levelled
+CKKS, restores the full depth budget, for the price of one interactive round.
+That is the mechanism behind the repository's headline result — a network of
+arbitrary depth evaluated with zero FHE bootstraps, since the scheme switch that
+computes each ReLU also refreshes the ciphertext. See
+[`docs/experiments.md` Part III](docs/experiments.md#part-iii--the-hybrid-construction).
+
+Scope, stated in the module too: the FHE→MPC direction stands a single client key
+in for a threshold decryption (the data flow is already the right one; a real
+deployment needs distributed-key threshold FHE), and everything is semi-honest.
+
+The Rust-level FHE schemes that make this cheap are not exposed as builtins,
+because they implement one specialized primitive rather than a general circuit
+evaluator: `fhe::bfv` and `fhe::bgv` do a **depth-1 packed matvec** — one
+ciphertext×ciphertext multiplication, no relinearization keys, no bootstrapping,
+decrypting the degree-2 product under `s²` — and `fhe::ckks_compare` does
+polynomial sign approximation for CKKS. Drive them from Rust (`src/bench/`,
+`src/gadgets/`) or through the `baru bench-*` commands.
 
 ---
 
@@ -394,25 +412,34 @@ subexpression as a witness. Proofs serialize to JSON (`proof-save` /
 ## 9. REPL
 
 `cargo run --bin baru`. Expressions are evaluated on three simulated
-participants. Colon-commands:
+participants. Colon-commands (`:help` prints the live list, which is shorter in
+distributed mode — see §6.5):
 
 | Command | Description |
 |---|---|
-| `:help` | language reference |
+| `:help` | show the command list |
 | `:examples [category]`, `:example <n>` | browse / run the built-in example library (arithmetic, comparisons, booleans, let-lambda, higher-order, lists, recursion, MPC, ZKP, FHE, …) |
-| `:env` | print the participant environment |
-| `:verbose on\|off` | trace evaluation |
-| `:last`, `:results` | inspect previous results |
-| `:reveal <pid>` | reveal the last shared result to a participant |
-| `:evalfor <pid> EXPR` | evaluate as a specific participant |
-| `:inspect <pid> <var>` | inspect a binding |
-| `:save <pid> [file]`, `:load <file>` | persist / restore an environment (JSON) |
-| `:reset` | clear user bindings, re-register builtins |
-| `quit` | exit |
+| `:verbose [on\|off]` | toggle per-participant eval traces |
+| `:last [pid]`, `:results` | last result for one participant / for all of them |
+| `:reveal <pid>` | reveal the last shared result for a participant |
+| `:evalfor <pid> EXPR` | evaluate `EXPR` as a specific participant |
+| `:inspect <pid> <var>` | reveal a variable for a participant |
+| `:save <pid> [file]`, `:load <pid> [file]` | persist / restore a participant store (JSON) |
+| `:reset [pid]` | clear participant store(s) |
+| `quit` / `exit` | exit the REPL |
+
+In distributed mode party 0 has `:help`, `:examples`, `:example`, `:verbose` and
+`:quit` (which signals every party to exit), plus the node commands in
+[README](README.md#running-a-multi-party-node) (`:commit`, `:chat`, `:post`).
 
 ---
 
-## 10. Benchmark harness
+## 10. Command-line tools
+
+Everything below is a subcommand of the `baru` binary. `--help` on any of them
+prints its own options.
+
+### 10.1 `baru bench` — the cross-backend suite
 
 ```sh
 cargo run --bin baru bench -- [--list] [--backends plain,mpc-aby3,fhe-mock,fhe-tfhe,zkp-binius64]
@@ -424,6 +451,67 @@ selected backend, checks the decrypted/reconstructed result against the plain
 interpreter, and reports per-phase timings (compile / keygen / encrypt / eval /
 prove / verify). Cases that branch on secrets carry a mux-style `mpc_expr`
 rewrite.
+
+The size-swept and application-level benchmarks are separate subcommands
+(`bench-nn`, `bench-hybrid-nn`, `bench-deep-nn`, `bench-cnn`, `bench-mnist`,
+`bench-medmnist`, `bench-train`, `bench-fhe-innerprod`, `bench-polymul`,
+`bench-triples`, `bench-ot`, `bench-psi`, `bench-pir`, `bench-layer`,
+`bench-net`, `bench-circuit`, `bench-backend-aware`, `bench-compiled-nn`,
+`bench-abstraction`, `bench-gc-compare`, `bench-mixed-layer`, `bench-cohort`,
+`bench-cohort-eval`, `bench-ckks-compare`). They drive the Rust APIs directly
+rather than the interpreter, for cost attribution and to reach realistic sizes;
+most accept `--json`, `--rtt-ms` and `--bandwidth-mbps`. What each one measures is
+listed in the [README](README.md#command-line-surface) and what it *found* is in
+[`docs/experiments.md`](docs/experiments.md).
+
+### 10.2 `baru quantize` — model import
+
+```sh
+baru quantize --in model.json --out model.quant.json --scale-bits 16 --validate samples.json
+```
+
+Train a model in whatever framework you like, export weights/biases to a plain
+JSON `NetworkSpec`, then quantize to Q16.16 fixed-point. `--validate` compares the
+float and quantized forward passes on real samples and reports max/mean absolute
+and max relative error — "good enough for inference" is a number you check, not
+an assumption. It is intentionally not optional-and-silent: skipping it prints a
+warning rather than implying the model is fine. `--scale-bits` defaults to 16,
+which is what `nn-load-model` (§5.7) requires; lower values are for studying the
+accuracy/footprint trade-off in isolation.
+
+### 10.3 `baru mpcc` — the MPC compiler
+
+```sh
+baru mpcc protocols                      # the registry: which protocols exist, and their status
+baru mpcc dump    --expr EXPR            # the lowered circuit IR
+baru mpcc analyse --expr EXPR            # rounds, interactive ops, depth
+baru mpcc compare --expr EXPR            # cost every protocol under a deployment
+baru mpcc run     --expr EXPR --protocol dealer|shamir|semi2k|lowgear --input k=v
+baru mpcc calibrate --expr EXPR          # predicted vs measured rounds and bytes
+baru mpcc optimize  --expr EXPR          # apply rewrite rules for a target backend
+baru mpcc assign    --expr EXPR          # per-region protocol assignment (mixed protocols)
+```
+
+Lowering options (`--domain ringN|field128`, `--bits N`, `--public a,b,c`) and
+deployment options (`--parties N`, `--security semi-honest|malicious`,
+`--lan`/`--wan`, `--dishonest`, `--dealer`, `--only ids`, `--no-offline`,
+`--json`) apply across the subcommands. `calibrate` is the important one: it
+checks each protocol's *cost model* against the VM actually running it, and has
+already caught a real accounting bug. Adding a rewrite rule is documented in
+`.claude/skills/mpcc-rewrite-rule/`.
+
+### 10.4 `baru db` — the experiment store
+
+```sh
+baru db put   --suite S --case C --backend B --metric name=value[unit] --tag T --ok true
+baru db query [--suite S] [--backend B] [--tag T] [--format table|csv|latex|json]
+baru db get   --id ID
+baru db stats
+```
+
+Records benchmark results so a claim in a paper can be traced to the run that
+produced it. `--store local:PATH` (a JSONL file, the default) or `barudb:PATH`
+(the encrypted store — see [`docs/barudb-api.md`](docs/barudb-api.md)).
 
 ---
 
@@ -502,19 +590,33 @@ src/
     parser.rs            tokenizer + parser; quote shorthand, :sintN sugar
     ast.rs               Expr / Types, Q16.16 constants
     eval.rs              trampolined evaluator, Participant, all builtins
-    backend.rs           Backend trait, ShareRef, SimBackend
-    aby3_backend.rs      in-process replicated ABY3
-    gc_backend.rs        2-party garbled circuits (experimental)
-    transport_backend.rs distributed backend over a Transport
-  crypto/                field arithmetic, Beaver triples, bit protocols,
-                         InprocHandle/TcpTransport, scheduler
-  fhe/                   FheBackend/RealFheBackend traits, mock, TFHE-rs,
-                         SEAL CKKS (+ mock twin), circuit emitter
+    backend.rs           Backend trait, ShareRef, batched-primitive defaults
+    aby3_simulator.rs    in-process ABY3 simulation (values only, not costs)
+    transport_backend.rs distributed backend over a Transport; batched primitives
+    hashcons.rs merkle.rs structural sharing; commitments
+  crypto/                Fr/Share3, ABY3 protocols (mul, a2b, batched forms),
+                         garbled circuits, Transport (InprocHandle/TcpTransport),
+                         PQ-TLS, identity, sim (in-process wrappers)
+  fhe/                   FheBackend/RealFheBackend traits and the mock, TFHE-rs and
+                         SEAL CKKS backends; bfv/bgv/bgv_wide (depth-1 packed matvec,
+                         no relin); ckks_compare (deep, polynomial sign); ntt
+                         (multi-modular, exact over power-of-two q); ntl (oracle);
+                         poly (runtime backend switch); slots (CRT packing);
+                         conv_pack (Cheetah-style); circuit_emitter; market; lifecycle
+  hybrid/                MPC <-> FHE scheme switching, mpc_reencrypt
+  gadgets/               relu, max2/max_reduce/maxpool2d, argmax, dense, conv2d
+  mpcc/                  circuit IR, rewrite rules, cost models, protocol registry
+                         (dealer/shamir/semi2k/lowgear), mixed assignment, VM
   zkp/                   CircuitCompiler (FlatIR), Binius64 backend, proof
                          serialization
-  bench.rs               `baru bench` harness
+  ot/ psi/ pir/          Chou-Orlandi + IKNP OT; DH-PSI; single-server BFV PIR
+  ml/                    NetworkSpec/QuantizedNetwork, `baru quantize`
+  precompile/            Gadget/Registry/champion dispatch, batched matvec
+  db/                    the experiment store (local JSONL and BaruDB backends)
+  bench/                 one module per `baru bench-*` command
+  demo/                  `baru demo-private-mnist`
   repl.rs                REPL commands + example library
-  bin/tcp_party.rs       multi-party binary
+  bin/tcp_party.rs       multi-party node (inproc demo + TCP mode)
 third_party/sealy/       vendored, patched SEAL bindings (see BARU_PATCHES.md)
 ```
 
@@ -522,8 +624,20 @@ third_party/sealy/       vendored, patched SEAL bindings (see BARU_PATCHES.md)
 
 - **Branch leakage**: `if` on a shared condition reveals the branch taken; use
   mux-style expressions for oblivious code.
-- **Trusted dealer, semi-honest model**: Beaver triples come from party 0; no
-  malicious-security authentication.
-- **CKKS**: approximate results, `+ − ×` only (no encrypted comparisons).
-- **Ring size**: 128-bit ring wraps on overflow.
-- **Single-evaluator model**: all parties run the same expression text.
+- **Semi-honest only**: no MACs, no authentication, no abort handling — a
+  malicious party can deviate undetected. This applies to every layer: the ABY3
+  protocols, IKNP (an inconsistent choice vector leaks the sender's bits) and
+  LowGear (no zero-knowledge proofs of plaintext knowledge). What malicious
+  security would cost is sketched in
+  [`docs/malicious-hybrid.md`](docs/malicious-hybrid.md).
+- **Scheme switching simulates threshold decryption** with a single client key
+  (§7.1). The data flow is the right one; a real deployment needs
+  distributed-key threshold FHE.
+- **CKKS**: approximate results; the builtins offer `+ − ×` only. Encrypted
+  comparison exists only as a Rust-level polynomial approximation with real error
+  and seconds-per-operation cost.
+- **Ring size**: the 128-bit ring wraps on overflow; there is no prime-order
+  field.
+- **Single-evaluator model**: all parties evaluate the same expression text.
+- **`nn-forward` activations**: only `relu` and `identity`. Richer
+  nonlinearities need a polynomial approximation to stay oblivious.

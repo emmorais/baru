@@ -13,11 +13,12 @@
 //!   hybrid-tfhe  TFHE linear → fhe->share → ABY3 ReLU → share->fhe
 //!   hybrid-ckks  shallow-CKKS SIMD linear (dot_plain, one ciphertext for
 //!                the whole input) → fhe->share → ABY3 ReLU → share->fhe
-//!   hybrid-ntru  SI-NTRU (LTV) packed linear: weights AND input encrypted,
-//!                the whole matvec is ONE ct×ct multiplication decrypted
-//!                under f² (no relinearization/bootstrapping), the whole
-//!                output vector switched to MPC in ONE masked decryption
-//!                → ABY3 ReLU → share->fhe (see `fhe::si_ntru`)
+//!   hybrid-bfv   BFV packed linear: weights AND input encrypted, the whole
+//!                matvec is ONE ct×ct multiplication per weight chunk
+//!                decrypted under s² (no relinearization/bootstrapping), the
+//!                whole output vector switched to MPC in ONE masked
+//!                decryption per chunk → ABY3 ReLU → share->fhe
+//!                (see `fhe::bfv`)
 //!
 //! # The MPC is the real protocol, not a simulator
 //!
@@ -25,7 +26,7 @@
 //! both directions of the scheme switch — runs the genuine replicated
 //! 3-party ABY3 **wire protocol** (`TransportBackend` over `InprocHandle`,
 //! three party threads exchanging real serialized messages), NOT the
-//! in-process `Aby3Backend` simulator (whose algorithms differ from the
+//! in-process `Aby3Simulator` simulator (whose algorithms differ from the
 //! distributed protocol — e.g. its `Share3` multiplication reconstructs
 //! and reshares locally, which costs nothing and reveals everything).
 //! A [`NetworkProfile`] (`--rtt-ms`, `--bandwidth-mbps`) injects one-way
@@ -46,7 +47,7 @@
 //!
 //! Scope notes, stated so the numbers are read fairly:
 //! - FHE paths use public weights (`mul_plain`/`dot_plain`) EXCEPT
-//!   hybrid-ntru, which encrypts them; the MPC path shares its weights
+//!   hybrid-bfv, which encrypts them; the MPC path shares its weights
 //!   (fully private).
 //! - `ckks` is *approximate*: its `ok` column checks agreement with the
 //!   plain-f64 Newton reference at the same iteration count; deviation
@@ -68,7 +69,6 @@ use crate::fhe::ckks_compare::{relu_approx_plain, CkksCompareBackend};
 use crate::fhe::bfv::{Bfv, BfvAdapter, BfvCt, BfvParams};
 // `Backend` is already taken by the MPC interpreter's trait, below.
 use crate::fhe::poly::{self, Backend as PolyBackend};
-use crate::fhe::si_ntru::{NtruCt, SiNtru, SiNtruAdapter, SiNtruParams};
 use crate::fhe::{CkksBackend, FheBackend, MockFheBackend, RealFheBackend, TfheBackend};
 use crate::hybrid::{shares_to_fhe, FheAdapter, IntFhe, RealFhe};
 use crate::interpreter::backend::{Backend, ShareRef};
@@ -681,203 +681,9 @@ fn run_hybrid_ckks(data: &LayerData, profile: NetworkProfile) -> StrategyReport 
     }
 }
 
-fn run_hybrid_ntru(data: &LayerData, profile: NetworkProfile) -> StrategyReport {
-    let mut t = Timer::new();
-    let in_dim = data.x.len();
-    let out_dim = data.w.len();
-
-    // Plaintext modulus sized to the activation range (a real deployment
-    // calibrates this on sample data — `ml::QuantizationReport`'s job);
-    // the noise analysis in `fhe::si_ntru` allows log2_t up to ~31.
-    let max_abs_pre = data.pre.iter().map(|v| v.abs()).max().unwrap_or(1).max(1) as u64;
-    let log2_t = (66 - max_abs_pre.leading_zeros()).max(20); // value bits + sign + headroom
-    assert!(log2_t <= 31, "activation range exceeds SI-NTRU's depth-1 noise budget");
-    let s = SiNtru::new(SiNtruParams {
-        n: 2048,
-        log2_q: 120,
-        log2_t,
-    });
-    let nbits = s.params.log2_t as usize;
-    let t_mask = s.params.t() - 1;
-
-    // Rows per weight ciphertext under the packing bound (rows+1)·in ≤ n;
-    // larger matrices split into chunks, each chunk one ct×ct mult against
-    // the SAME encrypted input.
-    assert!(2 * in_dim <= s.params.n, "in_dim exceeds the ring dimension");
-    let rows_per_chunk = (s.params.n / in_dim).saturating_sub(1).min(out_dim.max(1));
-    let chunks: Vec<&[Vec<i64>]> = data.w.chunks(rows_per_chunk).collect();
-
-    let ck = t.phase("keygen", || {
-        let (ck, _sk) = s.keygen();
-        ck
-    });
-
-    // Both the input AND the weight matrix are encrypted (fully private
-    // linear phase, like the MPC strategy).
-    let (cx, cws) = t.phase("encrypt", || {
-        let cx = s.encrypt_poly(&ck, &s.pack_input(&data.x));
-        let cws: Vec<NtruCt> = chunks
-            .iter()
-            .map(|chunk| s.encrypt_poly(&ck, &s.pack_weights(chunk)))
-            .collect();
-        (cx, cws)
-    });
-
-    let adapter = SiNtruAdapter(&s);
-    t.phase("link-io", || {
-        let bytes =
-            adapter.ct_bytes(&cx) + cws.iter().map(|c| adapter.ct_bytes(c)).sum::<usize>();
-        sleep_link(&profile, bytes, 2);
-    });
-
-    // The matvec: one ct×ct scale-invariant multiplication PER CHUNK (all
-    // against the one encrypted input), plus plaintext Δ·b bias additions.
-    let mut bias_iter = data.bias.iter();
-    let pre_chunks: Vec<NtruCt> = t.phase("linear", || {
-        chunks
-            .iter()
-            .zip(&cws)
-            .map(|(chunk, cw)| {
-                let mut prod = s.mul(&cx, cw);
-                for r in 0..chunk.len() {
-                    let b = *bias_iter.next().expect("bias per row");
-                    let pos = s.matvec_output_position(in_dim, r);
-                    prod = s.add_plain_at(&prod, pos, residue(b, nbits) as u64);
-                }
-                prod
-            })
-            .collect()
-    });
-
-    // Poly-level mask-and-open per chunk: one masked decryption converts
-    // every output coefficient of that chunk. Masks are full uniform-mod-t
-    // polynomials.
-    let mut rng = rand::thread_rng();
-    let masks: Vec<Vec<Vec<u64>>> = pre_chunks
-        .iter()
-        .map(|_| {
-            (0..3)
-                .map(|_| (0..s.params.n).map(|_| rng.gen::<u64>() & t_mask).collect())
-                .collect()
-        })
-        .collect();
-
-    let opened: Vec<Vec<u64>> = t.phase("to-mpc", || {
-        let mut conv_bytes = 0usize;
-        let y: Vec<Vec<u64>> = pre_chunks
-            .iter()
-            .zip(&masks)
-            .map(|(pre, chunk_masks)| {
-                let mut masked = pre.clone();
-                for m in chunk_masks {
-                    let enc = s.encrypt_poly(&ck, m);
-                    conv_bytes += adapter.ct_bytes(&enc);
-                    masked = s.add(&masked, &enc);
-                }
-                s.decrypt_poly(&ck, &masked)
-            })
-            .collect();
-        sleep_link(
-            &profile,
-            conv_bytes + y.iter().map(|v| v.len() * 8).sum::<usize>(),
-            2,
-        );
-        y
-    });
-
-    // Flatten (chunk, local row) -> per-output mask/opened values.
-    let mut flat_masks: Vec<[u64; 3]> = Vec::with_capacity(out_dim);
-    let mut flat_opened: Vec<u64> = Vec::with_capacity(out_dim);
-    for (ci, chunk) in chunks.iter().enumerate() {
-        for r in 0..chunk.len() {
-            let pos = s.matvec_output_position(in_dim, r);
-            flat_masks.push([masks[ci][0][pos], masks[ci][1][pos], masks[ci][2][pos]]);
-            flat_opened.push(opened[ci][pos]);
-        }
-    }
-
-    let (per_party, comm) = t.phase("mpc-relu", || {
-        run_parties(profile, |me| {
-            let my_masks: Vec<u64> = flat_masks.iter().map(|m| m[me]).collect();
-            let y = flat_opened.clone();
-            move |be: &mut TransportBackend<MpcTransport>| {
-                let my_comps: Vec<Fr> = (0..y.len())
-                    .map(|j| {
-                        if me == 0 {
-                            (y[j] as u128).wrapping_sub(my_masks[j] as u128)
-                        } else {
-                            0u128.wrapping_sub(my_masks[j] as u128)
-                        }
-                    })
-                    .collect();
-                let shares: Vec<ShareRef> = import_batched(be, &my_comps, me, nbits);
-                // Batched over every chunk's outputs at once — the flattening
-                // above exists precisely so this is one batch, not one per chunk.
-                let relu: Vec<ShareRef> = crate::gadgets::relu(be, &shares);
-                relu.iter()
-                    .map(|sref| be.my_additive_component(sref))
-                    .collect::<Vec<Fr>>()
-            }
-        })
-    });
-
-    // Return switch, packed: each party puts ALL its output components
-    // into ONE message polynomial (component j at coefficient j), encrypts
-    // once, and the homomorphic sum is a single ciphertext holding the
-    // whole ReLU'd output vector — 3 ciphertexts on the wire regardless of
-    // out_dim, instead of 3 per output scalar (which dominated conversion
-    // bytes at large shapes: 48 × 33 KB at layer(1024×16)).
-    let back = t.phase("to-fhe", || {
-        let mut sum: Option<NtruCt> = None;
-        let mut bytes = 0usize;
-        for comps in per_party.iter() {
-            let m: Vec<u64> = comps.iter().map(|&c| (c as u64) & t_mask).collect();
-            let enc = s.encrypt_poly(&ck, &m);
-            bytes += adapter.ct_bytes(&enc);
-            sum = Some(match sum {
-                None => enc,
-                Some(acc) => s.add(&acc, &enc),
-            });
-        }
-        sleep_link(&profile, bytes, 1);
-        sum.expect("three parties")
-    });
-
-    let output = t.phase("decrypt", || {
-        let coeffs = s.decrypt_poly(&ck, &back);
-        (0..out_dim)
-            .map(|j| s.to_signed(coeffs[j] & t_mask))
-            .collect::<Vec<i64>>()
-    });
-
-    StrategyReport {
-        strategy: "hybrid-ntru".into(),
-        total_ms: t.total_ms(),
-        phases: t.phases,
-        ok: output == data.expected,
-        max_abs_error_vs_exact: max_err(&output, &data.expected),
-        output,
-        comm: Some(comm),
-        notes: vec![
-            format!(
-                "SI-NTRU (LTV): n={}, q=2^{}, t=2^{} (adaptive) — see module docs for the \
-                 overstretched-regime security caveat",
-                s.params.n, s.params.log2_q, s.params.log2_t
-            ),
-            format!(
-                "weights AND input encrypted; matvec = {} ct×ct mult(s) ({} rows/chunk), \
-                 f² decrypt",
-                chunks.len(),
-                rows_per_chunk
-            ),
-            "whole output switched to MPC in one masked decryption per chunk".into(),
-        ],
-    }
-}
-
-/// The **secure** hybrid: identical pipeline to `run_hybrid_ntru` but on
-/// BFV (RLWE, no fatigue point) instead of overstretched SI-NTRU. Single
-/// chunk for clarity (the n=4096 ring packs generously); one ct×ct matvec
+/// The fully-private hybrid: weights AND input encrypted, on BFV — an RLWE
+/// lattice, so the standard `log q ≤ 109 at n = 4096` bound is the only
+/// constraint. One ct×ct matvec per weight chunk
 /// (decrypt under s², no relinearization), poly-level mask-and-open switch,
 /// real-protocol ABY3 ReLU, packed re-encryption. This is the no-bootstrap
 /// construction running end to end on a *provably-secure* FHE scheme.
@@ -1101,7 +907,7 @@ fn run_hybrid_bfv(data: &LayerData, profile: NetworkProfile) -> StrategyReport {
             let online = total_ms - offline;
             vec![
                 format!("BFV (RLWE, SECURE): n={}, log q={}, one ct×ct (no relin, decrypt under s²)", s.params.n, s.params.log2_q),
-                "same no-bootstrap pipeline as hybrid-ntru, on a provably-secure scheme".into(),
+                "no-bootstrap pipeline on a securely-parameterized RLWE scheme".into(),
                 format!(
                     "offline/online split: {offline:.0}ms precomputed (query-independent), {online:.0}ms ONLINE — same total work, moved off the critical path"
                 ),
@@ -1171,7 +977,6 @@ pub enum Strategy {
     Ckks,
     HybridTfhe,
     HybridCkks,
-    HybridNtru,
     HybridBfv,
     HybridMock,
 }
@@ -1187,7 +992,6 @@ impl Strategy {
             Strategy::Ckks => "ckks",
             Strategy::HybridTfhe => "hybrid-tfhe",
             Strategy::HybridCkks => "hybrid-ckks",
-            Strategy::HybridNtru => "hybrid-ntru",
             Strategy::HybridBfv => "hybrid-bfv",
             Strategy::HybridMock => "hybrid-mock",
         }
@@ -1200,12 +1004,11 @@ impl Strategy {
             "ckks" => Ok(Strategy::Ckks),
             "hybrid-tfhe" => Ok(Strategy::HybridTfhe),
             "hybrid-ckks" => Ok(Strategy::HybridCkks),
-            "hybrid-ntru" => Ok(Strategy::HybridNtru),
             "hybrid-bfv" => Ok(Strategy::HybridBfv),
             "hybrid-mock" => Ok(Strategy::HybridMock),
             other => Err(format!(
                 "unknown strategy '{other}' (expected mpc, tfhe, ckks, hybrid-tfhe, \
-                 hybrid-ckks, hybrid-ntru, hybrid-mock)"
+                 hybrid-ckks, hybrid-bfv, hybrid-mock)"
             )),
         }
     }
@@ -1223,7 +1026,6 @@ pub fn run_strategy(
         Strategy::Ckks => run_ckks_only(data, relu_iterations, profile),
         Strategy::HybridTfhe => run_hybrid_tfhe(data, profile),
         Strategy::HybridCkks => run_hybrid_ckks(data, profile),
-        Strategy::HybridNtru => run_hybrid_ntru(data, profile),
         Strategy::HybridBfv => run_hybrid_bfv(data, profile),
         Strategy::HybridMock => run_hybrid_mock(data, profile),
     }
@@ -1234,7 +1036,7 @@ const USAGE: &str = "usage: baru bench-hybrid-nn [options]
 One private dense layer (matvec + bias + ReLU) computed end-to-end under
 six strategies — pure ABY3 MPC (real wire protocol, 3 party threads), pure
 TFHE, pure CKKS (deep context, polynomial ReLU), and the Gazelle-style
-hybrids (TFHE/CKKS/SI-NTRU linear, then a scheme switch to real-protocol
+hybrids (TFHE/CKKS/BFV linear, then a scheme switch to real-protocol
 ABY3 for the ReLU) — each timed per phase and verified against the
 plaintext reference. A network model injects latency/bandwidth into every
 MPC protocol message AND the FHE upload/download + conversion round trips.
@@ -1248,7 +1050,7 @@ options:
   --bandwidth-mbps X   link bandwidth in Mbit/s (default: unlimited)
   --poly B             polynomial backend for the Rust FHE schemes: ntt
                        (default), ntl, or `all` to sweep both. Moves only the
-                       hybrid-bfv and hybrid-ntru rows — ckks/tfhe use SEAL
+                       hybrid-bfv row — ckks/tfhe use SEAL
                        and tfhe-rs, which have their own arithmetic, and mpc
                        has no polynomials at all. Flat rows there are the
                        expected result, not a bug. (ntl needs --features ntl)
@@ -1276,7 +1078,6 @@ pub fn run_cli(args: &[String]) -> Result<(), String> {
     let mut poly_sweep: Vec<PolyBackend> = vec![PolyBackend::Ntt];
     let mut strategies = vec![
         Strategy::Mpc,
-        Strategy::HybridNtru,
         Strategy::HybridBfv,
         Strategy::HybridCkks,
         Strategy::HybridTfhe,
@@ -1531,19 +1332,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // slow in debug (n=2048 schoolbook ring); fast in release
-    fn hybrid_ntru_matches_plaintext() {
-        let data = make_layer(8, 2);
-        let r = run_hybrid_ntru(&data, NetworkProfile::INSTANT);
-        assert!(
-            r.ok,
-            "hybrid-ntru output {:?} != expected {:?}",
-            r.output, data.expected
-        );
-        assert_eq!(r.max_abs_error_vs_exact, 0, "hybrid must be exact");
-    }
-
-    #[test]
     #[ignore] // slow in debug; fast in release
     fn hybrid_bfv_chunked_lifts_the_size_ceiling() {
         // (out+1)·in = 33·256 = 8448 > n = 4096, so this REQUIRES chunking
@@ -1567,21 +1355,6 @@ mod tests {
             r.output, data.expected
         );
         assert_eq!(r.max_abs_error_vs_exact, 0, "secure hybrid must be exact");
-    }
-
-    #[test]
-    #[ignore] // slow in debug (n=2048 schoolbook ring); fast in release
-    fn hybrid_ntru_chunked_large_layer_matches_plaintext() {
-        // (out+1)*in = 21*128 > 2048 forces multi-chunk packing, and the
-        // 128-input pre-activations force the adaptive t above 2^20.
-        let data = make_layer(128, 20);
-        let r = run_hybrid_ntru(&data, NetworkProfile::INSTANT);
-        assert!(
-            r.ok,
-            "chunked hybrid-ntru output {:?} != expected {:?}",
-            r.output, data.expected
-        );
-        assert_eq!(r.max_abs_error_vs_exact, 0, "hybrid must be exact");
     }
 
     #[test]

@@ -339,7 +339,7 @@ fn plain_value(src: &str, inputs: &HashMap<String, i64>) -> Option<i64> {
         .collect();
     let wrapped = format!("(let ({}) {})", bindings.join(" "), src);
     let expr = crate::interpreter::parse(&wrapped).ok()?;
-    match crate::interpreter::Participant::new(0).eval_quiet(&expr) {
+    match crate::interpreter::Participant::new_simulated(0).eval_quiet(&expr) {
         crate::interpreter::Types::Num(n) => Some(n),
         _ => None,
     }

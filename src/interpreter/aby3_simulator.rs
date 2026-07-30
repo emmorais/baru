@@ -1,7 +1,22 @@
-//! ABY3 backend implementation for in-process secret-shared computation.
+//! In-process **simulator** of the ABY3 protocol — correct on values, and
+//! deliberately named so no call site can mistake it for the protocol.
 //!
-//! This backend runs the ABY3 protocol with three simulated parties in-process,
-//! each holding their shares. Share data is stored locally in a HashMap.
+//! All three parties' shares live in one `HashMap` in one process, so the
+//! simulator can take shortcuts the distributed protocol cannot: its share
+//! multiplication **reconstructs and reshares locally**, which costs nothing and
+//! reveals everything. That is fine for what it is for — a fast oracle that
+//! checks a computation's *values* against a plaintext reference — and wrong for
+//! anything else.
+//!
+//! **Never quote its timings or message counts as protocol costs.** It
+//! understated one measured private layer by 2.7× (6.7 ms simulated against
+//! 18 ms real). Anything claiming a cost must run on
+//! [`crate::interpreter::transport_backend::TransportBackend`], which speaks the
+//! genuine wire protocol between three parties; see `src/bench/` for the
+//! three-thread pattern every benchmark here uses.
+//!
+//! It was called `Aby3Backend` until 2026-07-30, which read as a peer of
+//! `TransportBackend` rather than as a simulation of it.
 
 use std::collections::HashMap;
 
@@ -10,18 +25,18 @@ use crate::crypto::{arith, bits, sim, Share3};
 
 use super::backend::{Backend, ShareRef};
 
-/// ABY3 backend that runs the online protocol via explicit in-process message
-/// exchanges between three simulated parties.
-pub struct Aby3Backend {
+/// Simulates the ABY3 online protocol across three in-process parties. See the
+/// module docs: correct on values, not a source of costs.
+pub struct Aby3Simulator {
     /// Per-backend share storage: id -> Share3
     shares: HashMap<u64, Share3>,
     /// Next share ID to allocate
     next_id: u64,
 }
 
-impl Aby3Backend {
+impl Aby3Simulator {
     pub fn new() -> Self {
-        Aby3Backend {
+        Aby3Simulator {
             shares: HashMap::new(),
             next_id: 1,
         }
@@ -42,7 +57,7 @@ impl Aby3Backend {
     fn get(&self, sr: &ShareRef) -> &Share3 {
         self.shares
             .get(&sr.id)
-            .unwrap_or_else(|| panic!("Aby3Backend: unknown share id {}", sr.id))
+            .unwrap_or_else(|| panic!("Aby3Simulator: unknown share id {}", sr.id))
     }
 
     fn get_cloned(&self, sr: &ShareRef) -> Share3 {
@@ -50,14 +65,14 @@ impl Aby3Backend {
     }
 }
 
-// Default implementation for Aby3Backend
-impl Default for Aby3Backend {
+// Default implementation for Aby3Simulator
+impl Default for Aby3Simulator {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl Backend for Aby3Backend {
+impl Backend for Aby3Simulator {
     fn share_secret(&mut self, value: Fr, nbits: usize, owner: usize) -> ShareRef {
         let s = arith::share_secret(value);
         self.store(s, nbits, owner)

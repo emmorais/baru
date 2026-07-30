@@ -4,13 +4,9 @@
 //! against the plaintext reference, with a real cost measurement.
 //!
 //! The FHE side is **BFV at RLWE-secure parameters** (n=4096, q=2^100, at or
-//! below the ~109-bit ceiling for n=4096 at the 128-bit security level).
-//! This benchmark previously ran on SI-NTRU, which our own analysis shows is
-//! *not* secure at the parameters this construction needs — not even at
-//! depth 1, where the fatigue point sits around 2^59 (adjusted) against a
-//! required q ≳ 2^84. See the security note in `crate::fhe::si_ntru`. BFV
-//! supports the identical no-relinearization trick (multiply, then decrypt
-//! the degree-2 result under s^2), so the construction transfers unchanged.
+//! below the ~109-bit ceiling for n=4096 at the 128-bit security level), with
+//! the no-relinearization trick the whole construction rests on: multiply
+//! once, then decrypt the degree-2 result under `s²`.
 //!
 //! Architecture (a compact LeNet-shaped classifier):
 //!   input 1×D×D  →  conv(OC, 3×3, s1)  →  ReLU∘rescale  →  maxpool(2×2, s2)
@@ -1028,9 +1024,7 @@ pub fn run_cnn_hybrid_full(
     );
     let nbits = model.nbits;
     // RLWE-secure parameters: n=4096, q=2^100 is at/below the 128-bit bound
-    // of ~109 for n=4096 (HomomorphicEncryption.org). Unlike SI-NTRU there
-    // is no fatigue point to worry about — see `fhe::si_ntru`'s security note
-    // for why the NTRU instantiation could not be rescued even at depth 1.
+    // of ~109 for n=4096 (HomomorphicEncryption.org).
     let s = Bfv::new(BfvParams { n: 4096, log2_q: 100, log2_t: nbits as u32 });
     let n_in = model.d * model.d;
     assert!((n_in + 1) <= s.params.n, "input too large for coefficient packing");
@@ -1683,7 +1677,7 @@ mod tests {
     /// run on RLWE-secure parameters. `n = 4096` admits `log q ≤ 109` at the
     /// 128-bit level (HomomorphicEncryption.org), and the plaintext modulus
     /// must stay inside the depth-1 noise budget. Guards against a silent
-    /// regression to SI-NTRU, which is *not* secure here at any depth.
+    /// drift of either parameter out of the secure region.
     #[test]
     #[ignore]
     fn uses_rlwe_secure_parameters() {

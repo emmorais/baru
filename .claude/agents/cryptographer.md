@@ -47,9 +47,12 @@ Load these before analysing; they are the recurring sharp edges.
   *costed analytically only* — no implementation, so no security claim.
 - `src/ot/iknp.rs` has **no KOS-style consistency check**. It must never be cited
   as instantiating a maliciously secure protocol.
-- `src/fhe/si_ntru.rs` is **not secure** at the parameters this construction needs;
-  the security note in that module explains the fatigue-point analysis. BFV at
-  n=4096, q=2^100 replaced it. Do not let SI-NTRU numbers back into a claim.
+- **SI-NTRU was removed from the tree (2026-07-30)** as insecure at the parameters
+  this construction needs — overstretched even at depth 1; the fatigue-point
+  analysis is in `docs/experiments.md` §VII.1. BFV at n=4096, q=2^100 replaced it
+  everywhere. Do not let SI-NTRU numbers back into a claim, and note that
+  `docs/paper-outline.md` still contains historical SI-NTRU material behind a
+  stale-content warning.
 - The Binius64 **prover is hash-simulated**, not a real SNARK. ZKP timings are not
   meaningful and `docs/paper-outline.md` says so.
 - CKKS is **approximate** and supports only `+ - *` — no comparisons, so no

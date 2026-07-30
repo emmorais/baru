@@ -112,7 +112,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         return baru::db::run_cli(&args[1..]).map_err(|e| e.into());
     }
 
-    let participants: Vec<Participant> = (0..3).map(Participant::new).collect();
+    let participants: Vec<Participant> = (0..3).map(Participant::new_simulated).collect();
 
     println!(
         "{}",

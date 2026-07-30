@@ -11,19 +11,19 @@
 //!   bias + calibrated decision threshold). They are IP — also private.
 //!   (This is the part existing hybrid-inference systems — Gazelle,
 //!   Delphi, Cheetah — do NOT protect: their server sees the model in
-//!   plaintext. Our SI-NTRU linear phase is ciphertext×ciphertext.)
+//!   plaintext. Our linear phase is ciphertext×ciphertext.)
 //! - **Evaluator** (an untrusted server) computes on ciphertexts.
 //! - **Three MPC parties** (real ABY3 wire protocol) perform the one
 //!   nonlinear step — the threshold decision — on secret shares.
 //!
 //! # The pipeline
 //!
-//! 1. Client packs all 784 pixels into ONE SI-NTRU ciphertext.
+//! 1. Client packs all 784 pixels into ONE BFV ciphertext.
 //! 2. Model owner packs the reversed weights into ONE ciphertext.
 //! 3. Evaluator computes the entire 784-element dot product with **one**
 //!    ciphertext×ciphertext multiplication (the reversed-packing trick),
 //!    adds the bias as a plaintext Δ·b term — the result decrypts under
-//!    f², no relinearization, no bootstrapping, no evaluation keys.
+//!    s², no relinearization, no bootstrapping, no evaluation keys.
 //! 4. Scheme switch: the score crosses into 3-party ABY3 shares via
 //!    mask-and-open — the only value ever opened is a uniformly-masked
 //!    polynomial that reveals nothing.
@@ -38,9 +38,9 @@
 //!
 //! Same honesty notes as everywhere else in this repo: the conversion's
 //! masked decryption stands in for a threshold decryption (single key,
-//! in-process — see `crate::hybrid`), and SI-NTRU at these parameters is
-//! in the overstretched-NTRU regime (see `crate::fhe::si_ntru`) — this is
-//! a research demonstration, not a product.
+//! in-process — see `crate::hybrid`), so this is a research demonstration,
+//! not a product. The FHE parameters themselves are the secure RLWE ones
+//! (`n = 4096`, `q = 2^100` — see `crate::fhe::bfv`).
 
 #[path = "../../examples/data/mnist_data.rs"]
 mod mnist_data;
@@ -53,7 +53,7 @@ use crate::bench::comm::{CommStats, NetworkProfile};
 use crate::bench::hybrid_nn::{run_parties, sleep_link, MpcTransport};
 use crate::bench::Phase;
 use crate::crypto::types::Fr;
-use crate::fhe::si_ntru::{SiNtru, SiNtruAdapter, SiNtruParams};
+use crate::fhe::bfv::{Bfv, BfvAdapter, BfvParams};
 use crate::hybrid::FheAdapter;
 use crate::interpreter::backend::{Backend, ShareRef};
 use crate::interpreter::transport_backend::TransportBackend;
@@ -67,8 +67,14 @@ const BIAS: i64 = 80;
 const THRESHOLD: i64 = 399_536;
 
 /// Plaintext modulus: scores are < 2^19; one extra bit of headroom plus
-/// the sign bit. (The SI-NTRU depth-1 noise budget allows up to ~2^31.)
+/// the sign bit. (BFV's depth-1 noise budget at `n = 4096, q = 2^100`
+/// allows up to ~2^30 — see `fhe::bfv`'s measured budget test.)
 const LOG2_T: u32 = 21;
+
+/// Ring dimension. The reversed packing needs `(rows + 1)·d ≤ n`, i.e.
+/// `2·784 = 1568 ≤ n` for this one-row model; 4096 is also the dimension
+/// at which `q = 2^100` is inside the 128-bit RLWE bound.
+const RING_N: usize = 4096;
 
 pub struct DemoRun {
     pub predicted: u8,
@@ -96,14 +102,14 @@ pub fn classify(img: &[i64], expected: u8, profile: NetworkProfile) -> DemoRun {
         });
     };
 
-    let s = SiNtru::new(SiNtruParams {
-        n: 2048,
-        log2_q: 120,
+    let s = Bfv::new(BfvParams {
+        n: RING_N,
+        log2_q: 100,
         log2_t: LOG2_T,
     });
     let nbits = LOG2_T as usize;
     let t_mask = s.params.t() - 1;
-    let adapter = SiNtruAdapter(&s);
+    let adapter = BfvAdapter(&s);
 
     let t0 = Instant::now();
     let (ck, _sk) = s.keygen();
@@ -126,7 +132,7 @@ pub fn classify(img: &[i64], expected: u8, profile: NetworkProfile) -> DemoRun {
     phase("upload", t0);
 
     // [3] Evaluator: the ENTIRE dot product = one ct×ct multiplication;
-    // bias folded in as a plaintext Δ·b addition. Decrypts under f².
+    // bias folded in as a plaintext Δ·b addition. Decrypts under s².
     let t0 = Instant::now();
     let pos = s.matvec_output_position(img.len(), 0);
     let mut c_score = s.mul(&c_img, &c_w);
@@ -199,7 +205,7 @@ const USAGE: &str = "usage: baru demo-private-mnist [options]
 
 Private handwritten-digit recognition, end to end: the image is encrypted,
 the model weights are encrypted, the 784-pixel dot product is ONE
-homomorphic multiplication (SI-NTRU, decrypted under f² — no
+homomorphic multiplication (BFV, decrypted under s² — no
 bootstrapping, no evaluation keys), and the class decision is made by a
 real 3-party ABY3 threshold comparison that reveals ONLY the final bit —
 nobody, including the client, ever sees the score.
@@ -248,10 +254,10 @@ pub fn run_cli(args: &[String]) -> Result<(), String> {
 
     println!("╔══════════════════════════════════════════════════════════════════╗");
     println!("║  PRIVATE MNIST INFERENCE — encrypted image × ENCRYPTED model     ║");
-    println!("║  SI-NTRU (depth-1, no bootstrapping) + real 3-party ABY3         ║");
+    println!("║  BFV (depth-1, no bootstrapping) + real 3-party ABY3             ║");
     println!("╚══════════════════════════════════════════════════════════════════╝");
     println!();
-    println!("ring X^2048+1, q=2^120, t=2^{LOG2_T} | 784-pixel image = ONE ciphertext");
+    println!("ring X^{RING_N}+1, q=2^100, t=2^{LOG2_T} | 784-pixel image = ONE ciphertext");
     println!("network: rtt={rtt_ms}ms, bandwidth={}", bandwidth_mbps
         .map(|b| format!("{b}Mbps"))
         .unwrap_or_else(|| "unlimited".into()));
@@ -301,7 +307,7 @@ mod tests {
     use super::*;
 
     #[test]
-    #[ignore] // n=2048 schoolbook ring is slow in debug; fast in release
+    #[ignore] // the n=4096 ring is slow in debug; fast in release
     fn both_repo_samples_classify_correctly_end_to_end() {
         let zero = classify(&mnist_data::IMG_ZERO, 0, NetworkProfile::INSTANT);
         assert_eq!(zero.predicted, 0, "the '0' sample must classify as 0");

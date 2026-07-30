@@ -312,10 +312,10 @@ mod tests {
         }
     }
 
-    /// SI-NTRU's corner: `n = 2048`, `q = 2^120`, where `|c[k]|` reaches ~2^249
-    /// — the widest case the CRT modulus in `ntt.rs` can still represent.
+    /// The widest corner the CRT modulus in `ntt.rs` can still represent:
+    /// `n = 2048` with 119-bit coefficients, where `|c[k]|` reaches ~2^249.
     #[test]
-    fn agrees_with_multimodular_ntt_at_si_ntru_width() {
+    fn agrees_with_multimodular_ntt_at_the_widest_narrow_coefficients() {
         let (n, bits) = (2048usize, 119u32);
         let a = sample(n, bits, 0xDEAD);
         let b = sample(n, bits, 0xBEEF);

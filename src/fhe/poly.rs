@@ -1,7 +1,7 @@
 //! The one place every FHE scheme in this crate asks for a polynomial
 //! product — and the switch that decides *who computes it*.
 //!
-//! `bfv`, `bgv`, `si_ntru` and `pir` all bottom out in the same operation: the
+//! `bfv`, `bgv`, `bgv_wide` and `pir` all bottom out in the same operation: the
 //! exact negacyclic product of centered coefficients in `ℤ[X]/(X^n + 1)`. Two
 //! implementations exist:
 //!

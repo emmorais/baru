@@ -1,11 +1,9 @@
 // Interpreter module moved from main.rs. This file will re-export submodules.
-pub mod aby3_backend;
+pub mod aby3_simulator;
 pub mod ast;
 pub mod backend;
 pub mod eval;
-pub mod gc_backend;
 pub mod hashcons;
-pub mod merkle;
 pub mod parser;
 pub mod transport_backend;
 

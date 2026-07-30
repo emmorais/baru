@@ -2,43 +2,49 @@
 
 [![CI](https://github.com/emmorais/baru/actions/workflows/ci.yml/badge.svg)](https://github.com/emmorais/baru/actions/workflows/ci.yml)
 
-A Lisp-like language interpreter with built-in **three-party secure computation** (MPC) using an ABY3-style additive secret-sharing scheme.
+A Lisp-like language and research engine for **privacy-preserving computation**.
+One program can run on four cryptographic backends — a plain interpreter, 3-party
+MPC (ABY3-style replicated secret sharing), FHE (BFV/BGV/TFHE/CKKS), and
+zero-knowledge proofs (Binius64) — and, crucially, on **combinations** of them:
+values cross between MPC shares and FHE ciphertexts mid-computation without ever
+being exposed.
 
-> **Picking up the private-inference work?** Start at
-> [`docs/private-inference-performance.md`](docs/private-inference-performance.md)
-> — current measured state, the method that produced it, the prioritized next
-> steps, and the traps. It is written to be read cold.
->
-> **Working on the circuit-optimization paper?** Draft in
-> [`paper-circuits/`](paper-circuits/); plan, gaps and provenance in
-> [`docs/paper-circuit-optimization.md`](docs/paper-circuit-optimization.md).
+The research result the stack was built for: **deep private inference with zero
+FHE bootstraps.** The scheme switch that computes each ReLU under MPC also
+refreshes the ciphertext, so the FHE noise budget resets at every layer
+boundary. An arbitrarily deep network then runs at cost linear in depth on an FHE
+engine that supports only a *single* multiplication — with both the model and the
+input encrypted, and only the class index ever revealed.
 
----
-
-## Overview
-
-baru has two interleaved layers:
-
-| Layer | Location | Purpose |
-|---|---|---|
-| **Interpreter** | `src/interpreter/` | Lisp-like parser, AST, trampolined evaluator, REPL |
-| **Crypto / MPC** | `src/crypto/` | ABY3 replicated shares, triple-free multiplication, bit protocols, transports |
-
-The interpreter's `Backend` trait bridges the two: every arithmetic or comparison operation on a shared value is dispatched through a backend that performs the appropriate MPC protocol round.
+| | |
+|---|---|
+| **Language reference** | [`LANGUAGE.md`](LANGUAGE.md) — syntax, types, every builtin, the REPL, worked examples |
+| **All measured results** | [`docs/experiments.md`](docs/experiments.md) — the full experimental record, including the negative results |
+| **Where to pick up performance work** | [`docs/private-inference-performance.md`](docs/private-inference-performance.md) — written to be read cold |
+| **Publication framing** | [`docs/paper-outline.md`](docs/paper-outline.md), [`docs/paper-circuit-optimization.md`](docs/paper-circuit-optimization.md) |
 
 ---
 
 ## Quickstart
 
 ```sh
-# build everything
-cargo build
+cargo build                          # build everything
+cargo test                           # unit + integration tests
+cargo run --bin baru                 # single-process REPL (no networking)
 
-# run all tests (unit + integration)
-cargo test
+cargo build --release
+./target/release/baru demo-private-mnist    # the flagship demo, ~55 ms/digit
+```
 
-# single-process REPL (SimBackend, no networking)
-cargo run --bin baru
+```lisp
+; private ReLU on a single neuron — every value is secret-shared
+(let ((w :sint8 -1) (x :sint8 3) (b :sint8 0))
+  (let ((z (+ (* w x) b)))
+    (reconstruct (* z (> z 0)))))          ; => 0
+
+; a secret computed under MPC crosses into FHE without being revealed
+(let ((keys (fhe-keygen)) (x (share 6 32)) (y (share -7 32)))
+  (fhe-dec keys (share->fhe keys (* x y))))   ; => -42
 ```
 
 ### Building on Windows
@@ -46,7 +52,7 @@ cargo run --bin baru
 The vendored SEAL/CKKS backend (`third_party/sealy`) is a C++ library built via
 cmake + MSVC, so a plain `cargo build` from a bare shell fails — bindgen can't
 find the Windows SDK headers. Use the helper, which enters the Visual Studio
-developer environment and adds the extra include/PATH entries SEAL needs:
+developer environment and adds the include/PATH entries SEAL needs:
 
 ```bat
 build-windows.cmd build
@@ -54,2260 +60,265 @@ build-windows.cmd test --lib
 build-windows.cmd build --features pq-tls
 ```
 
-One-time prerequisites:
-
-- **Visual Studio 2022** (or Build Tools) with the *Desktop development with
-  C++* workload — provides MSVC + cmake.
-- **CorError.h** — SEAL's C wrapper includes it, but the modern Windows SDK no
-  longer ships it. Install an older SDK that also lays down the .NET Framework
-  SDK: `winget install Microsoft.WindowsSDK.10.0.18362`.
-- **NASM** — only for `--features pq-tls` (post-quantum TLS via aws-lc-rs):
-  `winget install NASM.NASM`.
-
-The Windows-specific source patches to the vendored crate are documented in
+One-time prerequisites: **Visual Studio 2022** (or Build Tools) with the *Desktop
+development with C++* workload; **CorError.h**, which SEAL's C wrapper includes
+but the modern Windows SDK no longer ships
+(`winget install Microsoft.WindowsSDK.10.0.18362`); and **NASM** for
+`--features pq-tls` (`winget install NASM.NASM`). Source patches to the vendored
+crate are documented in
 [`third_party/sealy/BARU_PATCHES.md`](third_party/sealy/BARU_PATCHES.md).
 
----
-
-## Secret sharing — how it works
-
-### The `Share3` representation
-
-Every secret `x` is split into three additive shares `(s₀, s₁, s₂)` over a 128-bit field such that:
-
-```
-s₀ + s₁ + s₂ = x  (mod 2¹²⁸)
-```
-
-In the ABY3 model **party `i` holds the pair `(sᵢ, sᵢ₊₁ mod 3)`** — two of the three components. No single party can recover `x` from its own pair alone.
-
-The `PartyShare` type in `src/crypto/protocol.rs` represents this per-party view:
-
-```rust
-pub struct PartyShare {
-    pub left:  Fr,  // sᵢ
-    pub right: Fr,  // s_{(i+1) mod 3}
-}
-```
-
-The higher-level `ShareRef` type (used by the interpreter) carries a stable share ID and bit-width so the evaluator can track values without touching the underlying field elements.
-
-### Sharing an input (`share`)
-
-```lisp
-(share <value> <nbits>)
-```
-
-The owner (the party calling `share`) performs **input sharing**:
-
-1. Samples two random field elements `s₀, s₁` uniformly.
-2. Computes `s₂ = value − s₀ − s₁ (mod 2¹²⁸)`.
-3. Sends `(s₁, s₂)` to party 1, `(s₂, s₀)` to party 2, keeps `(s₀, s₁)`.
-
-Signed values are handled via two's-complement: a signed `i64` value `v` is first converted to the unsigned field element `v mod 2ⁿᵇⁱᵗˢ` before sharing.
-
-```lisp
-(share -3 8)   ; shares the 8-bit two's-complement representation of -3 = 253
-(share  42 16) ; shares 42 as a 16-bit value
-```
-
-### Reconstructing a secret (`reconstruct`)
-
-```lisp
-(reconstruct <share-ref>)
-```
-
-Each party sends its `left` component (sᵢ) to the reveal target. The target sums all three contributions:
-
-```
-x = s₀ + s₁ + s₂  (mod 2¹²⁸)
-```
-
-When interpreting the result as a signed integer, `fr_to_signed(x, nbits)` applies the two's-complement decode:
-
-```
-if x ≥ 2^(nbits−1)  →  signed = x − 2^nbits
-else                 →  signed = x
-```
+Optional features: `--features ntl` builds the NTL+GMP polynomial backend (needs
+a C++ toolchain plus NTL and GMP) — kept as a **differential oracle** for our own
+NTT, which is now the faster of the two. `--features pq-tls` enables
+post-quantum TLS transports.
 
 ---
 
-## MPC operations
+## What is in the box
 
-### Addition and subtraction — local, no communication
-
-Because shares are additive, each party can compute its share of `a + b` or `a − b` independently:
-
-```
-(a + b)ᵢ.left  = aᵢ.left  + bᵢ.left
-(a + b)ᵢ.right = aᵢ.right + bᵢ.right
-```
-
-No network round is needed. The evaluator dispatches `+` and `-` on `ShareRef` values to `add_party` / `sub_party` in `src/crypto/protocol.rs`.
-
-### Multiplication — ABY3 resharing, no Beaver triples
-
-`*` on shared values is **one ring element sent to one neighbour**, with no
-dealer and nothing precomputed. With replicated sharing `x = x₀+x₁+x₂` (party
-`i` holds `xᵢ` and `xᵢ₊₁`), each party can form three of the nine cross terms
-of `x·y` locally:
-
-```
-zᵢ = xᵢyᵢ + xᵢyᵢ₊₁ + xᵢ₊₁yᵢ + αᵢ
-```
-
-Summed over the three parties these cover all nine terms exactly once, so
-`Σzᵢ = (Σxᵢ)(Σyᵢ) = xy`. The `αᵢ` are **zero-sum correlated randomness**
-`αᵢ = F(kᵢ, ctr) − F(kᵢ₋₁, ctr)` from pairwise PRF keys established once at
-startup: each PRF output appears once with each sign in the sum, so the α
-cancel, while no party can predict another's α. They re-randomise each
-party's `zᵢ` so it leaks nothing. The protocol (`mul_party` /
-`mul_batch_party` in `src/crypto/aby3_protocol.rs`):
-
-1. **Local** — each party computes `zᵢ` (three cross terms + `αᵢ`). No
-   communication; the PRF keys were exchanged once via a `PrfKey` handshake.
-2. **Reshare** — party `i` sends `zᵢ` to party `i−1` (a directed `TaggedZBatch`
-   message, not a broadcast), so each party ends holding `(zᵢ, zᵢ₊₁)` — a
-   valid replicated sharing of `a·b`.
-
-That is one element per party per multiplication. The previous
-implementation used **Beaver triples** dealt online by party 0 — 6 ring
-elements distributed plus 2 opened per multiplication, with party 0 a
-dealer bottleneck. This was not moved offline but **eliminated**: there is
-no triple to precompute or store, because the correlated randomness is
-regenerated locally per operation from the PRF keys.
-
-**Why "why not just precompute the triples?" has no work left in it.** Once
-multiplication needs no triples, precomputation optimises a phase that no
-longer exists. The remaining preprocessing is a single 32-byte key exchange
-per party pair, amortised over every multiplication in the session.
-
-**Measured** (`baru bench-cnn`, results bit-exact throughout — only privacy
-and cost differ across the three rows):
-
-| D | MPC, Beaver triples | MPC, ABY3 reshare | wire bytes, Beaver | ABY3 reshare |
-|---|---|---|---|---|
-| 8 | 4538 ms | 2254 ms | 9.1 MB | 0.59 MB |
-| 12 | 11789 ms | 6175 ms | 24.1 MB | 1.58 MB |
-| 28 | 76892 ms | 40759 ms | 159.4 MB | **10.4 MB** |
-
-At D=28 that is **15× less bandwidth** and ~1.9× faster MPC. ~117 MB of the
-old 159 MB was triple *distribution* alone; removing it is most of the win.
-
-### Arithmetic-to-bit decomposition (`a2b`)
-
-> [!NOTE]
-> **This was rebuilt after a verified privacy break.** The previous `a2b`
-> masked its input with a value derived from `op_id` — a public lockstep
-> counter — and then opened `a − r`. That mask carried no secret entropy, so
-> the input was recoverable by any party or wire observer, and everything
-> built on `a2b` (`lt`, `eq`, `le`, and hence ReLU, max-pool and argmax)
-> leaked its activations. The description below is the corrected protocol.
-> The "no extra communication per bit" property the old version advertised
-> was a *symptom*: the carry chain was free precisely because every operand
-> was already public. A correct protocol cannot have that property, and the
-> replacement is ~4.4x slower with ~130x the bandwidth (measured below).
-
-Converts an arithmetic share of `x` into `nbits` shared bits (LSB first) via
-ABY3's bit decomposition. `a = a₀ + a₁ + a₂` as a replicated sharing, so:
-
-1. **Binary-share the three additive components — free.** A replicated
-   sharing places a value in one additive component and zero elsewhere.
-   Component `j` is held as `left` by party `j` and as `right` by party
-   `j−1`, so exactly those two parties supply it and the third contributes
-   nothing and learns nothing. No communication.
-2. **Carry-save reduce 3 → 2.** In the arithmetic bit encoding,
-   `x⊕y⊕z = x+y+z − 2(xy+xz+yz) + 4xyz` and
-   `maj(x,y,z) = xy+xz+yz − 2xyz` — so the sum and carry vectors both fall
-   out of the *same* four products (`xy`, `xz`, `yz`, `xyz`). Two rounds,
-   not four.
-3. **Add the remaining two** with a Kogge–Stone parallel-prefix adder.
-   Combining `(g,p)` pairs uses `G = g ⊕ (p ∧ g')`; a group cannot both
-   generate and propagate a carry, so those two terms are mutually exclusive
-   and the XOR is plain local addition. Only the ANDs communicate.
-
-Depth is `2 + 1 + ⌈log₂ nbits⌉ + 1` ≈ 9 rounds at `nbits = 20`, versus the
-old (leaky) version's 1. Verified against plaintext binary expansion
-including two's-complement negatives, since the MSB is what `lt` returns.
-When many values are decomposed together (a whole ReLU or max-pool layer),
-`a2b_batch` runs them all in that *same* ~9 rounds — see *Batching* below.
-
-**Measured cost of correctness** (`baru bench-cnn`, results bit-exact in both
-cases — only privacy and cost differ):
-
-| D | MPC, leaky `a2b` | MPC, correct `a2b` | wire bytes, leaky | correct |
-|---|---|---|---|---|
-| 8 | 1079 ms | 4538 ms | 70 KB | 9.1 MB |
-| 12 | 2619 ms | 11789 ms | — | 24.1 MB |
-| 28 | 17593 ms | 76892 ms | 1.2 MB | 159.4 MB |
-
-**Where the bytes go — and the optimization it points to.** Each `a2b` at
-`nbits = 20` needs 257 multiplications (80 carry-save + 20 generate/propagate
-+ 138 prefix + 19 final). At D=28 that is 2375 `a2b` calls (1352 ReLU + 1014
-max-pool comparisons + 9 argmax) ≈ 610k multiplications. In the first cut,
-each one drew a **Beaver triple dealt online by party 0** at 6 ring elements
-per peer, ~117 MB of the observed 159 MB — since removed (see *Multiplication*
-above): ABY3 resharing needs *no dealt triples*, dropping D=28 to 10.4 MB.
-
-The historical note, for context: with replicated sharing each party computes
-`zᵢ = xᵢyᵢ + xᵢyᵢ₊₁ + xᵢ₊₁yᵢ + αᵢ` where the `αᵢ` are zero-sum correlated
-randomness derived locally from pairwise PRF keys, then sends one ring
-element to one neighbour. That is **one element per party per
-multiplication** instead of six dealt plus two opened — and it removes party
-0 as a dealer bottleneck.
-
-### Batching — the round count, not the multiplication count
-
-After triples were gone, the dominant cost was **round latency, not
-bandwidth**. The network's ~610k multiplications were bundled tightly within
-each `a2b`, but the `a2b` calls themselves ran one-per-element in a loop:
-1352 ReLUs, each a ~9-round decomposition, is ~12 000 sequential rounds. So
-the fix was to batch across elements, not to touch the comparison algorithm.
-
-Two backend methods do it, both with a default that just loops (so every
-non-batching backend is unaffected) and a `TransportBackend` override that
-runs the whole set in one id block:
-
-- **[`a2b_batch`](src/crypto/aby3_protocol.rs)** decomposes many shares at
-  once; every internal carry-save and prefix-adder round is flattened across
-  all lanes, so a batch of any width costs the same ~9 rounds as one value.
-- **`lt_batch`** compares many pairs at once (the MSB of each `a2b_batch`
-  lane), which lets **`maxpool2d`** reduce all its windows in lockstep —
-  `pool²−1` batched steps for the whole layer instead of one `max_reduce`
-  per window.
-
-The ReLU layer became one `a2b_batch` + one batched multiply; max-pool became
-a level-batched fold. Both are bit-exact against the per-element versions.
-
-**Measured** (`baru bench-cnn`, D=28 MPC, all rows bit-exact):
-
-| stage | MPC time | messages | wire bytes |
-|---|---|---|---|
-| leaky `a2b` (insecure baseline) | 17.6 s | 114 790 | 1.2 MB |
-| correct `a2b`, Beaver triples | 76.9 s | 114 790 | 159.4 MB |
-| + ABY3 resharing (no triples) | 40.8 s | 29 211 | 10.4 MB |
-| + batched ReLU | 20.7 s | 15 701 | 10.2 MB |
-| + batched max-pool | 6.1 s | 5 591 | 10.0 MB |
-| + batched scheme-switch import | 1.2 s | 147 | 10.0 MB |
-| + tournament `argmax` | **1.15 s** | **88** | 10.0 MB |
-
-Batching alone was 40.8 → 6.1 s (6.7×) and cut messages 5.2×. The endpoint is
-the payoff: the **private, triple-free** pipeline is now far **faster than the
-original leaky/insecure baseline** (17.6 s) it started from — correctness and
-privacy came out ahead on speed too, once the protocol was the right one.
-
-**The last row is the one that mattered, and it is not a protocol change.**
-After every *comparison* had been batched, a per-phase breakdown showed the
-comparisons were never the cost: **19.1 s of the remaining 20.4 s was the
-scheme-switch `import`** — reconstructing an opened layer into shares ran
-three blocking input-sharing rounds *per activation*, so D=28's 5408-wide conv
-output cost **16 224 sequential round trips**, while the ReLU it was importing
-values for cost 0.6 s. `share_input_batch` sends the same bytes with the same
-randomness in **three** rounds: import 19.1 s → **8 ms**, end-to-end
-**21.8 s → 2.6 s (8.3×)**.
-
-Worth remembering: *"the MPC segment dominates"* was true, but *"therefore the
-MPC protocols are the bottleneck"* did not follow. The cost was in the plumbing
-between the two representations — the part a switch-based construction crosses
-most often, and the part neither the FHE nor the MPC literature owns. The
-per-phase split that `bench-cnn` now prints exists so this is not repeatable.
-
-**The last row is the last *dependent* reduction.** Batching needs independent
-operations, and `gadgets::argmax` folded `nclasses−1` comparisons left to
-right, each waiting on the previous winner. It did the least work of any phase
-and, under latency, took the most time — **1.31 s of a 2.03 s MPC segment at
-RTT 20 ms**. Reassociating the fold into a **tournament** (pair adjacent
-candidates; one `lt_batch` decides a whole level, one `mul_batch` selects both
-value and index) makes it `⌈log₂ n⌉` batched levels instead of `n−1` serial
-ones: **2.4× at RTT 20 ms**, and `bench-cnn --img 8 --rtt-ms 20` as a whole
-3.31 s → 2.45 s. Tie-breaking (first maximum wins) is preserved because the
-bracket pairs adjacent elements in index order — verified **exhaustively** over
-small alphabets, since a tie split across sibling subtrees is precisely what
-random logits never generate.
-
-While batching, one latent bug surfaced and was fixed: the α re-randomiser
-counter (`op_id + i`) could repeat across multiplication rounds once a batch
-exceeded the id spacing. Harmless for correctness (α always cancels) but a
-privacy leak (two products under the same α expose their difference); the
-counter is now a collision-free `(op_id ‖ i)` encoding (`alpha_ctr`).
-
-### Comparisons (`>`, `<`, `>=`, `<=`, `==`)
-
-Comparisons on shared values follow a **signed two's-complement** interpretation:
-
-- `lt(a, b)` — run `a2b` on `a − b` and return the MSB (the sign bit). MSB = 1 means the result is negative, i.e. `a < b`.
-- `le(a, b)` — `OR(lt(a,b), eq(a,b))`.
-- `eq(a, b)` — run `a2b` on `a − b`; result is 1 iff all bits are 0 (via `NOT(OR(bits))`).
-- `gt`, `ge` — symmetric.
-
-The comparison result is a 1-bit `ShareRef`. It can be used as the condition of an `if` expression.
-
-### Branching on a shared boolean (`if`)
-
-```lisp
-(if (> z 0) z 0)
-```
-
-When the condition is a shared boolean, the evaluator:
-
-1. Reveals the condition to the owner (`reveal` protocol — one communication round).
-2. Selects the branch based on the revealed bit.
-3. Wraps the selected branch's result in a share if it was a plain number (the `IfResultNormalize` continuation), so downstream code always receives a `ShareRef`.
-
-> **Note:** revealing the condition leaks one bit of information (the branch taken). For programs where the branch itself must remain hidden, oblivious evaluation (multiplexer circuits) would be required. This is a known limitation documented in `src/interpreter/eval.rs`.
-
----
-
-## Zero-knowledge proofs (ZKP)
-
-Baru includes built-in support for **zero-knowledge proof compilation and verification** using the **Binius Reed-Solomon SNARK** backend. This allows proving and verifying statements about private computations without revealing the inputs.
-
-### ZKP builtins
-
-The interpreter provides five core ZKP operations:
-
-```lisp
-(zkp-compile <quoted-expr> <quoted-private-vars>)
-```
-
-Compiles an arithmetic expression to a circuit representation. The circuit encodes constraints for the given expression, with designated private variables.
-
-```
-Example:
-(zkp-compile '(* x (+ x 1)) '("x"))
-```
-
----
-
-```lisp
-(zkp-prove <circuit> <private-keys> <private-values> <public-keys> <public-values>)
-```
-
-Generates a zero-knowledge proof for the circuit, given private inputs and public outputs. All arguments except the circuit are quoted lists.
-
-```
-Example:
-(let ((c (zkp-compile '(+ x y) '("x" "y"))))
-  (zkp-prove c '("x" "y") '(3 5) '() '()))
-```
-
-The proof demonstrates knowledge of private values `x=3, y=5` without revealing them.
-
----
-
-```lisp
-(zkp-verify <circuit> <proof> <public-keys> <public-values>)
-```
-
-Verifies a zero-knowledge proof against a circuit. Returns `1` if valid, `0` if invalid.
-
-```
-Example:
-(zkp-verify c proof-obj '() '())
-```
-
----
-
-```lisp
-(proof-save <proof> <filename>)
-```
-
-Serializes a proof to a JSON file for persistence or transmission.
-
----
-
-```lisp
-(proof-load <filename>)
-```
-
-Deserializes a proof from a JSON file.
-
-### Quote shorthand
-
-To simplify REPL usage, Baru supports **quote shorthand syntax**: `'expr` is equivalent to `(quote expr)`. This makes ZKP calls more ergonomic:
-
-```lisp
-; Old syntax:
-(zkp-compile (quote (+ x 1)) (quote ("x")))
-
-; New syntax with quote shorthand:
-(zkp-compile '(+ x 1) '("x"))
-```
-
-The parser distinguishes char literals (`'a'`) from quote shorthand using lookahead: a quote followed by a closing quote indicates a char literal; otherwise, it begins a quoted form.
-
----
-
-## Transport layer
-
-All inter-party communication goes through the `Transport` trait (`src/crypto/net.rs`):
-
-```rust
-pub trait Transport: Send + Sync {
-    fn id(&self) -> PartyId;
-    fn send(&self, to: PartyId, msg: Message);
-    fn broadcast(&self, msg: Message);
-    fn recv(&self) -> Option<(PartyId, Message)>;
-}
-```
-
-Two implementations are provided:
-
-| Implementation | Location | Use case |
+| Layer | Location | What it provides |
 |---|---|---|
-| `InprocHandle` | `src/crypto/net.rs` | In-process queues; used by unit tests and the inproc demo |
-| `TcpTransport` | `src/crypto/net.rs` | Real TCP sockets; used by the multi-party binary |
+| **Interpreter** | `src/interpreter/` | Lisp parser, AST, trampolined evaluator, REPL, pluggable `Backend` |
+| **MPC** | `src/crypto/` | ABY3 replicated shares, **triple-free** multiplication, bit decomposition, batched primitives, in-process and TCP transports |
+| **FHE** | `src/fhe/` | BFV and BGV (secure, depth-1, no eval keys), TFHE-rs, SEAL CKKS (+ exact mock twins), multi-modular NTT, CRT slot packing |
+| **Hybrid** | `src/hybrid/` | MPC ↔ FHE scheme switching in both directions; re-encryption as a bootstrapping alternative |
+| **ZKP** | `src/zkp/` | Expression → circuit compiler, Binius64 SNARK prover/verifier, proof serialization |
+| **Gadgets** | `src/gadgets/` | UC-composable MPC building blocks: `relu`, `maxpool2d`, `argmax`, `dense`, `conv2d` — each bit-exact against a plaintext reference |
+| **MPC compiler** | `src/mpcc/` | Backend-aware circuit IR, rewrite rules, cost models, protocol registry (dealer / Shamir / Semi2k / LowGear), executable VM |
+| **Primitives** | `src/ot/`, `src/psi/`, `src/pir/` | Chou–Orlandi + IKNP OT, DH-PSI, single-server BFV PIR — all measured, including where they lose |
+| **ML plumbing** | `src/ml/`, `src/precompile/` | Model import + Q16.16 quantization with an accuracy report; champion-dispatched batched gadgets |
+| **Node** | `src/bin/tcp_party.rs` | Multi-party node: a distributed MPC evaluator over real sockets (plaintext TCP or optional PQ-TLS) |
 
-Messages are serialised with `bincode` and tagged with operation IDs so concurrent protocol rounds are demultiplexed correctly.
+The interpreter's `Backend` trait bridges the layers: every arithmetic or
+comparison operation on a shared value dispatches through a backend that runs the
+appropriate protocol round.
 
 ---
 
-## Multi-party binary
+## Results at a glance
 
-The `tcp_party` binary is a full node: an MPC REPL/evaluator with optional consensus, peer-to-peer messaging, and a REST control plane layered on top.
+Numbers from the maintainer's machine, release build. Full method, provenance and
+the corrections behind each row are in [`docs/experiments.md`](docs/experiments.md).
+
+| Result | Number | Command |
+|---|---|---|
+| **Deep inference, zero bootstraps** | depth 32 × width 16 in **2.1 s**, bit-exact, **0** bootstraps, linear in depth | `bench-deep-nn --depths 2,4,8,16,32` |
+| One private dense layer, secure hybrid | **79 ms** (BFV linear → ABY3 ReLU) vs 25 ms pure MPC — but **15 wire messages** vs 9276 | `bench-hybrid-nn` |
+| Private CNN, 28×28, image *and* weights encrypted | **840 ms**, 0 bootstraps, exact | `bench-cnn --img 28 --gc --precompute` |
+| Real MNIST accuracy, deployed integer model | **98.89%**; every encrypted prediction equals the plaintext one | `bench-mnist` |
+| Private *diagnosis* (MedMNIST chest X-ray) | **84.78%**, **2.90 s** online per diagnosis, 0 bootstraps | `bench-medmnist` |
+| Private *training* (SGD under MPC, backprop through ReLU) | trained model **bit-identical** to plaintext integer SGD | `bench-train --hidden 8` |
+| Convolution packing | 1352 ct×ct multiplications → **8** | `bench-cnn --img 28` |
+| Our NTT vs NTL+GMP | **1.8× faster** at every size (after the Shoup butterfly rewrite) | `bench-polymul` |
+| Triples from SHE vs from OT | **192 B/triple** vs 3074, and ~28× faster | `bench-triples` |
+| Compiler vs expert hand-written network | **0.38×** the interactive calls, **0.49×** the messages | `bench-compiled-nn` |
+
+Honest negatives are first-class here and kept alongside the wins: PIR loses to
+downloading the database by 13×; hybrid-TFHE does not pay; faster ring arithmetic
+does **not** bring FHE close to MPC; and the hybrid does not beat
+SHE-preprocessed MPC at any width measured. See
+[Part VII](docs/experiments.md#part-vii--negative-superseded-and-withdrawn-results).
+
+---
+
+## How the MPC works, briefly
+
+Every secret `x` is split into three additive shares over a 128-bit ring
+(`s₀ + s₁ + s₂ = x mod 2¹²⁸`), with party `i` holding the replicated pair
+`(sᵢ, sᵢ₊₁)`. No single party learns anything from its own pair. Signed values
+use two's-complement in the declared bit-width, so `(share -3 8)` shares 253.
+
+| Operation | Protocol | Cost |
+|---|---|---|
+| `+`, `−`, scalar × | local on shares | no communication |
+| `*` | ABY3 resharing — **no Beaver triples**, no dealer | 1 ring element to 1 neighbour, 1 round |
+| `a2b` | carry-save 3→2 + Kogge–Stone prefix adder | ~9 rounds at 20 bits |
+| `<`, `>`, `≤`, `≥`, `==` | `a2b(a−b)`, sign bit or zero test | as `a2b` |
+| `reconstruct` | each party sends its component | 1 round |
+| batched forms (`a2b_batch`, `lt_batch`, `mul_batch`) | same protocol, all lanes flattened | **the same round count for any batch width** |
+
+That last row is the one that matters in practice. Multiplication needs no
+precomputed triples because the correlated randomness is regenerated locally from
+pairwise PRF keys, so the only preprocessing is one 32-byte key exchange per
+party pair per session. And the recurring lesson of this repository is that **the
+arithmetic was never the bottleneck — the round structure was**: four separate
+times, a segment-level measurement said "MPC is slow" while a per-phase
+breakdown said "one unbatched loop inside it is slow." The details, with numbers,
+are in [`docs/experiments.md` Part I](docs/experiments.md#part-i--mpc-protocol-engineering).
+
+Branching on a shared boolean (`(if (> z 0) z 0)`) reveals the branch taken —
+one bit. For oblivious code, write a mux: `(* z (> z 0))`.
+
+---
+
+## The hybrid construction
+
+`src/hybrid/` converts values between representations without exposing them:
+
+- **MPC → FHE** — each party encrypts its own additive share component; the
+  evaluator homomorphically sums them. The sum *is* the secret, and nobody
+  reconstructed it. Needs only homomorphic addition, so every backend supports it.
+- **FHE → MPC** — mask-and-open. Each party contributes an encrypted uniform
+  mask; only the masked value (uniformly random) is ever decrypted, and the masks
+  turn it into additive shares.
+- **Re-encryption instead of bootstrapping** — compose the two: noise resets and,
+  for levelled CKKS, the full depth budget comes back, for one interactive round
+  instead of a bootstrapping circuit.
+
+The FHE side uses the cheapest primitive that exists: **one
+ciphertext×ciphertext multiplication, no relinearization keys, no bootstrapping,
+no evaluation keys**, decrypting the degree-2 product directly under `s²`.
+Reversed-coefficient packing makes a whole matvec one multiplication, and
+Cheetah-style reversed-axis packing makes a whole convolution channel one
+multiplication. Weights *and* input are encrypted, which is a stronger privacy
+setting than Gazelle/Delphi/Cheetah, whose server holds the model in plaintext.
+
+Parameters are `n = 4096, q = 2^100, t = 2^20` (BFV) — inside the ~109-bit
+`log q` ceiling for 128-bit security at that dimension. The plaintext modulus is
+calibrated from the measured activation range rather than fixed, because a fixed
+`t` silently wraps and gives wrong rather than merely noisy results.
+
+Two honesty notes carried everywhere: the scheme switch stands a single client
+key in for a threshold decryption (a real deployment uses distributed-key
+threshold FHE), and everything here is **semi-honest**.
+
+---
+
+## Command-line surface
+
+```sh
+baru                       # REPL
+baru bench [--json]        # every backend on a small expression suite
+baru quantize --in model.json --out model.quant.json --scale-bits 16 --validate samples.json
+baru mpcc <subcommand>     # the MPC compiler: dump / analyse / compare / run / calibrate / optimize / assign
+baru db <subcommand>       # the experiment store: put / query / export / get / stats
+baru demo-private-mnist    # encrypted image × encrypted model → only the class bit
+```
+
+Benchmarks (`baru bench-<name>`; all accept `--json`, most accept
+`--rtt-ms` / `--bandwidth-mbps` to model a network):
+
+| Command | Measures |
+|---|---|
+| `bench-nn` | size-swept private inference: MPC vs FHE cost shapes, real wire counts |
+| `bench-hybrid-nn` | one private dense layer under mpc / tfhe / ckks / hybrid-tfhe / hybrid-ckks / hybrid-bfv |
+| `bench-deep-nn` | **the headline**: deep private inference, zero bootstraps, linear in depth |
+| `bench-cnn` | full conv classifier through the hybrid pipeline, 0 bootstraps |
+| `bench-mnist`, `bench-medmnist` | trained+quantised CNNs on real MNIST / real biomedical images |
+| `bench-train` | private SGD training, including backprop through ReLU |
+| `bench-fhe-innerprod` | the minimal-FHE inner product across secure schemes |
+| `bench-polymul` | exact negacyclic product: schoolbook vs our NTT vs NTL+GMP |
+| `bench-ckks-compare` | polynomial-approximation sign/ReLU on real SEAL CKKS |
+| `bench-triples` | Beaver triples from SHE (LowGear) vs from OT (Semi2k) |
+| `bench-ot`, `bench-psi`, `bench-pir` | OT (base vs IKNP), DH-PSI, single-server PIR |
+| `bench-layer`, `bench-net` | the MPC↔FHE crossover; the cost model against a real socket |
+| `bench-circuit`, `bench-backend-aware`, `bench-compiled-nn` | circuit generation, per-backend rewriting, compiled vs hand-written |
+| `bench-abstraction`, `bench-gc-compare`, `bench-mixed-layer` | the abstraction tax; garbled vs arithmetic nonlinearities; mixed protocols |
+| `bench-cohort`, `bench-cohort-eval` | cohort-conditioned private evaluation over the encrypted store |
+
+---
+
+## Running a multi-party node
 
 ```sh
 cargo build --bin tcp_party
-```
+./target/debug/tcp_party        # no args: in-process demo, 3 threaded parties
 
-**In-process demo** (no arguments — runs a handful of example expressions with 3 threaded parties sharing an `InprocHandle` network):
-
-```sh
-./target/debug/tcp_party
-```
-
-**TCP mode** (3 separate terminals — every party gets the *same* address roster and differs only by the leading party id):
-
-```sh
-# party 0 — drives the interactive REPL, broadcasts to peers
+# TCP mode — three terminals, same address roster, differing only in the party id
 ./target/debug/tcp_party 0 127.0.0.1:7000,127.0.0.1:7001,127.0.0.1:7002
-
-# party 1 — silent worker
 ./target/debug/tcp_party 1 127.0.0.1:7000,127.0.0.1:7001,127.0.0.1:7002
-
-# party 2 — silent worker
 ./target/debug/tcp_party 2 127.0.0.1:7000,127.0.0.1:7001,127.0.0.1:7002
 ```
 
-Party 0 broadcasts each expression's text over the distribution transport and every party evaluates it jointly via `TransportBackend`, so all parties run in lockstep.
+Party 0 drives an interactive REPL and broadcasts each expression; every party
+evaluates it jointly via `TransportBackend`, so all parties run in lockstep. A
+parse or runtime error on party 0 broadcasts `:abort` so the workers re-sync
+instead of hanging. `share-from` / `:sintN-from-P` let each party contribute its
+own private input.
 
-### Transports
+The two transports run on ports derived from the MPC base port: MPC at `base`,
+expression distribution at `base+100`. Setting `BARU_TLS` switches both to
+PQ-TLS transports (needs `--features pq-tls`), with each party minting one
+long-term Ed25519 identity shared across its channels.
 
-Each subsystem runs on its own transport, on a port range derived from the MPC base port so they never interfere:
+REPL commands on party 0: `:help`, `:examples [category]`, `:example <n>`,
+`:verbose on|off`, `:quit`.
 
-| Transport | Port | Carries | Enabled by |
-|---|---|---|---|
-| MPC | base | ABY3 protocol traffic | always |
-| distribution | base + 100 | expression text from party 0 | always |
-| consensus | base + 200 | epoch commits | `BARU_CONSENSUS` |
-| messaging | base + 300 | chat + forum | `BARU_CHAT` |
-
-### Environment toggles
-
-| Variable | Effect |
-|---|---|
-| `BARU_TLS` | Use PQ-TLS transports (requires `--features pq-tls`); each party mints one long-term Ed25519 identity shared across all its channels. |
-| `BARU_CONSENSUS` | Enable a consensus backend on the consensus transport. |
-| `BARU_POUW` | With consensus on, elect the epoch leader by reputation (`ReputationPoUW`) instead of the fixed `SingleLeader` baseline (party 0). |
-| `BARU_POUW_REP` | Deterministic genesis reputation as `"party:delta,…"` (every party must set the same value). |
-| `BARU_CHAT` | Enable p2p chat + forum on the messaging transport. |
-| `BARU_REST[=port]` | Serve the per-node REST control plane; party `i` listens on `port + i` (default base 8090). |
-
-### REPL commands (party 0)
-
-| Command | Purpose |
-|---|---|
-| `:help` | Language reference |
-| `:examples [category]` | List examples (optionally filtered) |
-| `:example <n>` | Run example n |
-| `:verbose [on\|off]` | Toggle per-step evaluation tracing |
-| `:commit` | Run one live consensus epoch across the parties |
-| `:chat <party> <message>` | Send an end-to-end encrypted direct message |
-| `:post <message>` | Broadcast a signed forum post |
-| `:quit` | Signal all parties to exit |
-
-Anything else is parsed as a Baru expression, broadcast, and evaluated jointly; a parse/runtime error on party 0 broadcasts `:abort` so the workers re-sync instead of hanging.
-
-### REST control plane
-
-When `BARU_REST` is set each node serves a small HTTP API (tokio + axum) for operators — separate from the machine-to-machine p2p protocol:
-
-| Method & path | Purpose |
-|---|---|
-| `GET /health` | Liveness + party id + current epoch |
-| `GET /state` | Committed roots (state / reputation / forum) |
-| `GET /reputation` | Reputation ledger (per-identity + treasury) |
-| `GET /forum` | Forum posts + Merkle root |
-| `POST /forum` | Publish a signed post (`{"body": "..."}`) |
-| `GET /programs` | Submitted program queue |
-| `POST /programs` | Submit a program for the network (`{"source": "..."}`) |
-
-### Messaging
-
-The `baru::messaging` module provides two identity-authenticated channels wired into the node:
-
-- **Chat** — end-to-end encrypted direct messages (X25519 ECDH → ChaCha20-Poly1305, Ed25519-signed). Confidentiality is end-to-end and independent of the transport. Uses static-static ECDH, so it lacks forward secrecy (an ephemeral ratchet is future work).
-- **Forum** — an append-only, tamper-evident log of signed public posts committed by a Merkle root, so every party that sees the same posts agrees on the same root.
+> **History.** Until 2026-07-30 this node also carried consensus with
+> reputation-weighted leader election, a p2p chat/forum, a REST control plane and
+> FHE/MPC/storage job markets (~5,000 lines, and the `axum`/`tokio`/`x25519`/
+> `chacha20poly1305` dependencies). None of it was used by the cryptographic
+> research this repository is about, so it was removed. It is recoverable from
+> git history if that direction resumes.
 
 ---
 
-## Example: private ReLU (single-neuron)
-
-```lisp
-(let ((w (share -1 8))   ; weight  — private, signed 8-bit
-      (x (share  3 8))   ; input   — private, signed 8-bit
-      (b (share  0 8)))  ; bias    — private, signed 8-bit
-  (let ((z (+ (* w x) b)))           ; z = w·x + b  (all shared)
-    (let ((relu (if (> z 0) z 0)))   ; ReLU: max(z, 0)
-      (reconstruct relu))))           ; reveal result to owner
-```
-
-Step-by-step with 3 parties:
-
-| Step | Operation | Communication rounds |
-|---|---|---|
-| `(share -1 8)` | Owner distributes s₀,s₁,s₂ for −1 | 1 (send to 2 peers) |
-| `(* w x)` | Beaver online phase | 1 broadcast round |
-| `(+ ... b)` | Local addition | 0 |
-| `(> z 0)` | `a2b(z)` + MSB comparison | 1 broadcast round |
-| `(if ...)` | Reveal condition bit to owner | 1 round |
-| `(reconstruct relu)` | All parties send sᵢ to owner | 1 round |
-
----
-
-## Benchmarking
-
-Two complementary harnesses, both under `src/bench/`:
-
-- **`baru bench`** — correctness + per-phase timing for small hand-written
-  Lisp expressions, across *every* privacy backend (`plain`, `mpc-aby3`,
-  `fhe-mock`, `fhe-tfhe`, `fhe-ckks`, `zkp-binius64`). Good for "does this
-  expression still work / how fast is this specific case" checks.
-  ```sh
-  cargo run --release -- bench                 # built-in suite, tables
-  cargo run --release -- bench --json          # same, as JSON
-  cargo run --release -- bench --expr "(mod x y)" --input x=17 --input y=5
-  ```
-
-- **`baru bench-nn`** — size-swept private-inference benchmark, purpose-built
-  to characterize **MPC vs. FHE's complementary computation/communication
-  trade-off** for neural-network-shaped workloads (`dot`, `matvec`, `relu`,
-  `layer` = matvec + bias + ReLU), at multiple sizes. Unlike `bench`, it
-  drives `Backend`/`FheBackend` calls directly (bypassing the Lisp
-  interpreter) for precise cost attribution and to scale to realistic sizes
-  (e.g. MNIST's 784-pixel input layer via `--mnist-scale`).
-
-  For MPC it reports **real wire communication** — message counts and byte
-  totals — captured by wrapping the actual replicated-secret-sharing
-  transport (`TransportBackend` over `InprocHandle`) in counting/latency
-  decorators (`src/bench/comm.rs`) that observe traffic without touching any
-  protocol code. A `--rtt-ms`/`--bandwidth-mbps` network model can be
-  injected to see how a workload's wall time would change over a real link,
-  without needing real distributed processes. For FHE it reports ciphertext
-  count/size instead (MPC's cost is *rounds × messages*; FHE's is *bytes of
-  ciphertext material*, per the "MPC is compute-cheap/comm-expensive, FHE is
-  the reverse" intuition this tool exists to quantify).
-
-  ```sh
-  cargo build --release
-  ./target/release/baru bench-nn                          # mpc, fhe-mock, fhe-ckks; default sizes
-  ./target/release/baru bench-nn --backends mpc --workload matvec
-  ./target/release/baru bench-nn --mnist-scale             # also run the 784-input sizes (slow)
-  ./target/release/baru bench-nn --rtt-ms 20                # simulate a 20ms-RTT link for MPC
-  ./target/release/baru bench-nn --json > results.json      # for tracking across commits
-  ```
-
-  **The standard suite.** Sizes/shapes are a fixed, named set (see
-  `src/bench/nn.rs`'s "the standard suite" section) — not ad hoc per-run
-  choices — so `--json` results stay comparable across commits and
-  precompiles over time. "quick" is the small default sweep; "mnist-linear"
-  (`--mnist-scale`) is `examples/mnist.rs`'s real 784-pixel/10-class shape.
-
-  **What it already shows** (this machine): MPC throughput on the naive path
-  is *flat* at roughly 220–380 multiply-accumulates/sec regardless of shape —
-  cost and message count both scale exactly linearly with element count (no
-  batching of Beaver triples or wire messages), so `matvec(128×64)` — one
-  modest dense layer — cost ~25s and ~115k messages *before* the batched
-  precompile below existed. CKKS shows the opposite shape: its "circuit" form
-  (one ciphertext per input scalar) has encrypt cost growing linearly with
-  vector size (26s to encrypt 256 scalars), while its "batched" SIMD form
-  (`encrypt_vec` + `dot_plain`, one ciphertext for the whole vector) holds
-  encrypt/eval time roughly *constant* regardless of size. TFHE — the only
-  FHE backend here that can do real encrypted comparisons/ReLU, unlike CKKS —
-  is dramatically the slowest: dot-product throughput holds flat at ~0.3
-  ops/sec (≈3.3s per encrypted multiply-accumulate) from n=16 up, so
-  `dot(256)` took 812.7s. Three backends, three cost shapes, same workload.
-
----
-
-## CKKS comparisons: approximate, not impossible (`src/fhe/ckks_compare.rs`)
-
-`RealFheBackend`'s doc comment says comparisons are "impossible" on CKKS's
-approximate ciphertexts — true for *exact* comparison, but the CKKS/HEAAN
-literature has an established answer for *approximate* comparison, and since
-other research groups build private-inference systems on exactly this
-technique, treating it as out of scope here would leave CKKS's real
-performance profile unmeasured rather than characterized. So: don't compare —
-approximate `sign(x)` with a polynomial, then comparison/ReLU/max fall out
-arithmetically (`relu(x) ≈ x·(sign(x)+1)/2`).
-
-**The polynomial.** `f(x) = x·(3 − x²)/2` — the classical Newton–Schulz
-iteration for the scalar sign function (a numerical-analysis technique
-predating homomorphic encryption), and, not coincidentally, the exact "f"
-polynomial family Cheon, Kim, Kim and Song introduced for *homomorphic*
-comparison in [Numerical Method for Comparison on Homomorphically Encrypted
-Numbers](https://eprint.iacr.org/2019/417) (Asiacrypt 2019). `f` has fixed
-points at `-1, 0, 1`; `0` is repelling and `±1` are superattracting, so
-iterating pushes `x ∈ (-√3, √3)` towards `sign(x)` — slowly near 0, then
-quadratically fast. The follow-up work — [Efficient Homomorphic Comparison
-Methods with Optimal
-Complexity](https://eprint.iacr.org/2019/417) (Asiacrypt 2020) and [Minimax
-Approximation of Sign Function by Composite Polynomial for Homomorphic
-Comparison](https://eprint.iacr.org/2020/834) — composes `f` with a second
-polynomial family `g` (fast near ±1) via dynamic programming for
-asymptotically optimal depth. `src/fhe/ckks_compare.rs` implements only the
-foundational `f`-iteration, not that optimal composite — correct and
-independently verified (see below), but costlier in depth for a given
-precision than the state of the art. Implementing the `f`+`g` composite is
-future work.
-
-**Why this needs its own CKKS context.** `CkksBackend` (the existing,
-shallow path used for `matvec`/`dot`) deliberately never calls SEAL's
-`rescale_to_next` — it keeps every ciphertext at the top modulus level and
-tracks scale via a `depth` counter, which is exactly right for its depth-≤2
-linear workloads but means each multiplication *compounds* the required
-modulus budget instead of resetting it, so it cannot survive the several
-sequential multiplications a sign-approximation iteration needs.
-`CkksCompareBackend` is an independent context that does what real CKKS
-deployments do to support depth: a genuine `rescale_to_next` after every
-multiplication, so depth cost is linear in the number of primes (levels),
-not exponential — at the cost of a much bigger ring dimension (to fit enough
-primes) and correspondingly much slower arithmetic. It picks the smallest
-ring dimension (8192 / 16384 / 32768) that fits the requested level count
-using `CoefficientModulusFactory::max_bit_count` — SEAL's own
-HomomorphicEncryption.org-standard security table, looked up at run time,
-not a guessed constant.
-
-**Measured, not assumed** (`baru bench-ckks-compare`, this machine, one
-scalar `relu_approx` per row, bound=5.0):
-
-```sh
-./target/release/baru bench-ckks-compare --iterations 1,2,3
-```
-
-| iterations | levels | ring degree | keygen | relu (per op) | ciphertext | error vs. exact ReLU | error vs. plain approx |
-|---|---|---|---|---|---|---|---|
-| 1 | 6  | 16384 | 5.3s  | 1.7s  | 1.8 MB | 0.39  | 3.4×10⁻⁸ |
-| 2 | 9  | 32768 | 18.9s | 8.7s  | 5.2 MB | 0.19  | 2.3×10⁻⁸ |
-| 3 | 12 | 32768 | 30.0s | 17.2s | 6.8 MB | 0.17  | 1.9×10⁻⁸ |
-
-Two separate error columns on purpose: "vs. plain approx" (the same Newton
-iteration run in plain `f64`, `sign_approx_plain`/`relu_approx_plain`) stays
-at ~2×10⁻⁸ across the board — proof that real SEAL ciphertext noise is
-*not* the dominant error source, the polynomial's own approximation error
-is. And that error is large at these iteration counts specifically because
-the sample points include inputs close to the bound's boundary (the
-documented slow-near-zero regime) — the `f`-only simplification's known
-weakness relative to the optimal `f`+`g` composite. For comparison, MPC's
-`relu(4)` (real replicated-secret-sharing, `bench-nn`) costs **~10ms per
-element** end to end. This is the "totally different performance profile"
-CKKS has for nonlinearities made concrete: three to four orders of magnitude
-slower per comparison than MPC, before even reaching useful precision, and
-that cost is paid in a separate, deeper, ring-dimension-inflated context
-that the cheap linear/matvec CKKS path never has to touch.
-
----
-
-## Scheme switching: MPC ↔ FHE conversions (`src/hybrid/`)
-
-The two sections above measure a sharp asymmetry: MPC does comparisons/ReLU
-in ~10 ms but pays communication for every multiplication; CKKS does a whole
-linear layer in one SIMD ciphertext op but pays *seconds* per approximate
-comparison. Scheme switching turns that asymmetry from a limitation into a
-design space: convert values **between MPC shares and FHE ciphertexts,
-mid-computation, without ever exposing them**, and run each phase on
-whichever cryptosystem is cheapest there — Lego-style. This is the
-architecture of Gazelle (Juvekar et al., USENIX Security 2018) and its
-successors; the cross-scheme idea in general is
-[CHIMERA](https://eprint.iacr.org/2018/758), and the trust model is
-threshold FHE ([Asharov et al., EUROCRYPT 2012](https://eprint.iacr.org/2011/613)).
-
-Both directions are one short protocol each (`src/hybrid/mod.rs`):
-
-- **MPC → FHE** (`shares_to_fhe`): each party encrypts its *own additive
-  share component* under the FHE public key; the evaluator homomorphically
-  sums them. The sum of components *is* the secret, so the result is an
-  encryption of it — and nobody ever reconstructed it. Needs only
-  homomorphic addition (no relin/galois keys), so it works on every backend
-  in this repo: mock, TFHE, CKKS real + mock.
-- **FHE → MPC** (`fhe_to_shares`): mask-and-open. Each party contributes an
-  encrypted uniform mask; only the *masked* value (uniformly random,
-  reveals nothing) is ever decrypted, and the masks turn it into additive
-  shares. This is exactly the data flow of a threshold decryption; the
-  in-process implementation stands in a single client key for the
-  distributed key operation (same trust boundary as the existing
-  trusted-triple-dealer limitation — documented, not hidden).
-- **Re-encryption instead of bootstrapping** (`mpc_reencrypt`): compose the
-  two. FHE → shares → fresh FHE ciphertext resets encryption noise — and,
-  for levelled CKKS, restores the full depth budget — for the price of one
-  interactive round instead of a bootstrapping circuit.
-  `tests/hybrid.rs::test_real_ckks_share_conversion_resets_depth` proves it
-  on real SEAL: multiply a ciphertext (depth 1), re-encrypt, depth is 0
-  again and the value is intact.
-
-**Generic by construction**: conversions are written against two small
-capability traits, so new FHE backends compose with new MPC backends
-without touching the module — `hybrid::FheAdapter` on the FHE side
-(`IntFhe` blankets every integer `FheBackend`; `RealFhe` adapts any
-`RealFheBackend`), and `Backend::export_additive`/`import_additive` on the
-MPC side (implemented for the ABY3 simulator; a per-party transport backend
-needs one protocol round to split its replicated components — future work).
-
-From Baru itself, the switch is two builtins:
-
-```lisp
-; a secret computed under MPC crosses into FHE without being revealed
-(let ((keys (fhe-keygen)) (x (share 6 32)) (y (share -7 32)))
-  (fhe-dec keys (share->fhe keys (* x y))))          ; => -42
-
-; a value under FHE needs a ReLU (FHE's weak spot): switch to MPC for it
-(let ((keys (fhe-keygen)))
-  (let ((z (fhe->share keys (fhe-enc keys -4) 32)))
-    (reconstruct (* z (> z 0)))))                    ; => 0
-```
-
-The Gazelle-style pipeline — **FHE linear layer → switch → MPC ReLU →
-switch back** — runs end to end in
-`src/hybrid/mod.rs::gazelle_style_pipeline_fhe_linear_then_mpc_relu`, and
-the real-backend conversions are validated against TFHE and SEAL-CKKS in
-`tests/hybrid.rs` (ignored by default; run with `--ignored --release`).
-One documented caveat: a converted ciphertext holds the value's *residue
-class* mod `2^nbits` (share-sum carries may sit above it), so `+`/`−`/`×`
-keep working but FHE-side comparisons on converted values would see the
-carry — convert back to MPC for those, which is the point.
-
-### SI-NTRU: no-bootstrapping FHE for inner products (`src/fhe/si_ntru.rs`)
-
-A Rust port of the scale-invariant NTRU-based (LTV-family) scheme from
-[Inversed-Tech's `hom-ham`](https://github.com/Inversed-Tech/hom-ham)
-(`si-ntru/`, the `Mult` + `DecryptMul` path): `f = t·f′+1`, `h = t·g·f⁻¹`,
-`c = e₁ + h·e₂ + Δ·m`, multiplication = exact integer product rescaled by
-`t/q` — and **no relinearization, no bootstrapping, no evaluation keys at
-all**: a product ciphertext simply decrypts under **f²** (and depth-k under
-higher powers of f — `decrypt` applies the ciphertext's tracked key power).
-For depth-1 workloads (= inner products) the expensive machinery of FHE is
-deleted rather than optimized. Two further tricks from the reference make
-matvecs almost free:
-
-- **Reversed packing**: input in coefficients `0..d` of one message
-  polynomial, every weight row *reversed* at stride `d` in another — the
-  **whole matvec is ONE ciphertext×ciphertext multiplication**, row `r`'s
-  inner product landing in coefficient `r·d + d−1` (cross-term-free while
-  `(rows+1)·d ≤ n`; asserted). Weights and input are both *encrypted* —
-  fully private linear algebra.
-- **Poly-level scheme switch**: one masked decryption (under f²) converts
-  the *entire* output vector to ABY3 shares simultaneously.
-
-Port parameters vs the reference: `q = 2^120` instead of a 101-bit prime
-(mod-q arithmetic becomes native wrapping u128, `t | q` exactly so mod-t
-plaintext arithmetic is native and share-sum carries vanish, the rescale is
-a shift), `t = 2^20`, `n = 2048` (as the reference); the scale-invariant
-product is computed on centered representatives with exact 256-bit
-intermediates. Depth 2 at `t = 2^20` **fails** (the `f⁴`·roundoff term
-`≈ n³t⁴ ≈ 2^113` exceeds `Δ/2 = 2^99` — measured, then documented) and
-works with `t` re-balanced to `2^8` — the "parameters adapted accordingly"
-trade-off, exposed by a passing test rather than asserted.
-
-**Security caveat, stated plainly — depth-1 does *not* make it secure.**
-LTV/YASHE-family NTRU at these shapes is **overstretched**
-(Albrecht–Bai–Ducas 2016; Kirchner–Fouque 2017; Ducas–van Woerden "NTRU
-Fatigue" 2021). One might hope the minimal (single-multiply) regime stays
-below the fatigue point — it does not: at n=2048 the fatigue point is
-q ≈ 2^19 (≈ 2^59 after accounting for the large LTV secret f=t·f'+1), but
-one multiply with a usable t≈2^20 already forces q ≳ 2^84 by the noise
-budget, and no practical ring dimension closes that gap. So **this backend
-is a fast *reference point*, not a secure instantiation.** The construction
-(depth-1 ct×ct inner product, no relinearization, decrypt under the squared
-key, then switch to MPC) is scheme-agnostic and is realized **securely** by
-the RLWE schemes (BGV/BFV/CKKS) — which have no NTRU lattice and hence no
-fatigue point at these q, and admit the *same* skip-relinearization /
-decrypt-under-s² trick. SI-NTRU is kept only because it is the cheapest
-arithmetic, useful for isolating packing/switching cost from FHE-scheme
-cost. (Full analysis: `src/fhe/si_ntru.rs` docs and `docs/paper-outline.md`
-§8.)
-
-**The secure scheme runs the whole pipeline end to end.** `src/fhe/bfv.rs`
-is the RLWE instantiation, and `bench-hybrid-nn --strategies hybrid-bfv`
-runs the *same* no-bootstrap construction (packed ct×ct matvec → mask-open
-switch → real-protocol ABY3 ReLU → packed re-encryption) on it — **exact vs
-plaintext, on secure parameters**. The three-way comparison (this machine,
-layer 8×2, all exact):
-
-| strategy | secure? | total | linear | note |
-|---|---|---|---|---|
-| **mpc** (pure ABY3) | yes | 18 ms | 4.8 ms | fully private, weights shared |
-| **hybrid-ntru** | **no** (overstretched) | 187 ms | 8.6 ms | fast reference (NTT) |
-| **hybrid-bfv** | **yes** (RLWE, n=4096) | 437 ms | 45 ms | secure, same pipeline (NTT) |
-
-### NTT-accelerated ring arithmetic (`src/fhe/ntt.rs`)
-
-The polynomial multiply was the bottleneck, so it now runs on a **NTT**
-instead of the O(n²) schoolbook loop. There's a wrinkle worth knowing:
-a textbook NTT needs a modulus with a primitive 2n-th root of unity
-(`q ≡ 1 mod 2n`, prime) — but our `q = 2^100` is a **power of two**
-deliberately, because that's what makes the `t/q` rescale a rounded shift
-and the ring arithmetic native `u128`. A direct NTT is therefore
-impossible.
-
-The fix keeps the scheme and changes only the *computation*: the schemes
-really need the **exact integer** negacyclic product, so we compute it
-modulo four ~63-bit NTT-friendly primes (O(n log n) each) and
-CRT-reconstruct it exactly (Garner), then apply the unchanged rescale.
-The BFV entry point shares forward transforms across the tensor (4 forward
-+ 3 inverse NTTs per prime, not 12). Decryption switched to **Horner**
-(`c₀ + s·(c₁ + s·c₂)`), one ring multiply per key power instead of six.
-
-Correctness isn't argued, it's *tested*: the NTT product is differentially
-tested against the schoolbook implementation it replaced — at full ±2⁹⁹
-coefficient width and n=4096 — which is why the swap was safe.
-
-| operation | before | after | speedup |
-|---|---|---|---|
-| BFV multiply (n=4096) | 515 ms | **45 ms** | 11× |
-| BFV decrypt | 130 ms | **37 ms** | 3.5× |
-| SI-NTRU multiply (n=2048) | 31.6 ms | **9.0 ms** | 3.5× |
-| **hybrid-bfv end-to-end** | 1149 ms | **437 ms** | 2.6× |
-
-Both schemes are NTT-accelerated, so E9 stays apples-to-apples. The secure
-BFV multiply is ~5× SI-NTRU's, reflecting its 2× ring dimension and
-3-component tensor — the honest, isolated price of security. All outputs
-remain bit-exact.
-
-### A second implementation: NTL + GMP (`src/fhe/ntl.rs`, `baru bench-polymul`)
-
-The multi-modular NTT above is ~200 lines of hand-written modular
-arithmetic on the hottest path in the repo, validated against a schoolbook
-reference that is too slow to run at the sizes that matter. Both of those
-are worth a second opinion, so the same operation is now also implemented
-against **NTL** (arbitrary-precision `ZZX` multiplication, GMP underneath)
-through a small C++ shim (`cpp/ntl_polymul.cpp`) wrapped in Rust. NTL picks
-its own strategy by operand size — plain, Karatsuba, or homomorphic imaging
-— so it is an independent answer to the same question.
-
-That buys a much stronger correctness argument: `cargo test --features ntl`
-checks the hand-written NTT against NTL at **n = 4096 with ±2⁹⁹
-coefficients**, and at SI-NTRU's ±2¹¹⁹ / n = 2048 corner, where the O(n²)
-oracle is impractical. They agree exactly.
-
-It first produced a result we did not want, and then — after acting on it — the
-opposite one. `baru bench-polymul --schoolbook-max 4096` (per product, 20 reps,
-marshalling included, this machine, NTL 11.5.1 / GMP 6.3.0):
-
-| n | schoolbook | multi-modular NTT | NTL+GMP | NTT vs schoolbook | **NTT vs NTL** |
-|---|---|---|---|---|---|
-| 256 | 0.280 ms | **0.101 ms** | 0.188 ms | 2.8× | 1.9× |
-| 512 | 1.125 ms | **0.203 ms** | 0.375 ms | 5.5× | 1.8× |
-| 1024 | 4.500 ms | **0.422 ms** | 0.754 ms | 10.7× | 1.8× |
-| 2048 | 17.979 ms | **0.865 ms** | 1.555 ms | 20.8× | 1.8× |
-| 4096 | 71.859 ms | **1.771 ms** | 3.146 ms | 40.6× | 1.8× |
-
-**The hand-written NTT is now ~1.8× faster than NTL at every size.** It did not
-start that way: it was 8.232 ms at n=4096 and *lost* to NTL by 2.6×. Profiling
-NTL showed exactly where the gap was, and closing it gave **4.65× on our own
-transform** — which is also why the NTT now beats schoolbook at every size,
-including n=256 where it previously lost.
-
-NTL is not a *different* algorithm, which is worth stating precisely because
-it changes what the gap means. Probing the linked library directly (`NTL
-11.5.1 / GMP 6.3.0`, `NTL_SP_NBITS = 60`): a single-FFT-prime `zz_pX`
-multiply at n=4096 takes **0.151 ms**, and the 99-bit `ZZX` multiply takes
-1.763 ms — a ratio of 11.7 where the coefficient bound needs only
-`(2·99 + 12 + 1)/60 = 3.5` primes. So NTL is doing exactly what `ntt.rs`
-does — multi-modular FFT over ~60-bit primes plus CRT — and spending the
-rest on GMP bignum↔residue conversion. Two consequences:
-
-1. **Our transforms are the slow part, by ~13×.** Four primes × (2 forward +
-   1 inverse) is 12 transforms; NTL runs those in ~0.60 ms, we take 8.2 ms.
-   The cause is visible in [ntt.rs:214-224](src/fhe/ntt.rs#L214-L224): the
-   butterfly does **two** `mulmod`s, each a `u128 %` — a `__umodti3` libcall
-   on aarch64 — where NTL uses a precomputed root table and Shoup-preconditioned
-   multiplication with no division at all.
-2. **Our conversion is the fast part.** Fixed-width `i128`/`I256` coefficients
-   make `reduce_mod` and Garner CRT cheap, where NTL pays generic bignum costs
-   for the same step. That is why NTL wins by only 2.5× and not by 13×.
-
-So a Shoup butterfly in `ntt.rs` should *beat* NTL rather than merely match it —
-keeping the cheap fixed-width conversion **and** getting the fast transform.
-
-**That work is now done, and the prediction held.** Two changes to
-[ntt.rs](src/fhe/ntt.rs), both licensed by the primes being `< 2^63`:
-
-1. **Precomputed twiddle tables.** The old inner loop spent one `mulmod` on the
-   butterfly and a *second* walking `wn` forward. Twiddles are fixed per level,
-   so they are now built once per plan.
-2. **Shoup-preconditioned multiplication.** For a fixed multiplier `w`, cache
-   `w' = ⌊w·2^64/p⌋`; then `w·x mod p` is a multiply-high, a multiply, a
-   subtract and one conditional subtract — **no division at all**. The inverse
-   transform's `n^{-1}` scale and `ψ^{-i}` untwist were two `mulmod`s and are
-   now one fused Shoup multiply.
-
-`8.232 → 1.771 ms` at n=4096 (**4.65×**), and the schemes follow: a BFV ct×ct
-multiply went **20.7 → 5.4 ms**. Two guard tests pin the preconditions —
-`primes_admit_shoup` (the `p < 2^63` bound the prime search must keep supplying,
-or every transform silently corrupts) and `shoup_multiplication_matches_mulmod`
-(the fast path against the straightforward one, boundaries included).
-
-**So NTL is no longer a performance option — it is an oracle.**
-`poly::use_fastest()` now returns `Ntt` unconditionally, and the C++ toolchain
-buys correctness assurance rather than speed. That is a better outcome than
-adopting NTL would have been: the default build stays pure Rust *and* is the
-fast one. The NTL differential tests are what made the rewrite safe to do.
-
-The NTL path is wired in as a **runtime-selectable backend**
-([src/fhe/poly.rs](src/fhe/poly.rs)) rather than a replacement, so a single
-binary can measure either. Every FHE scheme here (BFV, BGV, SI-NTRU, PIR)
-routes through it, and `tests/fhe_poly_backends.rs` checks that all of them
-encrypt→multiply→decrypt identically under both, at deployed parameters.
-
-### BGV: the same construction, a third time (`src/fhe/bgv.rs`)
-
-SI-NTRU established the *construction* — reversed-coefficient packing so one
-ct×ct multiply is a whole matvec, decryption under the **squared key** so
-relinearization is deleted, depth 1 so bootstrapping never happens — and BFV
-showed it runs on a secure RLWE lattice. `bgv.rs` is the third instantiation
-of exactly that construction, at **BFV's exact parameters** (n=4096, q=2^100,
-t=2^20) so the comparison isolates the encoding:
-
-```text
-BFV:  c(s) = Δ·m + e      message in the HIGH bits  ⇒ tensor needs a t/q rescale
-BGV:  c(s) = m + t·e      message in the LOW bits   ⇒ tensor is reduced mod q, full stop
-```
-
-BGV's multiply is therefore BFV's multiply *minus* the rescale, and its
-decrypt is a mask rather than a rounded divide. Measured
-(`baru bench-fhe-innerprod --poly all --reps 15`, packed 8×4 matvec, both
-operands encrypted):
-
-| scheme | secure | n | multiply (NTT) | multiply (NTL) | ct bytes |
-|---|---|---|---|---|---|
-| BFV | yes | 4096 | 5.4 ms | 11.2 ms | 131072 |
-| **BGV** | **yes** | 4096 | **5.3 ms** | **11.1 ms** | 131072 |
-| SI-NTRU | **NO** | 2048 | 1.0 ms | 1.7 ms | 32772 |
-
-Two results, both against the hypothesis that motivated the work:
-
-- **BGV is indistinguishable from BFV.** Repeated runs put the multiply gap at
-  +0.5%, +0.5%, −0.1% — inside the 1–2% run-to-run spread. The rescale is
-  genuinely removed; it is just `3n = 12288` shifts against 28 size-4096
-  transforms. *The encoding is not where the cost is.*
-- **BGV is ~5× SI-NTRU, and that is structural.** SI-NTRU's ciphertext is
-  **one** ring element at n=2048, so a ct×ct is one ring multiply; RLWE's is
-  **two** at n=4096, so it is a three-component tensor. ~2× from the dimension
-  and ~2.3× from the tensor. No choice of RLWE encoding closes that, and the
-  single-ring-element structure that buys SI-NTRU the 5× is the same structure
-  that makes it overstretched and insecure.
-
-BGV's noise behaves differently from BFV's in one way worth having: the
-dominant term is `t·e·e'`, so the budget is **message-independent**. Measured
-at n=4096, `|m·m' + t·E| ≈ 2^60.2` against a `q/2 = 2^99` bound — **38.8 bits
-of slack** — and sweeping the plaintext magnitude 8× moves it by 0.1 bits.
-(The worst-case analytic bound is 2^79, so the ternary convolutions concentrate
-about 19 bits better than the bound assumes.)
-
-So the practical answer to "which secure scheme for the depth-1 product" is
-that BFV and BGV are interchangeable on cost, and the lever that actually
-moves FHE toward MPC is the ring arithmetic — `--poly ntl` buys 1.8–2.1× on
-multiply and ~2.6× on encrypt/decrypt across *all three* schemes.
-
-### Does faster ring arithmetic bring FHE closer to MPC? No — and finding out exposed a benchmark bug
-
-`baru bench-hybrid-nn --poly all` runs the whole private-layer pipeline
-(matvec + bias + ReLU, weights *and* input private) with only the polynomial
-arithmetic swapped. Two measurement traps had to be cleared first, and both are
-worth recording because each one produced a confident wrong answer.
-
-**Trap 1: process warm-up.** Running both backends in one process gave the
-polynomial-free `mpc` row a spurious 1.21× "speedup". Every number below is
-medians of 8, each backend in its **own process, alternating order**, with `mpc`
-as a control that must read 1.00×.
-
-**Trap 2 (the expensive one): the benchmark's ReLU was not batched.**
-`bench-hybrid-nn` applied a per-element `mpc_relu` in a `.map()` loop, costing
-`O(out_dim)` communication rounds — while [gadgets::relu](src/gadgets/mod.rs#L102)
-has done one `lt_batch` + one `mul_batch` for the whole slice all along, and its
-own docstring records that the per-element form costs "5× the messages and 9× the
-wall-clock". The benchmark simply never adopted its own gadget. Fixing the four
-call sites, for **bit-identical output**:
-
-| | ReLU, per-element | ReLU, batched | speedup |
-|---|---|---|---|
-| pure MPC, out=8 | 95.7 ms | 14.3 ms | 6.7× |
-| pure MPC, out=32 | 451.8 ms | 19.0 ms | 23.8× |
-| pure MPC, out=64 | 802.4 ms | 23.3 ms | **34.4×** |
-
-The batched ReLU is nearly **flat in layer width** (14.3 → 23.3 ms for 8× the
-outputs) because independent comparisons cost a constant number of rounds. The
-per-element version was linear. This is the round-structure tax the repo keeps
-rediscovering: the arithmetic was never the problem, the round *structure* was.
-
-With both traps cleared (one layer, 256→8):
-
-| strategy | poly | total | FHE work | MPC segment |
-|---|---|---|---|---|
-| mpc (control) | ntt | 37.6 ms | 6.1 ms | 14.4 ms |
-| mpc (control) | ntl | 36.6 ms | 6.4 ms | 15.3 ms |
-| hybrid-ntru | ntt | 166.6 ms | 115.5 ms | 51.0 ms |
-| hybrid-ntru | ntl | 94.6 ms | 44.4 ms | 48.9 ms |
-| **hybrid-bfv** | ntt | 254.0 ms | 207.3 ms | 52.1 ms |
-| **hybrid-bfv** | ntl | **139.1 ms** | **86.1 ms** | 53.5 ms |
-
-- **NTL speeds the FHE work up 2.41×**, reproducing `bench-polymul`'s isolated
-  2.5× end-to-end through a completely different code path. The `mpc` control
-  reads **0.97×**, as it must.
-- **FHE is still the bottleneck: 62% (NTL) to 82% (NTT) of the secure hybrid.**
-  An earlier version of this section claimed the opposite — that the MPC ReLU had
-  become 67% — which was entirely an artifact of the unbatched ReLU inflating the
-  MPC segment. Fixing the benchmark moved the bottleneck back to FHE.
-- **The gap to pure MPC widened, it did not close.** The secure hybrid is
-  **3.8× pure MPC** on the NTL backend (6.75× on NTT). Before the ReLU fix it
-  looked like 1.85×, because both sides were paying the same inflated MPC tax,
-  which compressed the ratio.
-
-So the honest answer to "will faster polynomials bring FHE close to MPC" is
-**no**. Faster ring arithmetic is real and worth having — 2.4× on the FHE work,
-1.8× on the whole secure layer — but pure ABY3 does this layer in 37 ms and the
-secure hybrid needs 139 ms. FHE's case here was never raw speed; it is the
-*communication* profile (36 KB and 75 messages against MPC's 350 KB and 9276),
-which is what pays on a WAN and what `bench-layer` measures.
-
-**The same defect was in `bench-deep-nn`**, whose `mpc_relu_rescale_layer` ran
-`a2b`/`b2a`/`mul` inside a per-element `.map`, and in **both benchmarks' FHE→MPC
-import**, which called `share_secret` three times per output. Fixing all of them
-— `a2b_batch` + one `mul_batch` for the nonlinearity (`b2a` is local, so it
-stays per element), and `share_secret_batch` per owner for the import:
-
-| | messages before | after | MPC segment before | after |
-|---|---|---|---|---|
-| `bench-deep-nn`, depth 4, width 16 | 1412 | **76** | 1273 ms | **102 ms** |
-| `bench-deep-nn`, depth 4, width 32 | 2820 | **76** | 2372 ms | **100 ms** |
-| `bench-hybrid-nn`, out=8 | 145 | **15** | 158 ms | **21 ms** |
-| `bench-hybrid-nn`, out=64 | 1153 | **15** | 1186 ms | **30 ms** |
-
-Bit-exact throughout, 0 bootstraps unchanged. The number to look at is not the
-speedup, it is that **message count is now constant in width** — 76 at both
-deep-nn widths, 15 at every hybrid-nn width. The round structure no longer
-depends on the size of the layer, which is what it should have been all along.
-`share_secret_batch` had existed on `TransportBackend` the whole time; `cnn.rs`,
-`compiled_nn.rs`, `abstraction.rs` and `mixed_layer.rs` all use it. These two
-benchmarks simply never adopted it — the same story as `gadgets::relu`, and now
-four instances of one defect.
-
-Corrected picture (256→8, medians of 8, separate processes, alternating order):
-
-| strategy | poly | total | FHE | MPC seg | msgs |
-|---|---|---|---|---|---|
-| mpc (control) | ntt | 34.1 ms | 6.1 ms | 13.9 ms | 9276 |
-| hybrid-ntru | ntt | 47.4 ms | 25.5 ms | 21.8 ms | 13 |
-| **hybrid-bfv** | **ntt** | **71.5 ms** | 45.9 ms | 25.4 ms | **15** |
-| hybrid-bfv | ntl | 100.1 ms | 75.4 ms | 24.4 ms | 15 |
-
-The secure hybrid is **2.09× pure MPC** on the pure-Rust backend (now the
-fastest — see the Shoup butterfly above). That figure has moved a lot as
-measurement errors were removed and real work landed: 1.85× (benchmark's own
-round-structure bug inflating both sides) → 3.80× (bug fixed on one side) →
-2.77× (imports batched) → **2.09×** (Shoup butterfly). Only the last was a
-genuine speedup; the others were corrections.
-
-FHE is now **64%** of the hybrid, down from 87%, so the two halves are finally
-comparable. And the communication story is stark — **15 messages against
-9276**. That, not speed, is the hybrid's actual case, and it is what pays on a
-WAN.
-
-### SHE as an MPC building block: LowGear triples, measured (`baru bench-triples`)
-
-MP-SPDZ builds its offline phase on somewhat-homomorphic encryption
-(Overdrive/LowGear/HighGear). Baru's cost model already carried that protocol —
-as an *estimate*: `Status::Planned("P3 — reuses fhe::bfv")`, ~384 B/triple from
-the literature, plus an explicit disclaimer that its CPU cost was not modelled.
-[src/mpcc/lowgear.rs](src/mpcc/lowgear.rs) runs it instead.
-
-The protocol is structurally identical to [semi2k](src/mpcc/semi2k.rs) — both
-compute `c = a₀b₀ + a₁b₁ + a₀b₁ + a₁b₀` and need the two cross terms from an
-OLE. Only the OLE differs: Semi2k uses `2k` correlated OTs; LowGear uses one
-**ciphertext × plaintext** multiply over `n` CRT slots (depth 0 — no relin, no
-bootstrap, no eval keys, and not even a ct×ct multiply).
-
-**What made it possible now:** [src/fhe/slots.rs](src/fhe/slots.rs). Every other
-packing in this repo is coefficient-based, where a ring product is a
-*convolution*; an OLE needs `n` **independent** products. CRT slot packing under
-a prime `t ≡ 1 (mod 2n)` gives that — which is why `BgvParams::t` had to stop
-being a power of two, and why BGV rather than BFV is the natural host (no
-`Δ = q/t` to divide, so `t` need not divide `q`). Without slots one ciphertext
-pair yields *one* product, i.e. ~131 KB/triple: **40× worse than the OT it
-replaces.** Slots are the difference between winning by 7× and losing by 40×.
-
-Measured, two parties, semi-honest, 4096 triples:
-
-| route | domain | B/triple | triples/s | rounds | ok |
-|---|---|---|---|---|---|
-| **lowgear (SHE)** | `F_941356466589171713` | **192** | 73 400 | 2 | ✓ |
-| semi2k (OT) | `Z_2^64` | 3074 | 2 620 | 3 | ✓ |
-
-LowGear's ~61-bit field covers Semi2k's 64-bit values without CRT limbs, so the
-comparison is direct: **192 B/triple against OT's 3074 — a 16.3× communication
-advantage**, and 2× better than the literature's 384 B estimate.
-
-**The surprise, and a correction to our own model.** `mpcc::cost` asserted that
-*"LowGear trades bandwidth for CPU: its preprocessing is compute-bound."* That
-note was never measured, and it is **wrong** here: LowGear generates triples
-**~28× faster** than the OT route (73 400 vs 2 620 triples/s). There is no trade
-at these parameters — SHE wins on bytes *and* on CPU, and by a wide margin. The
-note has been replaced with the measurement.
-
-**Scope, stated plainly.** Semi-honest only: no MACs, no sacrifice, and **no
-zero-knowledge proofs of plaintext knowledge**. A malicious party can send a
-malformed ciphertext and learn about the other's input from decryption
-behaviour. ZKPoPK is the bulk of the Overdrive paper and is deliberately absent
-— this is the LowGear analogue of Semi2k, not of SPDZ.
-
-### Widening the field, and what it cost the paper's claim
-
-LowGear originally ran at `n = 4096, q = 2^100`, which the flooding budget
-`t²·n²·3·2^(σ−1) < q/2` pins to a **~17-bit field**. That is enough to
-multiply and not enough to *compare*: masked bit-decomposition needs
-`bit_width + KAPPA` ≈ 58 bits, so the engine refused comparison-shaped programs
-and `bench-layer`'s SHE row had to be **composed** from two measurements rather
-than run.
-
-Closing that meant widening the arithmetic. `q = 2^190` needs 256-bit
-coefficients and a 512-bit product accumulator, so:
-
-- [src/fhe/bigint.rs](src/fhe/bigint.rs) — `IntN<const L: usize>`, replacing
-  the bespoke `I256`. The narrow path measured **1.770 ms → 1.770 ms** at
-  n=4096: zero regression, because the const-generic loops unroll as the
-  hand-written `u128` halves did.
-- [src/fhe/ntt.rs](src/fhe/ntt.rs) — a **wide profile**: `MAX_N` 4096 → 8192,
-  7 primes (CRT modulus ~2^441) against the narrow 4. One prime table serves
-  both, since `p ≡ 1 mod 16384` implies `p ≡ 1 mod 8192`.
-- [src/fhe/bgv_wide.rs](src/fhe/bgv_wide.rs) — BGV at 256-bit coefficients,
-  carrying only what the OLE needs (the OLE is ct×*plaintext*, so no tensor, no
-  relinearization, no key power above one).
-
-LowGear now runs at `n = 8192, q = 2^190, t ≈ 2^61` and **computes ReLU
-correctly**. Two bugs surfaced getting there, both mine: the flooding mask was
-`log2_bound + 1` bits instead of `log2_bound`, doubling the noise past `q/2` and
-silently invalidating every triple; and the parameter search accepted a set with
-**0.29 bits** of slack. `validate` now demands 2 bits, and the
-deployed-parameter triple test is **no longer `#[ignore]`d** — it was ignored,
-which is why a wrong answer three layers up was the first symptom.
-
-The measured consequence, WAN, 2 parties, preprocessing charged per triple
-*consumed*:
-
-| width | dealer (lower bound) | semi2k (OT) | **lowgear (SHE)** | hybrid/bfv |
-|---|---|---|---|---|
-| 64 | 600.6 ms | 694.5 ms | **606.2 ms** | 692.1 ms |
-| 1024 | 603.0 ms | 942.8 ms | **623.4 ms** | 692.1 ms |
-| 4096 | 610.9 ms | 1.74 s | **678.4 ms** | 733.7 ms |
-
-**The hybrid never beats SHE-preprocessed MPC at any width measured**, and
-LowGear tracks the trusted-dealer *lower bound* within 5 ms at width 64 —
-because its preprocessing is **192 B/triple against OT's 3136, 16.3× cheaper**,
-and ~28× faster. The earlier composed estimate said the crossover moved from
-width 64 to 4096; measuring it properly says it is gone in this range entirely.
-
-That is a real qualification to `paper-outline` E25, whose conclusion — *"the
-entire case for FHE here is the cost of preprocessing"* — turns out to be
-exactly right, and to cut the other way once MPC gets the better preprocessing.
-
-### Both are now executable protocols, not just cost rows
-
-`Semi2k` and `LowGear` are wired into the `mpcc` VM, so `baru mpcc run` and
-`baru mpcc calibrate` drive them like any other protocol — and both flip from
-`planned` to `impl` in `baru mpcc protocols`. The point of doing this is the
-calibration loop: a protocol you can only *cost* is a protocol whose cost model
-nobody has checked.
-
-```text
-baru mpcc calibrate --expr '(+ (* a b) (* c d))' --parties 2 ...
-
-protocol   parties  rounds pred/meas  online bytes pred/meas   result
-dealer          2        3/3                     72/72         42 ✓
-semi2k          2        3/3                     72/72         42 ✓
-lowgear         2        3/3                     27/27         42 ✓
-
-  dealer   rounds +0.0%  bytes +0.0%
-  semi2k   rounds +0.0%  bytes +0.0%
-  lowgear  rounds +0.0%  bytes +0.0%
-```
-
-All three at **0% on rounds and bytes**. The online phase is Beaver's in every
-case, which is exactly why this is a useful check: with the online phase held
-constant against two already-validated protocols, any disagreement would have
-to come from the part that differs — where the triples come from.
-
-Getting there caught a real accounting bug. LowGear is Baru's first protocol
-whose field is not byte-aligned (17-bit modulus), and `cost.rs` prices
-`field_bits / 8` while the VM charges `ceil(order_bits / 8)` — for every
-previous protocol those agree, so nothing had ever exercised the difference. It
-showed up as a −33% byte error. The fix follows Shamir's existing convention:
-the registry's `field_bits` is the **byte-aligned wire width** (24 for a 17-bit
-element, as Shamir declares 64 for a 61-bit prime), and a test in
-`mpcc::lowgear` now fails if the model's bytes-per-element and the VM's ever
-drift apart again.
-
-**LowGear's capability boundary is enforced, not documented-and-hoped.** Its
-~17-bit field cannot supply the `KAPPA = 26` bits of masking headroom that
-bit-decomposition needs, so comparison-shaped programs are **refused** rather
-than run and silently wrong. `mpcc::engine_can_run_program` is the predicate;
-sweeps that enumerate `RUNNABLE` (like `bench-layer`, whose layer contains a
-ReLU) skip that row and keep going, the same way an unsupported party count is
-handled. Arithmetic-only programs run fine.
-
-### Offline/online split for the scheme switch
-
-With the multiply cheap, the *conversions* became the bottleneck (149 ms +
-108 ms = 59% of the secure hybrid) — and they were dominated by BFV
-encryptions of masks. Two standard optimizations from the literature apply
-directly:
-
-- **Delphi-style offline/online split**: the to-MPC masks `rᵢ` are
-  *query-independent*, so their encryption is precomputed before the query
-  arrives. Online, that leg is 3 ciphertext additions + 1 decryption.
-- **Mask-and-correct on the return path**: each party precomputes
-  `Enc(ρᵢ)` offline and, online, publishes only `δᵢ = cᵢ − ρᵢ` — uniform,
-  so it leaks nothing — letting the evaluator fold it in with a *plaintext*
-  addition (`Bfv::add_plain_poly`, O(n), no ring multiply). Since
-  `Σ(ρᵢ + δᵢ) = Σcᵢ`, it is the same interactive bootstrap with **no online
-  encryption at all**.
-
-| conversion leg | before | after (online) |
-|---|---|---|
-| FHE → MPC (`to-mpc`) | 149 ms | **37 ms** |
-| MPC → FHE (`to-fhe`) | 108 ms | **0.4 ms** |
-| **secure hybrid, online latency** | 437 ms | **160 ms** |
-
-Stated honestly: this does **not** reduce total work (the same six
-encryptions happen — 282 ms of them now precomputed); it moves
-query-independent work *off the critical path*, which is precisely what the
-offline/online split buys. Output remains bit-exact.
-
-### Lifting the layer-size ceiling (and why our packing is already optimal)
-
-The secure hybrid previously asserted a single weight ciphertext, capping
-layers at `(out+1)·in ≤ n = 4096`. It now **chunks**: `⌈out/(n/in − 1)⌉`
-weight ciphertexts, each multiplied against the same encrypted input, whose
-forward NTT is **computed once and reused** (`Bfv::mul_pre`) — saving 2 of
-4 forward transforms per prime per chunk.
-
-Worth stating as a finding rather than a to-do: **our reversed-coefficient
-packing is already at the fundamental limit for dense layers.** A degree-n
-product yields at most `n/in` *separable* outputs, because distinct rows
-need disjoint weight windows — so a matvec inherently costs `⌈out·in/n⌉`
-multiplications, which is exactly what chunking does. Gazelle's SIMD
-packing achieves the same MAC throughput but needs **rotations and Galois
-keys**, which would forfeit this construction's no-evaluation-keys
-property; our layout is the rotation-free, Cheetah-style one. (Convolution
-is the case where coefficient packing does strictly better — overlapping
-windows are exactly the sliding window — see the next section, where it
-turns 1352 multiplications into 2.)
-
-Measured (secure hybrid, exact at every size):
-
-| layer | multiplications | online | offline |
-|---|---|---|---|
-| 8×2 | 1 | 164 ms | 282 ms |
-| 256×32 | 3 | 656 ms | 590 ms |
-| 784×16 | 4 | 505 ms | 734 ms |
-
-Two real bugs were caught getting here, both now fixed and tested:
-- **Mask reuse across chunks leaked**: every chunk opens the same
-  coefficient positions, so sharing one mask set would reveal
-  `pre_i − pre_j` to anyone seeing two openings. Masks are now fresh per
-  chunk.
-- **Fixed `t = 2^20` silently overflowed**: a 784-term dot product of
-  ~50-magnitude values reaches ~2²¹, wrapping the plaintext modulus and
-  producing wrong (not merely noisy) results. `t` is now sized from the
-  measured activation range, with the depth-1 noise budget asserted.
-
-### Cheetah-style convolution packing: 676 multiplications become 2
-
-Convolution is exactly the case the dense-layer limit above does *not*
-apply to. Polynomial multiplication **is** convolution, so if the image is
-flattened row-major and the kernel is packed **reversed on every axis**
-(channel, row, column) at matching strides, then one ciphertext
-multiplication computes the entire sliding-window convolution for a whole
-output channel. Two properties make it exact rather than approximate:
-
-- **Channels pair off automatically.** The reversed channel offset makes
-  `c + (C−1−c′) = C−1` hold only when `c = c′`, so every input channel's
-  contribution lands on the *same* coefficient and they sum — which is
-  precisely what a multi-channel convolution wants.
-- **No row-wrap contamination.** A neighbouring row could only leak into an
-  output coefficient via a column carry (`col + b ≥ W`), which would require
-  `ox ≤ −1`. Impossible for a valid output, so the read-out positions are
-  clean. (Other coefficients *are* garbage; we never read them.)
-
-Conv output `(oy,ox)` lands at `(C−1)·HW + (oy+kh−1)·W + (ox+kw−1)`. The
-cost is `out_c` multiplications — **independent of the image size** —
-against the `⌈out_c·oh·ow·CHW/n⌉` an im2col/Toeplitz matvec needs.
-
-Measured A/B on the same classifier (`baru bench-cnn --img D`), both paths
-exact against the plaintext reference, 0 bootstraps:
-
-| D | Toeplitz mults | packed mults | FHE time (Toeplitz) | FHE time (packed) |
-|---|---|---|---|---|
-| 8 | 3 | 2 | 289 ms | 222 ms |
-| 12 | 16 | 2 | 1037 ms | 209 ms |
-| 28 | 1352 | 2 | **77497 ms** | **264 ms** |
-
-At MNIST resolution that is a **294× faster convolution** and 5.5× faster
-end to end (94.0 s → 17.1 s) — and it puts a full 28×28 image within reach,
-which the module previously documented as out of scope (`D ≤ ~12`).
-
-**Half the remaining FHE time was query-independent (`--precompute`).**
-With MPC down to a fraction, the same per-phase treatment applied to the FHE
-side gave: model encryption 218 ms, ct×ct products 210 ms, decrypting the
-masked openings 217 ms, re-encrypting shares 50 ms, input 17 ms — and
-encrypting the **scheme-switch masks 656 ms**, 48% of FHE and 39 of the
-inference's 52 encryptions.
-
-Masks are uniform random values. They depend on neither the image nor the
-weights, only on the network's *shape*, so they can be generated before the
-query exists — Delphi's preprocessing idea applied to the *switch* rather
-than to the linear layer. They must still be **fresh per query** (two queries
-masked identically would reveal the difference of their pre-activations), so
-this moves work off the critical path rather than removing it — which is
-exactly the deployment question: a server idle between patients has the time,
-a patient waiting does not. Precomputing also lets the three parties' mask
-ciphertexts be *summed* in advance, so the online step is one ciphertext
-addition instead of three encryptions plus three additions.
-
-D=28: online **1.99 s → 1.31 s** against 680 ms offline. On the trained
-two-conv medical model, which switches four times rather than twice:
-**4.94 s → 2.90 s** online against 2.03 s offline. A test runs the identical
-inference both ways and requires the same class, and the pool asserts exact
-consumption so its size prediction cannot drift from the pipeline.
-
-**The bottleneck moved off FHE — and has since moved back.** Right after
-packing, the FHE work was 264 ms of a 17.1 s run (1.5%) and the rest was the
-MPC segment, which is what motivated the batching work above. But most of that
-MPC time was the unbatched scheme-switch import, not the comparisons; with the
-import batched and the nonlinearities garbled, the same D=28 classifier runs
-in **1.31 s of which 695 ms (53%) is FHE**, and the trained two-conv medical
-model — four encrypted linear layers to this one's two — is **73% FHE**. What
-is left is the irreducible part: the ct×ct products and the model encryption
-depend on the query or the weights, so no preprocessing reaches them. The
-highest-value remaining optimization is `fhe::bfv` itself (a single-threaded
-schoolbook NTT, no GPU), not the MPC layer.
-The general lesson is in the batching section above: a segment-level
-measurement told us which *component* was slow and nothing about *why*.
-
-### The private CNN now runs on secure parameters
-
-`bench-cnn` previously ran on SI-NTRU. Our own analysis (see the security
-note in `src/fhe/si_ntru.rs`) concluded that scheme is **not secure at the
-parameters this construction needs — not even at depth 1**, where the
-fatigue point sits near 2^59 (adjusted) against a required `q ≳ 2^84`. So
-the flagship demo was, until now, exact and bootstrap-free but not
-meaningfully private. It has been ported to **BFV at RLWE-secure parameters**
-(n=4096, q=2^100, at/below the ~109-bit ceiling for n=4096 at the 128-bit
-level). BFV supports the identical no-relinearization trick — multiply, then
-decrypt the degree-2 result under `s²` — so the construction transferred
-unchanged.
-
-Two supporting fixes went in with it:
-- The hardcoded `t = 2^20` is now **calibrated from the measured activation
-  range**, with the depth-1 noise budget asserted. A fixed `t` is a genuine
-  correctness hazard, not a tuning knob: too small and a dot product silently
-  wraps the plaintext modulus, giving wrong rather than merely noisy results.
-- The image's forward NTT is computed **once and reused** across output
-  channels and weight chunks (`Bfv::mul_pre`).
-
-`CnnRun` now records `ring_n`/`log2_q`/`log2_t`, so the security claim is a
-test (`uses_rlwe_secure_parameters`) rather than only prose.
-
-| D | FHE, SI-NTRU (insecure, n=2048) | FHE, BFV (secure, n=4096) | total, BFV |
-|---|---|---|---|
-| 8 | 222 ms | 1108 ms | 2273 ms |
-| 12 | 209 ms | 1084 ms | 3794 ms |
-| 28 | 264 ms | 1032 ms | 18709 ms |
-
-The security upgrade costs ~4× on the FHE side (bigger ring, more NTT
-primes) — but **conv packing more than paid for it**. At 28×28 the secure
-BFV pipeline runs in 18.7 s against 94.0 s for the old *insecure*
-Toeplitz-on-SI-NTRU path: 5× faster *and* actually private. FHE is now
-1032 ms of 18.7 s (5.5%); the rest is MPC.
-
-### Real MNIST: a trained model, real test digits, encrypted (`baru bench-mnist`)
-
-Everything above proves the pipeline is *exact*. This adds the orthogonal
-question a reviewer will ask: **what accuracy does it get on real data?**
-
-The model is a small but real **two-convolution** CNN —
-`1×28×28 → conv(8,3×3) → ReLU → pool → conv(16,3×3) → ReLU → pool → dense(→128) → ReLU → dense(→10) → argmax`
-— **trained** on the full 60 000-image MNIST training set (numpy SGD; the
-original `scratchpad/train_modeA.py` was lost — `tools/train_medmnist.py`
-supersedes it and can regenerate these weights) and then **quantised into the very integer
-fixed-point scheme `CnnModel::forward` runs** — so the number below is the
-accuracy of the *deployed integer model*, not a float model that would lose
-something afterward. It has **four encrypted linear layers** (two conv, two
-dense), three MPC nonlinearities and three scheme switches, and still
-**zero bootstraps** — the second, multi-channel convolution composes in with
-nothing but "switch again." Weights and a real test subset are embedded in
-`examples/data/mnist_cnn.rs`.
-
-```
-plaintext-integer accuracy : 299/300 = 99.67%   (in-repo test subset)
-full MNIST test set (10 000): 98.89%             (identical weights, offline)
-ENCRYPTED pipeline (4 imgs) : 4/4 match plaintext exactly, 0 bootstraps
-```
-
-The encrypted run matters more than the accuracy: because the hybrid is
-bit-exact against `forward`, **every encrypted prediction equals the
-plaintext one** — verified here on real digits through all four encrypted
-linear layers, not asserted. So the encrypted accuracy *is* 98.89%; privacy
-costs nothing in accuracy. The Rust integer forward was checked to agree
-with the numpy reference digit-for-digit on the embedded subset (299/300
-both), so the offline 10 000-image number transfers faithfully.
-
-These weights were **regenerated on 2026-07-28** by `tools/train_medmnist.py`
-after the original trainer was lost, which is why the number moved from 98.05%
-to 98.89%: same architecture, same quantisation scheme, a fresh 30-epoch run.
-The embedded 300-image test subset is byte-identical to the original file, so
-the two models are directly comparable.
-
-**Where this sits vs. the literature.** The honest framing is like-for-like
-on *what is hidden*, since that — not accuracy — is the axis this work moves.
-
-| system | model | MNIST acc | what is hidden |
-|---|---|---|---|
-| **baru** (this repo) | conv(8)+conv(16)+128-hidden+dense | **98.9%** | **image *and* weights** (ct×ct) |
-| Gazelle (2018) | larger CNN | ~99% | image only (server holds plaintext weights) |
-| Delphi (2019) | larger CNN | ~99% | image only |
-| CrypTFlow2 (2020) | larger CNN | ~99% | image only |
-| MiniONN / Cheetah | larger CNN | ~99% | image only |
-
-The residual ~0.1% accuracy gap is model size, and closing it is a *training*
-question the no-bootstrap construction is indifferent to (depth is free —
-this two-conv model is the same pipeline switched a few more times). The column
-that distinguishes this work is the last one: the systems above are
-two-party client/server protocols where **the server evaluates on plaintext
-weights** — the model is not hidden. Here the linear layers are
-**ciphertext×ciphertext**, so the weights are encrypted too, and the only
-value that ever leaves the cryptographic domain is the class index. That is
-a different (stronger) privacy model, not a faster route to the same one —
-the comparison is about *what is protected*, and only secondarily about
-speed. A larger encrypted model would move the accuracy column without
-touching that distinction.
-
-### Private *diagnosis*: real biomedical images (`baru bench-medmnist`)
-
-Handwritten digits are not a medical claim. **MedMNIST v2**
-(<https://medmnist.com>, CC BY 4.0) distributes twelve 2D biomedical datasets at
-**28×28 — exactly MNIST's shape**, so the pipeline above runs on them unchanged:
-
-```
-baru bench-medmnist --dataset all --hybrid 3 --both
-```
-
-| | pneumonia (chest X-ray, 2 classes) | organa (abdominal CT, 11 classes) |
-|---|---|---|
-| integer accuracy, full test set | **84.78%** (624 imgs) | **81.18%** (17 778 imgs) |
-| float accuracy of the same net | 84.78% | 81.03% |
-| majority-class baseline | 62.50% | 18.48% |
-| published ResNet-18 (28×28) | 0.854 | 0.935 |
-| encrypted == plaintext diagnosis | 3/3 | 3/3 |
-| FHE bootstraps | 0 | 0 |
-| latency/diagnosis, `a2b` | 5.71 s | 5.95 s |
-| + `--gc` | 4.94 s | 5.05 s |
-| + `--precompute` (**online**) | **2.90 s** | **3.00 s** |
-| offline, per query | 2.03 s | 2.04 s |
-| online at WAN (`--rtt-ms 20 --bandwidth-mbps 1000`) | 5.00 s | 5.30 s |
-
-Three readings. **Quantisation and encryption are both free**: the integer net
-tracks its float parent to within 0.2 points (agreeing on 99.7% / 98.7% of test
-predictions), and the encrypted pipeline reproduces the plaintext diagnosis
-bit-exactly — privacy costs wall-clock, not accuracy.
-**The model, not the crypto, is the ceiling**: this 2-conv classifier is
-sized to fit the depth-1 noise budget, which is enough to match published
-ResNet-18 on pneumonia and 12 points short of it on the 11-class organ task.
-And **the cost centre is now FHE**: of the 2.90 s chest-X-ray diagnosis,
-**2.13 s (73%) is FHE arithmetic** and 0.76 s is the whole MPC segment
-(import 0.02 s, ReLU 0.51 s, pool 0.21 s, argmax 0.01 s). A diagnosis used to
-take ~33 s: the batched scheme-switch import took it to 5.71 s, garbled
-nonlinearities (`--gc`) to 4.94 s, and preprocessed masks (`--precompute`) to
-**2.90 s online** — an 11× reduction with the construction unchanged. Anyone
-optimising this further should go to `fhe::bfv`, not to the MPC layer. On a
-wide-area link (RTT 20 ms, 1 Gbps) a diagnosis is 5.00 s — the pipeline is
-not round-bound, and garbling is worth 2.0× on the MPC segment there.
-
-The same swap applies to the linear-discriminator demo, where the medical
-version runs on every FHE scheme:
-
-```
-cargo run --release --example mnist -- --pneumonia --mpc --ckks
-```
-
-giving one 1669-gate circuit whose Q16.16 score is bit-identical across plain,
-fhe-mock and ABY3, and equal to ~1e-7 under CKKS. Weights for all of this are
-regenerated by `tools/train_medmnist.py`.
-
-### Private set intersection, and which construction to use (`baru bench-psi`)
-
-Two hospitals want to know which patients they share, and nothing else.
-`src/psi/` implements DH-PSI over Ristretto255 (semi-honest, one-sided output),
-and the benchmark prices the OT-based alternative from the *measured* OT cost
-rather than assuming it wins:
-
-| | hides non-shared items? | bytes/item | µs/item |
-|---|---|---|---|
-| naive hash exchange | **no** | 32 | **0.43** |
-| DH-PSI (measured) | yes | 96 | 165 |
-| OT-based (projected) | yes | ~58 | ~1 |
-
-DH-PSI is flat in both — three flights of compressed points, two scalar
-multiplications per item. The insecure baseline is **~380× faster**, which is
-exactly why hash-exchange keeps getting shipped; what the 380× buys is an offline
-dictionary attack that recovers the sender's *entire set*, and patient
-identifiers are precisely the low-entropy input that attack needs.
-
-The projection says an OT-based PSI wins by only ~1.7× on bytes but ~100× on
-time, so the deciding axis is **compute, not bandwidth**. That is worth knowing
-before building the harder protocol — and it is a projection (measured per-OT cost
-× a literature OPRF code width), not a measured PSI.
-
-### Oblivious transfer, base and extended (`baru bench-ot`)
-
-OT is the primitive that pays twice: private set intersection is built on it, and
-so are Semi2k's and MASCOT's triples. `src/ot/` has Chou–Orlandi base OT over
-Ristretto255 and the IKNP extension on top.
-
-```
-  protocol      OTs       us/OT   bytes/OT   rounds
-      base      128      126.35       64.2        2
- extension      128      127.99       48.2        3
-      base     8192      123.92       64.0        2
- extension     8192        4.67       16.5        3
-```
-
-Base OT is flat in the batch size — each transfer is its own pair of scalar
-multiplications. The extension starts level with it at 128 OTs (that batch *is*
-the `κ = 128` base OTs it must pay for first) and is **27× cheaper per OT and 4×
-smaller by 8192**. Bytes per OT converge to `κ/8 = 16` from above, which is the
-protocol's analytic online cost of one column bit per output OT — the measured
-curve landing on that floor is what says the accounting is the protocol's and not
-the harness's.
-
-Both layers are **semi-honest**, and for IKNP that is a concrete gap rather than a
-caveat: nothing forces the receiver to use the same choice vector in every
-column, and an inconsistent one leaks the sender's secret bit by bit. KOS15's
-correlation check is what closes it.
-
-### Private information retrieval, and why we are not using it (`baru bench-pir`)
-
-Encrypting records at rest does not hide *which* record you read, and an access
-pattern over a patient database is itself a disclosure. `src/pir/` implements the
-textbook single-server scheme over the same BFV: the database becomes one
-plaintext polynomial per shard, the query is an encrypted monomial, and since
-`xⁿ = −1` a single plaintext-ciphertext multiply drops the wanted record into the
-low coefficients. One round, `O(1)` query, no server key, **zero multiplicative
-depth**.
-
-It is also, measured honestly, the wrong tool — 256-byte records, n=4096:
-
-```
- records  shards      query     answer   whole db  vs plain  vs whole  server ms
-      32       1    104.0 KB   104.0 KB     8.0 KB      832x     0.04x  16
-     256       8    104.0 KB   832.0 KB    64.0 KB     3744x     0.07x  130
-    2048      64    104.0 KB     6.5 MB   512.0 KB    27040x     0.08x  1032
-```
-
-Retrieval is correct at every size, and the ratio converges to `1/13` rather
-than improving with scale. A response ciphertext costs `2·⌈log₂q/8⌉ / ⌊log₂t/8⌋`
-= **13×** the entire plaintext content of the shard that produced it, and this
-scheme returns one response per shard — so its traffic is ~13× a whole-database
-download regardless of `N`. There is no crossover.
-
-So by this repo's own admission rule for new primitives, PIR has not earned its
-stage yet: the cheapest way to hide the access pattern here is still to download
-the shard. What it has earned is a correct implementation, a measured baseline,
-and a specific next step (SealPIR-style recursion with server-side query
-expansion, which needs Galois automorphisms BFV here lacks). Reporting that is
-more useful than a table where every primitive wins.
-
-### Measured: one private dense layer, six ways (`baru bench-hybrid-nn`)
-
-The same layer — `matvec(8×2) + bias + ReLU`, inputs spanning both signs —
-computed end-to-end under six strategies and verified against the
-plaintext reference (this machine, release build).
-
-**The MPC is the real protocol, and the network is modeled.** Every MPC
-segment — the pure strategy, the hybrids' ReLU, and both scheme-switch
-directions — runs the genuine replicated 3-party ABY3 **wire protocol**
-(`TransportBackend`, three party threads exchanging serialized messages),
-not the in-process `Aby3Backend` simulator, whose algorithms differ from
-the distributed protocol (its share multiplication reconstructs and
-reshares locally — free and insecure) and which understated the pure-MPC
-row by ~2.7× (6.7 ms simulated vs **18 ms** real-protocol). A
-`--rtt-ms`/`--bandwidth-mbps` network model injects latency into every
-protocol message *and* into the FHE upload/download and conversion round
-trips, so parties can be "moved" from one rack to different continents
-without deploying anything. (Building this exposed a real harness bug:
-the old per-message latency timers could reorder back-to-back messages,
-corrupting the protocol — the model now preserves per-connection FIFO like
-a real TCP stream, with a regression test.)
-
-```sh
-./target/release/baru bench-hybrid-nn                 # rtt=0
-./target/release/baru bench-hybrid-nn --rtt-ms 20     # same computation, WAN rounds
-```
-
-At `rtt=0` (all parties co-located):
-
-| strategy | total | linear | MPC segment | wire (MPC) | correct? |
-|---|---|---|---|---|---|
-| **mpc** (pure ABY3, weights *also* private) | **18 ms** | 4.4 ms | relu 10.1 ms | 136 msgs / 8.1 KB | ✓ exact |
-| **hybrid-ntru** (SI-NTRU linear → ABY3 ReLU, weights *also* encrypted) | **200 ms** | 35 ms (one ct×ct mult) | 17 ms (+80 ms switch) | 32 msgs / 1.1 KB | ✓ exact |
-| **hybrid-ckks** (CKKS linear → ABY3 ReLU) | 8.9 s | 2.6 s | 18 ms (+1.6 s switch) | 32 msgs / 1.1 KB | ✓ exact |
-| **tfhe** (pure TFHE, PBS ReLU) | 67.8 s | 64.9 s | — | — | ✓ exact |
-| **hybrid-tfhe** (TFHE linear → ABY3 ReLU) | 74.5 s | 67.5 s | 20 ms (+5.8 s switch) | 32 msgs / 1.1 KB | ✓ exact |
-| **ckks** (pure deep CKKS, polynomial ReLU) | 75.0 s | 9.5 s | — | — | ✗ off by 282 vs exact¹ |
-
-And the latency sweep (mpc / hybrid-ntru / hybrid-ckks, layer 8×2):
-
-| network | mpc | hybrid-ntru | hybrid-ckks |
-|---|---|---|---|
-| rtt = 0 | 18 ms | 200 ms | 8.9 s |
-| rtt = 20 ms | 120 ms | 375 ms | 8.9 s |
-| rtt = 100 ms, 100 Mbps | 520 ms | 1.10 s | 9.6 s |
-
-¹ The pure-CKKS output matches its own plain-`f64` Newton-approximation
-reference (the crypto is correct) but deviates 282 from the exact ReLU on
-the negative pre-activation (−818 at bound 5820 — the documented
-slow-near-zero regime at 2 iterations).
-
-What the numbers say:
-
-- **Under latency, MPC cost is rounds × RTT — and ABY3's batched matvec
-  is remarkably round-cheap.** At 100 ms RTT the whole fully-private layer
-  is ~5 round trips (520 ms): the batched-Beaver matvec collapses to ~1
-  round regardless of shape, and the sequential per-element ReLU is what
-  stacks rounds. This is precisely the structure an in-process simulator
-  cannot show.
-- **The hybrids pay the same ReLU rounds plus ~1.5 conversion RTTs**, so
-  scheme switching does not beat pure MPC on *latency* at these shapes —
-  its win is elsewhere: deployment shape (client sends ciphertexts and
-  leaves; only the tiny nonlinear segment needs live parties) and wire
-  footprint. At `layer(64×8), rtt=20ms` pure MPC moved **2,452 messages /
-  200 KB** between parties (weights are shared!) vs the NTRU hybrid's
-  **128 messages / 4.4 KB** — 19× fewer messages, 46× fewer bytes —
-  because the bytes-heavy linear phase lives in FHE where it crosses the
-  wire once as ciphertext.
-- **Depth-1 FHE + MPC ReLU is the winning hybrid, and SI-NTRU is its
-  cheapest depth-1 engine** at every network profile (~9–44× faster than
-  hybrid-CKKS): no evaluation keys (keygen 36 ms vs CKKS's 4.2 s), one
-  multiplication for the whole matvec, one masked decryption for the whole
-  output switch — decrypting under f² replaces relinearization outright.
-  (Subject to the overstretched-regime security caveat above.)
-
-### When does the hybrid beat pure MPC? Large params, few ReLUs, thin pipes
-
-The hypothesis: small layers can't justify the hybrid (its scheme-switch
-floor dominates), but a *large* linear layer with *few* ReLUs should flip
-the comparison, because pure MPC's wire cost grows with the parameter
-count (every weight is secret-shared, every multiplication moves
-Beaver-triple traffic — measured: **~400 B/parameter**) while the hybrid's
-MPC segment stays tiny and its FHE bytes grow ~2.5× slower. Measured
-(hybrid-ntru extended with chunked packing — one ct×ct mult per
-`n/in − 1` weight rows against the same encrypted input — an adaptive
-plaintext modulus sized to the activation range, and a packed return
-switch: each party encrypts ALL its output components in one polynomial,
-so the MPC→FHE leg is 3 ciphertexts flat):
-
-| shape (params) | network | mpc | hybrid-ntru | winner |
-|---|---|---|---|---|
-| 8×2 (16) | 20 ms / 10 Mbps | **121 ms** | 431 ms | mpc |
-| 512×4 (2 K) | 20 ms / 10 Mbps | **815 ms** | 1.24 s | mpc |
-| 1024×4 (4 K) | 20 ms / 10 Mbps | 1.41 s | **1.30 s** | hybrid |
-| 1024×8 (8 K) | 20 ms / 10 Mbps | 2.71 s | **2.35 s** | hybrid |
-| 1024×16 (16 K) | 20 ms / 10 Mbps | 5.31 s | **4.43 s** | hybrid (and growing) |
-| 1024×16 (16 K) | 20 ms / 50 Mbps | **1.68 s** | 2.82 s | mpc |
-
-Wire traffic at 1024×16: pure MPC moved **69,924 messages / 6.2 MB**
-between parties; the hybrid's MPC segment moved **256 messages / 8.7 KB**
-(the rest crosses once as ciphertexts). So the crossover is real and sits
-where predicted — parameters ≳ 4 K with few outputs — but it is
-**bandwidth-gated**: at 50 Mbps the same 16 K-parameter layer flips back
-to MPC, because 6.2 MB simply stops hurting. (Finding this required
-fixing the harness's bandwidth model to serialize bulk transfers
-cumulatively, like a real pipe — the old per-message model undercharged
-exactly the byte-heavy phases this experiment is about, and there is a
-regression test pinning the corrected behavior.) The hybrid's remaining
-floor is its ReLU segment (~2× pure MPC's relu rounds, since the share
-import adds a round per component) — which is why the regime is "few
-ReLUs" specifically: the linear phase is where the hybrid wins, and the
-nonlinearity is where it still pays MPC prices plus conversion round
-trips.
-- **Scheme switching still rescues CKKS entirely** (exact ReLU in
-  milliseconds vs an approximate one costing 8.5 s/element in a
-  degree-32768 context), and **hybrid-TFHE's honest negative result
-  stands**: TFHE's linear phase (67.5 s) dominates and the conversion
-  costs more than its native PBS ReLU — switching pays only when it
-  replaces *many* FHE ops, not one comparison.
-
----
-
-## The headline: deep private inference with ZERO bootstrapping (`baru bench-deep-nn`)
-
-This is the result the whole stack was built toward, and the basis of the
-paper outline in [`docs/paper-outline.md`](docs/paper-outline.md). For where
-the pipeline's time actually goes today and what to optimise next, see
-[`docs/private-inference-performance.md`](docs/private-inference-performance.md).
-
-**The claim.** In the hybrid pipeline, the scheme switch that computes each
-ReLU *also refreshes the ciphertext*: the switch-back re-encrypts from
-scratch ([`shares_to_fhe`](src/hybrid/mod.rs) → `key_pow = 1`, fresh noise),
-so **the FHE noise budget resets at every layer boundary**. The MPC round
-trip *is* an interactive functional bootstrap. Therefore a network of
-**arbitrary depth** runs with **zero FHE bootstraps**, cost **linear in
-depth**, using an FHE engine (SI-NTRU) that supports only a *single*
-multiplication. A leveled-FHE competitor (CKKS/BGV) must bootstrap every
-few layers or exhaust its modulus chain; we never bootstrap.
-
-**Measured** (this machine, deep fully-connected ReLU net, width 16,
-weights *and* activations encrypted, real ABY3 protocol, exact integer
-fixed-point):
-
-```sh
-./target/release/baru bench-deep-nn --depths 2,4,8,16,32 --width 16
-```
-
-| depth | exact? | total | fhe | switch | mpc | msgs | bytes | our bootstraps | CKKS-competitor bootstraps |
-|---|---|---|---|---|---|---|---|---|---|
-| 2  | ✓ | 0.55 s | 80 ms | 119 ms | 298 ms | 768 | 24 KB | **0** | 0 |
-| 4  | ✓ | 1.09 s | 153 ms | 232 ms | 653 ms | 1,536 | 49 KB | **0** | 1 |
-| 8  | ✓ | 2.31 s | 304 ms | 471 ms | 1.49 s | 3,072 | 98 KB | **0** | 3 |
-| 16 | ✓ | 4.40 s | 598 ms | 986 ms | 2.76 s | 6,144 | 197 KB | **0** | 7 |
-| 32 | ✓ | 8.76 s | 1.18 s | 2.07 s | 5.46 s | 12,288 | 393 KB | **0** | 15 |
-
-Every row is **bit-exact** against the plaintext integer network (if noise
-accumulated, deep outputs would diverge — they don't, which is the
-empirical proof of the noise-reset invariant). Total time, messages, and
-bytes are all **perfectly linear in depth** (2→32 is 16×; total 0.55→8.76 s
-is 16.0×). Our bootstrap count is a flat **0**; the competitor's grows
-∝ depth.
-
-The competitor column is not fabricated: it uses *our own measured*
-per-ReLU level cost from `bench-ckks-compare`
-(`CkksCompareBackend::levels_for_relu` = 9 levels at 2 iterations, + 1 for
-the linear map = 10 levels/layer), with a stated conservative 20
-levels-recovered-per-bootstrap assumption — `⌈(10·L − 20)/20⌉` → 0, 1, 3,
-7, 15. The *shape* (∝ depth vs flat 0) is the point, and each CKKS
-bootstrap costs seconds in a degree-32768 context (see the CKKS section
-above). Everything is `--json`-emittable and reproducible; nothing is
-hand-entered.
-
-Two design choices make deep chains work (both documented in
-`src/bench/deep_nn.rs`): a **fused ReLU∘rescale** (`a' = ReLU((W·a + β≪s)≫s)`
-from one `a2b`, keeping fixed-point magnitude bounded at any depth), and
-**per-layer independent MPC sessions** whose only carried state is the
-scheme-switch ciphertext — i.e. the interactive bootstrap made concrete.
-
-### Private *training*, not just inference (`baru bench-train`)
-
-The whole stack so far assumes a model already exists. This closes the loop:
-a least-squares classifier is **trained by SGD entirely under the real
-3-party ABY3 protocol** — the training data stays secret-shared, and every
-forward pass, gradient, and weight update is an oblivious computation
-composed from `crate::gadgets` — then the trained model does private
-inference on a held-out example. "Encrypted data in → train → encrypted
-inference," end to end.
-
-The one design choice that makes this tractable: **MSE loss instead of
-softmax.** Softmax-cross-entropy's gradient needs `exp`/`log`/division (the
-transcendental wall again); regressing to one-hot targets with squared
-error gives a gradient that is purely `sub`/`mul`/shift — no nonlinearity in
-the loss at all (`forward z=W·x+b; δ=z−y; ∂W=δ⊗x; W-=∂W≫lr`, the shift being
-the new `gadgets::arith_shr` signed arithmetic shift). Every step is exact
-integer fixed-point, so the encrypted run matches a plaintext integer-SGD
-reference **bit-for-bit**. Measured (`bench-train`, 12 samples, 6 binary
-features, 3 classes, 20 epochs, lr = 2⁻⁴, real protocol):
-
-```
-loss (MSE): 65536 → 7172   (89% reduction, monotone)
-train accuracy: 100%
-encrypted model == plaintext model: EXACT (bit-for-bit)
-held-out example: classified correctly (only the class index revealed)
-FHE bootstraps: 0     MPC wire: 105,162 msgs / 3.8 MB
-```
-
-Honest framing: training is naturally an MPC computation (as in SecureML /
-ABY3's own training experiments), so "0 bootstraps" is trivially true on
-this side — the paper's no-bootstrap *FHE* contribution is the *inference*
-deployment, and this module completes the private-ML lifecycle around it,
-showing the same UC-gadget library composes a full SGD trainer. Correctness
-is exact; *accuracy* is a property of the (synthetic, separable) data,
-reported separately.
-
-**Backpropagation *through ReLU* (`--hidden H`).** The linear case above
-converges provably; adding a hidden layer makes it a real (non-convex)
-network whose backward pass differentiates a nonlinearity — and it stays
-inside the gadget library, because `ReLU′(z) = (z > 0)` is exactly the mask
-`gadgets::relu` already computes (reused from the forward pass for the
-backward). The whole loop — `z1=W1·x+b1; a1=ReLU(z1); z2=W2·a1+b2` forward,
-`δ2=z2−y; ∂W2=δ2⊗a1; δ1=(W2ᵀδ2)⊙step(z1); ∂W1=δ1⊗x` backward, arith-shift
-updates — runs under the real protocol and the trained model matches the
-plaintext integer reference **bit-for-bit**:
-
-```sh
-./target/release/baru bench-train --hidden 8 --epochs 16 --lr-shift 6 --lr2-shift 9
-# 6 -> 8 (ReLU) -> 3 | loss 64366 -> 39013 (39%), acc 50%
-# encrypted model (backprop through ReLU) == plaintext: EXACT (bit-for-bit)
-```
-
-Two honest notes: the two layers need **different learning rates**
-(`∂W1 = W2ᵀδ2 ⊙ step ⊗ x` is smaller than `∂W2 = δ2 ⊗ a1` by the scale of
-`W2`, so one rate freezes one layer or destabilizes the other), and
-unregularized *integer* SGD **diverges past a stable regime** — an ML
-tuning matter (gradient clipping / regularization), entirely orthogonal to
-the crypto claim, which is that **private backprop through a nonlinearity
-is exact**. Deeper nets and softmax loss remain future work.
-
-### A real CNN through the hybrid pipeline (`baru bench-cnn`)
-
-The gadget library composes into a full convolutional classifier that runs
-end-to-end through the actual hybrid pipeline — FHE ct×ct linear layers, MPC
-nonlinearities, **zero FHE bootstraps** — verified **bit-exact** against the
-plaintext reference:
-
-```
-1×D×D image → conv(OC, 3×3) → ReLU∘rescale → maxpool(2×2) → dense(→10) → argmax → class
-```
-
-Both the image *and* the weights are encrypted. The convolution uses the
-reversed-axis coefficient packing described above, and reuses the same
-scheme-switch machinery as `bench-deep-nn`; only the nonlinearities differ
-(ReLU fused with the fixed-point rescale; max-pool and argmax are the
-`crate::gadgets`). `--gc` swaps the nonlinearity protocol, `--both` runs the
-pair and prints the ratio, and every run prints the MPC **phase breakdown**
-— the thing whose absence hid an 8.3× win for months. Measured, this machine:
-
-| network | class | bootstraps | total | fhe | mpc | breakdown |
-|---|---|---|---|---|---|---|
-| D=8, rtt=0 | exact ✓ | **0** | 1.17 s | 957 ms | 184 ms | import 8 / relu 47 / pool 59 / argmax 60 ms |
-| D=8, rtt=20 ms | exact ✓ | **0** | 2.45 s | 1.19 s | 1.24 s | import 40 / relu 176 / pool 420 / argmax 546 ms |
-| D=28, rtt=0 | exact ✓ | **0** | 2.54 s | 1.36 s | 1.15 s | import 9 / relu 615 / pool 467 / argmax 55 ms |
-| D=28, rtt=0, `--gc` | exact ✓ | **0** | 1.99 s | 1.35 s | 609 ms | import 11 / relu 407 / pool 155 / argmax 27 ms |
-| D=28, `--gc --precompute` | exact ✓ | **0** | **1.31 s** | 695 ms | 600 ms | + 680 ms offline |
-
-At **rtt=0 the FHE side is now the majority** of the run — the reverse of what
-this section used to claim. The breakdown is also what surfaced the two
-optimizations above: the import row (once 19.1 s) and the argmax row (once
-1.31 s at rtt=20) were both invisible in a segment-level `mpc` total.
-**Correctness is
-exact; accuracy** on a real dataset is the orthogonal ML step — see
-`bench-mnist` (98.89%) and `bench-medmnist` (private diagnosis) above.
-Coefficient packing bounds this to small D; CIFAR-scale needs SIMD-slot conv
-packing (Gazelle-style) — the noted next crypto-engineering step, independent
-of the no-bootstrap result.
-
-> Building this surfaced two real transport-only bugs the earlier
-> benchmarks couldn't reach (they only ever compared secrets against zero):
-> `aby3_protocol::share_public` produced an inconsistent replicated share
-> (party 2's wraparound component was zeroed — invisible to `reveal`, wrong
-> under multiplication), and `b2a` returned a share carrying the bit-width
-> of its input bits (`1`) rather than the recomposed value's, so a
-> downstream comparison decomposed a single bit. Both are fixed, with
-> regression tests. That the *composition* (CNN) caught bugs the *unit*
-> paths didn't is itself the argument for the UC-gadget approach.
-
-### Circuit generation: where Baru beats hand-written code (`baru bench-circuit`)
-
-`bench-abstraction` above measures the *eager* APIs. The **compiled** path —
-`Expr` → `CircuitCompiler` → `FlatOp` → `mpcc` — is different, because there
-Baru is a circuit language and can rewrite before anything runs:
-
-```
-  program          n      ops ops/no-cse   interactive   rounds
-  relu-layer       1        3          3             3        3
-  relu-layer      64      192   255 (1x)           129        3
-  dot             64      127        127            65        2
-  max-fold         8       28 4372 (156x)            15       15
-```
-
-**Independent work batches automatically.** ReLU-layer rounds are *flat in
-width* — 3 at n=1 and 3 at n=64, while interactive ops grow 3 → 129. ASAP
-scheduling over the dependence DAG puts every independent operation at one
-level, with no vectorized IR and no user effort. That is what the hand-written
-route needs explicit `lt_batch`/`mul_batch` for, and what the gadget library
-had to be patched three times to get right — so **on this axis the compiler is
-already ahead of hand-writing.**
-
-**Dependent reductions needed a rewrite, and now have one.** A fold is a
-chain, and ASAP is optimal for a fixed lowering but cannot reassociate.
-`Rule::ReassociateReduction` recognises an associative reduction whose
-operator is a repeated *subgraph shape* — a maximum is `acc + (x>acc)·(x−acc)`,
-four instructions, which `Rule::Reassociate` cannot see — and rebalances the
-chain into a tournament, `2n−1` rounds → `2⌈log₂ n⌉+1`:
-
-| max-fold | as written | rebalanced |
-|---|---|---|
-| n=4 | 7 rounds | 5 |
-| n=8 | 15 | **7** |
-| n=10 | 19 | **9** |
-
-End to end under Shamir: **65 → 29 rounds (2.21×)**, instruction count
-unchanged, differentially verified. This is the transformation `gadgets::argmax`
-and `max_reduce` needed *by hand*; the compiler now derives it for any
-associative operator — and refuses it for non-associative ones, since a
-subtraction fold is left alone. Associativity is tested by evaluation, not
-assumed, because the optimizer accepts rewrites on cost rather than semantics.
-
-**CSE was missing from the compile path entirely, and now isn't.** `mpcc::opt`
-had a `Cse` rule reachable only from `baru mpcc optimize`; `compile_fhe` ran
-constant folding and dead-wire elimination and nothing else, so every circuit
-handed to FHE or ZKP carried the source's redundancy. A fold written the
-obvious way repeats its accumulator subtree per step and flattens
-*exponentially*. The pass now runs inside `CircuitCompiler`:
-
-| circuit | before | after |
-|---|---|---|
-| max-fold n=8 | 4372 ops | 28 ops (156×) |
-| **MNIST demo** | **2365 gates** | **1764 gates (−25%)** |
-
-MNIST scores bit-identical, all 18 FHE differential tests pass (real TFHE and
-SEAL CKKS included). At TFHE's ~0.2–0.5 s/gate, those 601 gates are minutes
-per run.
-
-### The same program, a different circuit per backend (`baru bench-backend-aware`)
-
-The claim nobody else makes. MP-SPDZ optimizes rounds and is blind to FHE; FHE
-compilers optimize multiplicative depth and are blind to MPC; HyCC → Silph →
-SING assign *protocols* to parts of a program but do not rewrite the circuit
-differently per target.
-
-One program, optimized once per backend, then every circuit priced under every
-backend (WAN, 3 parties, n=8, all differentially verified):
-
-```
-max-fold        as shamir  as semi-bin     as bmr    rules kept
-  shamir       1453.010ms*  3761.043ms   281.564ms   reassociate-reduction
-  semi-bin     1453.010ms   3761.043ms*  281.564ms   reassociate-reduction
-  bmr          3253.010ms   8761.043ms   281.564ms*  -
-```
-
-`*` marks each circuit under the backend it was optimized for. **The same
-rewrite is a 2.24× win under Shamir and worth nothing under BMR** — depth is
-the round count for an interactive protocol and free for a constant-round
-garbled one — so the optimizer keeps it for one and declines it for the other.
-Running BMR's circuit under Shamir costs 2.24×.
-
-Across `relu-layer`, `max-fold` and `dot-const`: **2, 2 and 3 distinct
-circuits from one program**, worst wrong-circuit penalties 1.66× / 2.33× /
-1.81×. The command fails if the diagonal is ever beaten.
-
-### A whole network: hand-written vs compiled (`baru bench-compiled-nn`)
-
-The question the circuit-optimization paper is actually about. Same network —
-`x(n) → dense(h) → ReLU → dense(c) → max`, **secret weights** — evaluated two
-ways over the *same* 3-party transport, both checked bit-exact against a
-plaintext integer reference:
-
-- `gadget` — Rust calling `gadgets::{dense, relu, max_reduce}` (the batched
-  expert baseline)
-- `compiled` — the same network as a **Baru expression**, through
-  `CircuitCompiler` → `FlatOp` → `mpcc::exec`, a level-batched executor
-
-The source says nothing about batching — it is scalar arithmetic, a mux-style
-ReLU and a left-fold `max`. n=32, h=16, c=8, RTT 20 ms:
-
-| route | ops | interactive calls | messages | wall-clock |
-|---|---|---|---|---|
-| `gadget` (expert) | — | 39 | 95 | 677 ms |
-| `compiled` | 1317 | 27 | 87 | 1272 ms |
-| `compiled+reassoc` | 1317 | **15** | **47** | 663 ms |
-
-**0.38× the interactive calls and 0.49× the messages of expert hand-written
-code**, at parity on wall-clock. The command also prints an **ablation
-ladder** attributing each pass — ASAP batching is 285× on interactive calls,
-CSE is 68× on circuit size and 30× on bytes, reassociation is 1.25× on
-rounds. The passes act on different axes and none substitutes for another,
-which is why the ladder is reported rather than one number. The advantage *grows with width*: the
-compiled route stays at 15 interactive calls while the expert route goes
-31 → 39, because ASAP scheduling batches every independent operation however
-many there are.
-
-Two honest notes. **Without `ReassociateReduction` the compiled route loses**
-(1.88× wall-clock) — the expert's `max_reduce` is a hand-written tournament,
-and that ablation is what shows which compiler pass buys what. And **the
-wall-clock is parity, not a win**: both routes perform the same number of
-comparison layers, which dominate latency; the compiler's gain is in
-multiplies and sharing.
-
-### Composable gadget library: arbitrary private CNNs, secure by construction (`src/gadgets/`)
-
-> **Composition has to be free in cost too, and once it wasn't.** Every gadget
-> was originally written the way its definition reads — one `lt`+`mul` *per
-> element* for `relu`, one `mul` *per weight* for `dense`, a left fold for
-> `max_reduce`. All correct, all secure, and all serializing a layer into
-> `O(n)` dependent rounds. Measured on a 64-wide layer over the real transport
-> (`baru bench-abstraction`): **5–14× the messages and 9–45× the wall-clock at
-> RTT 20 ms**, with byte counts within 5% and outputs bit-identical. The
-> gadgets are now defined over the *batched* primitives and match hand-written
-> batched code message for message; a test pins that, and the benchmark keeps
-> the per-element form as a control so the gap stays reproducible.
-
-The depth result above is about *chaining* — and the point of chaining is
-composition. `src/gadgets/` is a small library of MPC building blocks, each
-a pure function of the oblivious primitives (`add`/`sub`/`mul`/`lt`/
-`share_public`): `relu`, `max2`/`max_reduce`/`maxpool2d`, `argmax`,
-`dense`, `conv2d`. Every one ships with a plaintext reference and is tested
-for **bit-exact** equality, not approximation.
-
-Why this matters for the paper (see [`docs/paper-outline.md`](docs/paper-outline.md)
-§5b): Baru is effectively an **Arithmetic Black Box** — it manipulates
-secrets only through opaque handles and a fixed primitive set, never
-inspecting the representation. So if each primitive UC-realizes its ideal
-operation, each gadget does too (UC composition), and **any network
-composed from these gadgets is secure and correct by construction** — no
-per-architecture proof. The research question becomes "which architecture is
-*fastest*," not "is this one secure."
-
-As evidence the composition is semantically exact, not just type-correct,
-the library includes an end-to-end LeNet-shaped classifier —
-`conv → relu → maxpool → flatten → dense → relu → dense → argmax` — that
-runs entirely through the gadgets, matches its plaintext reference
-bit-for-bit, and reveals **only the class index** (`argmax` is the escape
-from the transformer softmax wall: a CNN *classifier* needs argmax over
-logits, never `exp`/division). Adding channels, conv blocks, or residual
-connections needs no new security argument. Convolution here is the
-correctness/composition form (direct MACs / im2col-matvec); the efficient
-FHE conv *packing* for CIFAR-scale speed is the noted remaining
-crypto-engineering step.
-
-### Flagship demo: private MNIST, encrypted model *and* image (`baru demo-private-mnist`)
-
-The audience-facing version. A handwritten digit (real MNIST sample) and a
-trained discriminator are **both encrypted**; the 784-pixel dot product is
-**one** SI-NTRU ciphertext×ciphertext multiplication (decrypted under f² —
-no bootstrapping, no evaluation keys); the class decision is a real 3-party
-ABY3 threshold comparison that reveals **only the final bit**. Nobody —
-not the evaluator, not the MPC parties, not even the client — ever sees the
-score, only the predicted digit. (This is the leak the reference `hom-ham`
-iris pipeline has — `DecryptMul` reveals the raw distance — closed by
-thresholding under MPC.) Encrypting the *model* is a strictly stronger
-privacy setting than Gazelle/Delphi/Cheetah, whose server holds the model
-in plaintext.
-
----
-
-## Precompiled gadgets (`src/precompile/`)
-
-The benchmark above found a real bottleneck: naive MPC has no batching, so
-cost scales linearly with element count. **Precompiles** are the fix, and a
-pattern for future ones: a named Rust trait per (operation, backend family)
-— a **Gadget** — that multiple implementations can satisfy, a
-[`Registry`](src/precompile/mod.rs) that tracks them plus which one is the
-current **champion** (dispatch target, set by a maintainer — see the module
-doc for why this is deliberately a reviewed decision, not an automated
-market), and a Baru builtin (`matvec`, in `Participant::register_builtins`)
-that calls the champion directly against the live backend instead of a Baru
-program re-deriving the same loop.
-
-The first gadget, `mpc_matvec::MpcMatVec`, ships two implementations:
-`NaiveMatVec` (the original per-element loop) and `BatchedMatVec`, which
-flattens the *entire* matrix's multiplications into one
-[`Backend::mul_batch`](src/interpreter/backend.rs) call — one batched ABY3
-reshare (`aby3_protocol::mul_batch_party`, a single `MpcMsg::TaggedZBatch`
-per party) collapsing the resharing from O(n) rounds to one, regardless of
-shape. `Backend::mul_batch`
-has a default (loop over `mul`) so every other backend keeps working
-unmodified; only `TransportBackend` overrides it with the real batched path.
-
-Compare registered precompiles yourself — every entry, same measurement,
-side by side:
-
-```sh
-./target/release/baru bench-nn --workload matvec --backends mpc --competition
-```
-
-| shape | naive | batched | speedup | messages (naive → batched) |
-|---|---|---|---|---|
-| matvec(8×8) | 178.8ms | 16.4ms | 10.9× | 944 → 308 |
-| matvec(64×32) | 5772.2ms | 56.8ms | 101.6× | 28,992 → 8,516 |
-| matvec(128×64) | 25.3s | 127.2ms | **199×** | 115,328 → 33,412 |
-
-Both agree with the plaintext reference at every shape (`bench/nn.rs`'s and
-`precompile/mpc_matvec.rs`'s tests hold this invariant permanently — a
-Precompile that disagrees with plaintext is a bug, full stop, independent of
-how fast it is). `matvec-batched` is the registry's champion today.
-
----
-
-## Model import & quantization (`src/ml/`)
-
-Every neural-net example in this repo so far (`examples/data/mnist_data.rs`)
-hand-quantized its weights once and pasted the resulting integers into a
-Rust literal array — not reproducible, and with no record of how much
-accuracy that quantization cost. `src/ml/` replaces that with a small,
-reusable pipeline: train a model in whatever framework you like, export its
-weights/biases to a plain JSON [`NetworkSpec`](src/ml/mod.rs), then:
-
-```sh
-# quantize to Q16.16 fixed-point and measure the accuracy loss on real samples
-./target/release/baru quantize --in model.json --out model.quant.json \
-    --scale-bits 16 --validate samples.json
-```
-
-`--validate` is intentionally not optional-and-silent: if you skip it, the
-CLI prints a warning rather than quietly implying the model is fine. The
-report ([`QuantizationReport`](src/ml/mod.rs)) gives max/mean absolute error
-and max relative error by comparing the float and quantized forward passes
-on the same inputs — "a bit of precision lost, but good enough for
-inference" is a number you check, not an assumption. `--scale-bits` defaults
-to 16 (required to actually load the model into Baru — see below) but can be
-set lower to study the accuracy/footprint trade-off in isolation.
-
-The quantized JSON loads straight into Baru as ordinary Lisp data:
-
-```lisp
-(let ((layers (nn-load-model "model.quant.json"))
-      (input (list (int->fixed 3) (int->fixed 1))))
-  (nn-forward layers input))
-```
-
-`nn-load-model` returns a plain list of `(weights bias activation)` triples
-— inspectable from Baru like any other value, not an opaque handle.
-`nn-forward` runs the full multi-layer forward pass (matvec + bias-add +
-activation, chained layer to layer), reusing the same `matvec` precompile
-dispatch, `vec_add`, and a new mux-based `vec_relu` — and it works
-identically whether `input` is public (`Num`/`Fixed`) or a private `Share`
-vector (or a private input against a *public* model, the common
-private-inference shape): each helper already dispatches per-element on the
-runtime type, so there is no separate "private mode" to opt into. Only
-`relu` and `identity` activations are supported today — richer
-nonlinearities need a polynomial approximation to stay oblivious, which is
-future work, not solved here.
-
----
-
-## Architecture summary
+## Repository map
 
 ```
 src/
-  interpreter/
-    parser.rs       — tokeniser + Lisp parser, :sintN sugar
-    ast.rs          — Expr / SharedValue types, Env
-    eval.rs         — trampolined reduce_expression, Participant, builtins
-    backend.rs      — Backend trait, SimBackend, Aby3Backend, TransportBackend<T>
-  crypto/
-    types.rs        — Fr (u128), Share3
-    arith.rs        — share_secret, add/sub/scalar_mul, gen_beaver_triple, mul_ab3
-    bits.rs         — a2b_ab3, xor/and/or/not on shares, lt/le/eq_ab3_signed
-    protocol.rs     — PartyShare, per-party distributed protocols (share_input,
-                       mul_party, a2b_party, reveal …)
-    sim.rs          — inproc and concurrent wrappers (mul_ab3_with_inproc, …)
-    net.rs          — Transport trait, InprocHandle, TcpTransport, MpcMsg
-    party.rs        — single-file ABY3 mul simulation (reference)
-    scheduler.rs    — broadcast round simulator with corruption injection
-  bin/
-    tcp_party.rs    — multi-party binary (inproc demo + TCP mode)
-  precompile/
-    mod.rs          — Gadget/Precompile/Registry, `baru bench-nn --competition`
-    mpc_matvec.rs   — MpcMatVec gadget: NaiveMatVec, BatchedMatVec
-  ml/
-    mod.rs          — NetworkSpec/QuantizedNetwork, `baru quantize` CLI
-  fhe/
-    ckks_backend.rs — shallow (depth <= 2) CKKS: matvec/dot, no comparisons
-    ckks_compare.rs — deep CKKS: polynomial-approximation sign/relu/compare
-    si_ntru.rs      — scale-invariant NTRU (LTV): decrypt-under-f^k instead
-                       of relinearization; packed one-mult matvecs (INSECURE
-                       reference — overstretched; see its docs)
-    bfv.rs          — BFV: the SECURE RLWE instantiation of the same one-mult
-                       inner product (no relin, decrypt under s²); n=4096
-    bgv.rs          — BGV: the same construction with the message in the LOW
-                       bits (no t/q rescale); same lattice+params as BFV, and
-                       measured indistinguishable from it
-    ntt.rs          — multi-modular NTT: exact negacyclic products over a
-                       power-of-two q, via NTT-friendly primes + Garner CRT
-    poly.rs         — runtime switch picking who computes the ring products
-                       (ntt or ntl) for every scheme above
-    slots.rs        — CRT slot packing (prime t): n INDEPENDENT values per
-                       ciphertext, what LowGear's OLE needs
-    ntl.rs          — the same product via NTL+GMP (C++ shim in `cpp/`),
-                       `--features ntl`: differential oracle for ntt.rs
-  bench/
-    ckks_compare.rs — `baru bench-ckks-compare`: measures the above
-  hybrid/
-    mod.rs          — MPC <-> FHE scheme switching (share->fhe, fhe->share,
-                       mpc_reencrypt as a bootstrapping alternative)
-  gadgets/
-    mod.rs          — composable MPC gadget library: relu, max/maxpool2d,
-                       argmax, dense, conv2d (UC-composable building blocks)
-  bench/
-    hybrid_nn.rs    — `baru bench-hybrid-nn`: one private dense layer under
-                       mpc / tfhe / ckks / hybrid-tfhe / hybrid-ckks / hybrid-ntru
-    deep_nn.rs      — `baru bench-deep-nn`: deep (L-layer) private inference,
-                       ZERO FHE bootstraps, cost linear in depth
-    cnn.rs          — `baru bench-cnn`: full conv classifier (conv/relu/
-                       maxpool/dense/argmax) through the hybrid, 0 bootstraps
-    mnist.rs        — `baru bench-mnist`: trained+quantised CNN on real MNIST
-                       test digits, encrypted, bit-exact
-    medmnist.rs     — `baru bench-medmnist`: the same pipeline on real
-                       biomedical images (MedMNIST v2) — private diagnosis
-    pir.rs          — `baru bench-pir`: cost of hiding *which* record was
-                       fetched (currently loses to a whole-db download)
-    ot.rs           — `baru bench-ot`: base OT vs IKNP extension, us/OT and
-                       bytes/OT (the input the MPC offline cost model needs)
-    layer.rs        — `baru bench-layer`: the measured MPC<->FHE crossover for one
-                       private layer (hybrid wins from width 64 vs Semi2k)
-    net.rs          — `baru bench-net`: validates the cost formula (rounds x
-                       latency + bytes/bw) against a real TCP socket
-    cohort_eval.rs  — `baru bench-cohort-eval`: cohort-conditioned private
-                       evaluation — stage 1 composed with stage 4
-    psi.rs          — `baru bench-psi`: DH-PSI measured, the insecure hash
-                       baseline, and the OT route priced from measured OT cost
-    fhe_innerprod.rs— `baru bench-fhe-innerprod`: BFV (secure) vs SI-NTRU
-                       (reference) on the minimal-FHE inner product
-    polymul.rs      — `baru bench-polymul`: exact negacyclic product —
-                       schoolbook vs our multi-modular NTT vs NTL+GMP
-    triples.rs      — `baru bench-triples`: Beaver triples from SHE (LowGear)
-                       vs from OT (Semi2k), bytes AND cpu, both measured
-    train.rs        — `baru bench-train`: private SGD training (MSE loss),
-                       gadget-composed, bit-exact, then private inference
-  demo/
-    mod.rs          — `baru demo-private-mnist`: encrypted image × encrypted
-                       model → MPC threshold → only the class bit revealed
+  interpreter/  parser, AST, trampolined evaluator, Backend trait,
+                Aby3Simulator (values only) / TransportBackend (real protocol)
+  crypto/       Fr and Share3, ABY3 protocols (mul, a2b, batched forms),
+                garbled circuits, Transport (InprocHandle / TcpTransport), TLS,
+                identity; sim.rs wraps the protocols for in-process use
+  fhe/          bfv, bgv, bgv_wide (256-bit coeffs), ckks_backend (shallow),
+                ckks_compare (deep, polynomial sign), tfhe_backend, mock_backend,
+                ntt (multi-modular, exact over power-of-two q), ntl (oracle),
+                poly (runtime backend switch), slots (CRT packing),
+                conv_pack (Cheetah-style), circuit_emitter
+  hybrid/       MPC <-> FHE scheme switching, mpc_reencrypt
+  gadgets/      relu, max2/max_reduce/maxpool2d, argmax, dense, conv2d
+  mpcc/         circuit IR, rewrite rules (opt), cost + fhe_cost + ot_cost models,
+                protocol registry, semi2k, lowgear, mixed, scheduler, VM, exec
+  zkp/          CircuitCompiler (FlatIR), Binius64 backend, proof serialization
+  ot/ psi/ pir/ Chou-Orlandi + IKNP; DH-PSI; single-server BFV PIR
+  ml/           NetworkSpec/QuantizedNetwork, `baru quantize`
+  precompile/   Gadget/Registry/champion dispatch, batched matvec
+  db/           the experiment store (BaruDB client / local JSONL backends)
+  bench/        one module per `baru bench-*` command
+  demo/         `baru demo-private-mnist`
+  bin/          tcp_party — the multi-party node
 docs/
-  paper-outline.md  — publication framing: claims, proof sketch, security
-                       model, related work, experiments, limitations
-  research-agenda.md— private AI for healthcare: the workflow, the admission
-                       rule for new primitives, measured cross-layer results
-  gadget-costs.md   — curated cost table (comparator/adder/multiplier/argmax,
-                       OT, PSI, PIR) with per-row provenance
-  related-work.md   — what SING (USENIX Sec'26) and CirC (S&P'22) say, what Baru
-                       took from each, and what it deliberately did not
-tools/
-  train_medmnist.py — trains + quantises the CNN and the linear discriminator
-                       for `bench-medmnist` / `--example mnist --pneumonia`
-.claude/skills/
-  mpcc-rewrite-rule/— how to add a backend-aware rewrite rule to `mpcc::opt`
-                       (the model proposes; the differential oracle disposes)
-tests/
-  features.rs       — unit/integration tests for the interpreter + MPC
-  tcp_integration.rs — spawns 3 tcp_party processes over TCP
+  experiments.md                  every measured result, organized by topic
+  private-inference-performance.md where the pipeline's time goes; what to do next
+  paper-outline.md                 claims, proof sketch, security model, related work
+  paper-circuit-optimization.md    the circuit-optimization paper's plan and gaps
+  mpc-compiler-roadmap.md          where `mpcc` is going
+  research-agenda.md               private AI for healthcare; the admission rule
+  gadget-costs.md                  curated cost table with per-row provenance
+  related-work.md                  what SING / CirC say, what Baru took and did not
+  malicious-hybrid.md              what malicious security would cost this design
+  barudb-api.md                    the external interface of the encrypted store
+tools/train_medmnist.py            trains + quantises the models the benches use
+paper/, paper-circuits/            LaTeX sources
+tests/                             interpreter, crypto, FHE differential, TCP
 ```
 
 ---
 
-## Known limitations / future work
+## Known limitations
 
-- **Condition leakage**: branching on a shared boolean reveals the branch taken (one bit). Oblivious branching via multiplexers is not yet implemented.
-- **Trusted triple dealer**: Beaver triples are generated by party 0 and distributed. A secure distributed triple generation protocol (e.g. via OT extension) is not yet implemented.
-- **Semi-honest only**: no authentication or abort handling; a malicious party can deviate undetected.
-- **Field size**: the 128-bit field wraps on overflow; programs requiring larger values need a proper prime-order field.
-- **Single-evaluator model**: all three parties run the same expression; multi-input programs where different parties provide different sub-expressions require additional work.
+- **Semi-honest only.** No authentication, MACs or abort handling; a malicious
+  party can deviate undetected. IKNP has a concrete gap here (an inconsistent
+  choice vector leaks the sender's bits — KOS15's correlation check is what
+  closes it), and LowGear lacks the zero-knowledge proofs of plaintext knowledge
+  that make Overdrive malicious-secure. What malicious security would cost is
+  sketched in [`docs/malicious-hybrid.md`](docs/malicious-hybrid.md).
+- **The scheme switch simulates threshold decryption** with a single client key.
+  A real deployment needs distributed-key threshold FHE; the data flow is already
+  the right one.
+- **Condition leakage.** `if` on a shared boolean reveals the branch taken. Use
+  mux-style expressions for oblivious code.
+- **CKKS is approximate**, and its exact-comparison story is polynomial
+  approximation with real error (measured, not hand-waved).
+- **Ring size.** The 128-bit ring wraps on overflow; there is no prime-order
+  field.
+- **Single-evaluator model.** All parties evaluate the same expression text.
+- **Coefficient packing bounds image size.** CIFAR-scale convolution needs
+  SIMD-slot packing (Gazelle-style) — a known next step, independent of the
+  no-bootstrap result.
 
 ---
 

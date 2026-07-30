@@ -183,7 +183,7 @@ fn score_expr_mpc(ds: &Dataset, img: &[i64]) -> String {
 
 fn eval_types(src: &str) -> Types {
     let expr = parse(src).expect("parse");
-    Participant::new(0).eval_quiet(&expr)
+    Participant::new_simulated(0).eval_quiet(&expr)
 }
 
 /// Plain-interpreter fixed score (raw Q16.16).

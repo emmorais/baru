@@ -4,7 +4,7 @@
 //! `fhe::ntl`'s own tests check that NTL and the multi-modular NTT agree on
 //! raw coefficient vectors, and `fhe::poly`'s check the dispatch layer. This
 //! file checks the level that actually matters: encrypt → multiply → decrypt,
-//! through BFV, BGV and SI-NTRU, with the backend switched underneath. A
+//! through BFV and BGV, with the backend switched underneath. A
 //! product that is exact in isolation could still be wired up wrongly (a
 //! prepared-operand path that skips a component, a centering convention that
 //! differs), and only a scheme-level test catches that.
@@ -18,7 +18,6 @@
 use baru::fhe::bfv::{Bfv, BfvParams};
 use baru::fhe::bgv::{Bgv, BgvParams};
 use baru::fhe::poly::{self, Backend};
-use baru::fhe::si_ntru::{SiNtru, SiNtruParams};
 
 /// A small deterministic matvec problem and its plaintext answer.
 fn problem() -> (Vec<i64>, Vec<Vec<i64>>, Vec<i64>) {
@@ -59,18 +58,6 @@ fn bgv_matvec(params: BgvParams) -> Vec<i64> {
         .collect()
 }
 
-fn si_ntru_matvec(params: SiNtruParams) -> Vec<i64> {
-    let s = SiNtru::new(params);
-    let (ck, pk) = s.keygen();
-    let (x, w, _) = problem();
-    let cx = s.encrypt_poly(&pk, &s.pack_input(&x));
-    let cw = s.encrypt_poly(&pk, &s.pack_weights(&w));
-    let out = s.decrypt_poly(&ck, &s.mul(&cx, &cw));
-    (0..w.len())
-        .map(|r| s.to_signed(out[s.matvec_output_position(x.len(), r)]))
-        .collect()
-}
-
 /// Run `f` under every backend this build has, and require all of them to
 /// produce `expected`.
 fn under_every_backend(label: &str, expected: &[i64], f: impl Fn() -> Vec<i64>) {
@@ -98,14 +85,6 @@ fn bgv_matvec_agrees_under_every_backend() {
     });
 }
 
-#[test]
-fn si_ntru_matvec_agrees_under_every_backend() {
-    let (_, _, expected) = problem();
-    under_every_backend("SI-NTRU packed matvec", &expected, || {
-        si_ntru_matvec(SiNtruParams::TEST_SMALL)
-    });
-}
-
 /// The same at the **deployed** parameters, where the ring dimension and
 /// coefficient width are the ones the backends actually have to agree on.
 /// Slow in debug, ~ms in release.
@@ -115,9 +94,6 @@ fn deployed_parameters_agree_under_every_backend() {
     let (_, _, expected) = problem();
     under_every_backend("BFV n=4096", &expected, || bfv_matvec(BfvParams::DEFAULT));
     under_every_backend("BGV n=4096", &expected, || bgv_matvec(BgvParams::DEFAULT));
-    under_every_backend("SI-NTRU n=2048", &expected, || {
-        si_ntru_matvec(SiNtruParams::DEFAULT)
-    });
 }
 
 /// Asking for a backend the build does not have must fail loudly. A benchmark

@@ -486,7 +486,7 @@ fn op_kind(op: &FlatOp) -> &'static str {
 mod tests {
     use super::*;
     use crate::fhe::bfv::{Bfv, BfvAdapter, BfvParams};
-    use crate::interpreter::aby3_backend::Aby3Backend;
+    use crate::interpreter::aby3_simulator::Aby3Simulator;
     use crate::interpreter::parse;
     use crate::zkp::circuit_compiler::CircuitCompiler;
 
@@ -526,7 +526,7 @@ mod tests {
         let b: Vec<i64> = (0..n).map(|i| ((i * 3) as i64 % 7) - 3).collect();
         let want: i64 = a.iter().zip(&b).map(|(x, y)| x * y).sum();
 
-        let bind = |be: &mut Aby3Backend| -> HashMap<String, ShareRef> {
+        let bind = |be: &mut Aby3Simulator| -> HashMap<String, ShareRef> {
             let mut m = HashMap::new();
             for i in 0..n {
                 let av = (a[i] as i128).rem_euclid(1i128 << NBITS) as Fr;
@@ -542,7 +542,7 @@ mod tests {
         let fhe = BfvAdapter(&s);
 
         // All-MPC.
-        let mut be = Aby3Backend::new();
+        let mut be = Aby3Simulator::new();
         let env = bind(&mut be);
         let (r_mpc, st_mpc) = run_mixed(
             &mut be,
@@ -562,7 +562,7 @@ mod tests {
         let mut asg = HashMap::new();
         asg.insert("mul".to_string(), Side::Fhe);
         asg.insert("add".to_string(), Side::Fhe);
-        let mut be2 = Aby3Backend::new();
+        let mut be2 = Aby3Simulator::new();
         let env2 = bind(&mut be2);
         let (r_mix, st_mix) =
             run_mixed(&mut be2, &fhe, &ck, &flat, &env2, &out, NBITS, &Placement::by_kind(asg)).unwrap();
@@ -609,8 +609,8 @@ mod tests {
         });
         let (ck, _pk) = s.keygen();
 
-        let mut be = Aby3Backend::new();
-        let sh = |be: &mut Aby3Backend, v: &[i64]| -> Vec<ShareRef> {
+        let mut be = Aby3Simulator::new();
+        let sh = |be: &mut Aby3Simulator, v: &[i64]| -> Vec<ShareRef> {
             v.iter()
                 .map(|&x| {
                     let r = (x as i128).rem_euclid(1i128 << W) as Fr;
@@ -651,7 +651,7 @@ mod tests {
             log2_t: 30,
         });
         let (ck, _pk) = s.keygen();
-        let mut be = Aby3Backend::new();
+        let mut be = Aby3Simulator::new();
         let v: Vec<ShareRef> = (0..64).map(|_| be.share_secret(1, 20, 0)).collect();
         let err = packed_dot(&mut be, &s, &ck, &v, &v, 20).unwrap_err();
         assert!(err.contains("plaintext modulus"), "{err}");
@@ -684,7 +684,7 @@ mod tests {
         let mut kinds = HashMap::new();
         kinds.insert("mul".to_string(), Side::Fhe);
 
-        let setup = |be: &mut Aby3Backend| -> HashMap<String, ShareRef> {
+        let setup = |be: &mut Aby3Simulator| -> HashMap<String, ShareRef> {
             let mut env = HashMap::new();
             for i in 0..n {
                 for nm in ["a", "b", "c", "e"] {
@@ -695,14 +695,14 @@ mod tests {
             env
         };
 
-        let mut be1 = Aby3Backend::new();
+        let mut be1 = Aby3Simulator::new();
         let env1 = setup(&mut be1);
         let flat_c = flat.clone();
         let p_kind = Placement::by_kind(kinds.clone());
         let (r1, st1) =
             run_mixed(&mut be1, &fhe, &ck, &flat_c, &env1, &out, NBITS, &p_kind).unwrap();
 
-        let mut be2 = Aby3Backend::new();
+        let mut be2 = Aby3Simulator::new();
         let env2 = setup(&mut be2);
         let p_sunk = Placement::by_kind(kinds).sink_to_fhe(&flat);
         let (r2, st2) =
@@ -734,7 +734,7 @@ mod tests {
         let mut asg = HashMap::new();
         asg.insert("mul".to_string(), Side::Fhe);
 
-        let mut be = Aby3Backend::new();
+        let mut be = Aby3Simulator::new();
         let mut env = HashMap::new();
         let vals = [3i64, 2, 4, 5];
         for (i, n) in ["a0", "b0", "a1", "b1"].iter().enumerate() {

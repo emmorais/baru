@@ -7,7 +7,7 @@ use std::path::Path;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
-use crate::interpreter::aby3_backend::Aby3Backend;
+use crate::interpreter::aby3_simulator::Aby3Simulator;
 use crate::interpreter::ast::{Env, Expr, Types};
 use crate::interpreter::backend::Backend;
 use crate::interpreter::parse;
@@ -1292,9 +1292,18 @@ enum PersistValue {
 }
 
 impl Participant {
-    pub fn new(id: usize) -> Self {
+    /// A participant backed by the in-process
+    /// [`Aby3Simulator`](crate::interpreter::aby3_simulator::Aby3Simulator).
+    ///
+    /// This is the right constructor for evaluating an expression on its own —
+    /// a correctness baseline, a test, a plaintext-vs-MPC comparison — and it is
+    /// the *only* one that can, because a single party of the real protocol has
+    /// no peers to exchange with and would block forever. For anything whose
+    /// timings or message counts are reported, use [`Participant::new_transport`]
+    /// with three parties running concurrently.
+    pub fn new_simulated(id: usize) -> Self {
         let backend: Arc<Mutex<Box<dyn Backend>>> =
-            Arc::new(Mutex::new(Box::new(Aby3Backend::new())));
+            Arc::new(Mutex::new(Box::new(Aby3Simulator::new())));
         let store: Env = Rc::new(RefCell::new(HashMap::new()));
         let participant = Participant {
             id,
@@ -2624,8 +2633,9 @@ impl Participant {
     }
 
     /// Content-addressed commitment to this participant's current top-level
-    /// environment, via the hash-consed store.  Serves as a state root that
-    /// consensus can agree on each epoch.
+    /// environment, via the hash-consed store: a 32-byte state root that two
+    /// parties can compare to decide whether they hold the same environment,
+    /// without exchanging it.
     pub fn env_root(&self) -> [u8; 32] {
         let mut store = crate::interpreter::hashcons::Store::new();
         let root = store.intern_env(&self.store);
@@ -3293,7 +3303,7 @@ fn int_to_fr_signed(n: i64, nbits: usize) -> u128 {
 /// Evaluate a plain (non-shared) expression and return the numeric result.
 pub fn eval_plain(src: &str) -> i64 {
     let expr = parse(src).expect("parse failed");
-    let p = Participant::new(0);
+    let p = Participant::new_simulated(0);
     match p.eval(&expr) {
         Types::Num(n) => n,
         other => panic!("expected Num, got: {:?}", other),
@@ -3303,7 +3313,7 @@ pub fn eval_plain(src: &str) -> i64 {
 /// Evaluate a plain (non-shared) expression and return the numeric result.
 pub fn eval_plain_string(src: &str) -> String {
     let expr = parse(src).expect("parse failed");
-    let p = Participant::new(0);
+    let p = Participant::new_simulated(0);
     match p.eval(&expr) {
         Types::Num(n) => {
             println!("eval_plain: numeric value: {}", n);
@@ -3322,7 +3332,7 @@ pub fn eval_plain_string(src: &str) -> String {
 /// reconstructed value interpreted as a signed 32-bit integer.
 pub fn eval_shared(src: &str) -> i64 {
     let expr = parse(src).expect("parse failed");
-    let p = Participant::new(0);
+    let p = Participant::new_simulated(0);
     match p.eval(&expr) {
         // Plain Num may carry a raw u128 field value stored as i64 bits; reinterpret as signed 32.
         Types::Num(n) => (n as u32) as i32 as i64,
@@ -3341,7 +3351,7 @@ pub fn eval_shared(src: &str) -> i64 {
 /// `fhe-dec` inside the expression to convert a ciphertext to a number.
 pub fn eval_fhe(src: &str) -> i64 {
     let expr = parse(src).expect("parse failed");
-    let p = Participant::new(0);
+    let p = Participant::new_simulated(0);
     match p.eval(&expr) {
         Types::Num(n) => n,
         other => panic!("eval_fhe: expected Num, got: {:?}", other),
@@ -3357,7 +3367,7 @@ mod fixed_point_tests {
     /// Evaluate a Baru source string through a fresh Participant and return the result.
     fn eval_str(src: &str) -> Types {
         let expr = parse(src).expect("parse failed");
-        let p = Participant::new(0);
+        let p = Participant::new_simulated(0);
         p.eval(&expr)
     }
 

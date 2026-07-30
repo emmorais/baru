@@ -22,7 +22,7 @@
 //!   mpc         3-party ABY3 over `TransportBackend`, wrapped in
 //!               [`super::comm`]'s counting/latency `Transport` decorators —
 //!               the *real* replicated-secret-sharing wire protocol (not the
-//!               legacy `Aby3Backend` simulator), so message counts/bytes are
+//!               legacy `Aby3Simulator` simulator), so message counts/bytes are
 //!               genuine.  Both the input vector and the weight matrix are
 //!               secret-shared (the fully-private setting).
 //!   fhe-mock    integer FHE pipeline on plaintext u64 "ciphertexts" (instant;

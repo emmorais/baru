@@ -20,11 +20,11 @@
 //! ([`crate::fhe::ntt::exact_negacyclic_product_wide`]).
 //!
 //! Making `bgv.rs` generic over coefficient width was the alternative. This
-//! repo has already answered that question the other way: `bfv.rs`, `bgv.rs`
-//! and `si_ntru.rs` each carry their own `poly_add` / `center` /
-//! `sample_ternary`, because self-contained schemes read better than a shared
-//! abstraction over three slightly different rings. A fourth instance at a
-//! fourth parameter regime follows the house pattern, and — the deciding
+//! repo has already answered that question the other way: `bfv.rs` and
+//! `bgv.rs` each carry their own `poly_add` / `center` / `sample_ternary`,
+//! because self-contained schemes read better than a shared abstraction over
+//! slightly different rings. A third instance at a third parameter regime
+//! follows the house pattern, and — the deciding
 //! argument — it cannot slow the narrow path, which was just tuned 4.65×.
 //!
 //! # What it implements, and what it does not

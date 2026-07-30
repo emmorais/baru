@@ -1,42 +1,44 @@
-//! BFV — a **securely-parameterized** RLWE instantiation of the same
-//! minimal-FHE inner product as `crate::fhe::si_ntru`: one
-//! ciphertext×ciphertext multiplication, **no relinearization keys**, **no
-//! bootstrapping**, decrypt the degree-2 product directly under `s²`.
+//! BFV — the securely-parameterized RLWE scheme Baru's FHE pipelines run on:
+//! the **minimal-FHE inner product**, i.e. one ciphertext×ciphertext
+//! multiplication, **no relinearization keys**, **no bootstrapping**, decrypt
+//! the degree-2 product directly under `s²`.
 //!
-//! # Why this exists (and why it's the secure one)
+//! # Parameters, and why they are secure
 //!
-//! SI-NTRU gives the cheapest arithmetic but is overstretched — insecure
-//! even at depth 1 (see `si_ntru.rs`'s security note). BFV is RLWE-based:
-//! there is **no NTRU lattice and no fatigue point**, so the only
-//! constraint is the standard RLWE bound `log q ≤ (limit for n)`. At
+//! The only constraint is the standard RLWE bound `log q ≤ (limit for n)`. At
 //! `n = 4096` the HomomorphicEncryption.org standard allows `log q ≤ 109`
 //! at 128-bit security; a single multiply with a usable `t = 2^20` needs
 //! `q ≈ 2^80..2^100`, which fits. So `n = 4096, q = 2^100, t = 2^20` is
-//! **secure and depth-1-capable** — the property SI-NTRU cannot have.
+//! **secure and depth-1-capable** — both at once, which is what the whole
+//! construction needs.
 //!
-//! # The construction (identical shape to SI-NTRU)
+//! # The construction
 //!
 //! - keygen: secret `s` (ternary), public key `pk = (-(a·s + e), a)`.
 //!   **No relinearization or Galois keys.**
 //! - encrypt: `c = (u·b + e₁ + Δ·m, u·a + e₂)`; decrypts as
 //!   `c₀ + c₁·s = Δ·m + small`.
-//! - **inner product** via the same reversed-coefficient packing as
-//!   SI-NTRU (`pack_input`/`pack_weights`): a single ct×ct multiply places
-//!   row `r`'s dot product in coefficient `r·d + d − 1`.
+//! - **inner product** via reversed-coefficient packing
+//!   ([`Bfv::pack_input`] / [`Bfv::pack_weights`]): a single ct×ct multiply
+//!   places row `r`'s dot product in coefficient `r·d + d − 1`, so one
+//!   multiplication computes a whole matvec.
 //! - multiply (no relin): the BFV "tensor" `(d₀,d₁,d₂)` with each
-//!   component rescaled by `t/q` (a rounded shift by `log q − log t`,
-//!   exactly SI-NTRU's rescale). It decrypts under `(1, s, s²)`:
+//!   component rescaled by `t/q` (a rounded shift by `log q − log t`). It
+//!   decrypts under `(1, s, s²)`:
 //!   `round((d₀ + d₁·s + d₂·s²)/Δ) mod t = m·m' mod t`.
 //!
-//! The only difference from SI-NTRU is the ciphertext arity (2, product 3)
-//! and that the key power is carried by decrypting under `s²` instead of
-//! `f²`. Everything downstream — the reversed packing, the mask-and-open
-//! scheme switch, the whole hybrid pipeline — is unchanged.
+//! Because the only consumer of the product is a *decryption* — the masked
+//! decryption of an FHE→MPC scheme switch ([`crate::hybrid`]) — the degree-2
+//! key never has to be switched back down. That is what deletes the
+//! relinearization keys, and with depth capped at 1 there is nothing to
+//! bootstrap either. [`crate::fhe::bgv`] instantiates the same construction on
+//! the other classic RLWE encoding, as a check that the encoding is not where
+//! the cost lives.
 //!
-//! Parameters use a power-of-two `q` (native `u128` arithmetic; `t | q` so
-//! plaintext arithmetic is native), matching SI-NTRU so the *only* thing
-//! the E9 benchmark varies between them is the scheme, not the
-//! implementation style.
+//! Parameters use a power-of-two `q`, so mod-q arithmetic is native wrapping
+//! `u128`, the `t/q` rescale is an arithmetic shift, and `t | q` makes
+//! plaintext arithmetic natively mod-t (share-sum carries in scheme switching
+//! vanish by construction).
 
 use rand::Rng;
 
@@ -54,8 +56,7 @@ pub struct BfvParams {
 
 impl BfvParams {
     /// Secure depth-1 default: n=4096, q=2^100 (≤ the 128-bit RLWE bound of
-    /// ~109 for n=4096), t=2^20. No fatigue point — this is genuine
-    /// RLWE-secure territory, unlike SI-NTRU.
+    /// ~109 for n=4096), t=2^20.
     pub const DEFAULT: BfvParams = BfvParams { n: 4096, log2_q: 100, log2_t: 20 };
     /// Small ring for fast unit tests (NOT secure — testing only).
     pub const TEST_SMALL: BfvParams = BfvParams { n: 64, log2_q: 100, log2_t: 20 };
@@ -274,6 +275,21 @@ impl Bfv {
         BfvCt { c }
     }
 
+    /// Add a plaintext scalar into a **single coefficient** (`c₀[i] += Δ·v`) —
+    /// the sparse case of [`Bfv::add_plain_poly`], used to fold a bias
+    /// directly onto a packed matvec's output position.
+    ///
+    /// Works on a degree-2 product as well as a fresh ciphertext: decryption
+    /// computes `round(t/q · Σ cᵢ sⁱ)`, so a `Δ·v` term in `c₀` contributes
+    /// `v` whatever the key power is.
+    pub fn add_plain_at(&self, ct: &BfvCt, position: usize, value: u64) -> BfvCt {
+        let p = &self.params;
+        let mut c = ct.c.clone();
+        let v = (value & (p.t() - 1)) as u128;
+        c[0][position] = c[0][position].wrapping_add(v << p.delta_shift()) & p.q_mask();
+        BfvCt { c }
+    }
+
     /// Multiply a ciphertext by a **plaintext** polynomial: every component
     /// times `m`, no rescaling and no relinearization.
     ///
@@ -352,7 +368,7 @@ impl Bfv {
         }
     }
 
-    // ── Packing (identical to SI-NTRU) ──────────────────────────────────
+    // ── Packing (shared with `bgv` — the construction, not the scheme) ──
 
     pub fn pack_input(&self, x: &[i64]) -> Vec<u64> {
         assert!(x.len() <= self.params.n);
@@ -402,10 +418,9 @@ impl Bfv {
     }
 }
 
-/// [`crate::hybrid::FheAdapter`] for BFV — lets the *secure* scheme drive
-/// the generic MPC↔FHE scheme switch and the whole hybrid pipeline,
-/// exactly as `SiNtruAdapter` does for the fast reference. The client key
-/// bundle carries `pk` too, so one handle both encrypts and decrypts.
+/// [`crate::hybrid::FheAdapter`] for BFV — what lets this scheme drive the
+/// generic MPC↔FHE scheme switch and the whole hybrid pipeline. The client
+/// key bundle carries `pk` too, so one handle both encrypts and decrypts.
 pub struct BfvAdapter<'a>(pub &'a Bfv);
 
 impl crate::hybrid::FheAdapter for BfvAdapter<'_> {

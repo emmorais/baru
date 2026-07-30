@@ -21,7 +21,7 @@ Lisp source
    │  parser.rs
    ▼
   Expr (AST)
-   ├──────────────► CEK interpreter (eval.rs) ──► Backend trait ──► Aby3Backend
+   ├──────────────► CEK interpreter (eval.rs) ──► Backend trait ──► Aby3Simulator
    │                                                             ├─ TransportBackend (TCP, real 3-party)
    │                                                             └─ GcBackend (Yao)
    └──► CircuitCompiler ──► FlatOp SSA ──► ZKP (Binius64)
@@ -156,7 +156,7 @@ Marked ✅ = implemented in Baru today, 🔨 = planned, in roughly the order bel
 | Protocol | Domain | Parties | Majority | Security | Status |
 |---|---|---|---|---|---|
 | ABY3 / Replicated | ring 2^k | 3 | honest | semi-honest | ✅ `crypto/aby3_protocol.rs` |
-| Yao GC | binary | 2 | dishonest | semi-honest | ✅ `interpreter/gc_backend.rs` |
+| Yao GC (2-party) | binary | 2 | dishonest | semi-honest | 🔨 P2 — the `interpreter/gc_backend.rs` placeholder was cleartext logic that nothing constructed, and was removed 2026-07-30. Real garbling exists for 3-party *nonlinearities* (`crypto/garbled.rs` + `crypto/gc_protocol.rs`, measured by `bench-gc-compare`), not as a standalone 2-party engine. |
 | Dealer | ring 2^k | n≥2 | — (trusted dealer) | semi-honest | ✅ `mpcc/sim.rs` — the online-cost lower bound |
 | Semi2k | ring 2^k | n≥2 | dishonest | semi-honest | ✅ `mpcc/semi2k.rs` — Dealer's online phase, triples from real OT (2-party) |
 | Shamir | field p | n≥3 | honest | semi-honest | ✅ `mpcc/sim.rs` (GRR degree reduction) |

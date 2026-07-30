@@ -12,14 +12,13 @@
 //! honest column — the security status of the parameters used.
 //!
 //! Schemes:
-//!   - **BFV** (`fhe::bfv`): RLWE, **secure** at n=4096, q=2^100 (no fatigue
-//!     point). The recommended instantiation.
-//!   - **SI-NTRU** (`fhe::si_ntru`): the fast *reference* — cheapest
-//!     arithmetic (n=2048) but overstretched/**insecure** (see its docs).
+//!   - **BFV** (`fhe::bfv`): RLWE, secure at n=4096, q=2^100.
+//!   - **BGV** (`fhe::bgv`): the same construction on the other classic RLWE
+//!     encoding, at deliberately identical parameters.
 //!
 //! Both use the *same* schoolbook-Rust polynomial style and the same
-//! reversed-coefficient packing, so the timing difference is the scheme
-//! (and its secure ring dimension), not the implementation. (CKKS is
+//! reversed-coefficient packing, so any timing difference is the scheme's
+//! encoding, not the implementation. (CKKS is
 //! measured elsewhere via SEAL — an optimized C++ NTT implementation, so it
 //! is not timing-comparable here; its structural cost is noted in the
 //! summary.)
@@ -31,7 +30,6 @@ use serde::Serialize;
 use crate::fhe::bfv::{Bfv, BfvParams};
 use crate::fhe::bgv::{Bgv, BgvParams};
 use crate::fhe::poly::{self, Backend};
-use crate::fhe::si_ntru::{SiNtru, SiNtruParams};
 
 #[derive(Debug, Clone, Serialize)]
 pub struct SchemeReport {
@@ -95,7 +93,7 @@ fn bench_bfv(in_dim: usize, out_dim: usize) -> SchemeReport {
     SchemeReport {
         scheme: "bfv".into(),
         secure: true,
-        security_note: "RLWE, no fatigue point; n=4096, log q=100 ≤ 128-bit bound (~109)".into(),
+        security_note: "RLWE; n=4096, log q=100 ≤ the 128-bit bound (~109)".into(),
         n: s.params.n,
         log2_q: s.params.log2_q,
         eval_keys: false,
@@ -141,49 +139,7 @@ fn bench_bgv(in_dim: usize, out_dim: usize) -> SchemeReport {
     SchemeReport {
         scheme: "bgv".into(),
         secure: true,
-        security_note: "RLWE, no fatigue point; same lattice and parameters as BFV".into(),
-        n: s.params.n,
-        log2_q: s.params.log2_q,
-        eval_keys: false,
-        keygen_ms,
-        encrypt_ms,
-        multiply_ms,
-        decrypt_ms,
-        ct_bytes,
-        correct: got == expected,
-    }
-}
-
-fn bench_si_ntru(in_dim: usize, out_dim: usize) -> SchemeReport {
-    let s = SiNtru::new(SiNtruParams::DEFAULT);
-    let (x, w, expected) = problem(in_dim, out_dim);
-
-    let t0 = Instant::now();
-    let (ck, _sk) = s.keygen();
-    let keygen_ms = ms(t0.elapsed());
-
-    let t0 = Instant::now();
-    let cx = s.encrypt_poly(&ck, &s.pack_input(&x));
-    let cw = s.encrypt_poly(&ck, &s.pack_weights(&w));
-    let encrypt_ms = ms(t0.elapsed()) / 2.0;
-    let ct_bytes = cx.poly.len() * 16 + 4;
-
-    let t0 = Instant::now();
-    let prod = s.mul(&cx, &cw);
-    let multiply_ms = ms(t0.elapsed());
-
-    let t0 = Instant::now();
-    let out = s.decrypt_poly(&ck, &prod);
-    let decrypt_ms = ms(t0.elapsed());
-
-    let got: Vec<i64> = (0..out_dim)
-        .map(|r| s.to_signed(out[s.matvec_output_position(in_dim, r)] & (s.params.t() - 1)))
-        .collect();
-
-    SchemeReport {
-        scheme: "si-ntru".into(),
-        secure: false,
-        security_note: "overstretched NTRU; INSECURE even at depth 1 (fast reference only)".into(),
+        security_note: "RLWE; same lattice and parameters as BFV".into(),
         n: s.params.n,
         log2_q: s.params.log2_q,
         eval_keys: false,
@@ -283,7 +239,6 @@ pub fn run_cli(args: &[String]) -> Result<(), String> {
             vec![
                 average((0..reps).map(|_| bench_bfv(in_dim, out_dim)).collect()),
                 average((0..reps).map(|_| bench_bgv(in_dim, out_dim)).collect()),
-                average((0..reps).map(|_| bench_si_ntru(in_dim, out_dim)).collect()),
             ]
         })?;
         runs.push((b, reports));
@@ -330,10 +285,10 @@ pub fn run_cli(args: &[String]) -> Result<(), String> {
          \x20   the coefficient-packed product, larger ciphertexts than BFV at equal security."
     );
     println!(
-        "\n  Takeaway: BFV and BGV are the recommended *secure* instantiations, and they cost\n\
-         \x20 nearly the same — the encoding is not where the money is. SI-NTRU is faster\n\
-         \x20 (half the ring, one ring element per ciphertext instead of two) but insecure;\n\
-         \x20 that gap is structural, and no choice of RLWE encoding closes it."
+        "\n  Takeaway: BFV and BGV cost nearly the same — the RLWE encoding is not where the\n\
+         \x20 money is. What makes this primitive cheap is the *construction* (one ct×ct\n\
+         \x20 multiply, degree-2 decryption, no relinearization or bootstrapping), not the\n\
+         \x20 choice of scheme."
     );
     Ok(())
 }
@@ -377,9 +332,6 @@ mod tests {
         let bgv = bench_bgv(6, 3);
         assert!(bgv.correct, "BGV inner product must be exact");
         assert!(bgv.secure && !bgv.eval_keys);
-        let ntru = bench_si_ntru(6, 3);
-        assert!(ntru.correct, "SI-NTRU inner product must be exact");
-        assert!(!ntru.secure);
     }
 
     /// BGV and BFV are deliberately at identical parameters, so their

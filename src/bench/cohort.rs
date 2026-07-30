@@ -498,9 +498,28 @@ mod tests {
     /// The real end-to-end sweep, which needs the `barudb` binary installed.
     /// Ignored by default so the suite stays hermetic; run with
     /// `cargo test --lib -- --ignored bench::cohort`.
+    ///
+    /// It **skips** rather than fails when `barudb` is absent, so that a blanket
+    /// `cargo test -- --ignored` stays green on a machine that has not installed
+    /// the external store. A missing optional dependency is not a regression,
+    /// and a red suite that is always red stops being read.
     #[test]
     #[ignore]
     fn plain_and_encrypted_agree_end_to_end() {
+        let binary = std::env::var("BARUDB_BIN").unwrap_or_else(|_| "barudb".to_string());
+        if std::process::Command::new(&binary)
+            .arg("--help")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_err()
+        {
+            eprintln!(
+                "skipping: `{binary}` not found — put barudb on PATH or set BARUDB_BIN \
+                 (see docs/barudb-api.md)"
+            );
+            return;
+        }
         let dir = std::env::temp_dir().join("baru-cohort-test");
         std::fs::create_dir_all(&dir).unwrap();
         let report = run(&[100], &dir, 1).expect("sweep");

@@ -452,7 +452,7 @@ pub const REGISTRY: &[ProtocolSpec] = &[
         max_parties: Some(2),
         majority: Majority::Dishonest,
         security: Security::SemiHonest,
-        status: Status::Implemented("interpreter::gc_backend"),
+        status: Status::Planned("P2"),
         cost: CostParams {
             offline_from_ot: None,
             mul_rounds: 0,
@@ -557,8 +557,17 @@ mod tests {
     /// `Implemented` means Baru can *run a program* under this protocol, which
     /// is exactly [`crate::mpcc::RUNNABLE`] minus the two simulation-only
     /// engines (`dealer` is a lower bound, not a protocol; `shamir` is not in
-    /// the registry as an id). If the two lists drift apart, one of them is
-    /// lying to a report.
+    /// the registry as an id), plus `aby3`, which runs through the interpreter
+    /// rather than the mpcc VM. If the lists drift apart, one of them is lying
+    /// to a report.
+    ///
+    /// `yao` was listed here until 2026-07-30, pointing at
+    /// `interpreter::gc_backend` — a backend nothing ever constructed. Nothing
+    /// could execute a 2-party Yao program, so the claim was false and the row
+    /// is now `Planned`. Costing it is unaffected: the cost model reads
+    /// `CostParams`, not the status. (Garbled *nonlinearities* inside the
+    /// 3-party protocol are a separate, live path — `crypto::gc_protocol` — and
+    /// are not this row.)
     #[test]
     fn implemented_protocols_match_the_backends_baru_actually_has() {
         let implemented: Vec<&str> = REGISTRY
@@ -566,11 +575,11 @@ mod tests {
             .filter(|p| p.status.is_implemented())
             .map(|p| p.id)
             .collect();
-        assert_eq!(implemented, vec!["aby3", "semi2k", "lowgear", "yao"]);
+        assert_eq!(implemented, vec!["aby3", "semi2k", "lowgear"]);
         // Everything claiming to be implemented must actually be executable.
         for id in &implemented {
-            if *id == "aby3" || *id == "yao" {
-                continue; // run through the interpreter, not the mpcc VM
+            if *id == "aby3" {
+                continue; // runs through the interpreter, not the mpcc VM
             }
             assert!(
                 crate::mpcc::RUNNABLE.contains(id),

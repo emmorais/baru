@@ -32,17 +32,6 @@ pub fn sub_shares(a: &Share3, b: &Share3) -> Share3 {
     a.clone() - b.clone()
 }
 
-/// Multiply two shares using a reconstruct-and-reshare strategy (INSECURE).
-///
-/// This is a placeholder until a proper ABY3 interactive multiplication is
-/// implemented. It reconstructs the product and generates a fresh sharing.
-pub fn mul_insecure(a: &Share3, b: &Share3) -> Share3 {
-    let pa = reconstruct(a);
-    let pb = reconstruct(b);
-    let prod = pa.wrapping_mul(pb);
-    share_secret(prod)
-}
-
 /// Multiply a share by a public scalar (local).
 pub fn scalar_mul(a: &Share3, k: Fr) -> Share3 {
     // multiply each local share by the scalar
@@ -139,4 +128,3 @@ pub fn eq_simulate(a: &Share3, b: &Share3) -> Share3 {
     share_secret((va == vb) as Fr)
 }
 
-pub use crate::crypto::party::mul_ab3_simulate; // expose simulator variant

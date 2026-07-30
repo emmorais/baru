@@ -124,7 +124,7 @@ pub struct Run {
     pub metrics: BTreeMap<String, Metric>,
     #[serde(default)]
     pub notes: String,
-    /// Merkle root of any bulk artefact held in [`crate::storage`].  Heavy data
+    /// Content hash of any bulk artefact held outside the record.  Heavy data
     /// (ciphertexts, keys, weights) never goes in the record itself — see
     /// `docs/barudb-api.md` §3.
     #[serde(default)]

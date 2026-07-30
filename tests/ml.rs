@@ -116,7 +116,7 @@ fn test_nn_load_model_rejects_non_16_scale_bits() {
 
     let src = format!("(nn-load-model \"{}\")", lisp_path_literal(&path));
     let expr = parse(&src).expect("parse failed");
-    let p = Participant::new(0);
+    let p = Participant::new_simulated(0);
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| p.eval(&expr)));
     let _ = std::fs::remove_file(&path);
     assert!(
@@ -136,7 +136,7 @@ fn test_nn_load_model_returns_inspectable_layer_structure() {
 
     let src = format!("(nn-load-model \"{}\")", lisp_path_literal(&path));
     let expr = parse(&src).expect("parse failed");
-    let p = Participant::new(0);
+    let p = Participant::new_simulated(0);
     let result = p.eval(&expr);
     let _ = std::fs::remove_file(&path);
 
