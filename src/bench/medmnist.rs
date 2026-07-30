@@ -100,7 +100,7 @@ use std::time::Instant;
 
 use serde::Serialize;
 
-use crate::bench::cnn::{run_cnn_hybrid_full, CnnModel, ConvLayer, Nonlin};
+use crate::bench::cnn::{run_cnn_hybrid_in_session, CnnModel, CnnSession, ConvLayer, Nonlin};
 use crate::bench::comm::NetworkProfile;
 
 /// A trained, quantised CNN plus the real test images it was measured on, in
@@ -214,9 +214,16 @@ pub struct MedMnistReport {
     /// Party-to-party messages and bytes for one encrypted diagnosis.
     pub per_image_messages: f64,
     pub per_image_bytes: f64,
-    /// Query-independent work per image (keygen, plus the mask pool when
-    /// `--precompute`), excluded from `per_image_ms`.
+    /// Query-independent work per image, excluded from `per_image_ms`. The
+    /// sum of the two fields below.
     pub per_image_offline_ms: f64,
+    /// The per-SESSION share: `(keygen + encrypted model) / images`. Paid once
+    /// for the whole batch, so this shrinks as the batch grows — real
+    /// amortization, not a latency shift.
+    pub per_image_offline_session_ms: f64,
+    /// The per-QUERY part: the mask pool, rebuilt for every image because masks
+    /// must be fresh. Flat in batch size.
+    pub per_image_offline_query_ms: f64,
     /// Per-image FHE sub-split — which of the FHE operations the online time
     /// is actually in. `weights` is query-independent and not yet preprocessed.
     pub per_image_weights_ms: f64,
@@ -251,6 +258,12 @@ pub fn run(
     let hybrid_n = hybrid_n.min(data.images.len());
     let (mut matches, mut hybrid_correct, mut bootstraps) = (0usize, 0usize, 0u64);
     let mut tot = CnnTotals::default();
+    // ONE session for the whole batch — this is the point of precomputing the
+    // model rather than the masks. Keygen and the encrypted weights are paid
+    // once here and reused by every image below, so their per-image share falls
+    // as the batch grows. The mask pool is still rebuilt inside each run,
+    // because masks must be fresh per query.
+    let session = CnnSession::new(&model, precompute);
     for ((img, &plain), &label) in data
         .images
         .iter()
@@ -258,7 +271,7 @@ pub fn run(
         .zip(&data.labels)
         .take(hybrid_n)
     {
-        let run = run_cnn_hybrid_full(&model, img, profile, nonlin, precompute);
+        let run = run_cnn_hybrid_in_session(&session, &model, img, profile, nonlin, precompute);
         if run.class == plain {
             matches += 1;
         }
@@ -296,7 +309,9 @@ pub fn run(
         per_image_argmax_ms: per.argmax_ms,
         per_image_messages: per.messages,
         per_image_bytes: per.bytes,
-        per_image_offline_ms: per.offline_ms,
+        per_image_offline_ms: session.offline_ms() / hybrid_n as f64 + per.offline_query_ms,
+        per_image_offline_session_ms: session.offline_ms() / hybrid_n as f64,
+        per_image_offline_query_ms: per.offline_query_ms,
         per_image_weights_ms: per.weights_ms,
         per_image_mul_ms: per.mul_ms,
         per_image_maskenc_ms: per.maskenc_ms,
@@ -319,7 +334,7 @@ struct CnnTotals {
     argmax_ms: f64,
     messages: f64,
     bytes: f64,
-    offline_ms: f64,
+    offline_query_ms: f64,
     weights_ms: f64,
     mul_ms: f64,
     maskenc_ms: f64,
@@ -338,7 +353,7 @@ impl CnnTotals {
         self.argmax_ms += r.phases.argmax_ms;
         self.messages += r.comm.messages as f64;
         self.bytes += r.comm.bytes as f64;
-        self.offline_ms += r.offline_ms;
+        self.offline_query_ms += r.offline_query_ms;
         self.weights_ms += r.fhe_phases.weights_ms;
         self.mul_ms += r.fhe_phases.mul_ms;
         self.maskenc_ms += r.fhe_phases.mask_ms;
@@ -361,7 +376,7 @@ impl CnnTotals {
             argmax_ms: self.argmax_ms / d,
             messages: self.messages / d,
             bytes: self.bytes / d,
-            offline_ms: self.offline_ms / d,
+            offline_query_ms: self.offline_query_ms / d,
             weights_ms: self.weights_ms / d,
             mul_ms: self.mul_ms / d,
             maskenc_ms: self.maskenc_ms / d,
@@ -454,14 +469,21 @@ fn print_report(r: &MedMnistReport) {
         r.per_image_import_ms, r.per_image_relu_ms, r.per_image_pool_ms, r.per_image_argmax_ms
     );
     println!(
-        "    offline  : {:.0} ms query-independent (keygen{}), NOT in the latency above",
-        r.per_image_offline_ms,
-        if r.precomputed_masks {
-            " + mask pool"
-        } else {
-            ""
-        }
+        "    offline  : {:.0} ms/image query-independent, NOT in the latency above",
+        r.per_image_offline_ms
     );
+    if r.precomputed_masks {
+        println!(
+            "               {:.0} ms/image per-SESSION (keygen + encrypted model, paid once for \
+             the batch — amortizes)",
+            r.per_image_offline_session_ms
+        );
+        println!(
+            "               {:.0} ms/image per-QUERY (mask pool, fresh every image — shifts \
+             latency only)",
+            r.per_image_offline_query_ms
+        );
+    }
     println!(
         "    traffic  : {:.0} messages, {:.1} MB party-to-party",
         r.per_image_messages,

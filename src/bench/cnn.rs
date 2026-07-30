@@ -104,6 +104,7 @@
 //! for a cost that was really an unbatched round trip. The phase breakdown in
 //! [`MpcPhases`] exists so that mistake is not repeatable.
 
+use std::borrow::Cow;
 use std::time::Instant;
 
 use rand::rngs::StdRng;
@@ -402,6 +403,140 @@ fn rows_per_chunk(n: usize, in_dim: usize) -> usize {
     (n / in_dim).saturating_sub(1).max(1)
 }
 
+/// Every packed weight polynomial the pipeline will multiply against, in the
+/// order it consumes them: the first conv's kernels, then each extra conv's,
+/// then each hidden dense layer's chunks, then the output dense's.
+///
+/// This is the pipeline's shape written down **once**. It gives one entry per
+/// ct×ct multiply, and since every multiply is followed by exactly one
+/// scheme-switch mask, it also sizes [`MaskPool`] — so the pool's count and the
+/// encrypted model's cannot drift apart, because they are the same walk. (The
+/// count used to be re-derived by hand in `MaskPool::for_model`; that is the
+/// kind of duplication the exact-consumption assertions existed to catch, and
+/// deriving both from one traversal removes the possibility instead.)
+fn weight_polys(s: &Bfv, model: &CnnModel) -> Vec<Vec<u64>> {
+    let n = s.params.n;
+    let t_mask = s.params.t() - 1;
+    let mut out: Vec<Vec<u64>> = Vec::new();
+
+    let conv1 = ConvShape { in_c: 1, h: model.d, w: model.d, kh: K, kw: K };
+    for kernel in &model.kernels {
+        out.push(conv_pack::pack_kernel(kernel, conv1, n, t_mask));
+    }
+    for cl in &model.extra_conv {
+        let shape = ConvShape { in_c: cl.in_c, h: cl.in_h, w: cl.in_w, kh: K, kw: K };
+        for kernel in &cl.kernels {
+            out.push(conv_pack::pack_kernel(kernel, shape, n, t_mask));
+        }
+    }
+
+    let mut in_dim = {
+        let fs = last_feature_shape(model);
+        fs.c * fs.h * fs.w
+    };
+    for (hidden_w, _) in &model.hidden {
+        for chunk in hidden_w.chunks(rows_per_chunk(n, in_dim)) {
+            out.push(s.pack_weights(chunk));
+        }
+        in_dim = hidden_w.len();
+    }
+    for chunk in model.dense_w.chunks(rows_per_chunk(n, in_dim)) {
+        out.push(s.pack_weights(chunk));
+    }
+    out
+}
+
+/// The model's weight ciphertexts, encrypted once per **session**.
+///
+/// This is a different kind of preprocessing from [`MaskPool`], and the
+/// difference is the point:
+///
+/// - **Masks are per-query.** They must be fresh for every inference, so
+///   precomputing them shifts latency off the critical path but buys **no
+///   throughput** — a saturated server does the same total work.
+/// - **Weights are per-session.** The model does not change between patients,
+///   so encrypting it once is genuine **amortization**: total work per query
+///   drops, permanently, after the first.
+///
+/// Any future preprocessing in this pipeline should say which of the two it is.
+struct EncryptedModel {
+    /// In [`weight_polys`] order — the order the pipeline consumes them.
+    cts: Vec<BfvCt>,
+    /// Wall-clock spent encrypting, reported as offline cost.
+    offline_ms: f64,
+}
+
+impl EncryptedModel {
+    fn encrypt(s: &Bfv, ck: &[u8], polys: &[Vec<u64>]) -> Self {
+        let t = Instant::now();
+        let cts = polys.iter().map(|p| s.encrypt_poly(ck, p)).collect();
+        EncryptedModel { cts, offline_ms: ms(t) }
+    }
+}
+
+/// Where a layer's weight ciphertext comes from.
+///
+/// Unlike [`Masks`], the session variant **borrows**: a weight ciphertext is
+/// reused by every query in the session rather than consumed by one.
+struct Weights<'a> {
+    /// `None` = encrypt on the critical path, which is what a deployment
+    /// without a session preamble must do on every single query. This is the
+    /// control the `--precompute` measurement is against.
+    model: Option<&'a EncryptedModel>,
+    /// How many have been handed out, so exact consumption can be asserted.
+    next: usize,
+}
+
+impl<'a> Weights<'a> {
+    fn online() -> Self {
+        Weights { model: None, next: 0 }
+    }
+
+    fn session(model: &'a EncryptedModel) -> Self {
+        Weights { model: Some(model), next: 0 }
+    }
+
+    /// The next weight ciphertext. `poly` is only evaluated in the online
+    /// case, so the session path does not even pack the polynomial.
+    fn take(
+        &mut self,
+        s: &Bfv,
+        ck: &[u8],
+        poly: impl FnOnce() -> Vec<u64>,
+        ph: &mut FhePhases,
+    ) -> Cow<'a, BfvCt> {
+        let i = self.next;
+        self.next += 1;
+        match self.model {
+            Some(m) => Cow::Borrowed(m.cts.get(i).unwrap_or_else(|| {
+                panic!(
+                    "encrypted model exhausted at {i}: weight_polys under-counted \
+                     the model's ct×ct multiplies"
+                )
+            })),
+            None => {
+                let t = Instant::now();
+                let cw = s.encrypt_poly(ck, &poly());
+                ph.weights_ms += ms(t);
+                ph.n_weight_enc += 1;
+                Cow::Owned(cw)
+            }
+        }
+    }
+
+    fn assert_fully_consumed(&self) {
+        if let Some(m) = self.model {
+            assert_eq!(
+                self.next,
+                m.cts.len(),
+                "encrypted model over-counted: {} ciphertexts built, {} consumed",
+                m.cts.len(),
+                self.next
+            );
+        }
+    }
+}
+
 /// One layer-output's worth of scheme-switch masking: the three parties'
 /// plaintext masks, and a single ciphertext encrypting their sum.
 ///
@@ -436,27 +571,13 @@ struct MaskPool {
 }
 
 impl MaskPool {
-    /// Build exactly the masks `model` will consume. Under-counting panics at
-    /// draw time and over-counting panics at the end of the run, so the
-    /// prediction cannot silently drift from the pipeline.
-    fn for_model(s: &Bfv, ck: &[u8], model: &CnnModel, rng: &mut impl Rng) -> Self {
+    /// Build exactly `count` masks — one per ct×ct multiply, which
+    /// [`weight_polys`] enumerates. Under-counting panics at draw time and
+    /// over-counting panics at the end of the run, so a pipeline that consumed
+    /// them in a different order still cannot pass silently.
+    fn with_len(s: &Bfv, ck: &[u8], count: usize, rng: &mut impl Rng) -> Self {
         let n = s.params.n;
         let t_mask = s.params.t() - 1;
-
-        let mut count = model.out_channels();
-        for cl in &model.extra_conv {
-            count += cl.out_c();
-        }
-        let mut in_dim = {
-            let fs = last_feature_shape(model);
-            fs.c * fs.h * fs.w
-        };
-        for (hidden_w, _) in &model.hidden {
-            count += hidden_w.len().div_ceil(rows_per_chunk(n, in_dim));
-            in_dim = hidden_w.len();
-        }
-        count += model.dense_w.len().div_ceil(rows_per_chunk(n, in_dim));
-
         let t = Instant::now();
         let triples = (0..count)
             .map(|_| {
@@ -570,6 +691,7 @@ fn hybrid_matvec_open(
     profile: NetworkProfile,
     rng: &mut impl Rng,
     masks_src: &mut Masks,
+    weights_src: &mut Weights,
 ) -> (Vec<u64>, Vec<[u64; 3]>, FhePhases) {
     let n = s.params.n;
     let t_mask = s.params.t() - 1;
@@ -583,10 +705,7 @@ fn hybrid_matvec_open(
     let mut opened = Vec::with_capacity(weights.len());
     let mut masks = Vec::with_capacity(weights.len());
     for chunk in weights.chunks(rows_per_chunk) {
-        let t = Instant::now();
-        let cw = s.encrypt_poly(ck, &s.pack_weights(chunk));
-        ph.weights_ms += ms(t);
-        ph.n_weight_enc += 1;
+        let cw = weights_src.take(s, ck, || s.pack_weights(chunk), &mut ph);
         let t = Instant::now();
         let prod = s.mul_pre(&cxt, &cw);
         ph.mul_ms += ms(t);
@@ -620,6 +739,7 @@ fn hybrid_conv_open(
     profile: NetworkProfile,
     rng: &mut impl Rng,
     masks_src: &mut Masks,
+    weights_src: &mut Weights,
 ) -> (Vec<u64>, Vec<[u64; 3]>, FhePhases) {
     let n = s.params.n;
     let t_mask = s.params.t() - 1;
@@ -640,11 +760,12 @@ fn hybrid_conv_open(
     ph.mul_ms += ms(t);
 
     for kernel in kernels.iter() {
-        let t = Instant::now();
-        let kpoly = conv_pack::pack_kernel(kernel, shape, n, t_mask);
-        let cw = s.encrypt_poly(ck, &kpoly);
-        ph.weights_ms += ms(t);
-        ph.n_weight_enc += 1;
+        let cw = weights_src.take(
+            s,
+            ck,
+            || conv_pack::pack_kernel(kernel, shape, n, t_mask),
+            &mut ph,
+        );
         let t = Instant::now();
         let prod = s.mul_pre(&cxt, &cw);
         ph.mul_ms += ms(t);
@@ -945,9 +1066,19 @@ pub struct CnnRun {
     pub phases: MpcPhases,
     /// Breakdown of `fhe_ms` — see [`FhePhases`].
     pub fhe_phases: FhePhases,
-    /// Query-independent work done before the clock started (keygen, and the
-    /// mask pool when precomputing). Not part of `total_ms`.
+    /// Query-independent work done before the clock started. Not part of
+    /// `total_ms`. Equal to `offline_session_ms + offline_query_ms`.
     pub offline_ms: f64,
+    /// The **per-session** half: keygen and the encrypted model. Paid once and
+    /// reused by every query in the session, so it is genuine amortization —
+    /// total work per query drops permanently after the first.
+    pub offline_session_ms: f64,
+    /// The **per-query** half: the mask pool. Masks must be fresh for every
+    /// inference, so pooling them moves latency off the critical path but buys
+    /// no throughput — a saturated server does the same total work. Reported
+    /// separately from `offline_session_ms` precisely so the two are not
+    /// conflated into one flattering number.
+    pub offline_query_ms: f64,
     pub comm: CommStats,
     pub bootstraps: u64,
     /// ct×ct multiplications the packed convolution actually performed.
@@ -1005,11 +1136,82 @@ pub fn run_cnn_hybrid_with(
     run_cnn_hybrid_full(model, input, profile, nonlin, false)
 }
 
+/// Everything a deployment sets up **once per model**, before any query
+/// exists: the FHE context, the key, and — when precomputing — the encrypted
+/// weights.
+///
+/// This is what makes the model's encryption *amortize* rather than merely
+/// shift. A session is built once and then serves every inference, so the cost
+/// of encrypting the weights is paid on the first query and never again. The
+/// mask pool deliberately does **not** live here: masks must be fresh per
+/// query, so they are rebuilt inside every run.
+pub struct CnnSession {
+    s: Bfv,
+    ck: Vec<u8>,
+    enc_model: Option<EncryptedModel>,
+    /// One per ct×ct multiply — also the number of masks each query needs.
+    n_weight_cts: usize,
+    keygen_ms: f64,
+}
+
+impl CnnSession {
+    /// Build the session for `model`. With `precompute`, the weights are
+    /// encrypted now; without it, every query re-encrypts them on its critical
+    /// path — the control the `--precompute` measurement is against.
+    pub fn new(model: &CnnModel, precompute: bool) -> Self {
+        // RLWE-secure parameters: n=4096, q=2^100 is at/below the 128-bit bound
+        // of ~109 for n=4096 (HomomorphicEncryption.org).
+        let s = Bfv::new(BfvParams { n: 4096, log2_q: 100, log2_t: model.nbits as u32 });
+        let n_in = model.d * model.d;
+        assert!((n_in + 1) <= s.params.n, "input too large for coefficient packing");
+
+        // Keygen FIRST: everything below must be encrypted under the *same* key
+        // the products are, or the masked ciphertext will not decrypt. An early
+        // `--precompute` draft called `s.keygen()` a second time for the pool
+        // and produced masks that silently did not open.
+        let tk = Instant::now();
+        let (ck, _sk) = s.keygen();
+        let keygen_ms = ms(tk);
+
+        // One walk of the model gives both halves of the preamble: the weight
+        // polynomials to encrypt, and (since every ct×ct multiply is followed by
+        // exactly one switch) the number of masks each query will pool.
+        let polys = weight_polys(&s, model);
+        let n_weight_cts = polys.len();
+        let enc_model = precompute.then(|| EncryptedModel::encrypt(&s, &ck, &polys));
+        CnnSession { s, ck, enc_model, n_weight_cts, keygen_ms }
+    }
+
+    /// Per-session offline cost: keygen plus, when precomputing, the encrypted
+    /// model. Divide by the number of queries served to get its per-query share.
+    pub fn offline_ms(&self) -> f64 {
+        self.keygen_ms + self.enc_model.as_ref().map_or(0.0, |m| m.offline_ms)
+    }
+}
+
 /// [`run_cnn_hybrid`] with both knobs: the nonlinearity protocol, and whether
-/// the scheme-switch masks are precomputed in an offline phase
-/// ([`MaskPool`]). With `precompute`, `total_ms`/`fhe_ms` are the **online**
-/// latency and `offline_ms` reports what was moved off the critical path.
+/// the preamble is precomputed in an offline phase. With `precompute`,
+/// `total_ms`/`fhe_ms` are the **online** latency and the `offline_*` fields
+/// report what was moved off the critical path.
+///
+/// This builds a fresh [`CnnSession`] per call, so it charges the per-session
+/// cost to this one query. To measure the amortization, build one session and
+/// call [`run_cnn_hybrid_in_session`] repeatedly.
 pub fn run_cnn_hybrid_full(
+    model: &CnnModel,
+    input: &[i64],
+    profile: NetworkProfile,
+    nonlin: Nonlin,
+    precompute: bool,
+) -> CnnRun {
+    let session = CnnSession::new(model, precompute);
+    run_cnn_hybrid_in_session(&session, model, input, profile, nonlin, precompute)
+}
+
+/// One inference against an existing [`CnnSession`]. The session's weights are
+/// reused; only the per-query mask pool is rebuilt.
+pub fn run_cnn_hybrid_in_session(
+    session: &CnnSession,
     model: &CnnModel,
     input: &[i64],
     profile: NetworkProfile,
@@ -1023,37 +1225,36 @@ pub fn run_cnn_hybrid_full(
         model.nbits
     );
     let nbits = model.nbits;
-    // RLWE-secure parameters: n=4096, q=2^100 is at/below the 128-bit bound
-    // of ~109 for n=4096 (HomomorphicEncryption.org).
-    let s = Bfv::new(BfvParams { n: 4096, log2_q: 100, log2_t: nbits as u32 });
-    let n_in = model.d * model.d;
-    assert!((n_in + 1) <= s.params.n, "input too large for coefficient packing");
+    let s = &session.s;
+    let ck = &session.ck;
     let t_mask = s.params.t() - 1;
 
     let (mut fhe_ms, mut mpc_ms) = (0.0, 0.0);
     let mut comm = CommStats::default();
     let mut rng = rand::thread_rng();
     let mut fhe_ph = FhePhases::default();
+    fhe_ph.keygen_ms = session.keygen_ms;
 
     // ── Offline, before the clock starts ──
-    // Keys are per-session, not per-image, and the scheme-switch masks depend
-    // only on the network's *shape* — neither is a function of the patient's
-    // image, so a deployment produces both while waiting for work. `total_ms`
+    // The masks depend only on the network's *shape*, not on the patient's
+    // image, so a deployment generates them while waiting for work. `total_ms`
     // is therefore the latency of a query against a warm server, which is the
-    // quantity a deployment is judged on. Both are reported separately so the
-    // amortization is visible rather than hidden.
-    let tk = Instant::now();
-    let (ck, _sk) = s.keygen();
-    fhe_ph.keygen_ms = ms(tk);
-    // The pool must be encrypted under the *same* key the products are, or the
-    // masked ciphertext will not decrypt.
-    let mut pool =
-        precompute.then(|| MaskPool::for_model(&s, &ck, model, &mut rand::thread_rng()));
-    let offline_ms = fhe_ph.keygen_ms + pool.as_ref().map_or(0.0, |p| p.offline_ms);
+    // quantity a deployment is judged on.
+    let mut pool = precompute
+        .then(|| MaskPool::with_len(s, ck, session.n_weight_cts, &mut rand::thread_rng()));
+    let offline_session_ms = session.offline_ms();
+    let offline_query_ms = pool.as_ref().map_or(0.0, |p| p.offline_ms);
+    let offline_ms = offline_session_ms + offline_query_ms;
+    // Per-session, so the cursor advances across the whole inference in the
+    // pipeline's consumption order.
+    let mut weights_src = match session.enc_model.as_ref() {
+        Some(m) => Weights::session(m),
+        None => Weights::online(),
+    };
 
     let start = Instant::now();
     let ti = Instant::now();
-    let c_input = s.encrypt_poly(&ck, &s.pack_input(input));
+    let c_input = s.encrypt_poly(ck, &s.pack_input(input));
     fhe_ph.input_ms = ms(ti);
 
     let shift = model.shift;
@@ -1066,7 +1267,7 @@ pub fn run_cnn_hybrid_full(
     let t0 = Instant::now();
     let conv1_shape = ConvShape { in_c: 1, h: model.d, w: model.d, kh: K, kw: K };
     let (conv_open, conv_masks, ph) =
-        hybrid_conv_open(&s, &ck, &c_input, conv1_shape, &model.kernels, profile, &mut rng, &mut masks_src(&mut pool));
+        hybrid_conv_open(s, ck, &c_input, conv1_shape, &model.kernels, profile, &mut rng, &mut masks_src(&mut pool), &mut weights_src);
     fhe_ph.add(&ph);
     fhe_ms += t0.elapsed().as_secs_f64() * 1000.0;
 
@@ -1087,11 +1288,11 @@ pub fn run_cnn_hybrid_full(
     //    conv is just the same three steps composed again — no bootstrap. ──
     for cl in &model.extra_conv {
         let tc = Instant::now();
-        let (c_conv_in, _, ph) = pack_shares_to_fhe(&s, &ck, &per_party_feat, t_mask, profile);
+        let (c_conv_in, _, ph) = pack_shares_to_fhe(s, ck, &per_party_feat, t_mask, profile);
         fhe_ph.add(&ph);
         let shape = ConvShape { in_c: cl.in_c, h: cl.in_h, w: cl.in_w, kh: K, kw: K };
         let (co, cm, ph) =
-            hybrid_conv_open(&s, &ck, &c_conv_in, shape, &cl.kernels, profile, &mut rng, &mut masks_src(&mut pool));
+            hybrid_conv_open(s, ck, &c_conv_in, shape, &cl.kernels, profile, &mut rng, &mut masks_src(&mut pool), &mut weights_src);
         fhe_ph.add(&ph);
         fhe_ms += tc.elapsed().as_secs_f64() * 1000.0;
 
@@ -1112,7 +1313,7 @@ pub fn run_cnn_hybrid_full(
     // ── Switch pooled features → packed FHE dense input ──
     let t0 = Instant::now();
     let flat = feat_shape.c * feat_shape.h * feat_shape.w;
-    let (mut c_dense_in, _, ph) = pack_shares_to_fhe(&s, &ck, &per_party_feat, t_mask, profile);
+    let (mut c_dense_in, _, ph) = pack_shares_to_fhe(s, ck, &per_party_feat, t_mask, profile);
     fhe_ph.add(&ph);
     let mut dense_in_dim = flat;
     fhe_ms += t0.elapsed().as_secs_f64() * 1000.0;
@@ -1124,7 +1325,7 @@ pub fn run_cnn_hybrid_full(
     for (hidden_w, hidden_b) in model.hidden.clone() {
         let th = Instant::now();
         let (hidden_open, hidden_masks, ph) =
-            hybrid_matvec_open(&s, &ck, &c_dense_in, &hidden_w, dense_in_dim, profile, &mut rng, &mut masks_src(&mut pool));
+            hybrid_matvec_open(s, ck, &c_dense_in, &hidden_w, dense_in_dim, profile, &mut rng, &mut masks_src(&mut pool), &mut weights_src);
         fhe_ph.add(&ph);
         fhe_ms += th.elapsed().as_secs_f64() * 1000.0;
 
@@ -1165,7 +1366,7 @@ pub fn run_cnn_hybrid_full(
         mpc_ms += t1.elapsed().as_secs_f64() * 1000.0;
 
         let t2 = Instant::now();
-        let (c_hidden, _, ph) = pack_shares_to_fhe(&s, &ck, &per_party_hidden, t_mask, profile);
+        let (c_hidden, _, ph) = pack_shares_to_fhe(s, ck, &per_party_hidden, t_mask, profile);
         fhe_ph.add(&ph);
         c_dense_in = c_hidden;
         dense_in_dim = h;
@@ -1175,14 +1376,15 @@ pub fn run_cnn_hybrid_full(
     // ── Output dense (FHE ct×ct matvec) → open ──
     let t3 = Instant::now();
     let (dense_open, dense_masks, ph) = hybrid_matvec_open(
-        &s,
-        &ck,
+        s,
+        ck,
         &c_dense_in,
         &model.dense_w,
         dense_in_dim,
         profile,
         &mut rng,
         &mut masks_src(&mut pool),
+        &mut weights_src,
     );
     fhe_ph.add(&ph);
     fhe_ms += t3.elapsed().as_secs_f64() * 1000.0;
@@ -1223,9 +1425,14 @@ pub fn run_cnn_hybrid_full(
     mpc_ms += t0.elapsed().as_secs_f64() * 1000.0;
     let class = classes[0].0;
 
+    // Both halves of the preamble must have been consumed exactly: a pool that
+    // over-counts hides work in the offline column, and an encrypted model that
+    // over-counts means the pipeline multiplied against fewer weights than the
+    // model has — which would still produce *a* class, just the wrong one.
     if let Some(p) = &pool {
         p.assert_fully_consumed();
     }
+    weights_src.assert_fully_consumed();
 
     CnnRun {
         correct: class == expected,
@@ -1237,6 +1444,8 @@ pub fn run_cnn_hybrid_full(
         phases,
         fhe_phases: fhe_ph,
         offline_ms,
+        offline_session_ms,
+        offline_query_ms,
         comm,
         bootstraps: 0,
         ring_n: s.params.n,
@@ -1457,10 +1666,23 @@ pub fn run_cli(args: &[String]) -> Result<(), String> {
     println!("  nonlinearity    : {}", nonlin.label());
     println!("  time            : total {:.0}ms  (fhe {:.0}ms, mpc {:.0}ms)", r.total_ms, r.fhe_ms, r.mpc_ms);
     println!(
-        "  offline         : {:.0}ms  (query-independent: keygen{}; NOT in total)",
-        r.offline_ms,
-        if precompute { " + mask pool" } else { "" }
+        "  offline         : {:.0}ms  (query-independent, NOT in total)",
+        r.offline_ms
     );
+    if precompute {
+        // The two halves are not the same kind of saving, and adding them into
+        // one number would overstate the result.
+        println!(
+            "                    {:.0}ms per SESSION (keygen + encrypted model) — paid once, \
+             reused by every query: real amortization",
+            r.offline_session_ms
+        );
+        println!(
+            "                    {:.0}ms per QUERY (mask pool) — masks must be fresh, so this \
+             shifts latency but not total work",
+            r.offline_query_ms
+        );
+    }
     println!(
         "  fhe breakdown   : keygen {:.0}ms, input {:.0}ms, weights {:.0}ms ({}x), \
          mul {:.0}ms, mask {:.0}ms ({}x), decrypt {:.0}ms, re-encrypt {:.0}ms ({}x)",
@@ -1572,13 +1794,56 @@ mod tests {
                 assert!(on.correct && pre.correct, "d={d} seed={seed}: must match plaintext");
                 assert_eq!(pre.class, on.class, "d={d} seed={seed}: precompute changed the class");
                 assert_eq!(pre.fhe_phases.n_mask_enc, 0, "online path still encrypted masks");
+                assert_eq!(
+                    pre.fhe_phases.n_weight_enc, 0,
+                    "d={d} seed={seed}: online path still encrypted the model"
+                );
+                assert!(
+                    pre.fhe_phases.weights_ms == 0.0,
+                    "d={d} seed={seed}: model encryption still charged to the online phase"
+                );
+                assert!(on.fhe_phases.n_weight_enc > 0, "the control must encrypt online");
+                assert!(pre.offline_ms > on.offline_ms, "the model's cost must move offline");
                 assert!(pre.offline_ms > 0.0, "offline work must be reported, not hidden");
             }
         }
-        // The two-conv model exercises the multi-layer pool-size prediction.
+        // The two-conv model exercises the multi-layer size prediction for both
+        // halves of the preamble — chunked hidden layers after two conv stages
+        // are where a count goes wrong.
         let (model, input, _) = two_conv_model();
         let pre = run_cnn_hybrid_full(&model, &input, NetworkProfile::INSTANT, Nonlin::Gc, true);
-        assert!(pre.correct, "two-conv: precomputed masks must still be exact");
+        assert!(pre.correct, "two-conv: the precomputed preamble must still be exact");
+        assert_eq!(pre.fhe_phases.n_weight_enc, 0, "two-conv: model not fully precomputed");
+    }
+
+    /// The encrypted model is **per-session**, so a second query in the same
+    /// session must reuse it: same class, and still no online weight encryption.
+    ///
+    /// This is what separates it from the mask pool, which is per-query and has
+    /// to be refilled. Masks shift latency; weights amortize.
+    #[test]
+    #[ignore]
+    fn the_encrypted_model_is_reused_across_queries_in_a_session() {
+        let (model, _) = CnnModel::random(8, 3);
+        let s = Bfv::new(BfvParams { n: 4096, log2_q: 100, log2_t: model.nbits as u32 });
+        let (ck, _sk) = s.keygen();
+        let polys = weight_polys(&s, &model);
+        let enc = EncryptedModel::encrypt(&s, &ck, &polys);
+
+        // Two different inputs, one encrypted model: the ciphertexts do not
+        // depend on the query, so the same `Weights` source serves both.
+        for seed in [3u64, 9] {
+            let (_, input) = CnnModel::random(8, seed);
+            let mut w = Weights::session(&enc);
+            let mut ph = FhePhases::default();
+            for poly in &polys {
+                let ct = w.take(&s, &ck, || poly.clone(), &mut ph);
+                assert_eq!(ct.c.len(), 2, "a fresh weight ciphertext is degree-1");
+            }
+            w.assert_fully_consumed();
+            assert_eq!(ph.n_weight_enc, 0, "session weights must not re-encrypt");
+            assert!(!input.is_empty());
+        }
     }
 
     /// The scheme-switch import must cost a *constant* number of rounds, not

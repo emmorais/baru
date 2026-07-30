@@ -64,26 +64,34 @@ baru bench-medmnist --dataset pneumonia --hybrid 2 --gc --precompute
 ```
 
 ```
-latency  : 2896 ms   (fhe 2123 ms, mpc 756 ms)
-fhe split: weights 670 ms, mul 634 ms, mask-enc 0 ms, decrypt 668 ms, re-encrypt 151 ms
-mpc split: import 21 ms, relu 505 ms, pool 216 ms, argmax 7 ms
-offline  : 2028 ms query-independent (keygen + mask pool), NOT in the latency above
+latency  : 1152 ms   (fhe 355 ms, mpc 793 ms)
+fhe split: weights 0 ms, mul 172 ms, mask-enc 0 ms, decrypt 148 ms, re-encrypt 34 ms
+mpc split: import 27 ms, relu 526 ms, pool 222 ms, argmax 7 ms
+offline  : 538 ms/image  —  78 per-SESSION (amortizes), 460 per-QUERY (shifts only)
 ```
 
-It was **32.7 s** the same morning. The construction never changed — only
-round batching, the protocol chosen for comparisons, and what sits on the
-critical path.
+It was **32.7 s** when this document was started. The construction never
+changed — only round batching, the protocol chosen for comparisons, what sits
+on the critical path, and the speed of the ring arithmetic underneath.
 
 | step | pneumonia latency | what changed |
 |---|---|---|
-| start of day | 32.7 s | — |
+| start | 32.7 s | — |
 | batched scheme-switch import | 5.71 s | 3 rounds per *layer*, not per activation |
 | garbled nonlinearities (`--gc`) | 4.94 s | constant-round ReLU + max-pool |
 | tournament `argmax` | 4.94 s | (invisible at rtt=0; 2.4× at RTT 20 ms) |
-| preprocessed masks (`--precompute`) | **2.90 s** | + 2.03 s offline |
+| preprocessed masks (`--precompute`) | 2.90 s | + 2.03 s offline |
+| Shoup butterfly in `ntt.rs` | 1.75 s | 4.65× on every transform |
+| precomputed model (§3.1) | **1.15 s** | weights encrypted once per *session* |
 
-WAN (RTT 20 ms, 1 Gbps): 5.00 s online. The pipeline is **not round-bound** —
-that is what the constant-round nonlinearities bought.
+**The MPC segment is now the majority again — 793 ms of 1152 ms (69%)** — and
+inside it the ReLU is 526 ms. That is a reversal of the standing finding this
+document recorded for months ("the cost centre is FHE"), and it is a direct
+consequence of the FHE side getting ~3× cheaper while the MPC side did not
+move. Anyone optimising next should read §3.3 before §3.2.
+
+WAN (RTT 20 ms, 1 Gbps): the pipeline is **not round-bound** — that is what the
+constant-round nonlinearities bought.
 
 ### The synthetic control (`bench-cnn --img 28`)
 
@@ -93,10 +101,14 @@ and prints everything:
 
 ```sh
 baru bench-cnn --img 28 --gc --precompute
-# total 1312ms (fhe 695ms, mpc 600ms) | offline 673ms
-# fhe: keygen 10 / input 17 / weights 218 (13x) / mul 209 / mask 0 (0x) / decrypt 216 / re-encrypt 51 (3x)
-# mpc: import 11 / relu 412 / pool 158 / argmax 28
+# total 736ms (fhe 116ms, mpc 616ms) | offline 201ms
+# fhe: keygen 4 / input 4 / weights 0 (0x) / mul 57 / mask 0 (0x) / decrypt 48 / re-encrypt 11 (3x)
+# mpc: import 12 / relu 417 / pool 157 / argmax 24
 ```
+
+Note this control builds a fresh session per call, so its `offline` includes the
+whole per-session cost. `bench-medmnist` builds one session for the batch, which
+is where the amortization shows.
 
 ---
 
@@ -278,45 +290,65 @@ extended to reductions returning an *index*: only the value is
 order-insensitive.
 
 
-### 3.1 Precompute the encrypted **model** — best remaining win, low risk
+### 3.1 ~~Precompute the encrypted **model**~~ — DONE 2026-07-30
 
-**670 ms, 23% of the online diagnosis**, and it is query-independent for a
-strictly better reason than the masks were.
+Landed as `CnnSession` (`src/bench/cnn.rs`): the FHE context, the key and the
+encrypted weights are built once per model and reused by every query.
+`bench-medmnist` now builds one session for the whole batch.
 
-`hybrid_conv_open` and `hybrid_matvec_open` call `s.encrypt_poly(ck, &kpoly)`
-inside their per-channel / per-chunk loop, so every inference re-encrypts the
-whole model. But the model does not change between patients. Under a
-per-session key the encrypted weights are uploaded **once** and reused for
-every query in that session.
+**Measured** (pneumonia, `--gc`, this machine — the control is the same command
+without `--precompute`):
 
-Note this is *better than the mask result*, and the distinction belongs in the
-paper:
+| | control | precomputed |
+|---|---|---|
+| online latency | 1752 ms | **1134 ms** |
+| of which FHE | 971 ms | **358 ms** |
+| weight encryption, online | 152 ms | **0 ms** |
+| mask encryption, online | 457 ms | **0 ms** |
 
-- **Masks** are per-query — precomputing shifts latency but buys **no
-  throughput**. A saturated server does the same total work.
-- **Weights** are per-*session* — precomputing is genuine **amortization**.
-  Total work drops by 670 ms per query after the first.
+**The predicted 670 ms was stale, and the shape of the result is what matters.**
+That figure predated the Shoup butterfly (§II.2 of `experiments.md`), which made
+`encrypt_poly` several times cheaper; on current code the model's encryption is
+**152 ms**, not 670. The saving is real but the headline 618 ms of offline work
+is mostly the *masks*, not the weights.
 
-**How:** generalise `MaskPool` into a session preamble holding both the mask
-pool and the encrypted model. Follow the existing shape exactly: build it
-before `start`, report it in `offline_ms`, assert exact consumption so the
-size prediction cannot drift from the pipeline
-(`MaskPool::for_model` + `rows_per_chunk` is the pattern).
+**Which is why the two are now reported separately**, and this is the part worth
+carrying into the paper. `CnnRun` splits `offline_ms` into
+`offline_session_ms` and `offline_query_ms`, and `bench-medmnist` prints both
+per image:
 
-**Trap:** the model ciphertexts must be encrypted under the *same* key as
-everything else. This already bit once — the first `--precompute` draft called
-`s.keygen()` a second time for the pool, which produces masks that do not
-decrypt. Hoist keygen above the preamble.
+```
+offline  : 613 ms/image        (1 image)      511 ms/image      (3 images)
+           156 ms/image per-SESSION            52 ms/image per-SESSION
+           457 ms/image per-QUERY             459 ms/image per-QUERY
+```
 
-**Verify:** extend `precomputed_masks_change_nothing_but_the_timing` — same
-class, both nonlinearity routes, and the two-conv model (multi-layer chunking
-is where a size prediction goes wrong).
+The per-session line falls exactly as `1/batch` while the per-query line stays
+flat. That is the distinction stated as a measurement rather than a claim:
 
-**Expected:** 2.90 s → ~2.23 s online.
+- **Masks are per-query.** Pooling them shifts latency off the critical path
+  and buys **no throughput** — a saturated server does the same total work.
+- **Weights are per-session.** Encrypting them once is genuine **amortization**
+  — total work per query drops permanently after the first.
+
+**Verified by** `precomputed_masks_change_nothing_but_the_timing` (extended: the
+online path must do zero weight encryptions and the offline column must grow)
+and `the_encrypted_model_is_reused_across_queries_in_a_session`.
+
+**Two structural notes for whoever continues:**
+
+- `weight_polys` is now the single source of truth for the pipeline's shape.
+  It yields one packed polynomial per ct×ct multiply, and since every multiply
+  is followed by exactly one scheme switch, it *also* sizes the mask pool. The
+  hand-written count in `MaskPool::for_model` is gone — the two can no longer
+  drift, rather than drifting and being caught.
+- The keygen trap held: `CnnSession::new` does keygen first, and everything else
+  in the session is encrypted under that key.
 
 ### 3.2 Store the weight ciphertexts **pre-transformed** (NTT domain)
 
-Follows directly from 3.1 and needs it first.
+Follows directly from 3.1, which is now done and supplies the preamble to hold
+the transformed ciphertexts.
 
 `mul_pre(a: &BfvCtNtt, b: &BfvCt)` takes the input pre-transformed and
 transforms `b` (the weights) inside `exact_bfv_tensor_pre`, once per output
@@ -329,9 +361,12 @@ offline, their transforms can be too.
 preamble instead of `BfvCt`. `BfvCtNtt` is currently not `Clone`/serialisable
 — it will need to be.
 
-**Expected:** roughly 2 of the ~5 NTTs per channel, so ~40% of the 634 ms
-`mul` phase. Estimate only — **measure before quoting**. Cumulative with 3.1:
-~2.0 s online.
+**Expected:** roughly 2 of the ~5 NTTs per channel. On current code the `mul`
+phase is **173 ms** of a 1134 ms diagnosis (the 634 ms figure predates the Shoup
+butterfly, as the 670 ms in 3.1 did), so the ceiling here is ~70 ms — worth
+having, but no longer the biggest remaining item. Estimate only — **measure
+before quoting**. With `mul` and `decrypt` now comparable (173 vs 148 ms) and
+the MPC segment at 789 ms, the honest next target is §3.3.
 
 ### 3.3 Parallelism
 
@@ -356,8 +391,14 @@ absolute win available and the least interesting scientifically.
 - **Optimising `import`.** It is 21 ms. It was 19 100 ms this morning; that is
   finished.
 - **Optimising `argmax` further.** 7 ms on 2 classes, 30 ms on 11.
-- **More MPC protocol work generally.** The MPC segment is 756 ms of 2896 ms
-  and its largest phase (ReLU, 505 ms) is already constant-round garbled.
+- ~~**More MPC protocol work generally.**~~ **This entry has flipped — do not
+  trust it.** It was written when the MPC segment was 756 ms of 2896 ms (26%).
+  After the Shoup butterfly and §3.1 the FHE side is ~3× cheaper and the MPC
+  side did not move, so the segment is now **793 ms of 1152 ms (69%)** and its
+  largest phase (ReLU, 526 ms) is the single biggest item in the pipeline. It
+  is already constant-round garbled, so the next lever there is parallelism
+  (§3.3) or a cheaper comparison, not batching. Re-derive before acting: this
+  is exactly the kind of entry §2 warns goes stale when the other side moves.
 
 ---
 
@@ -372,14 +413,19 @@ absolute win available and the least interesting scientifically.
 - **`tab:arch` mixes training budgets.** The winning row is a longer retrain
   (98.89%); the other rows are the original sweep. Flagged in the caption, but
   re-running the sweep under one recipe would remove the asterisk.
-- **The throughput caveat for preprocessing** (see 3.1) is stated for masks in
-  §7.5 but should be sharpened once weights are preprocessed too, because the
-  two differ in kind.
-- **`--precompute` offline cost exceeds online cost** for the synthetic model
-  (673 ms vs 1312 ms is fine; on the medical model 2028 vs 2896 is also fine —
-  but check this stays true as online shrinks). If offline ever exceeds online
-  by a lot, a continuously-loaded server cannot keep up and the framing has to
-  change from "latency" to "latency, given spare offline capacity".
+- ~~**The throughput caveat for preprocessing**~~ — resolved 2026-07-30. The
+  two kinds are now measured separately (`offline_session_ms` vs
+  `offline_query_ms`, printed per image by `bench-medmnist`), and §3.1 has the
+  numbers showing the per-session line falling as `1/batch` while the per-query
+  line stays flat. The paper should use that split rather than one offline
+  total.
+- **`--precompute` offline cost vs online cost.** Still comfortable, and the
+  margin has held as online shrank: synthetic 201 ms offline against 736 ms
+  online; medical 538 ms/image offline against 1152 ms online. Only the
+  per-*query* part (460 ms of that 538) is the one that matters for a
+  continuously-loaded server — the per-session part amortizes away. If the
+  per-query offline ever approaches online, the framing has to change from
+  "latency" to "latency, given spare offline capacity".
 - **MedMNIST scope.** Already stated: downsampled, pre-processed, no clinical
   claim. Keep it stated.
 
