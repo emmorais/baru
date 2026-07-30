@@ -1150,31 +1150,75 @@ Measured, two parties, semi-honest, 4096 triples:
 
 | route | domain | B/triple | triples/s | rounds | ok |
 |---|---|---|---|---|---|
-| **lowgear (SHE)** | `F_114689` | **104** | 197 600 | 2 | ✓ |
+| **lowgear (SHE)** | `F_941356466589171713` | **192** | 73 400 | 2 | ✓ |
 | semi2k (OT) | `Z_2^64` | 3074 | 2 620 | 3 | ✓ |
 
-The two work over different structures, so the honest comparison is at **equal
-field width**: LowGear's ~17-bit prime needs 4 CRT limbs to reach 64 bits ⇒
-**416 B/triple against OT's 3074 — a 7.4× communication advantage**, and within
-8% of the literature's 384 B, which is a good sign for both numbers.
+LowGear's ~61-bit field covers Semi2k's 64-bit values without CRT limbs, so the
+comparison is direct: **192 B/triple against OT's 3074 — a 16.3× communication
+advantage**, and 2× better than the literature's 384 B estimate.
 
 **The surprise, and a correction to our own model.** `mpcc::cost` asserted that
 *"LowGear trades bandwidth for CPU: its preprocessing is compute-bound."* That
 note was never measured, and it is **wrong** here: LowGear generates triples
-**~19× faster** than the OT route at equal field width (197 600 vs 2 624
-triples/s, divided by the 4 CRT limbs). There is no trade at these parameters —
-SHE wins on bytes *and* on CPU, and by a wide margin. The note has been replaced
-with the measurement. (It was ~4.5× when first measured; the Shoup butterfly
-below sped the SHE side up again, since LowGear rides the same NTT.)
+**~28× faster** than the OT route (73 400 vs 2 620 triples/s). There is no trade
+at these parameters — SHE wins on bytes *and* on CPU, and by a wide margin. The
+note has been replaced with the measurement.
 
 **Scope, stated plainly.** Semi-honest only: no MACs, no sacrifice, and **no
 zero-knowledge proofs of plaintext knowledge**. A malicious party can send a
 malformed ciphertext and learn about the other's input from decryption
 behaviour. ZKPoPK is the bulk of the Overdrive paper and is deliberately absent
-— this is the LowGear analogue of Semi2k, not of SPDZ. The ~17-bit field is
-also a real limit, forced by the noise-flooding budget at this crate's
-`u128`-capped `q ≤ 2^127` (Overdrive uses 250–350-bit `q` at `n = 16384–32768`);
-the 4-limb CRT extension is how the 64-bit figure is reached.
+— this is the LowGear analogue of Semi2k, not of SPDZ.
+
+### Widening the field, and what it cost the paper's claim
+
+LowGear originally ran at `n = 4096, q = 2^100`, which the flooding budget
+`t²·n²·3·2^(σ−1) < q/2` pins to a **~17-bit field**. That is enough to
+multiply and not enough to *compare*: masked bit-decomposition needs
+`bit_width + KAPPA` ≈ 58 bits, so the engine refused comparison-shaped programs
+and `bench-layer`'s SHE row had to be **composed** from two measurements rather
+than run.
+
+Closing that meant widening the arithmetic. `q = 2^190` needs 256-bit
+coefficients and a 512-bit product accumulator, so:
+
+- [src/fhe/bigint.rs](src/fhe/bigint.rs) — `IntN<const L: usize>`, replacing
+  the bespoke `I256`. The narrow path measured **1.770 ms → 1.770 ms** at
+  n=4096: zero regression, because the const-generic loops unroll as the
+  hand-written `u128` halves did.
+- [src/fhe/ntt.rs](src/fhe/ntt.rs) — a **wide profile**: `MAX_N` 4096 → 8192,
+  7 primes (CRT modulus ~2^441) against the narrow 4. One prime table serves
+  both, since `p ≡ 1 mod 16384` implies `p ≡ 1 mod 8192`.
+- [src/fhe/bgv_wide.rs](src/fhe/bgv_wide.rs) — BGV at 256-bit coefficients,
+  carrying only what the OLE needs (the OLE is ct×*plaintext*, so no tensor, no
+  relinearization, no key power above one).
+
+LowGear now runs at `n = 8192, q = 2^190, t ≈ 2^61` and **computes ReLU
+correctly**. Two bugs surfaced getting there, both mine: the flooding mask was
+`log2_bound + 1` bits instead of `log2_bound`, doubling the noise past `q/2` and
+silently invalidating every triple; and the parameter search accepted a set with
+**0.29 bits** of slack. `validate` now demands 2 bits, and the
+deployed-parameter triple test is **no longer `#[ignore]`d** — it was ignored,
+which is why a wrong answer three layers up was the first symptom.
+
+The measured consequence, WAN, 2 parties, preprocessing charged per triple
+*consumed*:
+
+| width | dealer (lower bound) | semi2k (OT) | **lowgear (SHE)** | hybrid/bfv |
+|---|---|---|---|---|
+| 64 | 600.6 ms | 694.5 ms | **606.2 ms** | 692.1 ms |
+| 1024 | 603.0 ms | 942.8 ms | **623.4 ms** | 692.1 ms |
+| 4096 | 610.9 ms | 1.74 s | **678.4 ms** | 733.7 ms |
+
+**The hybrid never beats SHE-preprocessed MPC at any width measured**, and
+LowGear tracks the trusted-dealer *lower bound* within 5 ms at width 64 —
+because its preprocessing is **192 B/triple against OT's 3136, 16.3× cheaper**,
+and ~28× faster. The earlier composed estimate said the crossover moved from
+width 64 to 4096; measuring it properly says it is gone in this range entirely.
+
+That is a real qualification to `paper-outline` E25, whose conclusion — *"the
+entire case for FHE here is the cost of preprocessing"* — turns out to be
+exactly right, and to cut the other way once MPC gets the better preprocessing.
 
 ### Both are now executable protocols, not just cost rows
 

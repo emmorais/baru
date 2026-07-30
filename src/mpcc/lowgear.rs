@@ -55,7 +55,7 @@
 //! which is why `BgvParams::t` had to stop being a power of two. With
 //! coefficient packing one ciphertext pair yields *one* useful product, i.e.
 //! ~131 KB per triple: **40× worse than the OT it replaces**. Slot packing is
-//! the difference between this protocol winning by ~30× and losing by ~40×.
+//! the difference between this protocol winning by 16× and losing by 40×.
 //!
 //! # Parameters, and the flooding budget that fixes them
 //!
@@ -71,13 +71,24 @@
 //!     t² · n² · 3 · 2^(σ−1) < q/2
 //! ```
 //!
-//! At `n = 4096`, `q = 2^100`, `σ = 40` this gives `t < 2^17.2`. So the field
-//! is **~17 bits**, not the 128 bits SPDZ uses — a direct consequence of this
-//! crate's `u128` coefficient representation capping `q` at `2^127`, where
-//! Overdrive runs `q` of 250–350 bits at `n = 16384–32768`. [`wider_field_cost`]
-//! extrapolates the per-triple cost to a 64-bit field by CRT over several such
-//! primes, which is the standard construction and the honest way to compare
-//! against Semi2k's `Z_2^64`.
+//! At `n = 8192`, `q = 2^190`, `σ = 40` this gives `t < 2^61`. That is the whole
+//! reason the parameters are as large as they are: the field has to carry
+//! `bit_width + KAPPA` bits or the engine cannot bit-decompose, cannot compare,
+//! and cannot run a private layer.
+//!
+//! It ran at `n = 4096, q = 2^100` until 2026-07-30, where the same inequality
+//! gives a ~17-bit field — enough to multiply, not enough to compare. Widening
+//! `q` past `u128` needed [`crate::fhe::bigint`]'s width-generic integers,
+//! `ntt`'s wide profile, and [`crate::fhe::bgv_wide`]. Overdrive itself runs
+//! `q` of 250–350 bits at `n = 16384–32768` for a 128-bit field.
+//!
+//! **Two bugs lived in this budget, so treat it as load bearing.** The flooding
+//! mask was `log2_bound + 1` bits rather than `log2_bound`, doubling the noise
+//! past `q/2` and silently invalidating *every* triple; and the parameter search
+//! accepted a set with 0.29 bits of slack. [`LowGearParams::validate`] now
+//! demands 2 bits, and `deployed_parameters_produce_valid_triples` is not
+//! `#[ignore]`d — while it was, the first symptom was a wrong ReLU three layers
+//! up.
 //!
 //! # Scope, stated
 //!
@@ -97,7 +108,7 @@
 
 use rand::Rng;
 
-use crate::fhe::bgv::{Bgv, BgvParams};
+use crate::fhe::bgv_wide::{BgvWide, WideParams};
 use crate::fhe::slots;
 
 use super::vm::{Counters, Modulus, ShareEngine};
@@ -118,12 +129,24 @@ pub struct LowGearParams {
 }
 
 impl LowGearParams {
-    /// The deployed set: `n = 4096`, `q = 2^100` (same ring and modulus as
-    /// [`BgvParams::DEFAULT`], so security carries over unchanged), `σ = 40`,
-    /// and the largest prime the flooding budget allows.
+    /// The deployed set: `n = 8192`, `q = 2^190`, `σ = 40`, and the largest
+    /// prime the flooding budget allows — which comes out ~2^61.
+    ///
+    /// **Why so large.** The field has to carry `bit_width + KAPPA` bits or the
+    /// engine cannot bit-decompose, and without bit-decomposition it cannot run
+    /// a comparison, and without a comparison it cannot run a private layer.
+    /// Working back through the budget below, a ~61-bit field needs
+    /// `q ≈ 2^190`; `q = 2^190` needs 256-bit coefficients
+    /// ([`crate::fhe::bgv_wide`]) and `n = 8192` to stay inside the ~218-bit
+    /// RLWE ceiling at 128-bit security.
+    ///
+    /// This was `n = 4096, q = 2^100` until 2026-07-30, giving a ~17-bit field
+    /// that could multiply but not compare — so `bench-layer`'s SHE row had to
+    /// be *composed* from two measurements rather than measured. That is the
+    /// gap these parameters close.
     pub fn default_params() -> LowGearParams {
-        Self::largest_usable(4096, 100, 40)
-            .expect("a slot prime fits the flooding budget at n=4096, q=2^100, sec=40")
+        Self::largest_usable(8192, 190, 40)
+            .expect("a slot prime fits the flooding budget at n=8192, q=2^190, sec=40")
     }
 
     /// The largest plaintext modulus that both admits slots **and** passes
@@ -136,19 +159,26 @@ impl LowGearParams {
     /// passes — the two can then never disagree.
     pub fn largest_usable(n: usize, log2_q: u32, sec: u32) -> Option<LowGearParams> {
         let mut cap = max_plaintext_modulus(n, log2_q, sec);
-        loop {
-            let t = slots::largest_slot_prime(n, cap)?;
-            let candidate = LowGearParams { n, log2_q, t, sec };
-            if candidate.validate().is_ok() {
-                return Some(candidate);
+        // **Halve** on failure, never decrement. The constraint is on `log2 t`,
+        // so stepping the cap down by 1 barely moves it: an earlier version did
+        // exactly that and scanned ~10^13 candidates before anyone noticed it
+        // had not hung. Halving drops `log2 t` by one per iteration, so this
+        // terminates in at most `log2 cap` rounds.
+        while cap > 1 {
+            if let Some(t) = slots::largest_slot_prime(n, cap) {
+                let candidate = LowGearParams { n, log2_q, t, sec };
+                if candidate.validate().is_ok() {
+                    return Some(candidate);
+                }
             }
-            cap = t.checked_sub(1)?;
+            cap /= 2;
         }
+        None
     }
 
     /// Small parameters for fast tests. **Not secure** — the ring is tiny.
     pub fn test_small() -> LowGearParams {
-        LowGearParams { n: 64, log2_q: 100, t: 3329, sec: 20 }
+        LowGearParams { n: 64, log2_q: 190, t: 3329, sec: 20 }
     }
 
     /// Bits per field element on the wire — **exactly**
@@ -160,8 +190,8 @@ impl LowGearParams {
         64 - self.t.leading_zeros()
     }
 
-    fn bgv(&self) -> BgvParams {
-        BgvParams { n: self.n, log2_q: self.log2_q, t: self.t }
+    fn bgv(&self) -> WideParams {
+        WideParams { n: self.n, log2_q: self.log2_q, t: self.t }
     }
 
     /// log2 of the flooding bound: `σ` bits above the input-dependent noise
@@ -186,19 +216,24 @@ impl LowGearParams {
         // Total magnitude that must stay under q/2 = 2^(log2_q − 1).
         let used = (self.t as f64).log2() + self.log2_flood_bound() as f64;
         let budget = self.log2_q as f64 - 1.0;
-        if used >= budget {
+        // Demand real margin, not just `<`. The first wide parameter set passed
+        // this check with **0.29 bits** to spare and produced silently invalid
+        // triples once a one-bit slip elsewhere ate the margin. Two bits is
+        // cheap here — it costs one bit of field, and the field has ~30 bits
+        // more than bit-decomposition needs.
+        const MIN_SLACK_BITS: f64 = 2.0;
+        if used + MIN_SLACK_BITS >= budget {
             return Err(format!(
-                "flooded noise 2^{used:.1} exceeds the correctness bound q/2 = 2^{budget:.0}; \
-                 lower t or sec, or raise log2_q"
+                "flooded noise 2^{used:.1} leaves under {MIN_SLACK_BITS} bits against the \
+                 correctness bound q/2 = 2^{budget:.0}; lower t or sec, or raise log2_q"
             ));
         }
         Ok(budget - used)
     }
 
     /// Serialized bytes of one ciphertext on the wire: 2 ring elements at
-    /// `⌈log₂q/8⌉` bytes per coefficient. Matches [`crate::pir`]'s convention —
-    /// what a real implementation sends, not the 16-byte `u128` this crate
-    /// happens to compute in.
+    /// `⌈log₂q/8⌉` bytes per coefficient — what a real implementation sends,
+    /// not the 32 bytes an `I256` occupies in memory.
     pub fn ct_wire_bytes(&self) -> usize {
         2 * self.n * self.log2_q.div_ceil(8) as usize
     }
@@ -210,7 +245,10 @@ impl LowGearParams {
 /// derived in the module docs.
 pub fn max_plaintext_modulus(n: usize, log2_q: u32, sec: u32) -> u64 {
     let n = n as f64;
-    let log2_rest = (n * n * 3.0).log2() + sec as f64 - 1.0;
+    // `validate` compares `log2 t + flood_bound` against `log2_q − 1`, and
+    // `flood_bound` takes a `ceil` — so allow a whole bit for that rounding or
+    // the closed form sits just above what the check accepts.
+    let log2_rest = (n * n * 3.0 / 2.0).log2() + sec as f64 + 1.0;
     let log2_t = ((log2_q as f64 - 1.0) - log2_rest) / 2.0;
     if log2_t <= 1.0 {
         return 0;
@@ -269,7 +307,7 @@ fn random_vec(n: usize, t: u64) -> Vec<u64> {
 /// The engine. Holds one BGV instance and each party's key material.
 pub struct LowGear {
     pub params: LowGearParams,
-    bgv: Bgv,
+    bgv: BgvWide,
     /// Per-party `(client_key, public_key)`. LowGear is pairwise-keyed: each
     /// party has its own, and there is no distributed key generation.
     keys: [(Vec<u8>, Vec<u8>); 2],
@@ -278,7 +316,7 @@ pub struct LowGear {
 impl LowGear {
     pub fn new(params: LowGearParams) -> Result<LowGear, String> {
         params.validate()?;
-        let bgv = Bgv::new(params.bgv());
+        let bgv = BgvWide::new(params.bgv())?;
         let k0 = bgv.keygen();
         let k1 = bgv.keygen();
         Ok(LowGear { params, bgv, keys: [k0, k1] })
@@ -425,22 +463,22 @@ pub fn wider_field_cost(params: &LowGearParams, field_bits: u32, one_limb_bytes:
 /// model was guessing at, with the online phase held constant against two
 /// protocols whose predictions are already validated.
 ///
-/// # Capability boundary, stated
+/// # Field width, and what it now permits
 ///
-/// The field is `t ≈ 2^17` (the flooding budget — see the module docs), and
-/// that is **too small for comparison-shaped programs**. `mpcc::vm`'s masked
-/// bit-decomposition needs [`crate::mpcc::vm::KAPPA`] = 26 bits of statistical
-/// headroom *above* the value width, which a 17-bit modulus cannot provide at
-/// any value width. So:
+/// The field is `t ≈ 2^61`, fixed by the flooding budget at `q = 2^190` (see
+/// the module docs). That is wide enough for `mpcc::vm`'s masked
+/// bit-decomposition, which needs [`crate::mpcc::vm::KAPPA`] = 26 bits of
+/// statistical headroom above the value width — so **comparison-shaped programs
+/// run**, and with them whole private layers.
 ///
-/// - arithmetic programs (`+`, `−`, `×`, constants, opens) run correctly;
-/// - anything needing `random_bits` / bit-decomposition (`<`, `>`, truncation)
-///   is **rejected at construction** rather than run and silently wrong.
-///
-/// This is a real limit of this artifact, not of LowGear. It follows from
-/// `q ≤ 2^127`, which follows from this crate representing ring coefficients as
-/// `u128`; Overdrive uses 250–350-bit `q` at `n = 16384–32768` and gets a
-/// 128-bit plaintext field. Widening the coefficient type is the unblock.
+/// Until 2026-07-30 the field was ~17 bits (`q = 2^100`, capped by `u128`
+/// coefficients) and this engine could multiply but not compare;
+/// `mpcc::engine_can_run_program` refused those programs rather than answer
+/// them wrongly. Widening the coefficient type
+/// ([`crate::fhe::bigint`], [`crate::fhe::bgv_wide`]) is what removed the
+/// restriction. Overdrive itself runs `q` of 250–350 bits at
+/// `n = 16384–32768` for a 128-bit field; 61 bits is enough for this repo's
+/// 32-bit values.
 pub struct LowGearEngine {
     gen: LowGear,
     m: Modulus,
@@ -585,19 +623,21 @@ impl ShareEngine for LowGearEngine {
         values.iter().map(|s| self.reconstruct(s)).collect()
     }
 
-    /// **Not supported at this field size.** Masked opening needs `KAPPA` bits
-    /// of headroom above the value, and `t ≈ 2^17` has none to give. Panicking
-    /// here is deliberate: the alternative is a silently wrong comparison, and
-    /// `mpcc::run_protocol` rejects such programs before reaching this point.
-    fn random_bits(&mut self, _n: usize) -> Vec<Additive> {
-        panic!(
-            "lowgear: random_bits needs KAPPA={} bits of masking headroom, but t = {} is \
-             only {} bits wide. Comparison-shaped programs cannot run on this engine — \
-             see `mpcc::lowgear::LowGearEngine`'s capability boundary.",
-            crate::mpcc::vm::KAPPA,
-            self.gen.params.t,
-            self.gen.params.field_bits()
-        )
+    /// `n` shared uniform bits.
+    ///
+    /// Same simplification as `DealerEngine` and `Semi2kEngine`: drawn locally
+    /// and counted, never executed (see `mpcc::vm`). What changed on
+    /// 2026-07-30 is that this is *reachable* at all — at the old ~17-bit field
+    /// it panicked, because masked opening needs `KAPPA` bits of headroom above
+    /// the value width and there were none. The wide parameters give ~61 bits,
+    /// so bit-decomposition, comparison and therefore a whole private layer now
+    /// run on this engine.
+    fn random_bits(&mut self, n: usize) -> Vec<Additive> {
+        self.counters.random_bits += n as u64;
+        let mut rng = rand::thread_rng();
+        (0..n)
+            .map(|_| self.split(u64::from(rng.gen::<bool>())))
+            .collect()
     }
 }
 
@@ -616,9 +656,15 @@ mod tests {
         assert!(p.t > 1000, "field should not be degenerate, got t={}", p.t);
         assert!(slots::supports_slots(p.n, p.t));
         assert!(slack > 0.0, "no noise budget left: {slack}");
-        // The bound in the module docs: ~17 bits at n=4096, q=2^100, sec=40.
+        // The bound in the module docs: ~61 bits at n=8192, q=2^190, sec=40.
         let log2_t = (p.t as f64).log2();
-        assert!((15.0..18.0).contains(&log2_t), "log2 t = {log2_t}");
+        assert!((58.0..62.0).contains(&log2_t), "log2 t = {log2_t}");
+        // …and that is the whole point: wide enough to bit-decompose.
+        assert!(
+            p.field_bits() >= 32 + crate::mpcc::vm::KAPPA,
+            "field must carry bit_width + KAPPA to run a comparison, got {} bits",
+            p.field_bits()
+        );
     }
 
     #[test]
@@ -771,37 +817,55 @@ mod tests {
         assert!(LowGearEngine::new(3, LowGearParams::test_small()).is_err());
     }
 
-    /// The capability boundary is a refusal, not a wrong answer.
+    /// `random_bits` used to panic — the ~17-bit field had no masking headroom.
+    /// At the wide parameters it works, which is what unlocks comparisons.
     #[test]
-    #[should_panic(expected = "masking headroom")]
-    fn random_bits_refuses_rather_than_returning_garbage() {
-        let mut e = LowGearEngine::new(2, LowGearParams::test_small()).unwrap();
-        let _ = e.random_bits(1);
+    fn random_bits_produces_valid_shared_bits() {
+        let mut e = LowGearEngine::new(2, LowGearParams::default_params()).unwrap();
+        let bits = e.random_bits(64);
+        assert_eq!(bits.len(), 64);
+        let opened = e.open_batch(&bits);
+        assert!(opened.iter().all(|&b| b == 0 || b == 1), "every share must open to a bit");
+        assert_eq!(e.counters().random_bits, 64);
     }
 
+    /// The headroom that makes bit-decomposition legal, stated as a test rather
+    /// than a comment: a 32-bit value in a ~61-bit field leaves ~29 bits, above
+    /// `KAPPA = 26`.
     #[test]
-    fn masking_headroom_reports_the_shortfall() {
+    fn the_field_has_masking_headroom_for_comparisons() {
         let e = LowGearEngine::new(2, LowGearParams::default_params()).unwrap();
-        // A 32-bit value in a ~17-bit field: deeply negative, i.e. impossible.
-        assert!(e.masking_headroom(32) < 0);
+        let headroom = e.masking_headroom(32);
+        assert!(
+            headroom >= crate::mpcc::vm::KAPPA as i32,
+            "need ≥ KAPPA = {} bits above a 32-bit value, got {headroom}",
+            crate::mpcc::vm::KAPPA
+        );
     }
 
     #[test]
     fn wider_field_cost_scales_by_the_number_of_limbs() {
         let p = LowGearParams::default_params();
         let (limbs, bytes) = wider_field_cost(&p, 64, 100.0);
-        assert!(limbs >= 4, "a ~17-bit prime needs ≥4 limbs for 64 bits, got {limbs}");
+        // A ~61-bit prime needs 2 limbs to cover 64 bits (it used to need 4).
+        assert_eq!(limbs, 2, "expected 2 CRT limbs for a 64-bit field, got {limbs}");
         assert!((bytes - 100.0 * limbs as f64).abs() < 1e-9);
+        // The layer's own values are 32-bit, which one limb already covers.
+        assert_eq!(wider_field_cost(&p, 32, 100.0).0, 1);
     }
 
     /// At the **deployed** parameters, where the measurement is taken.
+    ///
+    /// **Not `#[ignore]`d, deliberately.** This is the only test that exercises
+    /// the real noise budget, and while it was ignored a one-bit flooding slip
+    /// shipped parameters whose triples were all invalid — caught only by a
+    /// wrong answer three layers up. A parameter change must fail here.
     #[test]
-    #[ignore] // n=4096 BGV — slow in debug, fast in release
     fn deployed_parameters_produce_valid_triples() {
         let lg = LowGear::new(LowGearParams::default_params()).unwrap();
         let (p0, p1, stats) = lg.generate_batch().unwrap();
-        assert!(lg.triples_are_valid(&p0, &p1));
-        assert_eq!(stats.triples, 4096);
+        assert!(lg.triples_are_valid(&p0, &p1), "SHE triples must reconstruct at the real budget");
+        assert_eq!(stats.triples, lg.params.n);
         // The claim this module exists to check: far under the OT route's
         // measured 3104 B/triple.
         assert!(

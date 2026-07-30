@@ -107,17 +107,27 @@ pub fn engine_supports(id: &str, parties: usize) -> bool {
 /// caller cannot bypass the check.
 pub fn engine_can_run_program(id: &str, prog: &Program) -> Result<(), String> {
     if id == "lowgear" && prog.needs_bit_decomposition() {
+        // Masked bit-decomposition needs `KAPPA` bits of statistical headroom
+        // above the value width. LowGear's field carried none until its
+        // parameters widened to `n = 8192, q = 2^190` on 2026-07-30 (see
+        // `mpcc::lowgear`), so this used to be a blanket refusal. It is now a
+        // *bound check*, and it still has to be one: the field is fixed by the
+        // SHE flooding budget, so a program lowered for a wider value width
+        // than the field can mask would be silently wrong rather than slow.
         let params = lowgear::LowGearParams::default_params();
-        return Err(format!(
-            "lowgear cannot run comparison-shaped programs: masked bit-decomposition needs \
-             KAPPA = {} bits of headroom above the value, and its {}-bit field (t = {}, fixed \
-             by the SHE noise-flooding budget at q = 2^{}) has none. Arithmetic-only programs \
-             run fine.",
-            vm::KAPPA,
-            params.field_bits(),
-            params.t,
-            params.log2_q
-        ));
+        let available = params.field_bits().saturating_sub(prog.bit_width);
+        if available < vm::KAPPA {
+            return Err(format!(
+                "lowgear cannot run this program: masked bit-decomposition of a {}-bit value \
+                 needs KAPPA = {} bits of headroom, and its {}-bit field (t = {}, fixed by the \
+                 SHE noise-flooding budget at q = 2^{}) leaves only {available}.",
+                prog.bit_width,
+                vm::KAPPA,
+                params.field_bits(),
+                params.t,
+                params.log2_q
+            ));
+        }
     }
     Ok(())
 }

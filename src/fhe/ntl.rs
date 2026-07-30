@@ -118,10 +118,7 @@ fn from_limbs(limbs: &[u64], n: usize) -> Vec<I256> {
     (0..n)
         .map(|k| {
             let w = &limbs[4 * k..4 * k + 4];
-            I256 {
-                lo: (w[0] as u128) | ((w[1] as u128) << 64),
-                hi: (w[2] as u128) | ((w[3] as u128) << 64),
-            }
+            I256 { limbs: [w[0], w[1], w[2], w[3]] }
         })
         .collect()
 }
@@ -285,7 +282,7 @@ mod tests {
         acc.iter()
             .map(|&x| {
                 let u = x as u128;
-                I256 { lo: u, hi: if x < 0 { u128::MAX } else { 0 } }
+                I256::from_hi_lo(if x < 0 { u128::MAX } else { 0 }, u)
             })
             .collect()
     }
@@ -337,7 +334,7 @@ mod tests {
         let mut b = vec![0i128; n];
         b[1] = 1;
         let c = exact_negacyclic_product(&a, &b, n);
-        assert_eq!(c[0], I256::ZERO.wrapping_sub(I256::ONE));
+        assert_eq!(c[0], I256::ZERO.wrapping_sub(I256::one()));
         assert!(c[1..].iter().all(|&x| x == I256::ZERO));
     }
 

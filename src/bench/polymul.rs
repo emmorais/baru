@@ -86,7 +86,7 @@ fn schoolbook(a: &[i128], b: &[i128], n: usize) -> Vec<I256> {
         let mid = (p00 >> 64) + (p01 & 0xFFFF_FFFF_FFFF_FFFF) + (p10 & 0xFFFF_FFFF_FFFF_FFFF);
         let lo = (p00 & 0xFFFF_FFFF_FFFF_FFFF) | (mid << 64);
         let hi = p11 + (p01 >> 64) + (p10 >> 64) + (mid >> 64);
-        let m = I256 { hi, lo };
+        let m = I256::from_hi_lo(hi, lo);
         if neg { m.wrapping_neg() } else { m }
     }
     let mut acc = vec![I256::ZERO; n];
@@ -362,7 +362,7 @@ mod tests {
     fn bad_sizes_are_rejected() {
         let args = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
         assert!(run_cli(&args(&["--sizes", "100"])).is_err()); // not a power of two
-        assert!(run_cli(&args(&["--sizes", "8192"])).is_err()); // above MAX_N
+        assert!(run_cli(&args(&["--sizes", "16384"])).is_err()); // above MAX_N (8192)
         assert!(run_cli(&args(&["--reps", "0"])).is_err());
     }
 }

@@ -187,7 +187,7 @@ fn poly_mul_mod(a: &[u128], b: &[u128], p: &BgvParams) -> Poly {
     let bc: Vec<i128> = b.iter().map(|&c| center(c, p)).collect();
     poly::negacyclic_product(&ac, &bc, p.n)
         .into_iter()
-        .map(|c| c.lo & mask)
+        .map(|c| c.low_u128() & mask)
         .collect()
 }
 
@@ -197,7 +197,7 @@ fn poly_mul_mod(a: &[u128], b: &[u128], p: &BgvParams) -> Poly {
 /// ciphertext rather than scaled by `Δ`.
 fn reduce_q(acc: Vec<I256>, p: &BgvParams) -> Poly {
     let mask = p.q_mask();
-    acc.into_iter().map(|c| c.lo & mask).collect()
+    acc.into_iter().map(|c| c.low_u128() & mask).collect()
 }
 
 fn sample_ternary(n: usize) -> Poly {

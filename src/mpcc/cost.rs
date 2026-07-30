@@ -605,8 +605,8 @@ pub fn estimate(
         // preprocessing is compute-bound". `baru bench-triples` measured it and
         // the CPU half runs the *other* way — see `mpcc::lowgear`.
         notes.push(
-            "LowGear's offline cost is measured (`baru bench-triples`): 416 B/triple at a \
-             64-bit field vs Semi2k's 3074, and ~19x FASTER per triple, not slower — the \
+            "LowGear's offline cost is measured (`baru bench-triples`): 192 B/triple at its \
+             ~61-bit field vs Semi2k's 3074, and ~28x FASTER per triple, not slower — the \
              expected bandwidth-for-CPU trade did not appear at these parameters"
                 .to_string(),
         );

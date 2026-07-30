@@ -270,13 +270,24 @@ sacrifice both beat naive Gilboa).
 
 **Both halves are now measured** (`baru bench-triples`, `src/mpcc/lowgear.rs`),
 and one of them came out the other way round. Running the protocol — BGV over
-CRT slots, one ciphertext×plaintext multiply per cross term — gives **416 B per
-triple at a 64-bit field** (104 B at its native 17-bit field, ×4 CRT limbs),
-within 8% of the 384 B estimate. But LowGear is also **~19× faster per triple
-than the OT route** at equal field width, not slower. The "bandwidth-for-CPU trade LowGear exists to
+CRT slots, one ciphertext×plaintext multiply per cross term — gives **192 B per
+triple** at its native ~61-bit field,
+2× better than the 384 B estimate. But LowGear is also **~28× faster per
+triple than the OT route**, not slower. The "bandwidth-for-CPU trade LowGear exists to
 make" was never measured and does not appear at these parameters: SHE wins on
 bytes *and* on CPU, so the OT route's remaining advantage is neither, it is
 that it works over `Z_2^k` directly and needs no noise-flooding budget.
+
+**And it changes an answer.** §4's crossover — a wide encrypted layer moves to
+FHE under a dishonest majority — was measured against Semi2k, i.e. against **OT**
+preprocessing. LowGear now runs the same layer itself (its field widened to
+~2^61 on 2026-07-30, so it can bit-decompose the ReLU), and **the hybrid does
+not beat it at any width measured**: 606 ms vs 692 at width 64, 678 vs 734 at
+4096, against a trusted-dealer lower bound of 601–611. The mechanism survives —
+preprocessing volume still decides it — but the boundary belongs to the
+*baseline's preprocessing*, not to MPC in general, and against the best
+preprocessing there is no boundary in range. The claim has to name its baseline.
+See `paper-outline` E25.
 
 Two caveats bound the claim. The implemented engine is **semi-honest** — no
 MACs, no ZKPoPK, so it is the LowGear analogue of Semi2k rather than of SPDZ.

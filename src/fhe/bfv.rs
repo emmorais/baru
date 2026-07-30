@@ -92,7 +92,7 @@ fn poly_mul_mod(a: &[u128], b: &[u128], p: &BfvParams) -> Poly {
     let bc: Vec<i128> = b.iter().map(|&c| center(c, p)).collect();
     poly::negacyclic_product(&ac, &bc, p.n)
         .into_iter()
-        .map(|c| c.lo & mask)
+        .map(|c| c.low_u128() & mask)
         .collect()
 }
 
@@ -109,7 +109,7 @@ fn center(c: u128, p: &BfvParams) -> i128 {
 fn rescale(acc: Vec<I256>, p: &BfvParams) -> Poly {
     let mask = p.q_mask();
     let shift = p.delta_shift();
-    acc.into_iter().map(|c| c.shr_round(shift).lo & mask).collect()
+    acc.into_iter().map(|c| c.shr_round(shift).low_u128() & mask).collect()
 }
 
 fn sample_ternary(n: usize) -> Poly {

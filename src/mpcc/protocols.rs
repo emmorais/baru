@@ -413,10 +413,10 @@ pub const REGISTRY: &[ProtocolSpec] = &[
             mul_elems: Elems::new(0.0, 2.0),
             open_elems: Elems::new(0.0, 1.0),
             triples_per_mul: 1.0,
-            // **Measured** by `baru bench-triples`, not assumed: 104 B/triple
-            // at the implemented field below. One element is ceil(17/8) = 3
-            // bytes, so 104 B is ~35 elements.
-            offline_elems_per_triple: 35.0,
+            // **Measured** by `baru bench-triples`, not assumed: 192 B/triple
+            // at the implemented field below. One element is ceil(61/8) = 8
+            // bytes, so 192 B is 24 elements.
+            offline_elems_per_triple: 24.0,
             // The field Baru's engine ACTUALLY runs over, not Overdrive's.
             // `mpcc::lowgear`'s noise-flooding budget at q = 2^100 caps the
             // plaintext modulus at t = 114689 (~17 bits); the registry has to
@@ -427,13 +427,13 @@ pub const REGISTRY: &[ProtocolSpec] = &[
             // coefficients in u128.
             //
             // The byte-aligned WIRE width of one element, not the modulus
-            // size — the same convention `shamir` uses (64 for a 61-bit
-            // Mersenne prime). `t = 114689` needs 17 bits, which occupies 3
-            // bytes, so 24. The cost model prices `field_bits/8` and the VM
-            // charges `ceil(order_bits/8)`; declaring the byte-aligned width is
-            // what makes those agree, and `mpcc::lowgear` has a test that fails
-            // if they ever drift apart.
-            field_bits: 24,
+            // size — the same convention `shamir` uses. LowGear's `t` is a
+            // 61-bit prime (`n = 8192`, `q = 2^190`), which occupies 8 bytes,
+            // so 64. The cost model prices `field_bits/8` and the VM charges
+            // `ceil(order_bits/8)`; declaring the byte-aligned width is what
+            // makes those agree, and `mpcc::lowgear` has a test that fails if
+            // they ever drift apart.
+            field_bits: 64,
             and_bits: Elems::new(0.0, 2.0),
             // No MACs in the implemented engine (see `security` above), so
             // online shares carry no authentication material.

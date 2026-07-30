@@ -194,7 +194,7 @@ fn poly_mul_mod(a: &[u128], b: &[u128], params: &SiNtruParams) -> Poly {
     let bc: Vec<i128> = b.iter().map(|&c| center(c, params)).collect();
     crate::fhe::poly::negacyclic_product(&ac, &bc, params.n)
         .into_iter()
-        .map(|c| c.lo & mask)
+        .map(|c| c.low_u128() & mask)
         .collect()
 }
 
@@ -219,7 +219,7 @@ fn poly_mul_rescale(a: &[u128], b: &[u128], params: &SiNtruParams) -> Poly {
     let mask = params.q_mask();
     let shift = params.delta_shift();
     acc.into_iter()
-        .map(|c| c.shr_round(shift).lo & mask)
+        .map(|c| c.shr_round(shift).low_u128() & mask)
         .collect()
 }
 

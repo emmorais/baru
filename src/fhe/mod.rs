@@ -47,9 +47,15 @@
 //!        key decrypts their result.  Less communication than MPC (send once),
 //!        but heavier per-gate computation (bootstrapping).
 
+/// Fixed-width signed integers generic over limb count — the CRT accumulator
+/// for [`ntt`], at both the narrow and wide parameter profiles.
+pub mod bigint;
 pub mod backend;
 pub mod bfv;
 pub mod bgv;
+/// BGV at wide parameters (n=8192, q=2^190, 256-bit coefficients) — the regime
+/// [`crate::mpcc::lowgear`] needs for a field big enough to bit-decompose.
+pub mod bgv_wide;
 pub mod circuit_emitter;
 pub mod conv_pack;
 pub mod ckks_backend;

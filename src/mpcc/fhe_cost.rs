@@ -131,9 +131,16 @@ pub const BFV_DEPTH1: FheSpec = FheSpec {
     // Measured ceiling, not a nominal parameter: past t ≈ 2^32 the depth-1
     // noise budget at q=2^100 is gone and the product decrypts wrongly.
     log2_plaintext: 32,
-    // n = 4096 coefficient slots.  `conv_pack` needs 2·in_c·H·W ≲ n, which is
-    // what makes a 28×28 image fit with room to spare.
-    slots: 4096.0,
+    // **n/2**, not n.  The ring has n = 4096 coefficients, but the reversed
+    // packing this pipeline uses spends two coefficient blocks per packed
+    // vector: `bfv::pack_weights` asserts `(rows+1)·d ≤ n`, so a single dot
+    // product of length `d` needs `2d ≤ n`, and `conv_pack` needs
+    // `2·in_c·H·W ≲ n` for the same reason. Charging the full n here understated
+    // FHE's ciphertext count by 2× for any vector longer than 2048 — which is
+    // precisely where `bench-layer`'s crossover sits, so the error was load
+    // bearing rather than cosmetic. (A 28×28 image is 784, well inside either
+    // figure, which is why nothing caught it sooner.)
+    slots: 2048.0,
     note: "measured bench-fhe-innerprod; arithmetic-only, depth 1 (no relin)",
 };
 
