@@ -116,8 +116,11 @@ the corrections behind each row are in [`docs/experiments.md`](docs/experiments.
 
 Honest negatives are first-class here and kept alongside the wins: PIR loses to
 downloading the database by 13×; hybrid-TFHE does not pay; faster ring arithmetic
-does **not** bring FHE close to MPC; and the hybrid does not beat
-SHE-preprocessed MPC at any width measured. See
+does **not** bring FHE close to MPC; and on a secure ring dimension the hybrid
+does not beat pure ABY3 at any shape or bandwidth measured, nor SHE-preprocessed
+MPC at any width. The hybrid's case is the *deployment shape* — the client
+sends ciphertexts and leaves, only the nonlinear segment needs live parties —
+not raw cost. See
 [Part VII](docs/experiments.md#part-vii--negative-superseded-and-withdrawn-results).
 
 ---

@@ -1559,25 +1559,73 @@ The security cost was visible end to end and **conv packing more than paid for
 it**: at 28×28 the secure BFV pipeline ran in 18.7 s against 94.0 s for the old
 *insecure* Toeplitz-on-SI-NTRU path — 5× faster *and* actually private.
 
-### VII.2 Measurements withdrawn with the scheme
+### VII.2 The crossover, re-measured on BFV — and gone
 
-Two published tables were measured on the removed engine and have **not** been
-re-measured on BFV, so they are recorded here as withdrawn rather than
-reproduced:
+The old sweep found a real hybrid-vs-pure-MPC crossover: parameters ≳ 4 K with
+few outputs, bandwidth-gated, flipping back to MPC at 50 Mbps. It was measured
+on the removed engine, so it was withdrawn when the engine went. **Re-measured
+on `hybrid-bfv` (2026-07-30), the crossover does not exist anywhere in the
+range** — pure MPC wins at every shape and every bandwidth tried.
 
-- **The hybrid-vs-pure-MPC crossover sweep** (parameters ≳ 4 K with few
-  outputs; bandwidth-gated, flipping back to MPC at 50 Mbps). The qualitative
-  finding — the crossover is real, sits at large parameter counts with few
-  ReLUs, and is **bandwidth-gated rather than latency-gated** — is believed to
-  carry over, since it is driven by pure MPC's ~400 B/parameter wire cost
-  against the hybrid's flat 3-ciphertext return switch. The specific widths need
-  re-measuring with `hybrid-bfv`, whose linear phase is ~5× more expensive. Note
-  that VI.5 supersedes the framing anyway: against *SHE-preprocessed* MPC the
-  hybrid does not win at any measured width.
-- **The `bench-cnn` security-cost table** (FHE 222 → 1108 ms at D=8 etc.), which
-  compared the insecure and secure engines side by side. The conclusion — the
-  upgrade costs ~4× on the FHE side — stands as the reason the numbers in III.7
-  and IV.3 differ, but the side-by-side comparison is no longer runnable.
+`baru bench-hybrid-nn --strategies mpc,hybrid-bfv --rtt-ms 20 --bandwidth-mbps 10`:
+
+| layer (params) | mpc | hybrid-bfv | winner | (old, SI-NTRU) |
+|---|---|---|---|---|
+| 8×2 (16) | **224 ms** | 868 ms | mpc | mpc |
+| 512×4 (2 K) | **516 ms** | 874 ms | mpc | mpc |
+| 1024×4 (4 K) | **769 ms** | 1.36 s | mpc | *hybrid* |
+| 1024×8 (8 K) | **1.28 s** | 1.94 s | mpc | *hybrid* |
+| 1024×16 (16 K) | **2.29 s** | 3.28 s | mpc | *hybrid* |
+| 1024×32 (32 K) | **4.29 s** | 5.69 s | mpc | — |
+| 1024×64 (64 K) | **8.33 s** | 11.0 s | mpc | — |
+| 2048×32 (64 K) | **7.77 s** | 15.5 s | mpc | — |
+
+And it is not rescued by a thinner pipe, which is where the old finding said the
+hybrid's advantage lived (layer 1024×32, rtt 20 ms):
+
+| bandwidth | mpc | hybrid-bfv |
+|---|---|---|
+| 10 Mbps | **4.29 s** | 5.69 s |
+| 5 Mbps | **7.95 s** | 10.8 s |
+| 2 Mbps | **18.8 s** | 26.2 s |
+
+**Why it flipped, and the methodological point.** The hybrid at 1024×32 /
+10 Mbps spends **3810 ms of 5685 in `to-mpc`** and 1283 ms in `link-io` —
+i.e. two thirds of it is *ciphertext transfer*, against 49 ms of actual linear
+algebra. A BFV ciphertext at `n = 4096` is **131 KB** (two ring elements),
+against the removed scheme's 33 KB (one ring element at `n = 2048`), and the
+packing bound forces `⌈out·in/n⌉` of them — 11 weight chunks here, each needing
+three mask ciphertexts on the switch. So the hybrid moves *more* bytes than pure
+MPC at these shapes, not fewer.
+
+That is worth stating carefully, because the old claim was not wrong so much as
+**partial**: "19× fewer messages, 46× fewer bytes" counted the *MPC segment*
+only. That segment really is tiny and still is — 15 messages and 153 KB against
+MPC's 135 372 and 4.5 MB. But the ciphertexts crossing the link are charged by
+`sleep_link` and were never in that comparison, and at a secure ring dimension
+they dominate. **Quote the MPC-segment footprint as what it is — the footprint
+of one phase — not as the hybrid's wire cost.**
+
+Two things moved between the old table and this one, and the measurement cannot
+cleanly separate them: pure MPC got ~2.3× faster at 1024×16 (the batching work
+in Part I), and BFV's ciphertexts are 4× larger than the removed scheme's. Both
+push the same way.
+
+**One modelling caveat, stated rather than fixed.** The masks are precomputed
+under `--precompute`, but only their *encryption* is moved offline — the
+harness still charges their transfer online, which is that 3810 ms. A
+deployment that precomputes masks would also pre-*ship* them, which would move
+most of the hybrid's cost off the critical path here. Changing the model is a
+real decision about what the offline phase is allowed to include, so it is
+flagged rather than assumed. It would not change the conclusion against
+SHE-preprocessed MPC (VI.5), which does not depend on it.
+
+### VII.2b The `bench-cnn` security-cost table, withdrawn
+
+The side-by-side table (FHE 222 → 1108 ms at D=8 etc.) compared the insecure and
+secure engines directly and is no longer runnable. Its conclusion — the upgrade
+costs ~4× on the FHE side — stands as the reason the numbers in III.7 and IV.3
+differ.
 
 ### VII.3 Other honest negatives
 
@@ -1587,8 +1635,9 @@ reproduced:
   costs more than its native PBS ReLU (III.3).
 - **Faster polynomials do not bring FHE close to MPC** (III.4). The hybrid's
   case is the communication profile, not speed.
-- **The hybrid does not beat SHE-preprocessed MPC** at any width measured
-  (VI.5) — a direct qualification of our own earlier claim.
+- **The hybrid does not beat pure ABY3** at any shape or bandwidth measured
+  (VII.2), and does not beat SHE-preprocessed MPC either (VI.5). Both are direct
+  qualifications of our own earlier claims.
 - **`mpcc::cost`'s "LowGear is compute-bound" note was wrong** (VI.4), and was
   replaced by a measurement rather than softened.
 - **The abstraction was not free** until the gadgets were rewritten over batched
