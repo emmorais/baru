@@ -202,6 +202,43 @@ batched code message for message; a test pins that, and the benchmark keeps the
 per-element form as a control so the gap stays reproducible. **Only round counts
 catch this class of defect** — per-op timing and byte counts both look fine.
 
+### I.4b Where the garbled ReLU's time goes
+
+Once the FHE side got ~3× cheaper (III.5, III.6), the garbled ReLU became the
+pipeline's largest single phase — 409 ms of a 736 ms `bench-cnn --img 28 --gc`
+run, over one conv layer's 5408 comparisons. `bench-gc-compare` shows the cost is
+**linear in the item count and flat in RTT**, so it is per-item compute rather
+than round structure, which is the opposite of every other MPC finding in this
+part.
+
+Attributed against the real functions
+(`crypto::garbled::where_the_garbled_relu_spends_its_time`):
+
+| | |
+|---|---|
+| AND gates for the layer | 167 648 |
+| label hash | **178 ns — a full SHA-256 over 24 bytes** |
+| garbling the layer, measured | 169 ms (120 of it hashing) |
+| evaluation hashing | 60 ms |
+| **hash share of the phase** | **~44%** |
+| building the 7.1 MB wire payload | 2 ms |
+
+**The label hash is SHA-256 where the standard is a fixed-key block cipher.**
+Half-gates need four hashes per AND to garble and two to evaluate, so the
+primitive is called 1.0 M times for one layer. This is the same shape as the NTT
+finding in II.2 — a known-better primitive sitting on the hottest path — and the
+fix is equally well established (Bellare–Hoang–Keelveedhi–Rogaway S&P 2013;
+Guo–Katz–Wang–Yu S&P 2020 for the construction that is sound with half-gates and
+free-XOR). It is not yet done, because unlike the NTT rewrite a wrong choice here
+**passes every correctness test while breaking the security argument** — see
+`docs/private-inference-performance.md` §3.3.
+
+**One hypothesis died in the measurement**, kept so it is not re-formed: the wire
+payload is built 16 bytes at a time into a `Vec` with no reserved capacity, which
+looks like a textbook allocation problem. It costs 2 ms, and reserving capacity
+saves 1 ms of that. The obvious-looking defect was not the cost; the cryptographic
+primitive was.
+
 ### I.5 Precompiled gadgets: batching a whole matvec
 
 `src/precompile/` is a registry of named Rust gadgets per (operation, backend

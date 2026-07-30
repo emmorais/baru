@@ -384,9 +384,58 @@ returning a quiet wrong answer.
 
 **Where this leaves the pipeline.** FHE is 311 ms of 1086 (29%); MPC is 771 ms
 (71%), of which ReLU alone is 510 ms. Further FHE micro-optimisation has little
-left to reach — see the struck entry in §3.4 and read §3.3 next.
+left to reach — see the struck entry in §3.5 and read §3.3 next.
 
-### 3.3 Parallelism
+### 3.3 Replace the garbled-circuit label hash with fixed-key AES — the biggest remaining item
+
+**Attributed 2026-07-30, not yet implemented.** After §3.1 and §3.2, MPC is 71%
+of the pipeline and the garbled ReLU is its largest phase. That phase is now
+measured rather than guessed:
+
+`bench-cnn --img 28 --gc` spends **409 ms** of a 736 ms run in the ReLU over one
+conv layer (8 channels × 26×26 = 5408 items). `bench-gc-compare` shows the cost
+is **linear in the item count and flat in RTT**, so it is per-item compute, not
+rounds. `crypto::garbled`'s `where_the_garbled_relu_spends_its_time`
+(`--ignored --nocapture`) breaks that down against the real functions:
+
+| | |
+|---|---|
+| AND gates for the layer | 167 648 |
+| label hash (`garbled::hash`) | **178 ns — SHA-256 over 24 bytes** |
+| garbling the layer, measured | 169 ms (the hash is 120 of it) |
+| evaluation hashing | 60 ms |
+| **hash share of the 409 ms phase** | **~44%** |
+| building the 7.1 MB wire payload | 2 ms |
+
+**The fix is the standard one.** Every fast garbling implementation uses a
+**fixed-key block cipher**, not a hash function — Bellare, Hoang, Keelveedhi and
+Rogaway (S&P 2013) introduced it, and Guo, Katz, Wang and Yu (S&P 2020,
+*Efficient and Secure Multiparty Computation from Fixed-Key Block Ciphers*) give
+the construction that is proven sound for **half-gates with free-XOR**, which is
+what `garbled.rs` implements: `TMMO`, `H(x, i) = π(π(x) ⊕ i) ⊕ π(x)` with `π` a
+fixed-key AES permutation. On hardware with AES-NI (x86) or the ARMv8 crypto
+extensions this is a few nanoseconds against 178, so the phase should lose
+~180 ms — roughly **17% end to end** on the medical model.
+
+**Treat this as a security change, not a performance one.** A wrong hash
+construction still produces *correct outputs* — every existing test would pass —
+while silently breaking the garbling's security argument. Free-XOR in particular
+constrains which constructions are sound: the naive `AES_k(x) ⊕ x` is **not**
+safe here. So this needs the GKWY20 construction implemented exactly and
+reviewed against the paper, not a plausible-looking substitution. It also adds a
+dependency (`aes`, RustCrypto, which compiles to AES-NI intrinsics).
+
+**A hypothesis that died in the measurement**, recorded so it is not re-formed:
+the wire payload is built 16 bytes at a time into a `Vec` with no reserved
+capacity, which looked like an obvious allocation problem. It costs **2 ms**, and
+reserving capacity saves 1 ms of that. Not the cost.
+
+**The remaining ~230 ms** of the phase (409 − 169 garbling) is evaluation,
+bincode serialization of the 7.1 MB payload, transport and the `y2a` conversion
+back to arithmetic. Not yet attributed — that is the next measurement, and it
+should come before any more optimisation.
+
+### 3.4 Parallelism
 
 Everything is single-threaded. The per-output-channel FHE work (encrypt, mul,
 decrypt) is embarrassingly parallel — conv2 has 16 independent channels — and
@@ -400,7 +449,7 @@ threading changes what every number means, so it needs its own flag
 **Expected:** near-linear in cores on the FHE phases. This is the largest
 absolute win available and the least interesting scientifically.
 
-### 3.4 Things measured and deliberately *not* worth doing
+### 3.5 Things measured and deliberately *not* worth doing
 
 - **Faster decryption by computing only the coefficients we read.** We decrypt
   a full polynomial and then read `oh·ow` positions. Selective evaluation of a
@@ -414,8 +463,8 @@ absolute win available and the least interesting scientifically.
   After the Shoup butterfly and §3.1 the FHE side is ~3× cheaper and the MPC
   side did not move, so the segment is now **793 ms of 1152 ms (69%)** and its
   largest phase (ReLU, 526 ms) is the single biggest item in the pipeline. It
-  is already constant-round garbled, so the next lever there is parallelism
-  (§3.3) or a cheaper comparison, not batching. Re-derive before acting: this
+  is already constant-round garbled, and §3.3 now attributes it: 44% is the
+  SHA-256 label hash, which has a standard fixed-key-AES replacement. Re-derive before acting: this
   is exactly the kind of entry §2 warns goes stale when the other side moves.
 
 ---

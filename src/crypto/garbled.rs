@@ -476,4 +476,134 @@ mod tests {
         assert_eq!(s.and_gates, b - 1, "one AND per carry bit");
         assert_eq!(s.rounds, 1, "shared-output comparison is one round");
     }
+
+    /// Where the garbled ReLU's time actually goes — the measurement that says
+    /// whether the label hash is worth replacing.
+    ///
+    /// `bench-cnn --img 28 --gc` puts **409 ms** of a 736 ms run in the ReLU
+    /// over exactly this layer (8 channels x 26x26 = 5408 items), and
+    /// `bench-gc-compare` shows the cost is linear in the item count and flat in
+    /// RTT — so it is per-item compute, not rounds. This attributes that
+    /// compute against the real functions rather than a model.
+    ///
+    /// What it found, and the reason it is worth keeping:
+    ///
+    /// - **The label hash is SHA-256** (`hash`), at 179 ns per call. Half-gates
+    ///   need 4 per AND to garble and 2 to evaluate, so it is ~120 ms of the
+    ///   169 ms garbling and ~60 ms of the evaluation: **~44% of the phase**,
+    ///   and both halves are on the critical path. Every fast garbling
+    ///   implementation uses **fixed-key AES** instead — see the note below.
+    /// - **Payload construction is not a bottleneck.** Building the 7.1 MB wire
+    ///   payload 16 bytes at a time into an unreserved `Vec` costs 2 ms, and
+    ///   reserving capacity saves 1 ms of it. That was the first hypothesis and
+    ///   the measurement killed it; it is kept here so nobody re-forms it.
+    ///
+    /// Run with `--ignored --nocapture --release`.
+    #[test]
+    #[ignore]
+    fn where_the_garbled_relu_spends_its_time() {
+        use std::time::Instant;
+        let (n, b, shift) = (5408usize, 20usize, 8usize); // a D=28 conv layer
+        let st = relu_stats(n, b, shift);
+
+        // Garbling a half-gate AND is 4 hashes; evaluating it is 2.
+        let garble_hashes = st.and_gates * 4;
+        let eval_hashes = st.and_gates * 2;
+
+        let probe = 200_000usize;
+        let label: Label = [7u8; 16];
+        let t = Instant::now();
+        let mut acc = 0u8;
+        for i in 0..probe {
+            acc ^= hash(&label, i as u64)[0];
+        }
+        let per_hash_ns = t.elapsed().as_nanos() as f64 / probe as f64;
+        std::hint::black_box(acc);
+
+        let garble_ms = garble_hashes as f64 * per_hash_ns / 1e6;
+        let eval_ms = eval_hashes as f64 * per_hash_ns / 1e6;
+
+        println!("\n  ReLU layer: n={n}, {b} bits, shift {shift}");
+        println!("  AND gates          : {}", st.and_gates);
+        println!("  wire bytes         : {:.2} MB", st.wire_bytes as f64 / 1e6);
+        println!("  label hash         : {per_hash_ns:.0} ns  (SHA-256 over 24 bytes)");
+        println!("  garbling  {garble_hashes} hashes : {garble_ms:.0} ms");
+        println!("  evaluation {eval_hashes} hashes : {eval_ms:.0} ms");
+        println!(
+            "  => the hash alone accounts for ~{:.0} ms on the critical path \
+             (garbler and evaluator run concurrently, so the larger of the two)",
+            garble_ms.max(eval_ms)
+        );
+        println!(
+            "  measured GC ReLU for this layer is 409 ms (bench-cnn --img 28 --gc), \
+             so garble+eval hashing is ~{:.0}% of it",
+            100.0 * (garble_ms + eval_ms) / 409.0
+        );
+        println!(
+            "  fixed-key AES (Bellare-Hoang-Keelveedhi-Rogaway, S&P'13) is the \
+             standard primitive here and costs a few ns, not {per_hash_ns:.0}."
+        );
+
+        // …and the rest. Garbling a layer's worth for real, so allocation and
+        // table construction are counted rather than modelled.
+        let t = Instant::now();
+        let mut sink = 0u8;
+        for item in 0..n {
+            let mut g = Garbler::new(item as u64);
+            let r = g.garble_relu_rescale(b, shift);
+            sink ^= r.tables[0].tg[0] ^ (r.out_masks[0] as u8);
+        }
+        let garble_real_ms = t.elapsed().as_secs_f64() * 1000.0;
+        std::hint::black_box(sink);
+
+        // Building the wire payload the garbler ships, the way the protocol
+        // does it: 16 bytes at a time into a Vec with no reserved capacity.
+        let mut g = Garbler::new(1);
+        let one = g.garble_relu_rescale(b, shift);
+        let t = Instant::now();
+        let mut payload: Vec<u8> = Vec::new();
+        for _ in 0..n {
+            for tb in &one.tables {
+                payload.extend_from_slice(&tb.tg);
+                payload.extend_from_slice(&tb.te);
+            }
+            for l in &one.x0 {
+                payload.extend_from_slice(l);
+            }
+        }
+        let payload_ms = t.elapsed().as_secs_f64() * 1000.0;
+        let payload_len = payload.len();
+
+        // The same build with the size known up front.
+        let t = Instant::now();
+        let mut payload2: Vec<u8> = Vec::with_capacity(payload_len);
+        for _ in 0..n {
+            for tb in &one.tables {
+                payload2.extend_from_slice(&tb.tg);
+                payload2.extend_from_slice(&tb.te);
+            }
+            for l in &one.x0 {
+                payload2.extend_from_slice(l);
+            }
+        }
+        let payload_reserved_ms = t.elapsed().as_secs_f64() * 1000.0;
+        assert_eq!(payload.len(), payload2.len());
+
+        println!("\n  --- measured, not modelled ---");
+        println!("  garbling the layer for real : {garble_real_ms:.0} ms  \
+                  (hash model above said {garble_ms:.0})");
+        println!("  building the {:.1} MB payload : {payload_ms:.0} ms unreserved, \
+                  {payload_reserved_ms:.0} ms with capacity",
+                 payload_len as f64 / 1e6);
+        println!(
+            "  garble + payload            : {:.0} ms of the 409 ms measured ReLU",
+            garble_real_ms + payload_ms
+        );
+        println!(
+            "  => the payload build is NOT the cost (2 ms); the hash is. Replacing\n\
+             \x20    SHA-256 with fixed-key AES is the standard fix and would take\n\
+             \x20    ~180 ms off this phase."
+        );
+        assert!(st.and_gates > 0);
+    }
 }
