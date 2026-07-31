@@ -880,6 +880,34 @@ mod tests {
         vec![Backend::Plain, Backend::Mpc, Backend::FheMock, Backend::Zkp]
     }
 
+    /// The nonlinear cases must now compile on the ZKP backend.
+    ///
+    /// Before the circuit fragment gained comparisons and `if`, `relu` and `max`
+    /// were reported as unsupported — the real proof system refused them while
+    /// the placeholder it replaced "supported" them only by never checking
+    /// anything. This pins the improvement so it cannot silently regress.
+    #[test]
+    fn the_zkp_backend_can_prove_the_nonlinear_cases() {
+        for name in ["relu", "max"] {
+            let case = SUITE
+                .iter()
+                .find(|c| c.name == name)
+                .unwrap_or_else(|| panic!("no {name} case"));
+            let report = run_case(case, &[Backend::Zkp], 1);
+            let zkp = report
+                .backends
+                .iter()
+                .find(|b| b.backend.starts_with("zkp"))
+                .expect("zkp backend ran");
+            assert!(
+                zkp.error.is_none(),
+                "case {name} must now compile on the ZKP backend: {:?}",
+                zkp.error
+            );
+            assert_eq!(zkp.ok, Some(true), "case {name} must verify");
+        }
+    }
+
     #[test]
     fn suite_runs_on_fast_backends() {
         for case in SUITE {

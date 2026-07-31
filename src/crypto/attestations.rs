@@ -29,7 +29,7 @@
 //! | `NaiveHash` (PSI) | semi-honest | leaks by construction; see `psi::Hiding` |
 //! | `DhPsi` | semi-honest | trait path ships no proof; `respond_proved`/`verify_exponent` close it |
 //! | `Pir` | semi-honest | Stage 6 (gated): no integrity against a malicious server |
-//! | `zkp::binius_real` | sound | a real Binius64 prover/verifier; `+`/`−`/`×` only, other ops refused (`tests/zkp_real.rs`) |
+//! | `zkp::binius_real` | sound | real Binius64 prover/verifier; arithmetic + signed comparisons + `if`/`let` (enough for ReLU); division refused (`tests/zkp_real.rs`) |
 //! | `zkp::binius64_backend` | **none** | retained placeholder, unused: `verify` never checks constraint satisfaction (`tests/zkp_soundness.rs`) |
 //! | `Bfv`, `Bgv` | semi-honest | `fhe::threshold` built and tested; boundary proof (§4.4) still missing |
 //! | `CkksBackend`, `TfheBackend` | semi-honest | Stage 6 (gated): third-party randomness, cannot derandomise |

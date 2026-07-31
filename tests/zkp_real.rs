@@ -115,10 +115,15 @@ fn proofs_are_bound_to_their_own_statements() {
 
 /// Operations the backend cannot compile soundly are refused, rather than
 /// mis-compiled into a circuit that proves the wrong thing.
+///
+/// `<` and `if` were on this list until the fragment was extended; they now
+/// have real circuitry and are covered by the tests below. Division and modulo
+/// remain refused because they need quotient/remainder witnesses with range
+/// checks.
 #[test]
 fn unsupported_operations_are_refused_not_mis_compiled() {
     let be = Binius64Real::new();
-    for src in ["(< x y)", "(/ x y)", "(if x y 1)"] {
+    for src in ["(/ x y)", "(% x y)", "(lambda (a) a)"] {
         let expr = parse(src).expect("parse");
         assert!(
             be.compile_circuit(&expr, &["x".to_string()]).is_err(),
@@ -147,4 +152,128 @@ fn the_supported_arithmetic_fragment_works() {
     let mut wrong = pubs.clone();
     wrong.insert(OUTPUT_NAME.to_string(), 33i64);
     assert!(be.prove(&ckt, &witness(5), &wrong).is_err());
+}
+
+// ─── The extended fragment: comparisons, `if`, `let` ─────────────────────────
+
+/// Prove `expr` on the given inputs, with every named input private, and return
+/// whether the honest proof verified plus the value that was claimed.
+fn prove_and_verify(expr: &str, private: &[(&str, i64)]) -> (bool, i64) {
+    let be = Binius64Real::new();
+    let parsed = parse(expr).unwrap_or_else(|e| panic!("parse {expr}: {e}"));
+    let names: Vec<String> = private.iter().map(|(k, _)| k.to_string()).collect();
+    let ckt = be
+        .compile_circuit(&parsed, &names)
+        .unwrap_or_else(|e| panic!("compile {expr}: {e}"));
+    let priv_map: HashMap<String, i64> =
+        private.iter().map(|(k, v)| (k.to_string(), *v)).collect();
+    let mut pubs = HashMap::new();
+    let claimed = be
+        .evaluate(&ckt, &priv_map, &pubs)
+        .unwrap_or_else(|e| panic!("evaluate {expr}: {e}"));
+    pubs.insert(OUTPUT_NAME.to_string(), claimed);
+    let proof = be
+        .prove(&ckt, &priv_map, &pubs)
+        .unwrap_or_else(|e| panic!("prove {expr}: {e}"));
+    (be.verify(&ckt, &proof, &pubs).unwrap_or(false), claimed)
+}
+
+/// Signed comparison is the detail most likely to be quietly wrong: the
+/// underlying gate is *unsigned*, so without flipping the sign bit every
+/// negative value compares as larger than every positive one.
+#[test]
+fn signed_comparisons_are_correct_including_negatives() {
+    for (a, b) in [(3i64, 9i64), (9, 3), (-1, 1), (1, -1), (-5, -2), (0, 0), (-7, -7)] {
+        let (ok, lt) = prove_and_verify("(< x y)", &[("x", a), ("y", b)]);
+        assert!(ok, "verify (< {a} {b})");
+        assert_eq!(lt, (a < b) as i64, "signed {a} < {b}");
+
+        let (ok, le) = prove_and_verify("(<= x y)", &[("x", a), ("y", b)]);
+        assert!(ok, "verify (<= {a} {b})");
+        assert_eq!(le, (a <= b) as i64, "signed {a} <= {b}");
+
+        let (ok, gt) = prove_and_verify("(> x y)", &[("x", a), ("y", b)]);
+        assert!(ok, "verify (> {a} {b})");
+        assert_eq!(gt, (a > b) as i64, "signed {a} > {b}");
+
+        let (ok, eq) = prove_and_verify("(== x y)", &[("x", a), ("y", b)]);
+        assert!(ok, "verify (== {a} {b})");
+        assert_eq!(eq, (a == b) as i64, "{a} == {b}");
+    }
+}
+
+/// **ReLU** — the operation the whole extension exists for, and the one the
+/// benchmark suite could not compile before it.
+#[test]
+fn relu_compiles_proves_and_verifies() {
+    for v in [-100i64, -1, 0, 1, 42] {
+        let (ok, out) = prove_and_verify("(if (> x 0) x 0)", &[("x", v)]);
+        assert!(ok, "verify relu({v})");
+        assert_eq!(out, v.max(0), "relu({v})");
+    }
+}
+
+/// The multiplicative form of ReLU that Baru's own MPC path uses, so the two
+/// backends agree on the same expression.
+#[test]
+fn multiplicative_relu_agrees() {
+    for v in [-9i64, -1, 0, 5, 77] {
+        let (ok, out) = prove_and_verify("(* x (> x 0))", &[("x", v)]);
+        assert!(ok, "verify mul-relu({v})");
+        assert_eq!(out, v.max(0), "mul-relu({v})");
+    }
+}
+
+/// `let` with sequential bindings, and a shadowed name that must not leak.
+#[test]
+fn let_bindings_scope_correctly() {
+    let (ok, out) = prove_and_verify("(let ((a (* x 2)) (b (+ a 1))) (* a b))", &[("x", 5)]);
+    assert!(ok);
+    assert_eq!(out, 10 * 11);
+
+    // Inner shadowing must be restored afterwards.
+    let (ok, out) = prove_and_verify("(+ (let ((x 100)) x) x)", &[("x", 7)]);
+    assert!(ok);
+    assert_eq!(out, 107);
+}
+
+/// A single neuron with a ReLU — the shape private inference is built from.
+#[test]
+fn a_relu_neuron_proves() {
+    let src = "(let ((z (+ (* w x) bias))) (if (> z 0) z 0))";
+    for (w, x, bias) in [(-1i64, 3i64, 0i64), (2, 3, 1), (1, 1, -5)] {
+        let (ok, out) = prove_and_verify(src, &[("w", w), ("x", x), ("bias", bias)]);
+        let expect = (w * x + bias).max(0);
+        assert!(ok, "verify neuron({w},{x},{bias})");
+        assert_eq!(out, expect, "neuron({w},{x},{bias})");
+    }
+}
+
+/// Soundness must survive the extension: a false claim about a ReLU is still
+/// unprovable.
+#[test]
+fn a_false_relu_claim_is_still_unprovable() {
+    let be = Binius64Real::new();
+    let parsed = parse("(if (> x 0) x 0)").expect("parse");
+    let ckt = be
+        .compile_circuit(&parsed, &["x".to_string()])
+        .expect("compile");
+    let mut priv_map = HashMap::new();
+    priv_map.insert("x".to_string(), -5i64);
+    // relu(-5) = 0, but claim 5.
+    let mut pubs = HashMap::new();
+    pubs.insert(OUTPUT_NAME.to_string(), 5i64);
+    assert!(
+        be.prove(&ckt, &priv_map, &pubs).is_err(),
+        "claiming relu(-5) = 5 must fail"
+    );
+}
+
+/// Division stays refused — it needs quotient/remainder witnesses with range
+/// checks, which do not exist here.
+#[test]
+fn division_is_still_refused() {
+    let be = Binius64Real::new();
+    let expr = parse("(/ x y)").expect("parse");
+    assert!(be.compile_circuit(&expr, &["x".to_string()]).is_err());
 }

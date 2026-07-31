@@ -70,6 +70,13 @@ enum Op {
     Add(u32, u32),
     Sub(u32, u32),
     Mul(u32, u32),
+    /// Signed comparisons. Each yields the integer `1` or `0`, matching Baru's
+    /// semantics where `(> z 0)` is a value you can multiply by.
+    Lt(u32, u32),
+    Le(u32, u32),
+    Eq(u32, u32),
+    /// `cond ? t : f`, with `cond` a 0/1 integer.
+    Select(u32, u32, u32),
 }
 
 /// The serializable circuit description both sides rebuild from.
@@ -139,23 +146,103 @@ impl Ir {
                     BinOp::Add => Op::Add(x, y),
                     BinOp::Sub => Op::Sub(x, y),
                     BinOp::Mul => Op::Mul(x, y),
+                    // Comparisons are all expressed through `<` and `≤` on the
+                    // same operand order the circuit implements, so only two
+                    // gate shapes need to exist.
+                    BinOp::Lt => Op::Lt(x, y),
+                    BinOp::Gt => Op::Lt(y, x),
+                    BinOp::Le => Op::Le(x, y),
+                    BinOp::Ge => Op::Le(y, x),
+                    BinOp::Eq => Op::Eq(x, y),
                     other => {
                         return Err(format!(
-                            "binius64: {other:?} is not supported yet. Only +, - and * are \
-                             compiled; comparisons and division need bit-decomposition \
-                             circuitry, and accepting them here would silently prove the \
-                             wrong statement."
+                            "binius64: {other:?} is not supported. Division and modulo need \
+                             quotient/remainder witnesses with range checks, which do not \
+                             exist here; accepting them would silently prove the wrong \
+                             statement."
                         ))
                     }
                 };
                 Ok(self.push(node))
             }
+            Expr::If(c, t, f) => {
+                // Both branches are evaluated and one is selected. That is the
+                // only option in a circuit — there is no control flow to skip
+                // work — and it is why an `if` costs both sides.
+                let cond = self.walk(c, private_vars, seen)?;
+                let then_v = self.walk(t, private_vars, seen)?;
+                let else_v = self.walk(f, private_vars, seen)?;
+                Ok(self.push(Op::Select(cond, then_v, else_v)))
+            }
+            Expr::Let(bindings, body) => {
+                // Sequential (`let*`) scoping, matching how the rest of Baru
+                // evaluates a `let` body. Shadowed names are restored on exit so
+                // an inner binding cannot leak into a sibling expression.
+                let mut shadowed: Vec<(String, Option<u32>)> = Vec::new();
+                for (name, value) in bindings {
+                    let v = self.walk(value, private_vars, seen)?;
+                    shadowed.push((name.clone(), seen.insert(name.clone(), v)));
+                }
+                let mut last = None;
+                for e in body {
+                    last = Some(self.walk(e, private_vars, seen)?);
+                }
+                for (name, previous) in shadowed.into_iter().rev() {
+                    match previous {
+                        Some(idx) => {
+                            seen.insert(name, idx);
+                        }
+                        None => {
+                            seen.remove(&name);
+                        }
+                    }
+                }
+                last.ok_or_else(|| "binius64: `let` with an empty body".to_string())
+            }
+            Expr::Seq(items) => {
+                let mut last = None;
+                for e in items {
+                    last = Some(self.walk(e, private_vars, seen)?);
+                }
+                last.ok_or_else(|| "binius64: empty sequence".to_string())
+            }
             other => Err(format!(
                 "binius64: unsupported expression {other:?}. This backend compiles arithmetic \
-                 circuits over +, - and *; anything else is refused rather than mis-compiled."
+                 and comparison circuits over +, -, *, <, >, <=, >=, ==, `if`, `let` and \
+                 sequences; anything else is refused rather than mis-compiled."
             )),
         }
     }
+}
+
+/// Two's-complement negation: `−a = ¬a + 1`.
+fn negate(b: &CircuitBuilder, a: Wire) -> Wire {
+    let ones = b.add_constant_64(u64::MAX);
+    let one = b.add_constant_64(1);
+    let (n, _c) = b.iadd(b.bxor(a, ones), one);
+    n
+}
+
+/// **Signed** less-than, from the unsigned primitive.
+///
+/// `icmp_ult` compares words as unsigned, but Baru's values are `i64`. Flipping
+/// the sign bit of both operands maps the signed order onto the unsigned one:
+/// `a <ₛ b  ⇔  (a ⊕ 2⁶³) <ᵤ (b ⊕ 2⁶³)`. Without this every negative value would
+/// compare as *larger* than every positive one, so `relu(-1)` would return `-1`
+/// — a circuit that is perfectly sound about the wrong function.
+fn signed_lt(b: &CircuitBuilder, x: Wire, y: Wire) -> Wire {
+    let flip = b.add_constant_64(1u64 << 63);
+    b.icmp_ult(b.bxor(x, flip), b.bxor(y, flip))
+}
+
+/// Turn an MSB-encoded boolean into the integer `1` or `0`.
+///
+/// The comparison gates define only the *most significant* bit of their output;
+/// the remaining bits are explicitly undefined. A logical right shift by 63
+/// therefore both extracts the answer and discards the garbage, which is why
+/// this must not be replaced by a mask-and-compare.
+fn msb_to_int(b: &CircuitBuilder, msb: Wire) -> Wire {
+    b.shr(msb, 63)
 }
 
 /// Build the Binius circuit for an [`Ir`]. Deterministic: prover and verifier
@@ -201,6 +288,29 @@ fn build(ir: &Ir) -> (binius_frontend::Circuit, HashMap<String, Wire>, Wire) {
                 // like "the witness was never populated".
                 let (_hi, lo) = b.smul(wires[*x as usize], wires[*y as usize]);
                 lo
+            }
+            Op::Lt(x, y) => {
+                let m = signed_lt(&b, wires[*x as usize], wires[*y as usize]);
+                msb_to_int(&b, m)
+            }
+            Op::Le(x, y) => {
+                // a ≤ b  ⇔  ¬(b < a). Cheaper than a separate gate and avoids a
+                // second place where the signed/unsigned conversion could drift.
+                let gt = signed_lt(&b, wires[*y as usize], wires[*x as usize]);
+                let as_int = msb_to_int(&b, gt);
+                let one = b.add_constant_64(1);
+                let (diff, _c) = b.iadd(one, negate(&b, as_int));
+                diff
+            }
+            Op::Eq(x, y) => {
+                let m = b.icmp_eq(wires[*x as usize], wires[*y as usize]);
+                msb_to_int(&b, m)
+            }
+            Op::Select(c, t, f) => {
+                // `select` reads the MSB, and our conditions are 0/1 integers,
+                // so the bit has to be moved up first.
+                let cond = b.shl(wires[*c as usize], 63);
+                b.select(cond, wires[*t as usize], wires[*f as usize])
             }
         };
         wires.push(w);
@@ -262,6 +372,22 @@ impl Binius64Real {
                 Op::Add(x, y) => vals[*x as usize].wrapping_add(vals[*y as usize]),
                 Op::Sub(x, y) => vals[*x as usize].wrapping_sub(vals[*y as usize]),
                 Op::Mul(x, y) => vals[*x as usize].wrapping_mul(vals[*y as usize]),
+                // Signed comparisons, matching `signed_lt` in the circuit.
+                Op::Lt(x, y) => (vals[*x as usize] < vals[*y as usize]) as i64,
+                Op::Le(x, y) => (vals[*x as usize] <= vals[*y as usize]) as i64,
+                Op::Eq(x, y) => (vals[*x as usize] == vals[*y as usize]) as i64,
+                // The circuit reads the MSB of the condition after shifting bit
+                // 0 up, so only the low bit decides — mirror that exactly rather
+                // than testing `!= 0`, or the two would disagree on a condition
+                // like 2 and `evaluate` would claim an output the circuit
+                // rejects.
+                Op::Select(c, t, f) => {
+                    if vals[*c as usize] & 1 == 1 {
+                        vals[*t as usize]
+                    } else {
+                        vals[*f as usize]
+                    }
+                }
             };
             vals.push(v);
         }

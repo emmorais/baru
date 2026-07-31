@@ -83,7 +83,7 @@ post-quantum TLS transports.
 | **MPC** | `src/crypto/` | ABY3 replicated shares, **triple-free** multiplication, bit decomposition, batched primitives, in-process and TCP transports |
 | **FHE** | `src/fhe/` | BFV and BGV (secure, depth-1, no eval keys), TFHE-rs, SEAL CKKS (+ exact mock twins), multi-modular NTT, CRT slot packing |
 | **Hybrid** | `src/hybrid/` | MPC ↔ FHE scheme switching in both directions; re-encryption as a bootstrapping alternative |
-| **ZKP** | `src/zkp/` | Expression → circuit compiler, **real Binius64 prover/verifier** (`zkp::binius_real`, over `+`/`−`/`×`), proof serialization. The legacy `binius64_backend` is a retained placeholder that proves nothing — see the ZKP note below |
+| **ZKP** | `src/zkp/` | Expression → circuit compiler, **real Binius64 prover/verifier** (`zkp::binius_real`; arithmetic, signed comparisons, `if`, `let`), proof serialization. The legacy `binius64_backend` is a retained placeholder that proves nothing — see the ZKP note below |
 | **Gadgets** | `src/gadgets/` | UC-composable MPC building blocks: `relu`, `maxpool2d`, `argmax`, `dense`, `conv2d` — each bit-exact against a plaintext reference |
 | **MPC compiler** | `src/mpcc/` | Backend-aware circuit IR, rewrite rules, cost models, protocol registry (dealer / Shamir / Semi2k / LowGear), executable VM |
 | **Primitives** | `src/ot/`, `src/psi/`, `src/pir/` | Chou–Orlandi + IKNP OT, DH-PSI, single-server BFV PIR — all measured, including where they lose |
@@ -134,10 +134,20 @@ matter — an honest proof verifies; proving without a witness fails; a witness
 that does not satisfy the statement is rejected; a proof does not transfer to a
 different statement; a tampered transcript is rejected.
 
-Scope is stated rather than implied: it compiles arithmetic circuits over `+`,
-`−` and `×` on 64-bit words. Comparisons, division and `if` are **refused with
-an error**, because each needs bit-decomposition circuitry that does not exist
-yet. `bench-suite` reports those cases as unsupported instead of skipping them.
+Scope is stated rather than implied. It compiles `+`, `−`, `×`, the signed
+comparisons `<`, `>`, `<=`, `>=`, `==`, plus `if`, `let` and sequences, over
+64-bit words — enough to prove a **ReLU neuron**, which is the shape private
+inference is built from. Division and modulo are **refused with an error**,
+because they need quotient/remainder witnesses with range checks; `bench-suite`
+reports anything it cannot compile as unsupported instead of skipping it.
+
+Two details in that circuit are easy to get silently wrong, so they are worth
+knowing about if you extend it. The comparison gates are **unsigned**, so signed
+comparison flips both sign bits first — without that, every negative value
+compares as larger than every positive one and `relu(-1)` returns `-1`, a
+circuit that is perfectly sound about the wrong function. And those gates define
+only the *most significant bit* of their output, the rest being explicitly
+undefined, so the result is extracted with a logical shift rather than a mask.
 
 **The history is worth keeping.** Until 2026-07-31 this backend was
 `binius64_backend`, which concatenated hashes and whose `verify` never checked
