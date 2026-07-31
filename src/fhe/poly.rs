@@ -149,6 +149,33 @@ pub fn negacyclic_product(a: &[i128], b: &[i128], n: usize) -> Vec<I256> {
     }
 }
 
+/// A single polynomial prepared for repeated multiplication — the decryption
+/// key's forward transform, hoisted out of the per-ciphertext loop.
+///
+/// Under NTL this keeps the raw coefficients (that backend owns its transforms
+/// and exposes no handle), so the saving is NTT-only — the same asymmetry
+/// [`prepare_pair`] documents.
+pub enum PreparedPoly {
+    Ntt(Box<ntt::Transformed>),
+    Raw(Vec<i128>),
+}
+
+/// Prepare the reusable operand of a repeated single product.
+pub fn prepare_poly(a: &[i128], n: usize) -> PreparedPoly {
+    match backend() {
+        Backend::Ntt => PreparedPoly::Ntt(Box::new(ntt::forward_transform(a, n))),
+        Backend::Ntl => PreparedPoly::Raw(a.to_vec()),
+    }
+}
+
+/// The exact negacyclic product with the first operand already prepared.
+pub fn negacyclic_product_pre(a: &PreparedPoly, b: &[i128], n: usize) -> Vec<I256> {
+    match a {
+        PreparedPoly::Ntt(t) => ntt::exact_negacyclic_product_pre(t, b, n),
+        PreparedPoly::Raw(a) => negacyclic_product(a, b, n),
+    }
+}
+
 /// A ciphertext pair prepared for repeated multiplication.
 ///
 /// Under the NTT backend this holds the two forward transforms, so a chunked

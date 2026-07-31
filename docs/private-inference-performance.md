@@ -496,6 +496,34 @@ Pinned by `training_round_structure_is_constant_in_model_size`. **Repeat this
 search whenever an interactive primitive gains a `_batch` form** — that is the
 cheap habit six instances have now argued for.
 
+### 3.3d ~~Prepare the decryption key per session~~ — DONE 2026-07-30
+
+With the model precomputed and the gate hash fixed, `decrypt` became the FHE
+side's largest item. `Bfv::decrypt_poly` was doing two avoidable things on
+**every call**: bincode-deserializing the whole key bundle (three
+`n`-coefficient polynomials, ~196 KB at n=4096) and forward-transforming the
+secret key — while an inference decrypts once per ct×ct multiply and the key
+does not change within a session.
+
+`Bfv::decrypt_key` deserializes and transforms once; `decrypt_poly_pre` uses it.
+`CnnSession` holds it, alongside the encrypted model.
+
+| | before | after |
+|---|---|---|
+| decrypt, medical | 149 ms | **118 ms** |
+| decrypt, synthetic | 49 ms | **40 ms** |
+| medical latency | 542 ms | **509 ms** |
+
+21%, not the 33% the transform count suggests — the centering, the CRT
+reconstruction and the final rounding did not move, so the hoisted transform was
+never the whole phase. Same shape as §3.2's 26%-against-40%: **in this codebase
+the transforms are consistently about two thirds of what a transform-count
+estimate predicts.** Worth assuming for the next such estimate.
+
+Verified by `decrypt_matches_the_prepared_path`, requiring bit-identical output
+on both a fresh ciphertext and a degree-2 product (different numbers of key
+powers).
+
 ### 3.4 Parallelism
 
 Everything is single-threaded. The per-output-channel FHE work (encrypt, mul,

@@ -473,6 +473,30 @@ pub fn exact_negacyclic_product(a: &[i128], b: &[i128], n: usize) -> Vec<I256> {
     crt_reconstruct(&residues, n)
 }
 
+/// [`exact_negacyclic_product`] with the first operand already transformed.
+///
+/// Decryption multiplies by the *secret key* repeatedly — twice per degree-2
+/// ciphertext, and once per ciphertext for every layer of an inference — and
+/// the key does not change within a session. Hoisting its forward transform
+/// leaves 2 of the 3 transforms per prime.
+pub fn exact_negacyclic_product_pre(ta: &Transformed, b: &[i128], n: usize) -> Vec<I256> {
+    assert_eq!(ta.n, n);
+    assert_eq!(b.len(), n);
+    let mut residues: Vec<Vec<u64>> = Vec::with_capacity(NUM_PRIMES);
+    for (k, plan) in plans_for(n).iter().enumerate() {
+        let p = plan.p;
+        let fa = &ta.res[k];
+        let mut fb = reduce_mod(b, p);
+        plan.forward(&mut fb);
+        for i in 0..n {
+            fb[i] = mulmod(fa[i], fb[i], p);
+        }
+        plan.inverse(&mut fb);
+        residues.push(fb);
+    }
+    crt_reconstruct(&residues, n)
+}
+
 // ─── The wide profile ────────────────────────────────────────────────────────
 
 /// Reduce a **signed** 256-bit coefficient mod `p < 2^62`.

@@ -157,6 +157,12 @@ impl BfvCt {
     }
 }
 
+/// A secret key deserialized and forward-transformed once, for repeated
+/// decryption within a session. See [`Bfv::decrypt_key`].
+pub struct DecryptKey {
+    pre: poly::PreparedPoly,
+}
+
 /// A fresh ciphertext held in the NTT domain, ready to be multiplied
 /// against many others without re-transforming.
 pub struct BfvCtNtt {
@@ -225,6 +231,55 @@ impl Bfv {
 
     /// Decrypt under `s^{key_pow}`: compute `Σ_i c_i · s^i`, then
     /// `round(·/Δ) mod t`.
+    /// The secret key, deserialized once and forward-transformed once.
+    ///
+    /// [`Bfv::decrypt_poly`] does neither: it bincode-deserializes the whole
+    /// key bundle (three `n`-coefficient polynomials — ~196 KB at n=4096) and
+    /// re-transforms `s` on **every call**, while an inference decrypts once per
+    /// ct×ct multiply. Hoisting both is what [`Bfv::decrypt_poly_pre`] is for.
+    pub fn decrypt_key(&self, ck_bytes: &[u8]) -> DecryptKey {
+        let p = &self.params;
+        let s = self.bundle(ck_bytes).s;
+        assert!(!s.is_empty(), "BFV decrypt needs the client key (with s)");
+        let sc: Vec<i128> = s.iter().map(|&c| center(c, p)).collect();
+        DecryptKey { pre: poly::prepare_poly(&sc, p.n) }
+    }
+
+    /// [`Bfv::decrypt_poly`] against a prepared key.
+    ///
+    /// Identical output — `decrypt_matches_the_prepared_path` requires it — at
+    /// 2 of the 3 transforms per prime per key power, with no key
+    /// deserialization on the path at all.
+    pub fn decrypt_poly_pre(&self, key: &DecryptKey, ct: &BfvCt) -> Vec<u64> {
+        let p = &self.params;
+        let mask = p.q_mask();
+        let mut acc = ct.c.last().expect("ciphertext has components").clone();
+        for ci in ct.c.iter().rev().skip(1) {
+            let accc: Vec<i128> = acc.iter().map(|&c| center(c, p)).collect();
+            acc = poly::negacyclic_product_pre(&key.pre, &accc, p.n)
+                .into_iter()
+                .map(|c| c.low_u128() & mask)
+                .collect();
+            acc = poly_add(&acc, ci, mask);
+        }
+        self.round_to_plaintext(&acc)
+    }
+
+    /// The shared tail of both decryption paths: rescale by `t/q` with rounding
+    /// and reduce mod `t`.
+    fn round_to_plaintext(&self, acc: &[u128]) -> Vec<u64> {
+        let p = &self.params;
+        let shift = p.delta_shift();
+        let t_mask = p.t() - 1;
+        acc.iter()
+            .map(|&c| {
+                let centered = center(c, p);
+                let rounded = (centered + (1i128 << (shift - 1))) >> shift;
+                (rounded as u64) & t_mask
+            })
+            .collect()
+    }
+
     pub fn decrypt_poly(&self, ck_bytes: &[u8], ct: &BfvCt) -> Vec<u64> {
         let p = &self.params;
         let s = self.bundle(ck_bytes).s;
@@ -239,15 +294,7 @@ impl Bfv {
             acc = poly_mul_mod(&acc, &s, p);
             acc = poly_add(&acc, ci, mask);
         }
-        let shift = p.delta_shift();
-        let t_mask = p.t() - 1;
-        acc.iter()
-            .map(|&c| {
-                let centered = center(c, p);
-                let rounded = (centered + (1i128 << (shift - 1))) >> shift;
-                (rounded as u64) & t_mask
-            })
-            .collect()
+        self.round_to_plaintext(&acc)
     }
 
     pub fn decrypt_scalar(&self, ck_bytes: &[u8], ct: &BfvCt) -> u64 {
@@ -518,6 +565,47 @@ mod tests {
             let pos = s.matvec_output_position(x.len(), r);
             assert_eq!(s.to_signed(out[pos]), expected, "row {r}");
         }
+    }
+
+    /// The prepared decryption path must agree with the unprepared one
+    /// **exactly** — it is the same Horner evaluation with the key's forward
+    /// transform hoisted, so any disagreement is a bug in the hoist.
+    ///
+    /// Checked on a degree-2 product (the shape the pipeline actually
+    /// decrypts) as well as a fresh ciphertext, because the two exercise
+    /// different numbers of key powers.
+    #[test]
+    fn decrypt_matches_the_prepared_path() {
+        let s = Bfv::new(BfvParams::TEST_SMALL);
+        let (ck, pk) = s.keygen();
+        let key = s.decrypt_key(&ck);
+        let x = vec![3i64, -4, 5, -1];
+        let w = vec![vec![2i64, 3, -1, 4], vec![-5i64, 1, 0, 2]];
+
+        let cx = s.encrypt_poly(&pk, &s.pack_input(&x));
+        assert_eq!(
+            s.decrypt_poly(&ck, &cx),
+            s.decrypt_poly_pre(&key, &cx),
+            "fresh (degree-1) ciphertext"
+        );
+
+        let prod = s.mul(&cx, &s.encrypt_poly(&pk, &s.pack_weights(&w)));
+        assert_eq!(
+            s.decrypt_poly(&ck, &prod),
+            s.decrypt_poly_pre(&key, &prod),
+            "degree-2 product — the shape the pipeline decrypts"
+        );
+
+        // …and it is still the right matvec.
+        let out = s.decrypt_poly_pre(&key, &prod);
+        let got: Vec<i64> = (0..w.len())
+            .map(|r| s.to_signed(out[s.matvec_output_position(x.len(), r)]))
+            .collect();
+        let expected: Vec<i64> = w
+            .iter()
+            .map(|row| row.iter().zip(&x).map(|(a, b)| a * b).sum())
+            .collect();
+        assert_eq!(got, expected);
     }
 
     /// `mul_pre_pre` must agree with `mul_pre` and `mul` **exactly**, not

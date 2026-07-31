@@ -715,6 +715,7 @@ fn hybrid_matvec_open(
     rng: &mut impl Rng,
     masks_src: &mut Masks,
     weights_src: &mut Weights,
+    dk: &crate::fhe::bfv::DecryptKey,
 ) -> (Vec<u64>, Vec<[u64; 3]>, FhePhases) {
     let n = s.params.n;
     let t_mask = s.params.t() - 1;
@@ -733,7 +734,7 @@ fn hybrid_matvec_open(
             masks_src.take(s, ck, n, t_mask, rng, &mut ph);
         let masked = s.add(&prod, &mask_ct);
         let t = Instant::now();
-        let y = s.decrypt_poly(ck, &masked);
+        let y = s.decrypt_poly_pre(dk, &masked);
         ph.decrypt_ms += ms(t);
         sleep_link(&profile, conv_bytes + chunk.len() * 8, 2);
         for r in 0..chunk.len() {
@@ -760,6 +761,7 @@ fn hybrid_conv_open(
     rng: &mut impl Rng,
     masks_src: &mut Masks,
     weights_src: &mut Weights,
+    dk: &crate::fhe::bfv::DecryptKey,
 ) -> (Vec<u64>, Vec<[u64; 3]>, FhePhases) {
     let n = s.params.n;
     let t_mask = s.params.t() - 1;
@@ -794,7 +796,7 @@ fn hybrid_conv_open(
             masks_src.take(s, ck, n, t_mask, rng, &mut ph);
         let masked = s.add(&prod, &mask_ct);
         let t = Instant::now();
-        let y = s.decrypt_poly(ck, &masked);
+        let y = s.decrypt_poly_pre(dk, &masked);
         ph.decrypt_ms += ms(t);
         sleep_link(&profile, conv_bytes + oh * ow * 8, 2);
         for oy in 0..oh {
@@ -1166,6 +1168,9 @@ pub fn run_cnn_hybrid_with(
 pub struct CnnSession {
     s: Bfv,
     ck: Vec<u8>,
+    /// The secret key deserialized and forward-transformed once for the
+    /// session — decryption is per-ciphertext, the key is not.
+    dk: crate::fhe::bfv::DecryptKey,
     enc_model: Option<EncryptedModel>,
     /// One per ct×ct multiply — also the number of masks each query needs.
     n_weight_cts: usize,
@@ -1197,7 +1202,8 @@ impl CnnSession {
         let polys = weight_polys(&s, model);
         let n_weight_cts = polys.len();
         let enc_model = precompute.then(|| EncryptedModel::encrypt(&s, &ck, &polys));
-        CnnSession { s, ck, enc_model, n_weight_cts, keygen_ms }
+        let dk = s.decrypt_key(&ck);
+        CnnSession { s, ck, dk, enc_model, n_weight_cts, keygen_ms }
     }
 
     /// Per-session offline cost: keygen plus, when precomputing, the encrypted
@@ -1285,7 +1291,7 @@ pub fn run_cnn_hybrid_in_session(
     let t0 = Instant::now();
     let conv1_shape = ConvShape { in_c: 1, h: model.d, w: model.d, kh: K, kw: K };
     let (conv_open, conv_masks, ph) =
-        hybrid_conv_open(s, ck, &c_input, conv1_shape, &model.kernels, profile, &mut rng, &mut masks_src(&mut pool), &mut weights_src);
+        hybrid_conv_open(s, ck, &c_input, conv1_shape, &model.kernels, profile, &mut rng, &mut masks_src(&mut pool), &mut weights_src, &session.dk);
     fhe_ph.add(&ph);
     fhe_ms += t0.elapsed().as_secs_f64() * 1000.0;
 
@@ -1310,7 +1316,7 @@ pub fn run_cnn_hybrid_in_session(
         fhe_ph.add(&ph);
         let shape = ConvShape { in_c: cl.in_c, h: cl.in_h, w: cl.in_w, kh: K, kw: K };
         let (co, cm, ph) =
-            hybrid_conv_open(s, ck, &c_conv_in, shape, &cl.kernels, profile, &mut rng, &mut masks_src(&mut pool), &mut weights_src);
+            hybrid_conv_open(s, ck, &c_conv_in, shape, &cl.kernels, profile, &mut rng, &mut masks_src(&mut pool), &mut weights_src, &session.dk);
         fhe_ph.add(&ph);
         fhe_ms += tc.elapsed().as_secs_f64() * 1000.0;
 
@@ -1343,7 +1349,7 @@ pub fn run_cnn_hybrid_in_session(
     for (hidden_w, hidden_b) in model.hidden.clone() {
         let th = Instant::now();
         let (hidden_open, hidden_masks, ph) =
-            hybrid_matvec_open(s, ck, &c_dense_in, &hidden_w, dense_in_dim, profile, &mut rng, &mut masks_src(&mut pool), &mut weights_src);
+            hybrid_matvec_open(s, ck, &c_dense_in, &hidden_w, dense_in_dim, profile, &mut rng, &mut masks_src(&mut pool), &mut weights_src, &session.dk);
         fhe_ph.add(&ph);
         fhe_ms += th.elapsed().as_secs_f64() * 1000.0;
 
@@ -1403,6 +1409,7 @@ pub fn run_cnn_hybrid_in_session(
         &mut rng,
         &mut masks_src(&mut pool),
         &mut weights_src,
+        &session.dk,
     );
     fhe_ph.add(&ph);
     fhe_ms += t3.elapsed().as_secs_f64() * 1000.0;
