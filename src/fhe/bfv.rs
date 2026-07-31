@@ -157,6 +157,13 @@ impl BfvCt {
     }
 }
 
+/// A public key deserialized and forward-transformed once, for repeated
+/// encryption within a session. See [`Bfv::encrypt_key`].
+pub struct EncryptKey {
+    b: poly::PreparedPoly,
+    a: poly::PreparedPoly,
+}
+
 /// A secret key deserialized and forward-transformed once, for repeated
 /// decryption within a session. See [`Bfv::decrypt_key`].
 pub struct DecryptKey {
@@ -198,6 +205,56 @@ impl Bfv {
 
     fn bundle(&self, key_bytes: &[u8]) -> KeyBundle {
         bincode::deserialize(key_bytes).expect("BFV key bundle")
+    }
+
+    /// The public key, deserialized once and forward-transformed once.
+    ///
+    /// Encryption multiplies a *fresh* `u` by the *fixed* `(b, a)`, so the
+    /// public key's transforms are per-session work sitting on a per-ciphertext
+    /// path. That path is the busiest in the pipeline: the scheme-switch mask
+    /// pool alone encrypts three polynomials per switch, ~150 per inference.
+    pub fn encrypt_key(&self, key_bytes: &[u8]) -> EncryptKey {
+        let p = &self.params;
+        let pk = self.bundle(key_bytes);
+        let cen = |v: &[u128]| -> Vec<i128> { v.iter().map(|&c| center(c, p)).collect() };
+        EncryptKey {
+            b: poly::prepare_poly(&cen(&pk.b), p.n),
+            a: poly::prepare_poly(&cen(&pk.a), p.n),
+        }
+    }
+
+    /// [`Bfv::encrypt_poly`] against a prepared key — same distribution, same
+    /// ciphertext shape, 2 of the 3 transforms per prime per product.
+    ///
+    /// Not deterministic and *not* comparable ciphertext-for-ciphertext with
+    /// `encrypt_poly`: both draw fresh `u`, `e₁`, `e₂`. What must match is that
+    /// each decrypts to the message — `encrypt_prepared_roundtrips` checks that,
+    /// and the end-to-end bit-exactness checks it under composition.
+    pub fn encrypt_poly_pre(&self, key: &EncryptKey, m: &[u64]) -> BfvCt {
+        let p = &self.params;
+        let mask = p.q_mask();
+        let u = sample_ternary(p.n);
+        let e1 = sample_ternary(p.n);
+        let e2 = sample_ternary(p.n);
+        let uc: Vec<i128> = u.iter().map(|&c| center(c, p)).collect();
+        let prod = |k: &poly::PreparedPoly| -> Poly {
+            poly::negacyclic_product_pre(k, &uc, p.n)
+                .into_iter()
+                .map(|c| c.low_u128() & mask)
+                .collect()
+        };
+        let ub = prod(&key.b);
+        let ua = prod(&key.a);
+        let shift = p.delta_shift();
+        let t_mask = (p.t() - 1) as u128;
+        let c0: Poly = (0..p.n)
+            .map(|i| {
+                let mi = (*m.get(i).unwrap_or(&0) as u128) & t_mask;
+                ub[i].wrapping_add(e1[i]).wrapping_add(mi << shift) & mask
+            })
+            .collect();
+        let c1: Poly = (0..p.n).map(|i| ua[i].wrapping_add(e2[i]) & mask).collect();
+        BfvCt { c: vec![c0, c1] }
     }
 
     /// Encrypt a message polynomial (coeffs mod t) with the public key:
@@ -565,6 +622,42 @@ mod tests {
             let pos = s.matvec_output_position(x.len(), r);
             assert_eq!(s.to_signed(out[pos]), expected, "row {r}");
         }
+    }
+
+    /// The prepared *encryption* path cannot be compared ciphertext-for-
+    /// ciphertext — both draw fresh randomness — so what is checked is the
+    /// property that matters: it still decrypts to the message, at both key
+    /// powers, and composes through a ct×ct multiply.
+    #[test]
+    fn encrypt_prepared_roundtrips() {
+        let s = Bfv::new(BfvParams::TEST_SMALL);
+        let (ck, pk) = s.keygen();
+        let ek = s.encrypt_key(&pk);
+        let dk = s.decrypt_key(&ck);
+        let x = vec![3i64, -4, 5, -1];
+        let w = vec![vec![2i64, 3, -1, 4], vec![-5i64, 1, 0, 2]];
+
+        let cx = s.encrypt_poly_pre(&ek, &s.pack_input(&x));
+        let cw = s.encrypt_poly_pre(&ek, &s.pack_weights(&w));
+        let got: Vec<i64> = {
+            let out = s.decrypt_poly_pre(&dk, &s.mul(&cx, &cw));
+            (0..w.len())
+                .map(|r| s.to_signed(out[s.matvec_output_position(x.len(), r)]))
+                .collect()
+        };
+        let expected: Vec<i64> = w
+            .iter()
+            .map(|row| row.iter().zip(&x).map(|(a, b)| a * b).sum())
+            .collect();
+        assert_eq!(got, expected, "prepared encryption must survive a ct×ct multiply");
+
+        // Mixing the two paths must also work — the pipeline does.
+        let mixed = s.mul(&s.encrypt_poly(&pk, &s.pack_input(&x)), &cw);
+        let out = s.decrypt_poly(&ck, &mixed);
+        let got2: Vec<i64> = (0..w.len())
+            .map(|r| s.to_signed(out[s.matvec_output_position(x.len(), r)]))
+            .collect();
+        assert_eq!(got2, expected, "prepared and unprepared encryption must interoperate");
     }
 
     /// The prepared decryption path must agree with the unprepared one

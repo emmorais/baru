@@ -64,10 +64,10 @@ baru bench-medmnist --dataset pneumonia --hybrid 2 --gc --precompute
 ```
 
 ```
-latency  : 1152 ms   (fhe 355 ms, mpc 793 ms)
-fhe split: weights 0 ms, mul 172 ms, mask-enc 0 ms, decrypt 148 ms, re-encrypt 34 ms
-mpc split: import 27 ms, relu 526 ms, pool 222 ms, argmax 7 ms
-offline  : 538 ms/image  —  78 per-SESSION (amortizes), 460 per-QUERY (shifts only)
+latency  : 508 ms   (fhe 278 ms, mpc 227 ms)
+fhe split: weights 0 ms, mul 130 ms, mask-enc 0 ms, decrypt 118 ms, re-encrypt 37 ms
+mpc split: import 23 ms, relu 124 ms, pool 63 ms, argmax 10 ms
+offline  : 558 ms/image  —  ~103 per-SESSION (amortizes), ~456 per-QUERY (shifts only)
 ```
 
 It was **32.7 s** when this document was started. The construction never
@@ -82,13 +82,18 @@ on the critical path, and the speed of the ring arithmetic underneath.
 | tournament `argmax` | 4.94 s | (invisible at rtt=0; 2.4× at RTT 20 ms) |
 | preprocessed masks (`--precompute`) | 2.90 s | + 2.03 s offline |
 | Shoup butterfly in `ntt.rs` | 1.75 s | 4.65× on every transform |
-| precomputed model (§3.1) | **1.15 s** | weights encrypted once per *session* |
+| precomputed model (§3.1) | 1.15 s | weights encrypted once per *session* |
+| pre-transformed weights (§3.2) | 1.09 s | `mul_pre_pre`, both operands prepared |
+| batched garbled `y2a` (§3.3b) | 1.00 s | 379 725 → 61 messages |
+| fixed-key AES gate hash (§3.3) | 542 ms | 178 ns → 5 ns per hash |
+| prepared decryption key (§3.3d) | **508 ms** | key transformed once per session |
 
-**The MPC segment is now the majority again — 793 ms of 1152 ms (69%)** — and
-inside it the ReLU is 526 ms. That is a reversal of the standing finding this
-document recorded for months ("the cost centre is FHE"), and it is a direct
-consequence of the FHE side getting ~3× cheaper while the MPC side did not
-move. Anyone optimising next should read §3.3 before §3.2.
+**The composition inverted twice in one day.** It was 26% MPC; after §3.1–§3.2
+made FHE ~3× cheaper it became 69% MPC; then §3.3/§3.3b took the garbled ReLU
+from 526 ms to 124 ms and it is **55% FHE again** (278 ms of 508). The lesson is
+not any one of those numbers — it is that *"which side dominates"* has a
+half-life of about one optimisation, so any plan resting on it should be
+re-derived rather than inherited.
 
 WAN (RTT 20 ms, 1 Gbps): the pipeline is **not round-bound** — that is what the
 constant-round nonlinearities bought.
@@ -101,9 +106,9 @@ and prints everything:
 
 ```sh
 baru bench-cnn --img 28 --gc --precompute
-# total 736ms (fhe 116ms, mpc 616ms) | offline 201ms
-# fhe: keygen 4 / input 4 / weights 0 (0x) / mul 57 / mask 0 (0x) / decrypt 48 / re-encrypt 11 (3x)
-# mpc: import 12 / relu 417 / pool 157 / argmax 24
+# total 272ms (fhe 91ms, mpc 178ms) | offline 217ms
+# fhe: keygen 5 / input 4 / weights 0 (0x) / mul 43 / mask 0 (0x) / decrypt 40 / re-encrypt 11 (3x)
+# mpc: import 8 / relu 82 / pool 44 / argmax 25
 ```
 
 Note this control builds a fresh session per call, so its `offline` includes the
@@ -524,6 +529,38 @@ Verified by `decrypt_matches_the_prepared_path`, requiring bit-identical output
 on both a fresh ciphertext and a degree-2 product (different numbers of key
 powers).
 
+### 3.3e ~~Prepare the encryption key per session~~ — DONE 2026-07-30
+
+The same hoist as §3.3d, on the busier side. `Bfv::encrypt_poly` deserialized
+the key bundle and forward-transformed the *public* key on every call, while
+encryption multiplies a **fresh** `u` by a **fixed** `(b, a)` — and the mask pool
+alone encrypts three polynomials per switch, ~150 per inference.
+
+`Bfv::encrypt_key` / `encrypt_poly_pre`, held by `CnnSession` next to the
+decryption key. This one pays mostly on the *offline* column, where the mask pool
+lives:
+
+| | before | after |
+|---|---|---|
+| mask pool (per-query offline) | 456 ms/image | **321 ms/image** |
+| re-encrypt (online) | 37 ms | **24 ms** |
+| medical latency | 508 ms | **488 ms** |
+| synthetic offline | 217 ms | **160 ms** |
+
+**This closed a gap that had just opened** — see §4's offline-vs-online entry.
+
+Verified by `encrypt_prepared_roundtrips`. Note it cannot be a
+ciphertext-for-ciphertext differential like §3.2's and §3.3d's — both paths draw
+fresh `u`, `e₁`, `e₂` — so it checks the property that matters instead: the
+ciphertext decrypts to the message, survives a ct×ct multiply, and interoperates
+with the unprepared path.
+
+**Three hoists, one shape.** §3.2 (weights), §3.3d (secret key) and §3.3e
+(public key) are the same observation applied three times: *an operand that is
+fixed for the session was being transformed per ciphertext*. Any remaining
+`poly_mul_mod` with a session-lifetime operand is a candidate; there are no
+obvious ones left in `bfv.rs`.
+
 ### 3.4 Parallelism
 
 Everything is single-threaded. The per-output-channel FHE work (encrypt, mul,
@@ -547,13 +584,12 @@ absolute win available and the least interesting scientifically.
 - **Optimising `import`.** It is 21 ms. It was 19 100 ms this morning; that is
   finished.
 - **Optimising `argmax` further.** 7 ms on 2 classes, 30 ms on 11.
-- ~~**More MPC protocol work generally.**~~ **This entry has flipped — do not
-  trust it.** It was written when the MPC segment was 756 ms of 2896 ms (26%).
-  After the Shoup butterfly and §3.1 the FHE side is ~3× cheaper and the MPC
-  side did not move, so the segment is now **793 ms of 1152 ms (69%)** and its
-  largest phase (ReLU, 526 ms) is the single biggest item in the pipeline. It
-  is already constant-round garbled, and §3.3 now attributes it: 44% is the
-  SHA-256 label hash, which has a standard fixed-key-AES replacement. Re-derive before acting: this
+- ~~**More MPC protocol work generally.**~~ **This entry flipped twice in one
+  day; do not inherit either state.** Written when MPC was 756 ms of 2896 ms
+  (26%). §3.1–§3.2 made FHE ~3× cheaper and it became 69%, with the garbled
+  ReLU the single biggest item. Then §3.3 (fixed-key AES) and §3.3b (batched
+  `y2a`) took that ReLU from 526 ms to 124 ms, and MPC is back to **227 ms of
+  508 (45%)**. Re-derive before acting. Re-derive before acting: this
   is exactly the kind of entry §2 warns goes stale when the other side moves.
 
 ---
@@ -575,13 +611,16 @@ absolute win available and the least interesting scientifically.
   numbers showing the per-session line falling as `1/batch` while the per-query
   line stays flat. The paper should use that split rather than one offline
   total.
-- **`--precompute` offline cost vs online cost.** Still comfortable, and the
-  margin has held as online shrank: synthetic 201 ms offline against 736 ms
-  online; medical 538 ms/image offline against 1152 ms online. Only the
-  per-*query* part (460 ms of that 538) is the one that matters for a
-  continuously-loaded server — the per-session part amortizes away. If the
-  per-query offline ever approaches online, the framing has to change from
-  "latency" to "latency, given spare offline capacity".
+- **`--precompute` offline vs online — the margin nearly closed, and is now the
+  thing to watch.** Only the per-*query* part matters for a continuously-loaded
+  server; the per-session part amortizes away. After §3.3 cut the online path to
+  508 ms the mask pool stood at **456 ms/image — 90% of it**, about to cross the
+  line where the framing must change from "latency" to "latency, given spare
+  offline capacity". §3.3e took the pool to **321 ms** against **488 ms** online,
+  so it is comfortably under again. But masks are per-query and never amortize,
+  so **every further online win narrows this margin**. Current: synthetic 160 ms
+  offline / 260 ms online; medical 321 ms/image per-query offline / 488 ms
+  online.
 - **MedMNIST scope.** Already stated: downsampled, pre-processed, no clinical
   claim. Keep it stated.
 

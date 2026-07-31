@@ -470,11 +470,11 @@ struct EncryptedModel {
 }
 
 impl EncryptedModel {
-    fn encrypt(s: &Bfv, ck: &[u8], polys: &[Vec<u64>]) -> Self {
+    fn encrypt(s: &Bfv, ek: &crate::fhe::bfv::EncryptKey, polys: &[Vec<u64>]) -> Self {
         let t = Instant::now();
         let cts = polys
             .iter()
-            .map(|p| s.transform(&s.encrypt_poly(ck, p)))
+            .map(|p| s.transform(&s.encrypt_poly_pre(ek, p)))
             .collect();
         EncryptedModel { cts, offline_ms: ms(t) }
     }
@@ -514,7 +514,7 @@ impl<'a> Weights<'a> {
     fn mul_next(
         &mut self,
         s: &Bfv,
-        ck: &[u8],
+        ek: &crate::fhe::bfv::EncryptKey,
         cxt: &crate::fhe::bfv::BfvCtNtt,
         poly: impl FnOnce() -> Vec<u64>,
         ph: &mut FhePhases,
@@ -536,7 +536,7 @@ impl<'a> Weights<'a> {
             }
             None => {
                 let t = Instant::now();
-                let cw = s.encrypt_poly(ck, &poly());
+                let cw = s.encrypt_poly_pre(ek, &poly());
                 ph.weights_ms += ms(t);
                 ph.n_weight_enc += 1;
                 let t = Instant::now();
@@ -598,7 +598,12 @@ impl MaskPool {
     /// [`weight_polys`] enumerates. Under-counting panics at draw time and
     /// over-counting panics at the end of the run, so a pipeline that consumed
     /// them in a different order still cannot pass silently.
-    fn with_len(s: &Bfv, ck: &[u8], count: usize, rng: &mut impl Rng) -> Self {
+    fn with_len(
+        s: &Bfv,
+        ek: &crate::fhe::bfv::EncryptKey,
+        count: usize,
+        rng: &mut impl Rng,
+    ) -> Self {
         let n = s.params.n;
         let t_mask = s.params.t() - 1;
         let t = Instant::now();
@@ -609,7 +614,7 @@ impl MaskPool {
                 });
                 let mut combined: Option<BfvCt> = None;
                 for m in &plain {
-                    let enc = s.encrypt_poly(ck, m);
+                    let enc = s.encrypt_poly_pre(ek, m);
                     combined = Some(match combined {
                         None => enc,
                         Some(acc) => s.add(&acc, &enc),
@@ -669,7 +674,7 @@ impl Masks<'_> {
     fn take(
         &mut self,
         s: &Bfv,
-        ck: &[u8],
+        ek: &crate::fhe::bfv::EncryptKey,
         n: usize,
         t_mask: u64,
         rng: &mut impl Rng,
@@ -683,7 +688,7 @@ impl Masks<'_> {
                 let mut combined: Option<BfvCt> = None;
                 let mut bytes = 0usize;
                 for m in &plain {
-                    let enc = s.encrypt_poly(ck, m);
+                    let enc = s.encrypt_poly_pre(ek, m);
                     bytes += s.ct_bytes(&enc);
                     combined = Some(match combined {
                         None => enc,
@@ -707,7 +712,7 @@ impl Masks<'_> {
 
 fn hybrid_matvec_open(
     s: &Bfv,
-    ck: &[u8],
+    ek: &crate::fhe::bfv::EncryptKey,
     c_input: &BfvCt,
     weights: &[Vec<i64>],
     in_dim: usize,
@@ -729,9 +734,9 @@ fn hybrid_matvec_open(
     let mut opened = Vec::with_capacity(weights.len());
     let mut masks = Vec::with_capacity(weights.len());
     for chunk in weights.chunks(rows_per_chunk) {
-        let prod = weights_src.mul_next(s, ck, &cxt, || s.pack_weights(chunk), &mut ph);
+        let prod = weights_src.mul_next(s, ek, &cxt, || s.pack_weights(chunk), &mut ph);
         let (chunk_masks, mask_ct, conv_bytes) =
-            masks_src.take(s, ck, n, t_mask, rng, &mut ph);
+            masks_src.take(s, ek, n, t_mask, rng, &mut ph);
         let masked = s.add(&prod, &mask_ct);
         let t = Instant::now();
         let y = s.decrypt_poly_pre(dk, &masked);
@@ -753,7 +758,7 @@ fn hybrid_matvec_open(
 #[allow(clippy::type_complexity)]
 fn hybrid_conv_open(
     s: &Bfv,
-    ck: &[u8],
+    ek: &crate::fhe::bfv::EncryptKey,
     c_input: &BfvCt,
     shape: ConvShape,
     kernels: &[Vec<i64>],
@@ -784,7 +789,7 @@ fn hybrid_conv_open(
     for kernel in kernels.iter() {
         let prod = weights_src.mul_next(
             s,
-            ck,
+            ek,
             &cxt,
             || conv_pack::pack_kernel(kernel, shape, n, t_mask),
             &mut ph,
@@ -793,7 +798,7 @@ fn hybrid_conv_open(
         // Fresh masks per output channel (reuse across channels would leak
         // the difference of their pre-activations).
         let (chan_masks, mask_ct, conv_bytes) =
-            masks_src.take(s, ck, n, t_mask, rng, &mut ph);
+            masks_src.take(s, ek, n, t_mask, rng, &mut ph);
         let masked = s.add(&prod, &mask_ct);
         let t = Instant::now();
         let y = s.decrypt_poly_pre(dk, &masked);
@@ -816,7 +821,7 @@ fn hybrid_conv_open(
 /// the one modelled link hop. Returns the ciphertext and the bytes sent.
 fn pack_shares_to_fhe(
     s: &Bfv,
-    ck: &[u8],
+    ek: &crate::fhe::bfv::EncryptKey,
     per_party: &[Vec<Fr>],
     t_mask: u64,
     profile: NetworkProfile,
@@ -827,7 +832,7 @@ fn pack_shares_to_fhe(
     let t = Instant::now();
     for comps in per_party {
         let m: Vec<u64> = comps.iter().map(|&v| (v as u64) & t_mask).collect();
-        let enc = s.encrypt_poly(ck, &m);
+        let enc = s.encrypt_poly_pre(ek, &m);
         bytes += s.ct_bytes(&enc);
         c = Some(match c {
             None => enc,
@@ -1167,10 +1172,11 @@ pub fn run_cnn_hybrid_with(
 /// query, so they are rebuilt inside every run.
 pub struct CnnSession {
     s: Bfv,
-    ck: Vec<u8>,
     /// The secret key deserialized and forward-transformed once for the
     /// session — decryption is per-ciphertext, the key is not.
     dk: crate::fhe::bfv::DecryptKey,
+    /// Likewise the public key, which every encryption multiplies against.
+    ek: crate::fhe::bfv::EncryptKey,
     enc_model: Option<EncryptedModel>,
     /// One per ct×ct multiply — also the number of masks each query needs.
     n_weight_cts: usize,
@@ -1201,9 +1207,10 @@ impl CnnSession {
         // exactly one switch) the number of masks each query will pool.
         let polys = weight_polys(&s, model);
         let n_weight_cts = polys.len();
-        let enc_model = precompute.then(|| EncryptedModel::encrypt(&s, &ck, &polys));
+        let ek = s.encrypt_key(&ck);
+        let enc_model = precompute.then(|| EncryptedModel::encrypt(&s, &ek, &polys));
         let dk = s.decrypt_key(&ck);
-        CnnSession { s, ck, dk, enc_model, n_weight_cts, keygen_ms }
+        CnnSession { s, dk, ek, enc_model, n_weight_cts, keygen_ms }
     }
 
     /// Per-session offline cost: keygen plus, when precomputing, the encrypted
@@ -1250,7 +1257,6 @@ pub fn run_cnn_hybrid_in_session(
     );
     let nbits = model.nbits;
     let s = &session.s;
-    let ck = &session.ck;
     let t_mask = s.params.t() - 1;
 
     let (mut fhe_ms, mut mpc_ms) = (0.0, 0.0);
@@ -1265,7 +1271,7 @@ pub fn run_cnn_hybrid_in_session(
     // is therefore the latency of a query against a warm server, which is the
     // quantity a deployment is judged on.
     let mut pool = precompute
-        .then(|| MaskPool::with_len(s, ck, session.n_weight_cts, &mut rand::thread_rng()));
+        .then(|| MaskPool::with_len(s, &session.ek, session.n_weight_cts, &mut rand::thread_rng()));
     let offline_session_ms = session.offline_ms();
     let offline_query_ms = pool.as_ref().map_or(0.0, |p| p.offline_ms);
     let offline_ms = offline_session_ms + offline_query_ms;
@@ -1278,7 +1284,7 @@ pub fn run_cnn_hybrid_in_session(
 
     let start = Instant::now();
     let ti = Instant::now();
-    let c_input = s.encrypt_poly(ck, &s.pack_input(input));
+    let c_input = s.encrypt_poly_pre(&session.ek, &s.pack_input(input));
     fhe_ph.input_ms = ms(ti);
 
     let shift = model.shift;
@@ -1291,7 +1297,7 @@ pub fn run_cnn_hybrid_in_session(
     let t0 = Instant::now();
     let conv1_shape = ConvShape { in_c: 1, h: model.d, w: model.d, kh: K, kw: K };
     let (conv_open, conv_masks, ph) =
-        hybrid_conv_open(s, ck, &c_input, conv1_shape, &model.kernels, profile, &mut rng, &mut masks_src(&mut pool), &mut weights_src, &session.dk);
+        hybrid_conv_open(s, &session.ek, &c_input, conv1_shape, &model.kernels, profile, &mut rng, &mut masks_src(&mut pool), &mut weights_src, &session.dk);
     fhe_ph.add(&ph);
     fhe_ms += t0.elapsed().as_secs_f64() * 1000.0;
 
@@ -1312,11 +1318,11 @@ pub fn run_cnn_hybrid_in_session(
     //    conv is just the same three steps composed again — no bootstrap. ──
     for cl in &model.extra_conv {
         let tc = Instant::now();
-        let (c_conv_in, _, ph) = pack_shares_to_fhe(s, ck, &per_party_feat, t_mask, profile);
+        let (c_conv_in, _, ph) = pack_shares_to_fhe(s, &session.ek, &per_party_feat, t_mask, profile);
         fhe_ph.add(&ph);
         let shape = ConvShape { in_c: cl.in_c, h: cl.in_h, w: cl.in_w, kh: K, kw: K };
         let (co, cm, ph) =
-            hybrid_conv_open(s, ck, &c_conv_in, shape, &cl.kernels, profile, &mut rng, &mut masks_src(&mut pool), &mut weights_src, &session.dk);
+            hybrid_conv_open(s, &session.ek, &c_conv_in, shape, &cl.kernels, profile, &mut rng, &mut masks_src(&mut pool), &mut weights_src, &session.dk);
         fhe_ph.add(&ph);
         fhe_ms += tc.elapsed().as_secs_f64() * 1000.0;
 
@@ -1337,7 +1343,7 @@ pub fn run_cnn_hybrid_in_session(
     // ── Switch pooled features → packed FHE dense input ──
     let t0 = Instant::now();
     let flat = feat_shape.c * feat_shape.h * feat_shape.w;
-    let (mut c_dense_in, _, ph) = pack_shares_to_fhe(s, ck, &per_party_feat, t_mask, profile);
+    let (mut c_dense_in, _, ph) = pack_shares_to_fhe(s, &session.ek, &per_party_feat, t_mask, profile);
     fhe_ph.add(&ph);
     let mut dense_in_dim = flat;
     fhe_ms += t0.elapsed().as_secs_f64() * 1000.0;
@@ -1349,7 +1355,7 @@ pub fn run_cnn_hybrid_in_session(
     for (hidden_w, hidden_b) in model.hidden.clone() {
         let th = Instant::now();
         let (hidden_open, hidden_masks, ph) =
-            hybrid_matvec_open(s, ck, &c_dense_in, &hidden_w, dense_in_dim, profile, &mut rng, &mut masks_src(&mut pool), &mut weights_src, &session.dk);
+            hybrid_matvec_open(s, &session.ek, &c_dense_in, &hidden_w, dense_in_dim, profile, &mut rng, &mut masks_src(&mut pool), &mut weights_src, &session.dk);
         fhe_ph.add(&ph);
         fhe_ms += th.elapsed().as_secs_f64() * 1000.0;
 
@@ -1390,7 +1396,7 @@ pub fn run_cnn_hybrid_in_session(
         mpc_ms += t1.elapsed().as_secs_f64() * 1000.0;
 
         let t2 = Instant::now();
-        let (c_hidden, _, ph) = pack_shares_to_fhe(s, ck, &per_party_hidden, t_mask, profile);
+        let (c_hidden, _, ph) = pack_shares_to_fhe(s, &session.ek, &per_party_hidden, t_mask, profile);
         fhe_ph.add(&ph);
         c_dense_in = c_hidden;
         dense_in_dim = h;
@@ -1401,7 +1407,7 @@ pub fn run_cnn_hybrid_in_session(
     let t3 = Instant::now();
     let (dense_open, dense_masks, ph) = hybrid_matvec_open(
         s,
-        ck,
+        &session.ek,
         &c_dense_in,
         &model.dense_w,
         dense_in_dim,
@@ -1853,7 +1859,8 @@ mod tests {
         let s = Bfv::new(BfvParams { n: 4096, log2_q: 100, log2_t: model.nbits as u32 });
         let (ck, _sk) = s.keygen();
         let polys = weight_polys(&s, &model);
-        let enc = EncryptedModel::encrypt(&s, &ck, &polys);
+        let ek = s.encrypt_key(&ck);
+        let enc = EncryptedModel::encrypt(&s, &ek, &polys);
 
         // Two different inputs, one encrypted model: the weight ciphertexts do
         // not depend on the query, so the same `Weights` source serves both —
@@ -1861,13 +1868,13 @@ mod tests {
         let mut first: Option<Vec<Vec<u128>>> = None;
         for _ in 0..2 {
             let (_, input) = CnnModel::random(8, 3);
-            let c_in = s.encrypt_poly(&ck, &s.pack_input(&input));
+            let c_in = s.encrypt_poly_pre(&ek, &s.pack_input(&input));
             let cxt = s.transform(&c_in);
             let mut w = Weights::session(&enc);
             let mut ph = FhePhases::default();
             let mut prods = Vec::new();
             for poly in &polys {
-                let prod = w.mul_next(&s, &ck, &cxt, || poly.clone(), &mut ph);
+                let prod = w.mul_next(&s, &ek, &cxt, || poly.clone(), &mut ph);
                 assert_eq!(prod.c.len(), 3, "a ct×ct product is degree-2");
                 prods.push(prod.c[0].clone());
             }
