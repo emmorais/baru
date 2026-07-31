@@ -250,6 +250,30 @@ case the batched primitive already existed. Pinned by
 ratio (constant in layer width) and an absolute ceiling, since a ratio test alone
 passes if both sides regress together.
 
+**And a sixth, found by looking instead of waiting.** Four previous fixes had not
+prevented the fifth, because each was repaired where it surfaced rather than
+searched for elsewhere. So after `y2a` the obvious move was to grep every
+interactive primitive (`share_input`, `share_secret`, `mul`, `lt`, `a2b`)
+appearing inside a loop over a layer, and check each against its `_batch` form.
+Most hits are deliberate per-element *controls* — `NaiveMatVec`,
+`bench-nn`'s naive path, `bench-abstraction`'s control — which exist precisely to
+keep the gap reproducible. One was not: **`bench-train`**, both trainers, issuing
+one `mul` per weight and one `arith_shr` (hence one `a2b`) per gradient.
+
+Batched — `gadgets::dense` for the matvecs, one `mul_batch` per outer product,
+one new `gadgets::arith_shr_batch` per learning rate — with **bit-identical
+models and identical loss curves**:
+
+| `baru bench-train` | messages before | after |
+|---|---|---|
+| linear (12 samples, 6 features, 3 classes, 20 epochs) | 62 683 | **3 643** |
+| MLP (`--hidden 8`, backprop through ReLU) | 199 655 | **7 271** |
+
+The MLP forward pass also stopped recomputing its own comparison: the backward
+pass needs `step(z1)`, which *is* the ReLU's mask, so it is now computed once and
+reused rather than derived twice. Pinned by
+`training_round_structure_is_constant_in_model_size`.
+
 **What is left is genuinely compute, and it is the wrong primitive.**
 `garbled::hash` is SHA-256; half-gates call it four times per AND to garble and
 twice to evaluate, so it runs 1.0 M times for one layer. Every fast garbling

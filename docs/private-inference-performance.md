@@ -466,6 +466,32 @@ Pinned by `garbled_nonlinearity_does_not_scale_with_layer_width`, asserting both
 a ratio (constant in layer width) and an absolute ceiling — a ratio test alone
 passes if both sides regress together.
 
+### 3.3c ~~That search~~ — DONE 2026-07-30, and it found a sixth instance
+
+Running the grep above immediately turned up **`bench-train`**: both trainers
+issued one `mul` per weight and one `arith_shr` (hence one `a2b`) per gradient.
+Batched with `gadgets::dense` for the matvecs, one `mul_batch` per outer product,
+and a new `gadgets::arith_shr_batch` per learning rate:
+
+| `baru bench-train` | messages before | after |
+|---|---|---|
+| linear | 62 683 | **3 643** |
+| MLP (`--hidden 8`) | 199 655 | **7 271** |
+
+Models stay bit-for-bit identical to the plaintext integer-SGD reference, with
+identical loss curves. The MLP forward pass also stopped recomputing its own
+comparison — the backward pass needs `step(z1)`, which *is* the ReLU's mask, so
+it is computed once and reused.
+
+Most other hits are deliberate per-element **controls** — `NaiveMatVec`,
+`bench-nn`'s naive path, `bench-abstraction` — which exist to keep the gap
+reproducible and were left alone. Distinguishing a control from a defect is the
+only judgement in this search; everything else is mechanical.
+
+Pinned by `training_round_structure_is_constant_in_model_size`. **Repeat this
+search whenever an interactive primitive gains a `_batch` form** — that is the
+cheap habit six instances have now argued for.
+
 ### 3.4 Parallelism
 
 Everything is single-threaded. The per-output-channel FHE work (encrypt, mul,

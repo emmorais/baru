@@ -46,7 +46,8 @@ use serde::Serialize;
 
 use crate::bench::comm::{CommStats, NetworkProfile};
 use crate::bench::hybrid_nn::{run_parties, MpcTransport};
-use crate::gadgets::{arith_shr, argmax};
+use crate::crypto::types::Fr;
+use crate::gadgets::{arith_shr_batch, argmax, dense};
 use crate::interpreter::backend::{Backend, ShareRef};
 use crate::interpreter::transport_backend::TransportBackend;
 
@@ -307,40 +308,55 @@ fn private_train(
         let x_data = x_data.clone();
         let onehots = onehots.clone();
         move |be: &mut TransportBackend<MpcTransport>| {
-            let share = |be: &mut TransportBackend<MpcTransport>, v: i64| {
-                be.share_secret(if me == 0 { residue(v, NBITS) } else { 0 }, NBITS, 0)
-            };
             // Weights/bias start at public zero.
             let mut w: Vec<Vec<ShareRef>> = (0..c)
                 .map(|_| (0..d).map(|_| be.share_public(0, NBITS)).collect())
                 .collect();
             let mut b: Vec<ShareRef> = (0..c).map(|_| be.share_public(0, NBITS)).collect();
 
+            // Every round-costing step below is batched across the whole
+            // layer. The per-element form — one `mul` per weight, one
+            // `arith_shr` per gradient — is the round-structure defect this
+            // repo has found repeatedly; here it made a 12-sample, 20-epoch run
+            // move 62 683 messages for 3×6 weights of actual work.
             for _ in 0..epochs {
                 for s in 0..x_data.len() {
-                    let x: Vec<ShareRef> = x_data[s].iter().map(|&v| share(be, v)).collect();
-                    let y: Vec<ShareRef> = onehots[s].iter().map(|&v| share(be, v)).collect();
-                    // forward z = W·x + b
-                    let z: Vec<ShareRef> = (0..c)
-                        .map(|cc| {
-                            let mut acc = b[cc].clone();
-                            for i in 0..d {
-                                let p = be.mul(&w[cc][i], &x[i]);
-                                acc = be.add(&acc, &p);
-                            }
-                            acc
-                        })
+                    let xv: Vec<Fr> = x_data[s]
+                        .iter()
+                        .map(|&v| if me == 0 { residue(v, NBITS) } else { 0 })
                         .collect();
-                    // update W -= (δ·x) ≫ lr, b -= δ ≫ lr
-                    for cc in 0..c {
-                        let delta = be.sub(&z[cc], &y[cc]);
-                        for i in 0..d {
-                            let g = be.mul(&delta, &x[i]);
-                            let upd = arith_shr(be, &g, lr_shift, NBITS);
-                            w[cc][i] = be.sub(&w[cc][i], &upd);
+                    let yv: Vec<Fr> = onehots[s]
+                        .iter()
+                        .map(|&v| if me == 0 { residue(v, NBITS) } else { 0 })
+                        .collect();
+                    let x = be.share_secret_batch(&xv, NBITS, 0);
+                    let y = be.share_secret_batch(&yv, NBITS, 0);
+
+                    // forward z = W·x + b — one batched multiply for the layer.
+                    let z = dense(be, &x, &w, &b);
+
+                    // δ = z − y (local), then the whole outer product δ⊗x in
+                    // ONE batched multiply, and every gradient shifted in one
+                    // decomposition round.
+                    let delta: Vec<ShareRef> =
+                        (0..c).map(|cc| be.sub(&z[cc], &y[cc])).collect();
+                    let mut pairs = Vec::with_capacity(c * d);
+                    for dl in delta.iter() {
+                        for xi in x.iter() {
+                            pairs.push((dl.clone(), xi.clone()));
                         }
-                        let gb = arith_shr(be, &delta, lr_shift, NBITS);
-                        b[cc] = be.sub(&b[cc], &gb);
+                    }
+                    let grads = be.mul_batch(&pairs);
+                    // Bias gradients ride along in the same shift batch.
+                    let mut to_shift = grads;
+                    to_shift.extend(delta.iter().cloned());
+                    let shifted =
+                        arith_shr_batch(be, &to_shift, lr_shift, NBITS);
+                    for cc in 0..c {
+                        for i in 0..d {
+                            w[cc][i] = be.sub(&w[cc][i], &shifted[cc * d + i]);
+                        }
+                        b[cc] = be.sub(&b[cc], &shifted[c * d + cc]);
                     }
                 }
             }
@@ -390,9 +406,6 @@ fn private_train_mlp(
         let init = Mlp { w1: init.w1.clone(), b1: init.b1.clone(), w2: init.w2.clone(), b2: init.b2.clone() };
         move |be: &mut TransportBackend<MpcTransport>| {
             let pubv = |be: &mut TransportBackend<MpcTransport>, v: i64| be.share_public(residue(v, NBITS), NBITS);
-            let priv_ = |be: &mut TransportBackend<MpcTransport>, v: i64| {
-                be.share_secret(if me == 0 { residue(v, NBITS) } else { 0 }, NBITS, 0)
-            };
             // Public random init.
             let mut w1: Vec<Vec<ShareRef>> = init.w1.iter().map(|r| r.iter().map(|&v| pubv(be, v)).collect()).collect();
             let mut b1: Vec<ShareRef> = init.b1.iter().map(|&v| pubv(be, v)).collect();
@@ -401,67 +414,97 @@ fn private_train_mlp(
 
             for _ in 0..epochs {
                 for s in 0..x_data.len() {
-                    let x: Vec<ShareRef> = x_data[s].iter().map(|&v| priv_(be, v)).collect();
-                    let y: Vec<ShareRef> = onehots[s].iter().map(|&v| priv_(be, v)).collect();
-                    // forward: z1, mask = (0<z1), a1 = z1·mask, z2
-                    let mut z1 = Vec::with_capacity(h);
-                    let mut mask = Vec::with_capacity(h);
-                    let mut a1 = Vec::with_capacity(h);
-                    for hh in 0..h {
-                        let mut acc = b1[hh].clone();
-                        for i in 0..d {
-                            let p = be.mul(&w1[hh][i], &x[i]);
-                            acc = be.add(&acc, &p);
-                        }
-                        let zero = be.sub(&acc, &acc);
-                        let m = be.lt(&zero, &acc);
-                        let a = be.mul(&acc, &m);
-                        z1.push(acc);
-                        mask.push(m);
-                        a1.push(a);
-                    }
-                    let z2: Vec<ShareRef> = (0..c)
-                        .map(|cc| {
-                            let mut acc = b2[cc].clone();
-                            for hh in 0..h {
-                                let p = be.mul(&w2[cc][hh], &a1[hh]);
-                                acc = be.add(&acc, &p);
-                            }
-                            acc
-                        })
+                    let xv: Vec<Fr> = x_data[s]
+                        .iter()
+                        .map(|&v| if me == 0 { residue(v, NBITS) } else { 0 })
                         .collect();
+                    let yv: Vec<Fr> = onehots[s]
+                        .iter()
+                        .map(|&v| if me == 0 { residue(v, NBITS) } else { 0 })
+                        .collect();
+                    let x = be.share_secret_batch(&xv, NBITS, 0);
+                    let y = be.share_secret_batch(&yv, NBITS, 0);
+
+                    // forward: z1 (one batched matvec), mask = (0<z1) in one
+                    // comparison round, a1 = z1·mask in one multiply round.
+                    // The mask is kept because the backward pass needs
+                    // step(z1) — which is exactly the ReLU's own comparison,
+                    // so it is computed once and reused rather than redone.
+                    let z1 = dense(be, &x, &w1, &b1);
+                    let zeros: Vec<ShareRef> = z1.iter().map(|v| be.sub(v, v)).collect();
+                    let lt_pairs: Vec<(ShareRef, ShareRef)> =
+                        zeros.iter().zip(&z1).map(|(z, v)| (z.clone(), v.clone())).collect();
+                    let mask = be.lt_batch(&lt_pairs);
+                    let a1_pairs: Vec<(ShareRef, ShareRef)> =
+                        z1.iter().zip(&mask).map(|(v, m)| (v.clone(), m.clone())).collect();
+                    let a1 = be.mul_batch(&a1_pairs);
+
+                    let z2 = dense(be, &a1, &w2, &b2);
+
                     // backward
                     let delta2: Vec<ShareRef> = (0..c).map(|cc| be.sub(&z2[cc], &y[cc])).collect();
-                    // da1[hh] = Σ_c W2[c][hh]·δ2[c]  (W2 pre-update)
-                    let delta1: Vec<ShareRef> = (0..h)
+                    // da1[hh] = Σ_c W2[c][hh]·δ2[c] (W2 pre-update): every
+                    // product is independent, so the whole c×h outer product is
+                    // one batched multiply and the summation is local.
+                    let mut back_pairs = Vec::with_capacity(c * h);
+                    for cc in 0..c {
+                        for hh in 0..h {
+                            back_pairs.push((w2[cc][hh].clone(), delta2[cc].clone()));
+                        }
+                    }
+                    let back = be.mul_batch(&back_pairs);
+                    let da1: Vec<ShareRef> = (0..h)
                         .map(|hh| {
                             let mut acc: Option<ShareRef> = None;
                             for cc in 0..c {
-                                let p = be.mul(&w2[cc][hh], &delta2[cc]);
-                                acc = Some(match acc { None => p, Some(a) => be.add(&a, &p) });
+                                let p = &back[cc * h + hh];
+                                acc = Some(match acc {
+                                    None => p.clone(),
+                                    Some(a) => be.add(&a, p),
+                                });
                             }
-                            let da1 = acc.unwrap();
-                            be.mul(&da1, &mask[hh]) // ⊙ step(z1)
+                            acc.expect("at least one class")
                         })
                         .collect();
-                    // updates (arith_shr for the signed shift)
+                    let step_pairs: Vec<(ShareRef, ShareRef)> =
+                        da1.iter().zip(&mask).map(|(v, m)| (v.clone(), m.clone())).collect();
+                    let delta1 = be.mul_batch(&step_pairs); // ⊙ step(z1)
+
+                    // Both gradient outer products in ONE batched multiply, and
+                    // every signed shift in ONE decomposition round. The two
+                    // layers keep separate learning rates, so the shifts are
+                    // batched per rate rather than all together.
+                    let mut g_pairs = Vec::with_capacity(c * h + h * d);
                     for cc in 0..c {
                         for hh in 0..h {
-                            let g = be.mul(&delta2[cc], &a1[hh]);
-                            let u = arith_shr(be, &g, lr2, NBITS);
-                            w2[cc][hh] = be.sub(&w2[cc][hh], &u);
+                            g_pairs.push((delta2[cc].clone(), a1[hh].clone()));
                         }
-                        let u = arith_shr(be, &delta2[cc], lr2, NBITS);
-                        b2[cc] = be.sub(&b2[cc], &u);
                     }
                     for hh in 0..h {
                         for i in 0..d {
-                            let g = be.mul(&delta1[hh], &x[i]);
-                            let u = arith_shr(be, &g, lr1, NBITS);
-                            w1[hh][i] = be.sub(&w1[hh][i], &u);
+                            g_pairs.push((delta1[hh].clone(), x[i].clone()));
                         }
-                        let u = arith_shr(be, &delta1[hh], lr1, NBITS);
-                        b1[hh] = be.sub(&b1[hh], &u);
+                    }
+                    let grads = be.mul_batch(&g_pairs);
+
+                    let mut l2: Vec<ShareRef> = grads[..c * h].to_vec();
+                    l2.extend(delta2.iter().cloned());
+                    let s2 = arith_shr_batch(be, &l2, lr2, NBITS);
+                    let mut l1: Vec<ShareRef> = grads[c * h..].to_vec();
+                    l1.extend(delta1.iter().cloned());
+                    let s1 = arith_shr_batch(be, &l1, lr1, NBITS);
+
+                    for cc in 0..c {
+                        for hh in 0..h {
+                            w2[cc][hh] = be.sub(&w2[cc][hh], &s2[cc * h + hh]);
+                        }
+                        b2[cc] = be.sub(&b2[cc], &s2[c * h + cc]);
+                    }
+                    for hh in 0..h {
+                        for i in 0..d {
+                            w1[hh][i] = be.sub(&w1[hh][i], &s1[hh * d + i]);
+                        }
+                        b1[hh] = be.sub(&b1[hh], &s1[h * d + hh]);
                     }
                 }
             }
@@ -721,6 +764,41 @@ mod tests {
             assert!(w[1] <= w[0], "loss must be monotone in the stable regime: {curve:?}");
         }
         assert!(*curve.last().unwrap() < l0);
+    }
+
+    /// Training's round structure must be constant in the model size, not
+    /// linear in the weight count.
+    ///
+    /// Both trainers used to issue one `mul` per weight and one `arith_shr`
+    /// (hence one `a2b`) per gradient: the linear run moved **62 683** messages
+    /// and the MLP **199 655**, for 3×6 and 8×6+3×8 weights of actual work.
+    /// Batched — `dense` for the matvecs, one `mul_batch` per outer product,
+    /// one `arith_shr_batch` per learning rate — they move **3 643** and
+    /// **7 271**, with bit-identical models.
+    ///
+    /// Pinned on message count rather than wall-clock: the bytes were never the
+    /// problem, and a time threshold would be flaky on shared CI.
+    #[test]
+    #[ignore]
+    fn training_round_structure_is_constant_in_model_size() {
+        let ds = make_dataset(12, 6, 3, 7);
+        let (_, _, comm) = private_train(&ds, 20, 4, NetworkProfile::INSTANT);
+        assert!(
+            comm.messages < 20_000,
+            "linear trainer moved {} messages; it was 62683 when every weight \
+             took its own multiply and every gradient its own a2b",
+            comm.messages
+        );
+
+        // The MLP does strictly more work per sample, so it gets its own
+        // ceiling — but it must still be far under the per-element count.
+        let init = Mlp::random(6, 8, 3, 11);
+        let (_, comm2) = private_train_mlp(&ds, &init, 16, 6, 9, NetworkProfile::INSTANT);
+        assert!(
+            comm2.messages < 40_000,
+            "MLP trainer moved {} messages; it was 199655 per-element",
+            comm2.messages
+        );
     }
 
     #[test]

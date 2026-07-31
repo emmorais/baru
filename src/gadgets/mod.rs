@@ -217,6 +217,36 @@ pub fn arith_shr(be: &mut dyn Backend, x: &ShareRef, k: usize, nbits: usize) -> 
     r
 }
 
+/// [`arith_shr`] over a whole slice in **one** decomposition round.
+///
+/// The shifts are independent, so `a2b_batch` decomposes every value in the
+/// same ~9 rounds one value costs; `b2a` is local. The per-element form issues
+/// one `a2b` per value, which is the round-structure defect this repository has
+/// now found six times — see `docs/experiments.md` Part I.
+pub fn arith_shr_batch(
+    be: &mut dyn Backend,
+    xs: &[ShareRef],
+    k: usize,
+    nbits: usize,
+) -> Vec<ShareRef> {
+    if k == 0 || xs.is_empty() {
+        return xs.to_vec();
+    }
+    let all_bits = be.a2b_batch(xs, nbits);
+    all_bits
+        .iter()
+        .map(|bits| {
+            let sign = bits[nbits - 1].clone();
+            let out_bits: Vec<ShareRef> = (0..nbits)
+                .map(|j| if j + k < nbits { bits[j + k].clone() } else { sign.clone() })
+                .collect();
+            let mut r = be.b2a(&out_bits);
+            r.nbits = nbits;
+            r
+        })
+        .collect()
+}
+
 pub fn arith_shr_ref(x: i64, k: usize) -> i64 {
     x >> k
 }
