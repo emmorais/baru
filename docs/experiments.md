@@ -274,15 +274,31 @@ pass needs `step(z1)`, which *is* the ReLU's mask, so it is now computed once an
 reused rather than derived twice. Pinned by
 `training_round_structure_is_constant_in_model_size`.
 
-**What is left is genuinely compute, and it is the wrong primitive.**
-`garbled::hash` is SHA-256; half-gates call it four times per AND to garble and
-twice to evaluate, so it runs 1.0 M times for one layer. Every fast garbling
-implementation uses a **fixed-key block cipher** instead
-(Bellare–Hoang–Keelveedhi–Rogaway S&P 2013; Guo–Katz–Wang–Yu S&P 2020 for the
-construction sound with half-gates and free-XOR). That is ~180 ms more, and it
-is *not* done here on purpose: unlike the NTT rewrite in II.2, a wrong
-construction **passes every correctness test while breaking the security
-argument**. See `docs/private-inference-performance.md` §3.3.
+**What was left really was compute, and it was the wrong primitive.**
+`garbled::hash` was SHA-256; half-gates call it four times per AND to garble and
+twice to evaluate, so it ran 1.0 M times for one layer. It is now **TMMO over a
+fixed-key AES permutation** — `H(x, i) = π(π(x) ⊕ i) ⊕ π(x)` — at **5 ns against
+178**, taking garbling from 169 ms to 10 ms and the ReLU phase from 323 ms to
+**88 ms**.
+
+**The first attempt made it three times slower, and that is the transferable
+part.** On a default `cargo build` the RustCrypto `aes` crate falls back to
+constant-time *bitsliced software*: the hash measured **525 ns**, worse than the
+SHA-256 it replaced, because `sha2` is hardware-accelerated on this machine and
+`aes` was not. Enabling the ARMv8 crypto extensions
+(`.cargo/config.toml`, scoped to `aarch64-apple-darwin`) is what produced the
+36× — so *"use the faster primitive"* was not the finding; **which build gets the
+hardware** was. The measurement test now warns above 50 ns/hash so a build that
+has silently lost the hardware path is visible rather than merely slow.
+
+Half-gates with free-XOR needs a **tweakable circular correlation robust** hash,
+which is stronger than collision resistance: the garbler hashes labels differing
+by the global offset `R` and reuses `R` across every gate. TMMO is proven to
+achieve it (Guo–Katz–Wang–Yu, S&P 2020); plain MMO `π(x) ⊕ x` is not tweakable
+and `π(x ⊕ i) ⊕ x` leaks under free-XOR. **The tests here are evidence of
+correctness, not of security** — a wrong gate hash computes correct outputs — so
+this one is flagged for review against the paper in a way the NTT rewrite (II.2)
+never needed to be.
 
 **One hypothesis died in the measurement**, kept so it is not re-formed: the wire
 payload is built 16 bytes at a time into a `Vec` with no reserved capacity, which

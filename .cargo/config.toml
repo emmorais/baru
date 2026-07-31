@@ -1,0 +1,16 @@
+# Enable the ARMv8 Cryptography Extensions for the `aes` crate, which backs the
+# garbled-circuit gate hash (`crypto::garbled::hash`).
+#
+# Without this the RustCrypto `aes` crate falls back to a constant-time
+# *bitsliced software* implementation, and the gate hash costs **525 ns** —
+# three times SLOWER than the truncated SHA-256 it replaced, because `sha2`
+# does get hardware acceleration here. With it, the same hash is **5 ns** and
+# garbling a conv layer's ReLUs drops from 169 ms to 10 ms.
+#
+# Scoped to `aarch64-apple-darwin` on purpose: every Apple Silicon machine has
+# the crypto extensions, so `+aes` cannot produce an illegal instruction there.
+# Generic aarch64 targets keep the software fallback rather than risk a SIGILL
+# on a chip without them. x86-64 needs nothing — the `aes` crate detects AES-NI
+# at run time via `cpufeatures`.
+[target.aarch64-apple-darwin]
+rustflags = ["-C", "target-feature=+aes", "--cfg", "aes_armv8"]

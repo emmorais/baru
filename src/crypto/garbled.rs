@@ -34,7 +34,11 @@
 //! XORs. The output is a garbled bit whose semantics match a boolean sharing
 //! (evaluator holds the masked value, garbler holds the mask).
 
-use sha2::{Digest, Sha256};
+use std::sync::OnceLock;
+
+use aes::cipher::generic_array::GenericArray;
+use aes::cipher::{BlockEncrypt, KeyInit};
+use aes::Aes128;
 
 /// A 128-bit wire label.
 pub type Label = [u8; 16];
@@ -55,17 +59,95 @@ fn lsb(a: &Label) -> bool {
     a[0] & 1 == 1
 }
 
-/// `H(label, tweak)` — the gate-hashing function. Truncated SHA-256 of the
-/// label concatenated with a per-gate tweak (prevents cross-gate reuse).
+/// The fixed key of the garbling permutation `π`.
+///
+/// **Public and constant by design.** In the fixed-key paradigm `π` is a public
+/// random permutation, not a secret-keyed PRF: security comes from the labels
+/// being unpredictable, not from the key. Every party — including the evaluator
+/// — uses the same `π`, which is what lets the key schedule be computed once
+/// per process instead of per gate.
+///
+/// The bytes are the first 16 of `SHA-256("baru-garbling-fixed-key-permutation-v1")`
+/// — nothing-up-my-sleeve rather than chosen, and checked by
+/// [`tests::pi_key_is_nothing_up_my_sleeve`] so the claim cannot rot.
+const PI_KEY: [u8; 16] = [
+    0xf4, 0xa5, 0x4d, 0xca, 0x72, 0x0c, 0x64, 0x78, 0xcc, 0x1d, 0x02, 0x9a, 0x1c, 0x2b, 0x2a, 0x56,
+];
+
+/// The fixed-key permutation, key-scheduled once per process.
+fn pi() -> &'static Aes128 {
+    static PI: OnceLock<Aes128> = OnceLock::new();
+    PI.get_or_init(|| Aes128::new(GenericArray::from_slice(&PI_KEY)))
+}
+
+/// `H(label, tweak)` — the gate-hashing function, **TMMO** over a fixed-key
+/// AES permutation:
+///
+/// ```text
+/// H(x, i) = π(π(x) ⊕ i) ⊕ π(x)
+/// ```
+///
+/// # Why this construction specifically
+///
+/// Half-gates with free-XOR (`and_gate_t`, `xor_gate`) needs the gate hash to
+/// be **tweakable circular correlation robust** (TCCR) — a strictly stronger
+/// property than collision or preimage resistance, because the garbler hashes
+/// labels that differ by the *global* offset `R` and reuses `R` across every
+/// gate in the circuit. Guo, Katz, Wang and Yu (*Efficient and Secure
+/// Multiparty Computation from Fixed-Key Block Ciphers*, IEEE S&P 2020) prove
+/// TMMO achieves TCCR in the random-permutation model; it is the construction
+/// `emp-toolkit` uses for the same reason.
+///
+/// Weaker-looking options are **not** interchangeable here:
+///
+/// - `π(x) ⊕ x` (plain MMO) is correlation robust but *not tweakable*, so it
+///   cannot safely reuse one permutation across gates.
+/// - `π(x ⊕ i) ⊕ x` leaks under free-XOR's correlated labels.
+///
+/// So the two permutation calls are load-bearing, not a naive translation of
+/// "hash twice".
+///
+/// # Why it replaced SHA-256
+///
+/// This function is the pipeline's hottest primitive: half-gates call it four
+/// times per AND gate to garble and twice to evaluate, which is ~1.0 M calls for
+/// a single 28×28 convolution's ReLUs. As truncated SHA-256 it cost 178 ns and
+/// was ~44% of that phase (`where_the_garbled_relu_spends_its_time`).
+///
+/// # What has and has not been verified here
+///
+/// Verified: the construction computes what the citation specifies, output is
+/// deterministic and identical across parties, and every garbling test —
+/// including the bit-exact end-to-end CNN — still passes.
+///
+/// **Not verified by any test in this repository: that the implementation is
+/// *secure*.** A wrong gate hash produces perfectly correct outputs while
+/// breaking the garbling's security argument, so the tests below are evidence
+/// of correctness only. This warrants review against the paper by someone who
+/// has it open.
 #[inline]
 fn hash(label: &Label, tweak: u64) -> Label {
-    let mut h = Sha256::new();
-    h.update(label);
-    h.update(tweak.to_le_bytes());
-    let d = h.finalize();
-    let mut o = [0u8; 16];
-    o.copy_from_slice(&d[..16]);
-    o
+    let cipher = pi();
+
+    // π(x)
+    let mut px = *GenericArray::from_slice(label);
+    cipher.encrypt_block(&mut px);
+
+    // π(x) ⊕ i, with the tweak in the low bytes
+    let mut inner = px;
+    for (k, tb) in tweak.to_le_bytes().iter().enumerate() {
+        inner[k] ^= tb;
+    }
+
+    // π(π(x) ⊕ i)
+    cipher.encrypt_block(&mut inner);
+
+    // ⊕ π(x)
+    let mut out = [0u8; 16];
+    for k in 0..16 {
+        out[k] = inner[k] ^ px[k];
+    }
+    out
 }
 
 /// One garbled AND gate: two ciphertexts (the half-gate rows).
@@ -407,6 +489,7 @@ pub fn comparator_stats(n: usize, b: usize) -> GcStats {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sha2::{Digest, Sha256};
 
     /// The garbled comparator must output `MSB(x+y mod 2^b)` for every input
     /// — i.e. real garbling + evaluation is correct, not a cleartext stub.
@@ -477,6 +560,32 @@ mod tests {
         assert_eq!(s.rounds, 1, "shared-output comparison is one round");
     }
 
+    /// The fixed key must be derivable, not chosen — otherwise "nothing up my
+    /// sleeve" is just an assertion in a comment.
+    #[test]
+    fn pi_key_is_nothing_up_my_sleeve() {
+        let mut h = Sha256::new();
+        h.update(b"baru-garbling-fixed-key-permutation-v1");
+        let d = h.finalize();
+        assert_eq!(&PI_KEY[..], &d[..16], "PI_KEY is not the documented digest");
+    }
+
+    /// The gate hash must be deterministic and identical on every party — both
+    /// garblers derive the same garbling from the same seed, and the evaluator
+    /// re-derives the active labels, so any per-process variation desynchronises
+    /// the protocol rather than failing loudly.
+    #[test]
+    fn hash_is_deterministic_and_tweak_separated() {
+        let x: Label = [0x11; 16];
+        let y: Label = [0x12; 16];
+        assert_eq!(hash(&x, 7), hash(&x, 7), "hash must be a function");
+        assert_ne!(hash(&x, 7), hash(&x, 8), "the tweak must separate gates");
+        assert_ne!(hash(&x, 7), hash(&y, 7), "distinct labels must not collide");
+        // The tweak enters after the first permutation, so a tweak difference
+        // must not be recoverable as a label difference.
+        assert_ne!(xor(&hash(&x, 7), &hash(&x, 8)), xor(&hash(&y, 7), &hash(&y, 8)));
+    }
+
     /// Where the garbled ReLU's time actually goes — the measurement that says
     /// whether the label hash is worth replacing.
     ///
@@ -488,11 +597,12 @@ mod tests {
     ///
     /// What it found, and the reason it is worth keeping:
     ///
-    /// - **The label hash is SHA-256** (`hash`), at 179 ns per call. Half-gates
-    ///   need 4 per AND to garble and 2 to evaluate, so it is ~120 ms of the
-    ///   169 ms garbling and ~60 ms of the evaluation: **~44% of the phase**,
-    ///   and both halves are on the critical path. Every fast garbling
-    ///   implementation uses **fixed-key AES** instead — see the note below.
+    /// - **The label hash was SHA-256** (`hash`), at 178 ns per call. Half-gates
+    ///   need 4 per AND to garble and 2 to evaluate, so it was ~120 ms of the
+    ///   169 ms garbling and ~60 ms of the evaluation: **~44% of the phase**.
+    ///   It is now TMMO over a fixed-key AES permutation at **5 ns**, and
+    ///   garbling the layer costs **10 ms**. The test warns if it measures the
+    ///   software AES path, which is *slower* than the SHA-256 it replaced.
     /// - **Payload construction is not a bottleneck.** Building the 7.1 MB wire
     ///   payload 16 bytes at a time into an unreserved `Vec` costs 2 ms, and
     ///   reserving capacity saves 1 ms of it. That was the first hypothesis and
@@ -526,7 +636,7 @@ mod tests {
         println!("\n  ReLU layer: n={n}, {b} bits, shift {shift}");
         println!("  AND gates          : {}", st.and_gates);
         println!("  wire bytes         : {:.2} MB", st.wire_bytes as f64 / 1e6);
-        println!("  label hash         : {per_hash_ns:.0} ns  (SHA-256 over 24 bytes)");
+        println!("  label hash         : {per_hash_ns:.0} ns  (TMMO over fixed-key AES)");
         println!("  garbling  {garble_hashes} hashes : {garble_ms:.0} ms");
         println!("  evaluation {eval_hashes} hashes : {eval_ms:.0} ms");
         println!(
@@ -535,14 +645,18 @@ mod tests {
             garble_ms.max(eval_ms)
         );
         println!(
-            "  measured GC ReLU for this layer is 409 ms (bench-cnn --img 28 --gc), \
-             so garble+eval hashing is ~{:.0}% of it",
-            100.0 * (garble_ms + eval_ms) / 409.0
+            "  the phase was 409 ms on truncated SHA-256 at 178 ns/hash; hashing \
+             is now {:.0} ms of it",
+            garble_ms + eval_ms
         );
-        println!(
-            "  fixed-key AES (Bellare-Hoang-Keelveedhi-Rogaway, S&P'13) is the \
-             standard primitive here and costs a few ns, not {per_hash_ns:.0}."
-        );
+        if per_hash_ns > 50.0 {
+            println!(
+                "  WARNING: {per_hash_ns:.0} ns/hash means the `aes` crate is on its \n\
+                 \x20         BITSLICED SOFTWARE path, which is slower than the SHA-256\n\
+                 \x20         it replaced. See .cargo/config.toml — aarch64 needs\n\
+                 \x20         `-C target-feature=+aes --cfg aes_armv8`."
+            );
+        }
 
         // …and the rest. Garbling a layer's worth for real, so allocation and
         // table construction are counted rather than modelled.
@@ -599,11 +713,7 @@ mod tests {
             "  garble + payload            : {:.0} ms of the 409 ms measured ReLU",
             garble_real_ms + payload_ms
         );
-        println!(
-            "  => the payload build is NOT the cost (2 ms); the hash is. Replacing\n\
-             \x20    SHA-256 with fixed-key AES is the standard fix and would take\n\
-             \x20    ~180 ms off this phase."
-        );
+        println!("  => the payload build was never the cost; the hash was.");
         assert!(st.and_gates > 0);
     }
 }

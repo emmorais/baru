@@ -86,6 +86,7 @@ dependencies = [
 name = "baru"
 version = "0.1.0"
 dependencies = [
+ "aes",
  "bincode",
  "binius-core",
  "binius-field",

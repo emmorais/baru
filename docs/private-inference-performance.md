@@ -386,55 +386,59 @@ returning a quiet wrong answer.
 (71%), of which ReLU alone is 510 ms. Further FHE micro-optimisation has little
 left to reach — see the struck entry in §3.5 and read §3.3 next.
 
-### 3.3 Replace the garbled-circuit label hash with fixed-key AES — the biggest remaining item
+### 3.3 ~~Replace the garbled-circuit label hash with fixed-key AES~~ — DONE 2026-07-30
 
-**Attributed 2026-07-30, not yet implemented.** After §3.1 and §3.2, MPC is 71%
-of the pipeline and the garbled ReLU is its largest phase. That phase is now
-measured rather than guessed:
+`crypto::garbled::hash` is now **TMMO over a fixed-key AES permutation**,
+`H(x, i) = π(π(x) ⊕ i) ⊕ π(x)`, replacing truncated SHA-256.
 
-`bench-cnn --img 28 --gc` spends **409 ms** of a 736 ms run in the ReLU over one
-conv layer (8 channels × 26×26 = 5408 items). `bench-gc-compare` shows the cost
-is **linear in the item count and flat in RTT**, so it is per-item compute, not
-rounds. `crypto::garbled`'s `where_the_garbled_relu_spends_its_time`
-(`--ignored --nocapture`) breaks that down against the real functions:
+| | SHA-256 | TMMO/AES |
+|---|---|---|
+| per hash | 178 ns | **5 ns** |
+| garbling one conv layer | 169 ms | **10 ms** |
+| ReLU phase (`bench-cnn --img 28 --gc`) | 323 ms | **88 ms** |
+| synthetic total | 628 ms | **270 ms** |
+| medical diagnosis | 1000 ms | **542 ms** |
 
-| | |
-|---|---|
-| AND gates for the layer | 167 648 |
-| label hash (`garbled::hash`) | **178 ns — SHA-256 over 24 bytes** |
-| garbling the layer, measured | 169 ms (the hash is 120 of it) |
-| evaluation hashing | 60 ms |
-| **hash share of the 409 ms phase** | **~44%** |
-| building the 7.1 MB wire payload | 2 ms |
+Bit-exact throughout; `gc_and_a2b_nonlinearities_agree` still holds, so the
+garbled and arithmetic routes remain interchangeable.
 
-**The fix is the standard one.** Every fast garbling implementation uses a
-**fixed-key block cipher**, not a hash function — Bellare, Hoang, Keelveedhi and
-Rogaway (S&P 2013) introduced it, and Guo, Katz, Wang and Yu (S&P 2020,
-*Efficient and Secure Multiparty Computation from Fixed-Key Block Ciphers*) give
-the construction that is proven sound for **half-gates with free-XOR**, which is
-what `garbled.rs` implements: `TMMO`, `H(x, i) = π(π(x) ⊕ i) ⊕ π(x)` with `π` a
-fixed-key AES permutation. On hardware with AES-NI (x86) or the ARMv8 crypto
-extensions this is a few nanoseconds against 178, so the phase should lose
-~180 ms — roughly **17% end to end** on the medical model.
+**The construction is not interchangeable with a plausible-looking one.**
+Half-gates with free-XOR needs the gate hash to be **tweakable circular
+correlation robust** — stronger than collision resistance, because the garbler
+hashes labels differing by the global offset `R` and reuses `R` across every
+gate. Guo–Katz–Wang–Yu (S&P 2020) prove TMMO achieves it; `emp-toolkit` uses the
+same. Plain MMO `π(x) ⊕ x` is not tweakable, and `π(x ⊕ i) ⊕ x` leaks under
+free-XOR's correlated labels. The two permutation calls are load-bearing.
 
-**Treat this as a security change, not a performance one.** A wrong hash
-construction still produces *correct outputs* — every existing test would pass —
-while silently breaking the garbling's security argument. Free-XOR in particular
-constrains which constructions are sound: the naive `AES_k(x) ⊕ x` is **not**
-safe here. So this needs the GKWY20 construction implemented exactly and
-reviewed against the paper, not a plausible-looking substitution. It also adds a
-dependency (`aes`, RustCrypto, which compiles to AES-NI intrinsics).
+**⚠️ The first attempt made it 3× SLOWER, and the reason generalises.** With a
+default `cargo build` on aarch64 the RustCrypto `aes` crate falls back to a
+constant-time *bitsliced software* implementation: the gate hash measured
+**525 ns**, three times worse than the SHA-256 it replaced — because `sha2` *is*
+hardware-accelerated on Apple Silicon and `aes` was not. The fix is
+`.cargo/config.toml`, scoped to `aarch64-apple-darwin`:
 
-**A hypothesis that died in the measurement**, recorded so it is not re-formed:
-the wire payload is built 16 bytes at a time into a `Vec` with no reserved
-capacity, which looked like an obvious allocation problem. It costs **2 ms**, and
-reserving capacity saves 1 ms of that. Not the cost.
+```toml
+[target.aarch64-apple-darwin]
+rustflags = ["-C", "target-feature=+aes", "--cfg", "aes_armv8"]
+```
 
-**The remaining ~230 ms was attributed and fixed the same day** — see §3.3b. It
-was `y2a` re-sharing the garbled output one bit at a time, the fifth instance of
-this repo's recurring round-structure defect. The ReLU phase is now 323 ms, of
-which the hash is ~180 — i.e. the hash is now **56%** of what is left, which
-strengthens rather than weakens the case above.
+Scoped deliberately — every Apple Silicon machine has the crypto extensions, so
+`+aes` cannot SIGILL there, while generic aarch64 keeps the software fallback.
+x86-64 needs nothing; the crate detects AES-NI at run time.
+`where_the_garbled_relu_spends_its_time` now **warns** if it measures >50 ns per
+hash, so a build that has silently lost the hardware path is visible rather than
+just slow. *"Replace the hash with the faster primitive" was not sufficient
+advice; which build gets the hardware was the whole result.*
+
+**What is verified and what is not.** Verified: the construction computes what
+the citation specifies, the key is derived rather than chosen
+(`pi_key_is_nothing_up_my_sleeve`), the hash is deterministic and
+tweak-separated, and every garbling test including the bit-exact end-to-end CNN
+passes. **Not verified by any test here: that the implementation is *secure*.** A
+wrong gate hash produces correct outputs while breaking the security argument, so
+these tests are evidence of correctness only. **This warrants review against the
+paper by someone who has it open** — it is the one change in this sequence whose
+failure mode is silent.
 
 ### 3.3b ~~The garbled `y2a` conversion~~ — DONE 2026-07-30
 
