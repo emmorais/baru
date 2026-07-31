@@ -105,9 +105,9 @@ the corrections behind each row are in [`docs/experiments.md`](docs/experiments.
 |---|---|---|
 | **Deep inference, zero bootstraps** | depth 32 × width 16 in **2.1 s**, bit-exact, **0** bootstraps, linear in depth | `bench-deep-nn --depths 2,4,8,16,32` |
 | One private dense layer, secure hybrid | **79 ms** (BFV linear → ABY3 ReLU) vs 25 ms pure MPC — but **15 wire messages** vs 9276 | `bench-hybrid-nn` |
-| Private CNN, 28×28, image *and* weights encrypted | **272 ms**, 0 bootstraps, exact | `bench-cnn --img 28 --gc --precompute` |
+| Private CNN, 28×28, image *and* weights encrypted | **260 ms**, 0 bootstraps, exact | `bench-cnn --img 28 --gc --precompute` |
 | Real MNIST accuracy, deployed integer model | **98.89%**; every encrypted prediction equals the plaintext one | `bench-mnist` |
-| Private *diagnosis* (MedMNIST chest X-ray) | **84.78%**, **508 ms** online per diagnosis, 0 bootstraps | `bench-medmnist` |
+| Private *diagnosis* (MedMNIST chest X-ray) | **84.78%**, **488 ms** online per diagnosis, 0 bootstraps | `bench-medmnist` |
 | Private *training* (SGD under MPC, backprop through ReLU) | trained model **bit-identical** to plaintext integer SGD, in **3 643** wire messages | `bench-train --hidden 8` |
 | Convolution packing | 1352 ct×ct multiplications → **8** | `bench-cnn --img 28` |
 | Our NTT vs NTL+GMP | **1.8× faster** at every size (after the Shoup butterfly rewrite) | `bench-polymul` |

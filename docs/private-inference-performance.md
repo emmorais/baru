@@ -64,10 +64,10 @@ baru bench-medmnist --dataset pneumonia --hybrid 2 --gc --precompute
 ```
 
 ```
-latency  : 508 ms   (fhe 278 ms, mpc 227 ms)
-fhe split: weights 0 ms, mul 130 ms, mask-enc 0 ms, decrypt 118 ms, re-encrypt 37 ms
-mpc split: import 23 ms, relu 124 ms, pool 63 ms, argmax 10 ms
-offline  : 558 ms/image  —  ~103 per-SESSION (amortizes), ~456 per-QUERY (shifts only)
+latency  : 488 ms   (fhe 269 ms, mpc 216 ms)
+fhe split: weights 0 ms, mul 126 ms, mask-enc 0 ms, decrypt 118 ms, re-encrypt 24 ms
+mpc split: import 21 ms, relu 124 ms, pool 62 ms, argmax 9 ms
+offline  : 400 ms/image  —  ~78 per-SESSION (amortizes), ~321 per-QUERY (shifts only)
 ```
 
 It was **32.7 s** when this document was started. The construction never
@@ -86,11 +86,12 @@ on the critical path, and the speed of the ring arithmetic underneath.
 | pre-transformed weights (§3.2) | 1.09 s | `mul_pre_pre`, both operands prepared |
 | batched garbled `y2a` (§3.3b) | 1.00 s | 379 725 → 61 messages |
 | fixed-key AES gate hash (§3.3) | 542 ms | 178 ns → 5 ns per hash |
-| prepared decryption key (§3.3d) | **508 ms** | key transformed once per session |
+| prepared decryption key (§3.3d) | 508 ms | key transformed once per session |
+| prepared encryption key (§3.3e) | **488 ms** | public key too; mask pool −30% |
 
 **The composition inverted twice in one day.** It was 26% MPC; after §3.1–§3.2
 made FHE ~3× cheaper it became 69% MPC; then §3.3/§3.3b took the garbled ReLU
-from 526 ms to 124 ms and it is **55% FHE again** (278 ms of 508). The lesson is
+from 526 ms to 124 ms and it is **55% FHE again** (269 ms of 488). The lesson is
 not any one of those numbers — it is that *"which side dominates"* has a
 half-life of about one optimisation, so any plan resting on it should be
 re-derived rather than inherited.
@@ -106,9 +107,9 @@ and prints everything:
 
 ```sh
 baru bench-cnn --img 28 --gc --precompute
-# total 272ms (fhe 91ms, mpc 178ms) | offline 217ms
-# fhe: keygen 5 / input 4 / weights 0 (0x) / mul 43 / mask 0 (0x) / decrypt 40 / re-encrypt 11 (3x)
-# mpc: import 8 / relu 82 / pool 44 / argmax 25
+# total 260ms (fhe 89ms, mpc 168ms) | offline 160ms
+# fhe: keygen 5 / input 3 / weights 0 (0x) / mul 42 / mask 0 (0x) / decrypt 39 / re-encrypt 8 (3x)
+# mpc: import 8 / relu 86 / pool 38 / argmax 25
 ```
 
 Note this control builds a fresh session per call, so its `offline` includes the
@@ -588,9 +589,9 @@ absolute win available and the least interesting scientifically.
   day; do not inherit either state.** Written when MPC was 756 ms of 2896 ms
   (26%). §3.1–§3.2 made FHE ~3× cheaper and it became 69%, with the garbled
   ReLU the single biggest item. Then §3.3 (fixed-key AES) and §3.3b (batched
-  `y2a`) took that ReLU from 526 ms to 124 ms, and MPC is back to **227 ms of
-  508 (45%)**. Re-derive before acting. Re-derive before acting: this
-  is exactly the kind of entry §2 warns goes stale when the other side moves.
+  `y2a`) took that ReLU from 526 ms to 124 ms, and MPC is back to **216 ms of
+  488 (44%)**. This is exactly the kind of entry §2 warns goes stale when the
+  other side moves — re-derive before acting on it.
 
 ---
 
