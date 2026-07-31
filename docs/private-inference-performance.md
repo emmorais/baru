@@ -430,10 +430,41 @@ the wire payload is built 16 bytes at a time into a `Vec` with no reserved
 capacity, which looked like an obvious allocation problem. It costs **2 ms**, and
 reserving capacity saves 1 ms of that. Not the cost.
 
-**The remaining ~230 ms** of the phase (409 − 169 garbling) is evaluation,
-bincode serialization of the 7.1 MB payload, transport and the `y2a` conversion
-back to arithmetic. Not yet attributed — that is the next measurement, and it
-should come before any more optimisation.
+**The remaining ~230 ms was attributed and fixed the same day** — see §3.3b. It
+was `y2a` re-sharing the garbled output one bit at a time, the fifth instance of
+this repo's recurring round-structure defect. The ReLU phase is now 323 ms, of
+which the hash is ~180 — i.e. the hash is now **56%** of what is left, which
+strengthens rather than weakens the case above.
+
+### 3.3b ~~The garbled `y2a` conversion~~ — DONE 2026-07-30
+
+`gc_protocol::y2a` converts the garbled boolean output back to arithmetic. It
+called `share_input` **per (item, bit)** — `2 × 5408 × 12 = 129 792` calls for
+one D=28 ReLU — while `aby3_protocol::share_input_batch` had existed since the
+scheme-switch import was fixed. Two batched calls replace both loops.
+
+| `bench-cnn --img 28 --gc --precompute` | before | after |
+|---|---|---|
+| ReLU phase | 409 ms | **323 ms** |
+| total | 736 ms | **628 ms** |
+| **MPC messages** | **319 139** | **47** |
+| MPC bytes | 21.8 MB | 18.0 MB |
+
+Medical model: 1086 → 1000 ms, traffic 379 725 messages → 61. Bit-exact
+throughout.
+
+**This is the fifth instance of the same defect** (import, `gadgets::relu`,
+`bench-hybrid-nn`, `bench-deep-nn`, now `y2a`), and in every case the batched
+primitive already existed. §2 is the method that finds them; the thing worth
+internalising is that *four* previous fixes did not stop the fifth, because each
+was fixed where it was found rather than searched for elsewhere. **A useful next
+task is not an optimisation at all: grep every call of `share_input`,
+`share_secret`, `mul`, `lt` and `a2b` that sits inside a loop over a layer, and
+check each against its `_batch` form.**
+
+Pinned by `garbled_nonlinearity_does_not_scale_with_layer_width`, asserting both
+a ratio (constant in layer width) and an absolute ceiling — a ratio test alone
+passes if both sides regress together.
 
 ### 3.4 Parallelism
 

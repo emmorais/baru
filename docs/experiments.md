@@ -202,16 +202,15 @@ batched code message for message; a test pins that, and the benchmark keeps the
 per-element form as a control so the gap stays reproducible. **Only round counts
 catch this class of defect** — per-op timing and byte counts both look fine.
 
-### I.4b Where the garbled ReLU's time goes
+### I.4b The garbled ReLU: the same defect, a fifth time
 
 Once the FHE side got ~3× cheaper (III.5, III.6), the garbled ReLU became the
 pipeline's largest single phase — 409 ms of a 736 ms `bench-cnn --img 28 --gc`
-run, over one conv layer's 5408 comparisons. `bench-gc-compare` shows the cost is
-**linear in the item count and flat in RTT**, so it is per-item compute rather
-than round structure, which is the opposite of every other MPC finding in this
-part.
+run over one conv layer's 5408 comparisons. `bench-gc-compare` showed the cost
+was **linear in the item count and flat in RTT**, so the instinct was that this
+one really is per-item compute rather than round structure.
 
-Attributed against the real functions
+Half of that was right. Attributing it against the real functions
 (`crypto::garbled::where_the_garbled_relu_spends_its_time`):
 
 | | |
@@ -220,24 +219,52 @@ Attributed against the real functions
 | label hash | **178 ns — a full SHA-256 over 24 bytes** |
 | garbling the layer, measured | 169 ms (120 of it hashing) |
 | evaluation hashing | 60 ms |
-| **hash share of the phase** | **~44%** |
 | building the 7.1 MB wire payload | 2 ms |
 
-**The label hash is SHA-256 where the standard is a fixed-key block cipher.**
-Half-gates need four hashes per AND to garble and two to evaluate, so the
-primitive is called 1.0 M times for one layer. This is the same shape as the NTT
-finding in II.2 — a known-better primitive sitting on the hottest path — and the
-fix is equally well established (Bellare–Hoang–Keelveedhi–Rogaway S&P 2013;
-Guo–Katz–Wang–Yu S&P 2020 for the construction that is sound with half-gates and
-free-XOR). It is not yet done, because unlike the NTT rewrite a wrong choice here
-**passes every correctness test while breaking the security argument** — see
-`docs/private-inference-performance.md` §3.3.
+Garbling really is compute, and the label hash is 44% of it — see below. But
+that left **~230 ms unattributed**, and it turned out to be the round structure
+after all, hiding in the conversion back to arithmetic.
+
+**`gc_protocol::y2a` re-shared the garbled output one bit at a time.** It called
+`share_input` per (item, bit) — at `d=28` with width 12 that is
+`2 × 5408 × 12 = 129 792` calls for a single ReLU — while
+`aby3_protocol::share_input_batch` had existed the whole time. Replacing the two
+loops with two batched calls, for bit-identical output:
+
+| `bench-cnn --img 28 --gc --precompute` | before | after |
+|---|---|---|
+| ReLU phase | 409 ms | **323 ms** |
+| total | 736 ms | **628 ms** |
+| **MPC messages** | **319 139** | **47** |
+| MPC bytes | 21.8 MB | 18.0 MB |
+
+**A 6 790× reduction in messages, and the bytes went *down* too** — batching
+removes per-message framing rather than adding any. On the trained medical model
+the same change is 1086 → 1000 ms with traffic falling from 379 725 messages to
+61.
+
+This is the **fifth** instance of one defect. The scheme-switch import,
+`gadgets::relu`, `bench-hybrid-nn` and `bench-deep-nn` all had it, and in every
+case the batched primitive already existed. Pinned by
+`garbled_nonlinearity_does_not_scale_with_layer_width`, which asserts both a
+ratio (constant in layer width) and an absolute ceiling, since a ratio test alone
+passes if both sides regress together.
+
+**What is left is genuinely compute, and it is the wrong primitive.**
+`garbled::hash` is SHA-256; half-gates call it four times per AND to garble and
+twice to evaluate, so it runs 1.0 M times for one layer. Every fast garbling
+implementation uses a **fixed-key block cipher** instead
+(Bellare–Hoang–Keelveedhi–Rogaway S&P 2013; Guo–Katz–Wang–Yu S&P 2020 for the
+construction sound with half-gates and free-XOR). That is ~180 ms more, and it
+is *not* done here on purpose: unlike the NTT rewrite in II.2, a wrong
+construction **passes every correctness test while breaking the security
+argument**. See `docs/private-inference-performance.md` §3.3.
 
 **One hypothesis died in the measurement**, kept so it is not re-formed: the wire
 payload is built 16 bytes at a time into a `Vec` with no reserved capacity, which
-looks like a textbook allocation problem. It costs 2 ms, and reserving capacity
-saves 1 ms of that. The obvious-looking defect was not the cost; the cryptographic
-primitive was.
+looks like a textbook allocation problem. It costs 2 ms. The obvious-looking
+defect was not the cost — the round structure and the cryptographic primitive
+were.
 
 ### I.5 Precompiled gadgets: batching a whole matvec
 

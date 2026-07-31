@@ -51,7 +51,7 @@
 //! ReLU output — recomposing `Σ 2ⁱ·(oᵢ⊕mᵢ)` locally.
 
 use crate::crypto::aby3_protocol::{
-    add_party, mul_batch_party, scalar_mul_party, share_input, sub_party, PartyShare,
+    add_party, mul_batch_party, scalar_mul_party, share_input_batch, sub_party, PartyShare,
 };
 use crate::crypto::garbled::{eval_and, eval_xor, AndTable, Garbler, Label};
 use crate::crypto::net::{serialize_msg, Mailbox, MpcMsg, PartyId, Transport};
@@ -339,21 +339,32 @@ fn y2a<T: Transport>(
     let take = |n: &mut u64| { let v = *n; *n += 1; v };
 
     // Re-share observed bits (owner = evaluator) and mask bits (owner = P0).
-    let mut obs_sh = Vec::with_capacity(total);
-    for item in 0..n {
-        for b in 0..width {
-            let v: Fr = if me == EVALUATOR { out.observed[item][b] as Fr } else { 0 };
-            obs_sh.push(share_input(v, take(&mut next_id), EVALUATOR, me, mbx));
-        }
-    }
-    let mut mask_sh = Vec::with_capacity(total);
-    for item in 0..n {
-        for b in 0..width {
-            // Both garblers hold the mask; owner 0 supplies it.
-            let v: Fr = if me == 0 { out.masks[item][b] as Fr } else { 0 };
-            mask_sh.push(share_input(v, take(&mut next_id), 0, me, mbx));
-        }
-    }
+    //
+    // **Two batched rounds, not `2·n·width` sequential ones.** These loops used
+    // to call `share_input` per (item, bit): at a 5408-wide conv layer and
+    // width 12 that is 129 792 blocking round trips for a single ReLU, which is
+    // most of the phase's cost and none of its work. `share_input_batch` sends
+    // the same bytes with the same randomness in one message per peer.
+    //
+    // This is the fifth instance of one defect — the scheme-switch import,
+    // `gadgets::relu`, `bench-hybrid-nn` and `bench-deep-nn` all had it, and the
+    // batched primitive existed the whole time in every case.
+    let obs_vals: Vec<Fr> = (0..n)
+        .flat_map(|item| {
+            (0..width).map(move |b| {
+                if me == EVALUATOR { out.observed[item][b] as Fr } else { 0 }
+            })
+        })
+        .collect();
+    let obs_sh = share_input_batch(&obs_vals, take(&mut next_id), EVALUATOR, me, mbx);
+
+    // Both garblers hold the mask; owner 0 supplies it.
+    let mask_vals: Vec<Fr> = (0..n)
+        .flat_map(|item| {
+            (0..width).map(move |b| if me == 0 { out.masks[item][b] as Fr } else { 0 })
+        })
+        .collect();
+    let mask_sh = share_input_batch(&mask_vals, take(&mut next_id), 0, me, mbx);
 
     // XOR per bit: o ⊕ m = o + m − 2·o·m. One batched multiply for all bits.
     let prod_base = take(&mut next_id);
@@ -382,8 +393,15 @@ fn y2a<T: Transport>(
 // ─── Public entry points ─────────────────────────────────────────────────────
 
 /// Reserved id block per `gc_lt_batch` / `gc_relu_batch` call, given `n` items
-/// of output width `w`: Y2A uses `2·n·w` `share_input` ids + one multiply base,
-/// plus slack. Callers must advance their lockstep id counter by this much.
+/// of output width `w`.
+///
+/// **Deliberately larger than what Y2A now consumes.** Since the two
+/// `share_input` loops became two *batched* calls, Y2A spends 2 ids plus the
+/// multiply block rather than `2·n·w` — but the reservation stays, because it is
+/// a lockstep counter every party advances by the same amount and shrinking it
+/// buys nothing while risking a collision with a caller that has not been
+/// updated. Over-reserving ids is free; under-reserving is a silent
+/// cross-operation collision.
 pub fn gc_id_block(n: usize, width: usize) -> u64 {
     (4 * n * width + 16) as u64
 }
@@ -454,7 +472,7 @@ fn summands(shares: &[PartyShare], mask: Fr, me: PartyId) -> (Vec<Fr>, Vec<Fr>) 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::crypto::aby3_protocol::reveal;
+    use crate::crypto::aby3_protocol::{reveal, share_input};
     use crate::crypto::net::InprocHandle;
     use std::thread;
 

@@ -1905,6 +1905,43 @@ mod tests {
         );
     }
 
+    /// The **garbled** nonlinearity's round structure must be constant in the
+    /// layer width too — the same invariant as the import above, on the other
+    /// protocol.
+    ///
+    /// `gc_protocol::y2a` converts the garbled boolean output back to
+    /// arithmetic, and it used to call `share_input` once per (item, bit): at
+    /// `d=28` that is `2 × 5408 × 12 = 129 792` calls for one ReLU, and the
+    /// D=28 run moved **319 139 messages**. Batched, the same inference moves
+    /// **47**. Message count is the right thing to pin rather than wall-clock —
+    /// the bytes were never the problem and a time threshold would be flaky on
+    /// shared CI.
+    #[test]
+    #[ignore]
+    fn garbled_nonlinearity_does_not_scale_with_layer_width() {
+        let (m8, i8v) = CnnModel::random(8, 1);
+        let (m28, i28) = CnnModel::random(28, 1);
+        let small = run_cnn_hybrid_with(&m8, &i8v, NetworkProfile::INSTANT, Nonlin::Gc);
+        let big = run_cnn_hybrid_with(&m28, &i28, NetworkProfile::INSTANT, Nonlin::Gc);
+        assert!(small.correct && big.correct, "batching must not change the class");
+        // 288 activations versus 5408, an 18.8× wider layer. Per-element
+        // resharing would put the message counts in that ratio.
+        assert!(
+            big.comm.messages < 2 * small.comm.messages,
+            "y2a looks per-element again: {} messages at d=28 vs {} at d=8",
+            big.comm.messages,
+            small.comm.messages
+        );
+        // An absolute ceiling as well: the ratio test alone would pass if both
+        // regressed together.
+        assert!(
+            big.comm.messages < 1000,
+            "garbled D=28 inference moved {} messages; it was 319139 when y2a \
+             resharing was per-element and should now be tens",
+            big.comm.messages
+        );
+    }
+
     /// A **two-convolution** model (a second, multi-channel conv layer after
     /// the first, feeding a hidden dense) must classify bit-exactly through
     /// the encrypted pipeline — the extra conv is just another
