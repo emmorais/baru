@@ -49,6 +49,7 @@ pub mod ot_cost;
 pub mod protocols;
 pub mod schedule;
 pub mod semi2k;
+pub mod spdz2k;
 pub mod sim;
 pub mod vm;
 
@@ -174,6 +175,27 @@ pub fn run_protocol(
             };
             let mut e = semi2k::Semi2kEngine::new(parties, bits)?;
             execute(prog, sched, &mut e, id, inputs)
+        }
+        "spdz2k" => {
+            let bits = match prog.domain {
+                Domain::Ring { k } => k,
+                other => {
+                    return Err(format!(
+                        "spdz2k computes mod 2^k, but the program was lowered for {}",
+                        other
+                    ))
+                }
+            };
+            // `s` statistical security bits on top of the value width — the
+            // price of a sound MAC over a ring (see `mpcc::spdz2k`). The
+            // working ring is `2^(k+s)`, so `k` is capped accordingly.
+            const S: u32 = 40;
+            let mut e = spdz2k::Spdz2kEngine::new(parties, bits, S)?;
+            let out = execute(prog, sched, &mut e, id, inputs);
+            // The results are meaningless unless the MACs check out, so the
+            // verdict is taken before anything is returned.
+            e.mac_check().map_err(|err| err.to_string())?;
+            out
         }
         "lowgear" => {
             let params = lowgear::LowGearParams::default_params();

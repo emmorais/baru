@@ -4,8 +4,9 @@
 
 A Lisp-like language and research engine for **privacy-preserving computation**.
 One program can run on four cryptographic backends — a plain interpreter, 3-party
-MPC (ABY3-style replicated secret sharing), FHE (BFV/BGV/TFHE/CKKS), and
-zero-knowledge proofs (Binius64) — and, crucially, on **combinations** of them:
+MPC (ABY3-style replicated secret sharing), FHE (BFV/BGV/TFHE/CKKS), and a
+circuit compiler for zero-knowledge proofs (see the ZKP caveat below) — and,
+crucially, on **combinations** of them:
 values cross between MPC shares and FHE ciphertexts mid-computation without ever
 being exposed.
 
@@ -83,7 +84,7 @@ post-quantum TLS transports.
 | **MPC** | `src/crypto/` | ABY3 replicated shares, **triple-free** multiplication, bit decomposition, batched primitives, in-process and TCP transports |
 | **FHE** | `src/fhe/` | BFV and BGV (secure, depth-1, no eval keys), TFHE-rs, SEAL CKKS (+ exact mock twins), multi-modular NTT, CRT slot packing |
 | **Hybrid** | `src/hybrid/` | MPC ↔ FHE scheme switching in both directions; re-encryption as a bootstrapping alternative |
-| **ZKP** | `src/zkp/` | Expression → circuit compiler, Binius64 SNARK prover/verifier, proof serialization |
+| **ZKP** | `src/zkp/` | Expression → circuit compiler and proof serialization. **The `binius64` backend is a placeholder, not a proof system** — it establishes no soundness; see the caveat below and `tests/zkp_soundness.rs` |
 | **Gadgets** | `src/gadgets/` | UC-composable MPC building blocks: `relu`, `maxpool2d`, `argmax`, `dense`, `conv2d` — each bit-exact against a plaintext reference |
 | **MPC compiler** | `src/mpcc/` | Backend-aware circuit IR, rewrite rules, cost models, protocol registry (dealer / Shamir / Semi2k / LowGear), executable VM |
 | **Primitives** | `src/ot/`, `src/psi/`, `src/pir/` | Chou–Orlandi + IKNP OT, DH-PSI, single-server BFV PIR — all measured, including where they lose |
@@ -122,6 +123,30 @@ MPC at any width. The hybrid's case is the *deployment shape* — the client
 sends ciphertexts and leaves, only the nonlinear segment needs live parties —
 not raw cost. See
 [Part VII](docs/experiments.md#part-vii--negative-superseded-and-withdrawn-results).
+
+---
+
+## The ZKP caveat
+
+`src/zkp/` contains a real expression → circuit compiler and proof
+serialization. It does **not** contain a working proof system.
+
+The `binius64` backend's `prove` concatenates hashes of the circuit, the
+witness and the public values, plus five rounds its own comment labels
+"simulated" FRI. Its `verify` checks a magic header, that the circuit hash
+matches one it recomputes from the *public* circuit, that the public values echo
+what was supplied, and that the proof is long enough. **It never checks that any
+witness satisfies any constraint.** Anyone holding the circuit can produce an
+accepting proof for any public statement without knowing a witness, and
+`tests/zkp_soundness.rs` demonstrates exactly that rather than describing it.
+
+The `binius-field` and `binius-core` dependencies in `Cargo.toml` are not
+imported anywhere under `src/`.
+
+So no ZKP result from this repository should be quoted, and the circuit
+compiler — which is genuine and is shared with the FHE backend — is the part
+worth citing. Wiring in a real Binius64 prover would make the soundness tests
+fail, which is the intended tripwire.
 
 ---
 
@@ -275,7 +300,7 @@ src/
   gadgets/      relu, max2/max_reduce/maxpool2d, argmax, dense, conv2d
   mpcc/         circuit IR, rewrite rules (opt), cost + fhe_cost + ot_cost models,
                 protocol registry, semi2k, lowgear, mixed, scheduler, VM, exec
-  zkp/          CircuitCompiler (FlatIR), Binius64 backend, proof serialization
+  zkp/          CircuitCompiler (FlatIR), binius64 *placeholder* backend, serialization
   ot/ psi/ pir/ Chou-Orlandi + IKNP; DH-PSI; single-server BFV PIR
   ml/           NetworkSpec/QuantizedNetwork, `baru quantize`
   precompile/   Gadget/Registry/champion dispatch, batched matvec

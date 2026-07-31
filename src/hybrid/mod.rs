@@ -97,6 +97,8 @@ use crate::crypto::types::Fr;
 use crate::fhe::backend::{FheBackend, RealFheBackend};
 use crate::interpreter::backend::{Backend, ShareRef};
 
+pub mod threshold_switch;
+
 // ─── FHE capability trait ─────────────────────────────────────────────────────
 
 /// The minimal FHE surface scheme switching needs: encrypt/decrypt `u64`

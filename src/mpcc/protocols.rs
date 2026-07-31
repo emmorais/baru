@@ -45,35 +45,14 @@ impl fmt::Display for Majority {
     }
 }
 
-/// Adversary behaviour the protocol is secure against.  Ordered: a protocol
-/// secure against a stronger adversary also satisfies a weaker requirement.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
-pub enum Security {
-    SemiHonest,
-    Covert,
-    Malicious,
-}
-
-impl fmt::Display for Security {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Security::SemiHonest => write!(f, "semi-honest"),
-            Security::Covert => write!(f, "covert"),
-            Security::Malicious => write!(f, "malicious"),
-        }
-    }
-}
-
-impl Security {
-    pub fn parse(s: &str) -> Option<Security> {
-        match s.to_ascii_lowercase().replace('_', "-").as_str() {
-            "semi-honest" | "semihonest" | "passive" => Some(Security::SemiHonest),
-            "covert" => Some(Security::Covert),
-            "malicious" | "active" => Some(Security::Malicious),
-            _ => None,
-        }
-    }
-}
+/// Adversary behaviour the protocol is secure against.
+///
+/// Re-exported from [`crate::crypto::security`], which is now the canonical
+/// home: the same value that describes a *registry row* also gates what an
+/// *engine* is allowed to be used for, so the cost matrix and the running code
+/// can never drift apart on what "malicious" means. The `--security` flag in
+/// [`crate::mpcc`] parses into this type unchanged.
+pub use crate::crypto::security::Security;
 
 /// Whether Baru can actually run this protocol today.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -350,7 +329,15 @@ pub const REGISTRY: &[ProtocolSpec] = &[
         max_parties: None,
         majority: Majority::Dishonest,
         security: Security::Malicious,
-        status: Status::Planned("P2"),
+        // `mpcc::spdz2k` implements and tests the MAC-checked **online** phase,
+        // but this row stays `Planned` deliberately. Two things are missing
+        // before the claim would be true: authenticated triple generation
+        // (MASCOT-style, currently dealt), and calibration of the engine's
+        // counters against the online cost parameters below. Listing it as
+        // implemented made `calibrate` compare a measured 160 bytes against a
+        // predicted 117 — the row is not validated until those agree, and
+        // adjusting the engine to match would defeat the purpose of the check.
+        status: Status::Planned("P2 — online phase in mpcc::spdz2k; needs triples + calibration"),
         cost: CostParams {
             mul_elems: Elems::new(0.0, 2.0),
             open_elems: Elems::new(0.0, 1.0),

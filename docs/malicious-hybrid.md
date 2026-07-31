@@ -136,6 +136,67 @@ or sublinear distributed-ZK on secret-shared data — fully-linear PCPs of
 Boneh–Boyle–Corrigan-Gibbs–Ishai). No new technique; it composes with the
 above because both live in the same RSS world.
 
+> **Correction (2026-07-31, from implementing it).** "No new technique" was too
+> quick. Building the nonlinearity path surfaced a subtlety that is *not*
+> handled by the deferred-abort discipline of §4.6, and that a careless
+> implementation gets wrong while appearing to work. It is recorded in §4.5a.
+
+### 4.5a Why bit-decomposition MACs cannot be multiplied into existence
+
+The malicious ABY3 layer (`src/crypto/aby3_verify.rs`) carries every wire as
+`([x], [r·x])` and verifies all multiplications with one batched sacrifice.
+Bit decomposition breaks the inductive step: its **leaves are built locally,
+with no communication** (`share_component`), so they arrive without MACs.
+
+The leaf *values* are safe — nothing goes on the wire, so the only available
+deviation is to use a value the co-holder disagrees with, and replication
+catches that through the pairwise transcript.
+
+The leaf *MACs* are the problem. The obvious construction, `[r·x] = [r]·[x]`,
+is unsound, and unsound in a way that is worse than a missed cheat. A corrupt
+party injects `δ` into that multiplication; the first downstream gate
+`[z] = [x]·[y]` then carries the MAC error
+
+```text
+([r·x] + δ)·[y] = [r·z] + δ·y
+```
+
+where `y` is a **secret bit**. When `y = 0` the error cancels by itself and the
+run completes; when `y = 1` the check fails and the parties abort. *Whether the
+computation aborts is now a function of the data.* The adversary learns a
+predicate on the secret inputs from nothing more than whether the run survived.
+
+This is a selective-failure attack, and §4.6 does **not** stop it. Deferring
+the abort to a single point hides *when* the abort happens; it does not hide
+*whether* it happens. The two are different channels and only the first is
+closed by batching.
+
+**The fix** (Chida et al., CRYPTO'18 §3–4) is to never multiply a MAC into
+existence. Prepare random pairs `([ρ], [r·ρ])` in advance and attach MACs
+affinely:
+
+```text
+d = open(x − ρ)                 uniform: ρ is a fresh one-time pad
+[r·x] = [r·ρ] + d·[r]           local — no multiplication, no deviation
+```
+
+A corrupt party can still cheat while the *pairs* are produced, and the same
+sacrifice still catches it — but `ρ` is random and **independent of the
+inputs**, so that abort carries no information about the data. The channel
+closes because the only place deviation remains possible has been moved off
+the data path.
+
+Implemented as `MacPair` / `generate_mac_pairs` / `mac_existing_batch`, with
+the whole pool produced in one batched round and attachment costing one batched
+opening. Cost is the same order as the multiplication it replaces; the
+difference is entirely in soundness.
+
+**Reading for the paper.** This is worth stating explicitly rather than
+burying, because the naive construction *passes every functional test* — it
+computes the right answer, and it aborts when cheated. It fails only against an
+adversary willing to spend the abort to learn one bit, which no correctness
+test will ever exhibit.
+
 ### 4.6 Selective-failure defense
 
 Per-operation abort could leak: a malicious party might inject an error that
@@ -269,6 +330,16 @@ n=4096 if the 3× ciphertext of n=8192 is unwelcome.
 1. ~~Concrete threshold-BFV parameters *with smudging*.~~ **Done (§6a).**
    Measured: fits at n=4096 for λ=40; needs n=8192 (~3× ciphertext) for λ=80,
    or decrypt-to-shares to stay at n=4096. **Gate passed — not paper-blocking.**
+
+   **Implemented and re-measured, 2026-07-31.** `src/fhe/threshold.rs` and
+   `src/hybrid/threshold_switch.rs` now carry replicated key shares,
+   derandomized encryption, checkable partial decryptions, and both directions
+   of the scheme switch. The λ=40 claim is no longer an estimate from a noise
+   measurement — `decryption_survives_realistic_smudging` and
+   `threshold_switch_still_works_at_realistic_smudging` sweep the flooding
+   magnitude and confirm correctness holds with three parties each contributing
+   a flooding term. §4.1–4.3 are done; §4.4 (the boundary proof) is what remains,
+   and it is now the *only* thing between this and a malicious attestation.
 2. Pin the boundary ZKPoK: which lattice proof, what noise bound, what cost per
    input. (Now the top open item.)
 3. Write the ideal functionality `F_infer` and the simulator for the one

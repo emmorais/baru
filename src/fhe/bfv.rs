@@ -61,30 +61,30 @@ impl BfvParams {
     /// Small ring for fast unit tests (NOT secure — testing only).
     pub const TEST_SMALL: BfvParams = BfvParams { n: 64, log2_q: 100, log2_t: 20 };
 
-    fn q_mask(&self) -> u128 {
+    pub(crate) fn q_mask(&self) -> u128 {
         (1u128 << self.log2_q) - 1
     }
     pub fn t(&self) -> u64 {
         1u64 << self.log2_t
     }
-    fn delta_shift(&self) -> u32 {
+    pub(crate) fn delta_shift(&self) -> u32 {
         self.log2_q - self.log2_t
     }
-    fn half_q(&self) -> u128 {
+    pub(crate) fn half_q(&self) -> u128 {
         1u128 << (self.log2_q - 1)
     }
 }
 
 // ─── Polynomial helpers (coeffs mod q, power-of-two q) ────────────────────────
 
-type Poly = Vec<u128>;
+pub(crate) type Poly = Vec<u128>;
 
 fn poly_add(a: &[u128], b: &[u128], mask: u128) -> Poly {
     a.iter().zip(b).map(|(x, y)| x.wrapping_add(*y) & mask).collect()
 }
 
 /// Negacyclic schoolbook product mod q (wrapping u128 is exact since q | 2^128).
-fn poly_mul_mod(a: &[u128], b: &[u128], p: &BfvParams) -> Poly {
+pub(crate) fn poly_mul_mod(a: &[u128], b: &[u128], p: &BfvParams) -> Poly {
     // Exact negacyclic product via the multi-modular NTT, then reduced mod
     // q. Centering the operands first is sound because a ≡ a_c (mod q), so
     // the product agrees mod q; the exact result's low bits are the answer.
@@ -97,7 +97,7 @@ fn poly_mul_mod(a: &[u128], b: &[u128], p: &BfvParams) -> Poly {
         .collect()
 }
 
-fn center(c: u128, p: &BfvParams) -> i128 {
+pub(crate) fn center(c: u128, p: &BfvParams) -> i128 {
     if c >= p.half_q() {
         c as i128 - (1i128 << p.log2_q)
     } else {
@@ -141,6 +141,20 @@ struct KeyBundle {
     s: Vec<u128>,
     b: Vec<u128>,
     a: Vec<u128>,
+}
+
+/// The public key's two polynomials `(b, a)`, for callers that need to encrypt
+/// with explicitly supplied randomness — see [`crate::fhe::threshold`].
+pub fn public_parts(key_bytes: &[u8]) -> (Vec<u128>, Vec<u128>) {
+    let k: KeyBundle = bincode::deserialize(key_bytes).expect("BFV key bundle");
+    (k.b, k.a)
+}
+
+/// The secret polynomial `s` from a client key bundle, so it can be split into
+/// threshold shares by [`crate::fhe::threshold::deal_key_shares`].
+pub fn secret_part(client_key_bytes: &[u8]) -> Vec<u128> {
+    let k: KeyBundle = bincode::deserialize(client_key_bytes).expect("BFV key bundle");
+    k.s
 }
 
 /// A BFV ciphertext: a vector of ring elements (2 fresh, 3 after one

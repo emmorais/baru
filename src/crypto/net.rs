@@ -71,6 +71,41 @@ pub enum MpcMsg {
     },
 
 
+    /// A whole batch of reveal contributions in one message — the batched form
+    /// of [`MpcMsg::RevealShare`], used by the malicious layer.
+    ///
+    /// Bit decomposition attaches a MAC to every leaf, and each attachment
+    /// needs one opening. Unbatched that would be one round *per leaf* —
+    /// thousands for a single layer — which would dwarf the protocol it is
+    /// protecting. Batched it is one round for the whole decomposition.
+    RevealShareBatch {
+        base_id: u64,
+        values: Vec<u128>,
+    },
+
+    /// One party's accumulated pairwise transcript hash, exchanged once at the
+    /// deferred check point (`crate::crypto::aby3_verify`).
+    ///
+    /// `toward_next` says which of the sender's two transcripts this is: the one
+    /// it keeps with its successor (`true`) or its predecessor (`false`). The
+    /// receiver compares it against the matching transcript of its own.
+    ViewHash {
+        toward_next: bool,
+        digest: [u8; 32],
+    },
+
+    /// Commitment to this party's contribution to the verification coin flip.
+    /// Sent by every party before any seed is opened, so the public challenge
+    /// coefficients cannot be biased by whoever speaks last.
+    CoinCommit {
+        digest: [u8; 32],
+    },
+
+    /// Opening of a [`MpcMsg::CoinCommit`].
+    CoinOpen {
+        seed: [u8; 32],
+    },
+
     /// One-time PRF key handshake. Party `i` samples `k_i` and sends it to
     /// party `i+1`, so each adjacent pair ends up sharing a key that the
     /// third party does not know. Those keys generate the zero-sum
@@ -119,6 +154,34 @@ impl PrfKeys {
     /// `α₀+α₁+α₂ = 0` — while no single party can predict any other's α.
     pub fn alpha(&self, ctr: u64) -> u128 {
         prf(&self.mine, ctr).wrapping_sub(prf(&self.prev, ctr))
+    }
+
+    /// A replicated sharing of a **fresh uniform value nobody knows**, for
+    /// counter `ctr`, with *no communication*.
+    ///
+    /// The same pairwise keys that make [`Self::alpha`] free also make this
+    /// free, and it is the reason the malicious upgrade needs no dealer and no
+    /// extra round to obtain its MAC key.
+    ///
+    /// The component assignment is forced by what each key is shared with.
+    /// `prev` is the key party `i` shares with `i−1`, so `F(prev, ctr)` is known
+    /// to exactly `{P_{i−1}, P_i}` — which is precisely the pair that must hold
+    /// additive component `i` under replicated sharing (`P_i` as `left`,
+    /// `P_{i−1}` as `right`). Symmetrically `F(mine, ctr)` is component `i+1`,
+    /// this party's `right`. So
+    ///
+    /// ```text
+    /// rᵢ = F(k_{i−1,i}, ctr)      known to P_{i−1}, P_i
+    /// ```
+    ///
+    /// is a consistent replicated sharing across all three parties, and no
+    /// single party can predict the component it does not hold.
+    ///
+    /// `ctr` must not collide with counters used for [`Self::alpha`]; callers
+    /// take their counters from disjoint domains (see
+    /// `aby3_verify::VERIFY_CTR_BASE`).
+    pub fn random_share(&self, ctr: u64) -> (u128, u128) {
+        (prf(&self.prev, ctr), prf(&self.mine, ctr))
     }
 }
 

@@ -395,7 +395,7 @@ pub const A2B_ID_BLOCK: u64 = 64;
 /// `right` by party `owner−1`, so exactly those two parties supply `v` and
 /// the third contributes nothing and learns nothing. This is what makes the
 /// first step of bit decomposition free.
-fn share_component(value: Fr, owner: usize, me: PartyId) -> PartyShare {
+pub(crate) fn share_component(value: Fr, owner: usize, me: PartyId) -> PartyShare {
     PartyShare {
         left: if me == owner { value } else { 0 },
         right: if (me + 1) % N == owner { value } else { 0 },

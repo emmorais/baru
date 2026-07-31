@@ -1600,6 +1600,70 @@ cryptosystem.**
 
 ---
 
+## Part VIII — The cost of active security
+
+*Command:* `baru bench-malicious --n 64 --bits 32`. Both legs run the same
+workload through the **identical** transport stack (`LatencyTransport` +
+`CountingTransport`), so the only difference is the protocol.
+`docs/malicious-hybrid.md` describes the constructions.
+
+### The headline
+
+| Workload | bytes | interactive calls | wall clock (WAN, 25 ms one-way) |
+|---|---|---|---|
+| Comparisons, n=32, 32-bit | **2.63×** | **1.06×** | **1.23×** |
+| Dot product, n=64, 32-bit | 2.44× | 2.00× | 2.87× |
+
+The comparison row is the one that matters for private inference: every ReLU,
+max-pool and argmax reduces to a comparison, so it is the entire nonlinear
+surface. Active security there costs **2.6× the bytes and 1.06× the rounds**.
+
+That is the predicted shape, and the prediction was worth making explicit
+because it is the repository's recurring lesson applied to a new protocol: the
+MAC doubles what is *sent* but batches into the *same* round, so on a link where
+latency dominates the upgrade is nearly free. Bit decomposition's two extra
+rounds — the random-pair pool and the MAC-attaching opening — are per *batch*,
+not per value, so they amortise: 1.06× at n=32.
+
+The dot-product row is a small-workload artifact and is reported rather than
+hidden. The semi-honest leg needs only 4 interactive calls in total, so the
+fixed cost of generating a pair pool is not amortised against anything. It is
+2.00× calls because the base is 4, not because multiplication doubles rounds.
+
+### The ring sacrifice is free at these widths
+
+The malicious multiplication check needs statistical slack in the ring, which
+the literature charges as a widening to `Z_2^{k+s}`. Baru already shares over
+`Z_2^128` while values are 32-bit, so the slack is already paid for:
+
+```
+values occupy 70 bits of the 128-bit ring
+  → 58 bits of statistical security at no widening cost
+```
+
+70 bits is a 32-bit product (64) plus the accumulation depth of a 64-term dot
+product (6). Reported by the benchmark from the widths actually in use, not
+asserted — `aby3_verify::headroom_bits` computes it, and it returns 0 rather
+than a comfortable number when the width leaves no room.
+
+### Method note — an unbatched loop, again
+
+The first run of this benchmark reported **39×–52× wall clock** on the dot
+product against only 2× interactive calls. The cause was in the benchmark, not
+the protocol: it shared inputs with scalar `share_secret` in a loop, and each
+call costs one extra synchronisation in the malicious backend (the MAC-attaching
+opening). `Mailbox::recv_matching` polls on a 2 ms sleep, so 128 extra
+synchronisations are ~256 ms of pure waiting.
+
+Switching to `share_secret_batch` — which both backends have, and which every
+real workload in this repository already uses — took the dot product from 39× to
+2.18×. This is the fourth time in this record that a segment-level measurement
+said "the protocol is slow" and a per-phase breakdown said "one unbatched loop
+inside it is slow." It is recorded here because the earlier number was wrong in
+a way that would have been quotable.
+
+---
+
 ## Part VII — Negative, superseded and withdrawn results
 
 Kept because a repository that only records its wins is not reporting.

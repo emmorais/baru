@@ -193,6 +193,34 @@ impl BitColumns {
     }
 }
 
+/// Multiply in `GF(2^128)` modulo `x^128 + x^7 + x^2 + x + 1`.
+///
+/// The KOS15 consistency check ([`iknp::ExtSender::kos_verify`]) is a random
+/// linear combination over this field: the receiver proves it used one
+/// consistent choice-bit vector across all `κ` columns, and soundness comes
+/// from the combination being taken over a *field* rather than bit by bit.
+///
+/// Bits are little-endian within the block, so bit `i` of the polynomial is bit
+/// `i` of the corresponding `u128`. The reduction constant `0x87` is the
+/// low-order form of `x^7 + x^2 + x + 1`, the same polynomial AES-GCM uses.
+pub(crate) fn gf128_mul(a: &Block, b: &Block) -> Block {
+    let x = u128::from_le_bytes(*a);
+    let y = u128::from_le_bytes(*b);
+    let mut acc: u128 = 0;
+    let mut cur = x;
+    for i in 0..128 {
+        if (y >> i) & 1 == 1 {
+            acc ^= cur;
+        }
+        let overflow = cur >> 127;
+        cur <<= 1;
+        if overflow == 1 {
+            cur ^= 0x87;
+        }
+    }
+    acc.to_le_bytes()
+}
+
 /// Pack `bits` little-endian into bytes.
 pub(crate) fn pack_bits(bits: &[bool]) -> Vec<u8> {
     let mut out = vec![0u8; bits.len().div_ceil(8)];
