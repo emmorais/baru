@@ -31,7 +31,7 @@ use serde::Serialize;
 use crate::fhe::circuit_emitter::evaluate_fhe;
 use crate::fhe::{FheBackend, MockFheBackend, TfheBackend};
 use crate::interpreter::{parse, Participant, Types};
-use crate::zkp::binius64_backend::Binius64Backend;
+use crate::zkp::binius_real::Binius64Real;
 use crate::zkp::circuit_compiler::CircuitCompiler;
 use crate::zkp::ZKPBackend;
 
@@ -384,18 +384,41 @@ fn run_fhe_real<B: crate::fhe::RealFheBackend>(
 
 fn run_zkp(expr: &str, inputs: &[(String, i64)]) -> BackendReport {
     let mut t = Timer::new();
-    let be = Binius64Backend::new();
+    let be = Binius64Real::new();
     let parsed = parse(expr).unwrap_or_else(|e| panic!("parse error: {}", e));
     let private_vars: Vec<String> = inputs.iter().map(|(k, _)| k.clone()).collect();
 
-    let circuit = t.phase("compile", || {
-        be.compile_circuit(&parsed, &private_vars)
-            .unwrap_or_else(|e| panic!("compile: {}", e))
-    });
+    // The real backend refuses expressions it cannot compile soundly (`if`,
+    // comparisons, division). Report that as a limitation of the backend rather
+    // than panicking: the placeholder this replaced "supported" them only by
+    // never checking anything, and a benchmark that hid the difference would be
+    // reintroducing exactly that dishonesty.
+    let compiled = t.phase("compile", || be.compile_circuit(&parsed, &private_vars));
+    let circuit = match compiled {
+        Ok(c) => c,
+        Err(e) => {
+            return BackendReport {
+                backend: "zkp-binius64".into(),
+                total_micros: t.total().as_micros(),
+                phases: t.phases,
+                result: None,
+                ok: None,
+                notes: vec![],
+                error: Some(format!("unsupported by the binius64 circuit fragment: {e}")),
+            }
+        }
+    };
 
     let private_values: HashMap<String, i64> =
         inputs.iter().map(|(k, v)| (k.clone(), *v)).collect();
-    let public_values: HashMap<String, i64> = HashMap::new();
+    // The statement a proof establishes is "the circuit evaluates to *this*",
+    // so the claimed output is part of the public input. A prover always knows
+    // it — it holds the witness.
+    let mut public_values: HashMap<String, i64> = HashMap::new();
+    let claimed = be
+        .evaluate(&circuit, &private_values, &public_values)
+        .unwrap_or_else(|e| panic!("evaluate: {}", e));
+    public_values.insert(crate::zkp::binius_real::OUTPUT_NAME.to_string(), claimed);
 
     let proof = t.phase("prove", || {
         be.prove(&circuit, &private_values, &public_values)
@@ -863,13 +886,18 @@ mod tests {
             let report = run_case(case, &fast_backends(), 1);
             assert!(report.baseline.is_some(), "case {}: no baseline", case.name);
             for b in &report.backends {
-                assert!(
-                    b.error.is_none(),
-                    "case {} backend {}: {:?}",
-                    case.name,
-                    b.backend,
-                    b.error
-                );
+                // A backend may honestly decline a case it cannot compile
+                // soundly; that is a reported limitation, not a failure. Only
+                // *unexpected* errors fail the suite.
+                if let Some(err) = &b.error {
+                    assert!(
+                        err.contains("unsupported by the binius64 circuit fragment"),
+                        "case {} backend {}: {err}",
+                        case.name,
+                        b.backend
+                    );
+                    continue;
+                }
                 if b.backend != "plain" {
                     assert_eq!(
                         b.ok,

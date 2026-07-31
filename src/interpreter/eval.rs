@@ -1718,7 +1718,7 @@ impl Participant {
                 }
                 _ => panic!("zkp-compile: second arg must be a list of strings or a quoted list like '(\"x\")"),
             };
-            let backend = crate::zkp::binius64_backend::Binius64Backend::new();
+            let backend = crate::zkp::binius_real::Binius64Real::new();
             use crate::zkp::ZKPBackend;
             let circuit = backend
                 .compile_circuit(&expr, &private_vars)
@@ -1769,7 +1769,7 @@ impl Participant {
             let public_vals: std::collections::HashMap<String, i64> =
                 public_keys.into_iter().zip(public_nums).collect();
 
-            let backend = crate::zkp::binius64_backend::Binius64Backend::new();
+            let backend = crate::zkp::binius_real::Binius64Real::new();
             use crate::zkp::ZKPBackend;
             let proof = backend
                 .prove(&circuit, &private_vals, &public_vals)
@@ -1811,7 +1811,7 @@ impl Participant {
             let public_vals: std::collections::HashMap<String, i64> =
                 public_keys.into_iter().zip(public_nums).collect();
 
-            let backend = crate::zkp::binius64_backend::Binius64Backend::new();
+            let backend = crate::zkp::binius_real::Binius64Real::new();
             use crate::zkp::ZKPBackend;
             match backend.verify(&circuit, &proof, &public_vals) {
                 Ok(true) => Types::Num(1),

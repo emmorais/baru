@@ -8,6 +8,12 @@
 //! The audit did not confirm that. These tests record what the backend actually
 //! does, because the gap between the claim and the code is large enough that it
 //! must be demonstrated rather than described.
+//!
+//! **Superseded.** `zkp::binius_real` is now a real Binius64 prover/verifier and
+//! is what the interpreter uses; `tests/zkp_real.rs` runs these same attacks
+//! against it, where they are rejected. This file is kept pointing at the old
+//! `binius64_backend` so the contrast stays visible and so nothing quietly
+//! reintroduces it.
 
 use std::collections::HashMap;
 

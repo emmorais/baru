@@ -23,14 +23,15 @@
 //! | `TransportBackend` (ABY3 over transport) | semi-honest | superseded by `MaliciousBackend`; kept as the measurement baseline |
 //! | `Aby3Simulator` | semi-honest | in-process simulator; models values, not adversaries |
 //! | `gc_protocol` (garbled leg) | semi-honest | tables cross-checked; input labels and evaluator output are not — see `GC_MALICIOUS_GAPS` |
-//! | `Semi2kEngine` | semi-honest | Stage 5: no MACs (SPDZ2k) |
-//! | `ChouOrlandi` (base OT) | semi-honest | Stage 3: no proof of knowledge, no point validation |
-//! | `Iknp` (OT extension) | semi-honest | Stage 3: **actively broken** — no KOS check |
+//! | `Semi2kEngine` | semi-honest | no MACs; `mpcc::spdz2k` is the authenticated upgrade |
+//! | `ChouOrlandi` (base OT) | semi-honest | trait path omits the Schnorr proof; `new_proved`/`verify_setup` close it |
+//! | `Iknp` (OT extension) | semi-honest | trait path omits the KOS check; `simulate_checked` runs it |
 //! | `NaiveHash` (PSI) | semi-honest | leaks by construction; see `psi::Hiding` |
-//! | `DhPsi` | semi-honest | Stage 3: no proof of consistent exponent |
+//! | `DhPsi` | semi-honest | trait path ships no proof; `respond_proved`/`verify_exponent` close it |
 //! | `Pir` | semi-honest | Stage 6 (gated): no integrity against a malicious server |
-//! | `zkp::binius64` | **none** | not a proof system: `verify` never checks constraint satisfaction (`tests/zkp_soundness.rs`) |
-//! | `Bfv`, `Bgv` | semi-honest | Stage 4: no replication, no threshold decryption |
+//! | `zkp::binius_real` | sound | a real Binius64 prover/verifier; `+`/`−`/`×` only, other ops refused (`tests/zkp_real.rs`) |
+//! | `zkp::binius64_backend` | **none** | retained placeholder, unused: `verify` never checks constraint satisfaction (`tests/zkp_soundness.rs`) |
+//! | `Bfv`, `Bgv` | semi-honest | `fhe::threshold` built and tested; boundary proof (§4.4) still missing |
 //! | `CkksBackend`, `TfheBackend` | semi-honest | Stage 6 (gated): third-party randomness, cannot derandomise |
 //!
 //! [`crate::interpreter::malicious_backend::MaliciousBackend`] is the only

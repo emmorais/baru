@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 pub mod binius64_backend;
+pub mod binius_real;
 pub mod circuit_compiler;
 pub mod serialization;
 
