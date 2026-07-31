@@ -1664,6 +1664,57 @@ a way that would have been quotable.
 
 ---
 
+## Part IX — Proving a quantized layer (ZKP)
+
+*Command:* `baru bench-zkp-layer --widths 1,4,16,64,256,784`. Real Binius64
+prover and verifier (`zkp::binius_real`); weights public, inputs private.
+
+Baru's comparison table carried an empty ZKP column for anything resembling
+inference. The reason was not that it had not been measured — it was that
+before 2026-07-31 the ZKP backend proved nothing at all (Part VII), and the
+real one that replaced it could not compile a ReLU until the circuit fragment
+gained comparisons, `if`, shifts and division.
+
+### A Q16.16 quantized neuron: `relu((Σ wᵢ·xᵢ) >> 16 + b)`
+
+| width | gates | constraints | prove | verify | proof bytes |
+|---|---|---|---|---|---|
+| 1 | 11 | 14 | 6.3 ms | 1.0 ms | 18 544 |
+| 4 | 23 | 42 | 4.6 ms | 0.8 ms | 21 120 |
+| 16 | 71 | 151 | 5.2 ms | 1.0 ms | 31 456 |
+| 64 | 263 | 589 | 8.0 ms | 1.3 ms | 47 808 |
+| 256 | 1 031 | 2 341 | 14.6 ms | 2.3 ms | 71 968 |
+| **784** | **3 143** | **7 159** | **32.3 ms** | **4.8 ms** | **111 712** |
+
+784 is the MNIST input width, so the last row is one full first-layer neuron of
+the network the rest of this record benchmarks.
+
+Two things are worth reading off the sweep rather than the last row alone.
+**Constraints grow linearly** in width (≈9 per input — a multiply, an add, and
+the shared rescale/ReLU tail amortising away). **Proof size does not**: a 286×
+larger circuit produces a 6× larger proof, which is the succinctness that makes
+a SNARK worth using. Verification stays in single-digit milliseconds throughout.
+
+The small-width rows are dominated by fixed setup, which is why width 4 proves
+marginally *faster* than width 1 — not noise worth explaining away, just the
+floor.
+
+### What this does not say
+
+This is **integrity, not confidentiality**, and the two are easy to conflate
+when the numbers sit in adjacent columns:
+
+* MPC and FHE keep data secret **from the parties computing on it**.
+* A SNARK proves the computation was done correctly while hiding the witness
+  **from a verifier**. The prover holds everything in the clear.
+
+So "ZKP proves a 784-wide neuron in 32 ms" must not be set against "MPC
+evaluates a layer in *N* ms" as if they were alternatives. They answer different
+questions, and a deployment that needs both pays for both. The benchmark prints
+this caveat with its results so the numbers cannot travel without it.
+
+---
+
 ## Part VII — Negative, superseded and withdrawn results
 
 Kept because a repository that only records its wins is not reporting.

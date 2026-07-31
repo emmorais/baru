@@ -77,6 +77,17 @@ enum Op {
     Eq(u32, u32),
     /// `cond ? t : f`, with `cond` a 0/1 integer.
     Select(u32, u32, u32),
+    /// Shift left by a **public constant**. Secret shift amounts would need a
+    /// different construction (a multiplexer over 64 cases) and are refused.
+    Shl(u32, u32),
+    /// **Arithmetic** shift right by a public constant — sign-preserving, which
+    /// is what Q16.16 fixed-point rescaling needs. A logical shift here would
+    /// turn every negative activation into a huge positive one.
+    Sar(u32, u32),
+    /// Truncating signed division: quotient. See [`emit_divmod`].
+    Div(u32, u32),
+    /// Truncating signed division: remainder, taking the dividend's sign.
+    Rem(u32, u32),
 }
 
 /// The serializable circuit description both sides rebuild from.
@@ -154,6 +165,31 @@ impl Ir {
                     BinOp::Le => Op::Le(x, y),
                     BinOp::Ge => Op::Le(y, x),
                     BinOp::Eq => Op::Eq(x, y),
+                    BinOp::DivExact => Op::Div(x, y),
+                    BinOp::Mod => Op::Rem(x, y),
+                    // Shifts must be by a public constant: a secret amount
+                    // would need a 64-way multiplexer, which is a different
+                    // construction rather than a bigger one.
+                    BinOp::AshLeft | BinOp::AshRight => {
+                        let amount = match self.ops.get(y as usize) {
+                            Some(Op::Const(n)) if (0..64).contains(n) => *n as u32,
+                            _ => {
+                                return Err(
+                                    "binius64: shift amounts must be public constants in 0..64; \
+                                     a secret shift needs a multiplexer construction that does \
+                                     not exist here"
+                                        .to_string(),
+                                )
+                            }
+                        };
+                        // The constant node stays in the IR but is unused by the
+                        // shift, which is harmless — it compiles to a constant
+                        // wire nothing reads.
+                        match op {
+                            BinOp::AshLeft => Op::Shl(x, amount),
+                            _ => Op::Sar(x, amount),
+                        }
+                    }
                     other => {
                         return Err(format!(
                             "binius64: {other:?} is not supported. Division and modulo need \
@@ -245,14 +281,86 @@ fn msb_to_int(b: &CircuitBuilder, msb: Wire) -> Wire {
     b.shr(msb, 63)
 }
 
+/// Absolute value of a signed word. `v`'s own MSB *is* its sign bit, so it
+/// doubles as the MSB-boolean condition.
+fn abs(b: &CircuitBuilder, v: Wire) -> Wire {
+    b.select(v, negate(b, v), v)
+}
+
+/// Emit the quotient/remainder gadget for `a / b`, returning `(q, r)`.
+///
+/// # The attack this has to stop
+///
+/// Division cannot be computed by a circuit; the prover supplies `q` and `r` as
+/// witnesses and the circuit *checks* them. The obvious check —
+/// `a == b·q + r` with `|r| < |b|` — is **unsound**, because circuit
+/// multiplication wraps modulo `2^64`.
+///
+/// Concretely, take `a = 1`, `b = 3`. Since 3 is odd it is invertible mod
+/// `2^64`, so a cheating prover sets `r = 0` and `q = 3⁻¹ mod 2^64`, a huge
+/// value. Then `b·q ≡ 1 = a` and `|r| = 0 < 3`, and both checks pass while the
+/// claimed quotient is nonsense. Every "obvious" soundness test still passes,
+/// because the honest path is unaffected.
+///
+/// # What closes it
+///
+/// The product must not wrap. `smul` gives the full 128-bit result, so
+/// requiring `hi == sar(lo, 63)` — the high word is exactly the sign extension
+/// of the low word — forces `b·q` to be representable in a signed 64-bit word.
+/// With `|b·q| < 2^63` and `|r| < |b| ≤ 2^63`, the sum lies in `(−2^64, 2^64)`,
+/// so the only remaining escape is a single wrap in the addition, which the
+/// signed-overflow check rules out.
+///
+/// Together with `b ≠ 0`, `|r| < |b|`, and `r`'s sign matching the dividend's,
+/// `(q, r)` is then unique and equals Rust's truncating `/` and `%`.
+///
+/// # Known limit
+///
+/// `b = i64::MIN` is rejected rather than handled: `abs(i64::MIN)` is not
+/// representable, so the magnitude comparison cannot be trusted there. That is
+/// a refusal, not a silent wrong answer.
+fn emit_divmod(b: &CircuitBuilder, a: Wire, d: Wire, q: Wire, r: Wire) {
+    // 1. Division by zero is undefined; reject it outright.
+    b.assert_non_zero("div/nonzero", d);
+
+    // 2. The product must be representable: hi is the sign extension of lo.
+    //    This is what defeats the modular-inverse forgery above.
+    let (hi, lo) = b.smul(d, q);
+    let sign_ext = b.sar(lo, 63);
+    b.assert_eq("div/no-product-overflow", hi, sign_ext);
+
+    // 3. d*q + r == a, with no signed overflow in the addition.
+    let (sum, _carry) = b.iadd(lo, r);
+    b.assert_eq("div/identity", sum, a);
+    // Signed overflow iff the addends share a sign and the result differs.
+    let ones = b.add_constant_64(u64::MAX);
+    let same_sign = b.bxor(b.bxor(lo, r), ones);
+    let result_differs = b.bxor(lo, sum);
+    b.assert_false("div/no-add-overflow", b.band(same_sign, result_differs));
+
+    // 4. |r| < |d|. Also rules out d = i64::MIN, whose abs is unrepresentable
+    //    (it stays negative, so the comparison fails and the proof is refused).
+    let abs_r = abs(b, r);
+    let abs_d = abs(b, d);
+    b.assert_true("div/remainder-magnitude", signed_lt(b, abs_r, abs_d));
+    b.assert_false("div/divisor-not-int-min", b.icmp_ult(abs_d, b.add_constant_64(1)));
+
+    // 5. Truncation toward zero: the remainder takes the dividend's sign, or is
+    //    zero. Without this, (q, r) and (q±1, r∓d) would both satisfy 1–4.
+    let r_is_zero = b.icmp_eq(r, b.add_constant_64(0));
+    let signs_match = b.bxor(b.bxor(r, a), ones);
+    b.assert_true("div/remainder-sign", b.bor(r_is_zero, signs_match));
+}
+
 /// Build the Binius circuit for an [`Ir`]. Deterministic: prover and verifier
 /// both call this and must obtain identical constraint systems.
-fn build(ir: &Ir) -> (binius_frontend::Circuit, HashMap<String, Wire>, Wire) {
+fn build(ir: &Ir) -> Built {
     let b = CircuitBuilder::new();
     let mut wires: Vec<Wire> = Vec::with_capacity(ir.ops.len());
     let mut named: HashMap<String, Wire> = HashMap::new();
+    let mut divmod_wires: Vec<(u32, Wire, Wire)> = Vec::new();
 
-    for op in &ir.ops {
+    for (idx, op) in ir.ops.iter().enumerate() {
         let w = match op {
             Op::Const(v) => b.add_constant_64(*v as u64),
             Op::Public(name) => {
@@ -312,6 +420,24 @@ fn build(ir: &Ir) -> (binius_frontend::Circuit, HashMap<String, Wire>, Wire) {
                 let cond = b.shl(wires[*c as usize], 63);
                 b.select(cond, wires[*t as usize], wires[*f as usize])
             }
+            Op::Shl(x, n) => b.shl(wires[*x as usize], *n),
+            // Arithmetic, not logical: `sar` fills from the sign bit, so a
+            // negative activation rescales to a negative value instead of a
+            // huge positive one.
+            Op::Sar(x, n) => b.sar(wires[*x as usize], *n),
+            Op::Div(x, y) | Op::Rem(x, y) => {
+                // The quotient and remainder are *witnesses* — a circuit cannot
+                // divide — so they are supplied by the prover and checked here.
+                let q = b.add_witness();
+                let r = b.add_witness();
+                emit_divmod(&b, wires[*x as usize], wires[*y as usize], q, r);
+                divmod_wires.push((idx as u32, q, r));
+                if matches!(op, Op::Div(..)) {
+                    q
+                } else {
+                    r
+                }
+            }
         };
         wires.push(w);
     }
@@ -322,7 +448,23 @@ fn build(ir: &Ir) -> (binius_frontend::Circuit, HashMap<String, Wire>, Wire) {
     named.insert(OUTPUT_NAME.to_string(), out);
     b.assert_eq("output", wires[ir.output as usize], out);
 
-    (b.build(), named, out)
+    Built {
+        circuit: b.build(),
+        named,
+        out,
+        divmod_wires,
+    }
+}
+
+/// A built circuit plus the handles callers need to populate it.
+struct Built {
+    circuit: binius_frontend::Circuit,
+    named: HashMap<String, Wire>,
+    #[allow(dead_code)]
+    out: Wire,
+    /// `(ir node index, quotient wire, remainder wire)` for every division —
+    /// the values only the prover can supply.
+    divmod_wires: Vec<(u32, Wire, Wire)>,
 }
 
 /// The real backend.
@@ -359,6 +501,17 @@ impl Binius64Real {
         public_values: &PublicValues,
     ) -> Result<i64, String> {
         let ir = Self::ir_of(circuit)?;
+        let vals = Self::node_values(&ir, private_values, public_values)?;
+        Ok(vals[ir.output as usize])
+    }
+
+    /// Every node's value, in the clear. Shared by [`Self::evaluate`] and by
+    /// the prover, which needs intermediate values to fill division witnesses.
+    fn node_values(
+        ir: &Ir,
+        private_values: &HashMap<String, i64>,
+        public_values: &PublicValues,
+    ) -> Result<Vec<i64>, String> {
         let mut vals: Vec<i64> = Vec::with_capacity(ir.ops.len());
         for op in &ir.ops {
             let v = match op {
@@ -388,18 +541,38 @@ impl Binius64Real {
                         vals[*f as usize]
                     }
                 }
+                Op::Shl(x, n) => ((vals[*x as usize] as u64) << n) as i64,
+                // `>>` on i64 in Rust is already arithmetic, matching `sar`.
+                Op::Sar(x, n) => vals[*x as usize] >> n,
+                // Rust's `/` and `%` truncate toward zero and give the
+                // remainder the dividend's sign, which is exactly what
+                // `emit_divmod` constrains.
+                Op::Div(x, y) => {
+                    let d = vals[*y as usize];
+                    if d == 0 {
+                        return Err("binius64: division by zero".to_string());
+                    }
+                    vals[*x as usize].wrapping_div(d)
+                }
+                Op::Rem(x, y) => {
+                    let d = vals[*y as usize];
+                    if d == 0 {
+                        return Err("binius64: division by zero".to_string());
+                    }
+                    vals[*x as usize].wrapping_rem(d)
+                }
             };
             vals.push(v);
         }
-        Ok(vals[ir.output as usize])
+        Ok(vals)
     }
 }
 
 impl ZKPBackend for Binius64Real {
     fn compile_circuit(&self, expr: &Expr, private_vars: &[String]) -> Result<Circuit, String> {
         let ir = Ir::lower(expr, private_vars)?;
-        let (circuit, _wires, _out) = build(&ir);
-        let stat = binius_frontend::CircuitStat::collect(&circuit);
+        let built = build(&ir);
+        let stat = binius_frontend::CircuitStat::collect(&built.circuit);
         let circuit_data =
             bincode::serialize(&ir).map_err(|e| format!("binius64: cannot serialize IR: {e}"))?;
         Ok(Circuit {
@@ -426,7 +599,7 @@ impl ZKPBackend for Binius64Real {
         use binius_verifier::Verifier;
 
         let ir = Self::ir_of(circuit)?;
-        let (built, wires, _out) = build(&ir);
+        let Built { circuit: built, named: wires, divmod_wires, .. } = build(&ir);
 
         // Populate the witness. Every declared input must be supplied — a
         // missing one is an error, not a zero, because silently substituting
@@ -448,6 +621,26 @@ impl ZKPBackend for Binius64Real {
             .get(OUTPUT_NAME)
             .ok_or_else(|| format!("binius64: the statement needs a claimed `{OUTPUT_NAME}`"))?;
         filler[wires[OUTPUT_NAME]] = binius_core::word::Word(*claimed as u64);
+
+        // Divisions need prover-supplied quotients and remainders: a circuit
+        // cannot divide, it can only check a claimed result. Evaluating the IR
+        // in the clear gives every node's value, from which each `(q, r)` pair
+        // follows.
+        if !divmod_wires.is_empty() {
+            let vals = Self::node_values(&ir, private_values, public_values)?;
+            for (node, q_wire, r_wire) in &divmod_wires {
+                let (x, y) = match &ir.ops[*node as usize] {
+                    Op::Div(x, y) | Op::Rem(x, y) => (*x, *y),
+                    other => unreachable!("divmod wire on a non-division node: {other:?}"),
+                };
+                let (a, d) = (vals[x as usize], vals[y as usize]);
+                if d == 0 {
+                    return Err("binius64: division by zero".to_string());
+                }
+                filler[*q_wire] = binius_core::word::Word(a.wrapping_div(d) as u64);
+                filler[*r_wire] = binius_core::word::Word(a.wrapping_rem(d) as u64);
+            }
+        }
 
         built
             .populate_wire_witness(&mut filler)
@@ -482,7 +675,7 @@ impl ZKPBackend for Binius64Real {
         use binius_verifier::Verifier;
 
         let ir = Self::ir_of(circuit)?;
-        let (built, wires, _out) = build(&ir);
+        let Built { circuit: built, named: wires, divmod_wires, .. } = build(&ir);
 
         // The public values the *verifier* was given are the statement. They
         // must also match what the proof carries, or a prover could prove one

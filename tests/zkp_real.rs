@@ -116,14 +116,13 @@ fn proofs_are_bound_to_their_own_statements() {
 /// Operations the backend cannot compile soundly are refused, rather than
 /// mis-compiled into a circuit that proves the wrong thing.
 ///
-/// `<` and `if` were on this list until the fragment was extended; they now
-/// have real circuitry and are covered by the tests below. Division and modulo
-/// remain refused because they need quotient/remainder witnesses with range
-/// checks.
+/// `<`, `if`, division and modulo were all on this list at various points and
+/// now have real circuitry, covered by the tests below. What remains refused is
+/// what has no circuit at all: lambdas and list operations.
 #[test]
 fn unsupported_operations_are_refused_not_mis_compiled() {
     let be = Binius64Real::new();
-    for src in ["(/ x y)", "(% x y)", "(lambda (a) a)"] {
+    for src in ["(lambda (a) a)", "(car (list 1 2))"] {
         let expr = parse(src).expect("parse");
         assert!(
             be.compile_circuit(&expr, &["x".to_string()]).is_err(),
@@ -269,11 +268,142 @@ fn a_false_relu_claim_is_still_unprovable() {
     );
 }
 
-/// Division stays refused — it needs quotient/remainder witnesses with range
-/// checks, which do not exist here.
+
+
+/// Fixed-point rescaling: Q16.16 multiplication needs a `>> 16` that preserves
+/// sign. A *logical* shift here would turn every negative activation into a
+/// huge positive one, so this sweeps negatives deliberately.
 #[test]
-fn division_is_still_refused() {
+fn arithmetic_shift_right_preserves_sign() {
+    for v in [-65536i64, -1, -100000, 0, 65536, 123456] {
+        let (ok, out) = prove_and_verify("(ash-right x 16)", &[("x", v)]);
+        assert!(ok, "verify (ash-right {v} 16)");
+        assert_eq!(out, v >> 16, "arithmetic shift of {v}");
+    }
+}
+
+/// A Q16.16 multiply-then-rescale, which is the operation every fixed-point
+/// layer in this repo performs.
+#[test]
+fn q16_16_multiply_rescales_correctly() {
+    let scale = 65536i64;
+    for (a, b) in [(1.5f64, 2.0f64), (-1.5, 2.0), (0.25, -4.0)] {
+        let (av, bv) = ((a * scale as f64) as i64, (b * scale as f64) as i64);
+        let (ok, out) = prove_and_verify("(ash-right (* x y) 16)", &[("x", av), ("y", bv)]);
+        assert!(ok, "verify Q16.16 {a} * {b}");
+        assert_eq!(out, (av * bv) >> 16, "Q16.16 {a} * {b}");
+    }
+}
+
+#[test]
+fn shift_left_works_and_secret_shift_amounts_are_refused() {
+    let (ok, out) = prove_and_verify("(ash-left x 4)", &[("x", 3)]);
+    assert!(ok);
+    assert_eq!(out, 48);
+
+    // A secret shift amount needs a multiplexer construction that does not
+    // exist here, so it must be refused rather than mis-compiled.
+    let be = Binius64Real::new();
+    let expr = parse("(ash-right x y)").expect("parse");
+    assert!(be
+        .compile_circuit(&expr, &["x".to_string(), "y".to_string()])
+        .is_err());
+}
+
+// ─── Division ────────────────────────────────────────────────────────────────
+
+/// Truncating signed division and remainder, matching Rust's `/` and `%`
+/// across every sign combination.
+#[test]
+fn division_matches_rust_semantics() {
+    for (a, b) in [
+        (7i64, 2i64), (-7, 2), (7, -2), (-7, -2),
+        (100, 10), (0, 5), (1, 3), (-1, 3), (i64::MAX, 3),
+    ] {
+        let (ok, q) = prove_and_verify("(/ x y)", &[("x", a), ("y", b)]);
+        assert!(ok, "verify ({a} / {b})");
+        assert_eq!(q, a / b, "{a} / {b}");
+
+        let (ok, r) = prove_and_verify("(mod x y)", &[("x", a), ("y", b)]);
+        assert!(ok, "verify ({a} % {b})");
+        assert_eq!(r, a % b, "{a} % {b}");
+    }
+}
+
+/// **The attack the gadget exists to stop.**
+///
+/// Circuit multiplication wraps mod 2^64, so the naive check `a == b*q + r`
+/// with `|r| < |b|` is satisfiable by a false quotient: for `a = 1, b = 3`, the
+/// prover can set `r = 0` and `q = 3^-1 mod 2^64`, since 3 is invertible.
+/// The no-overflow constraint on the product is what rejects it.
+///
+/// This drives the forgery through the real prover rather than reasoning about
+/// it: `1 / 3` is claimed to be the modular inverse of 3.
+#[test]
+fn a_modular_inverse_quotient_is_rejected() {
     let be = Binius64Real::new();
     let expr = parse("(/ x y)").expect("parse");
-    assert!(be.compile_circuit(&expr, &["x".to_string()]).is_err());
+    let ckt = be
+        .compile_circuit(&expr, &["x".to_string(), "y".to_string()])
+        .expect("compile");
+
+    // 3^-1 mod 2^64: the value that satisfies 3*q == 1 with wrapping.
+    let inv3 = 0xAAAA_AAAA_AAAA_AAABu64 as i64;
+    assert_eq!((3i64).wrapping_mul(inv3), 1, "inv3 really is the inverse");
+
+    let mut priv_map = HashMap::new();
+    priv_map.insert("x".to_string(), 1i64);
+    priv_map.insert("y".to_string(), 3i64);
+    let mut pubs = HashMap::new();
+    pubs.insert(OUTPUT_NAME.to_string(), inv3);
+
+    assert!(
+        be.prove(&ckt, &priv_map, &pubs).is_err(),
+        "the modular-inverse forgery must be rejected: this is the whole point \
+         of the no-overflow constraint on the product"
+    );
+
+    // And the honest answer is still provable.
+    let mut honest = HashMap::new();
+    honest.insert(OUTPUT_NAME.to_string(), 0i64);
+    let proof = be.prove(&ckt, &priv_map, &honest).expect("1/3 == 0");
+    assert!(be.verify(&ckt, &proof, &honest).unwrap());
+}
+
+/// Division by zero must be refused, not wrapped into some other value.
+#[test]
+fn division_by_zero_is_refused() {
+    let be = Binius64Real::new();
+    let expr = parse("(/ x y)").expect("parse");
+    let ckt = be
+        .compile_circuit(&expr, &["x".to_string(), "y".to_string()])
+        .expect("compile");
+    let mut priv_map = HashMap::new();
+    priv_map.insert("x".to_string(), 5i64);
+    priv_map.insert("y".to_string(), 0i64);
+    let mut pubs = HashMap::new();
+    pubs.insert(OUTPUT_NAME.to_string(), 0i64);
+    assert!(be.prove(&ckt, &priv_map, &pubs).is_err());
+}
+
+/// A wrong-but-plausible quotient (off by one) must be rejected — this is what
+/// the remainder-sign constraint rules out.
+#[test]
+fn an_off_by_one_quotient_is_rejected() {
+    let be = Binius64Real::new();
+    let expr = parse("(/ x y)").expect("parse");
+    let ckt = be
+        .compile_circuit(&expr, &["x".to_string(), "y".to_string()])
+        .expect("compile");
+    let mut priv_map = HashMap::new();
+    priv_map.insert("x".to_string(), 7i64);
+    priv_map.insert("y".to_string(), 2i64);
+    for claimed in [2i64, 4, -3] {
+        let mut pubs = HashMap::new();
+        pubs.insert(OUTPUT_NAME.to_string(), claimed);
+        assert!(
+            be.prove(&ckt, &priv_map, &pubs).is_err(),
+            "7/2 = {claimed} must not be provable"
+        );
+    }
 }

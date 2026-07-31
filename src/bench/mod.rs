@@ -966,6 +966,7 @@ pub mod cohort_eval;
 pub mod cnn;
 pub mod gc_compare;
 pub mod malicious;
+pub mod zkp_layer;
 pub mod deep_nn;
 pub mod layer;
 pub mod medmnist;

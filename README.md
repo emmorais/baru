@@ -134,20 +134,32 @@ matter — an honest proof verifies; proving without a witness fails; a witness
 that does not satisfy the statement is rejected; a proof does not transfer to a
 different statement; a tampered transcript is rejected.
 
-Scope is stated rather than implied. It compiles `+`, `−`, `×`, the signed
-comparisons `<`, `>`, `<=`, `>=`, `==`, plus `if`, `let` and sequences, over
-64-bit words — enough to prove a **ReLU neuron**, which is the shape private
-inference is built from. Division and modulo are **refused with an error**,
-because they need quotient/remainder witnesses with range checks; `bench-suite`
-reports anything it cannot compile as unsupported instead of skipping it.
+Scope is stated rather than implied. It compiles `+`, `−`, `×`, `/`, `mod`,
+the signed comparisons `<`, `>`, `<=`, `>=`, `==`, arithmetic shifts by a public
+constant, plus `if`, `let` and sequences, over 64-bit words — enough to prove a
+**ReLU neuron** and a **Q16.16 multiply-rescale**, which are the shapes private
+inference is built from. Lambdas and list operations are **refused with an
+error**; `bench-suite` reports anything it cannot compile as unsupported instead
+of skipping it.
 
-Two details in that circuit are easy to get silently wrong, so they are worth
-knowing about if you extend it. The comparison gates are **unsigned**, so signed
-comparison flips both sign bits first — without that, every negative value
-compares as larger than every positive one and `relu(-1)` returns `-1`, a
-circuit that is perfectly sound about the wrong function. And those gates define
-only the *most significant bit* of their output, the rest being explicitly
-undefined, so the result is extracted with a logical shift rather than a mask.
+Three details in that circuit are easy to get silently wrong, so they are worth
+knowing about if you extend it.
+
+The comparison gates are **unsigned**, so signed comparison flips both sign bits
+first — without that, every negative value compares as larger than every
+positive one and `relu(-1)` returns `-1`, a circuit that is perfectly sound
+about the wrong function. Those gates also define only the *most significant
+bit* of their output, the rest being explicitly undefined, so the result is
+extracted with a logical shift rather than a mask.
+
+**Division is the sharp one.** A circuit cannot divide, so the prover supplies
+the quotient and remainder as witnesses and the circuit checks them — and the
+obvious check `a == b*q + r` with `|r| < |b|` is *unsound*, because circuit
+multiplication wraps mod 2⁶⁴. For `a = 1, b = 3` a cheating prover sets `r = 0`
+and `q = 3⁻¹ mod 2⁶⁴`; both checks pass and the quotient is nonsense. What
+closes it is requiring the 128-bit product's high word to be exactly the sign
+extension of the low word, so `b*q` cannot wrap. `tests/zkp_real.rs` drives that
+forgery through the real prover and asserts it is rejected.
 
 **The history is worth keeping.** Until 2026-07-31 this backend was
 `binius64_backend`, which concatenated hashes and whose `verify` never checked
