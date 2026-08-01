@@ -358,6 +358,64 @@ fn plans_for(n: usize) -> &'static [Plan] {
     plans_for_count(n, NUM_PRIMES)
 }
 
+// ─── Per-prime parallelism ───────────────────────────────────────────────────
+//
+// The multi-modular decomposition is the one place in this crate where
+// parallelism is *free of argument*: each prime gets its own reduction, its own
+// pair of transforms and its own residue vector, sharing only `&'static [Plan]`
+// and the immutable inputs. There is no reduction across threads, no RNG, and
+// no ordering — the residues are written into fixed slots, so the result is
+// bit-identical to the serial path whatever the scheduler does. That is why
+// this, and not the evaluator's channel loop, is where threading belongs: the
+// channel loop draws masks from an RNG stream whose order is part of the
+// protocol.
+//
+// It buys at most `NUM_PRIMES` (4), not the core count, and it speeds up every
+// caller — encryption, the ct×ct multiply and decryption all bottom out here.
+
+/// Worker threads for the per-prime loops. `BARU_NTT_THREADS=1` forces the
+/// serial path.
+///
+/// Kept switchable on purpose. A wall-clock figure that silently depends on how
+/// many cores the machine had is not comparable against published work, so the
+/// docs quote both, and quoting both requires both to stay runnable.
+fn ntt_threads() -> usize {
+    static N: OnceLock<usize> = OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("BARU_NTT_THREADS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|&v| v >= 1)
+            .unwrap_or(NUM_PRIMES_WIDE)
+    })
+}
+
+/// Map `f` over the plans, one thread per prime when enabled.
+///
+/// Results land in per-index slots rather than being pushed, so the output
+/// order is the prime order regardless of completion order — CRT
+/// reconstruction indexes residues by prime and would otherwise silently
+/// reconstruct against the wrong modulus.
+fn map_plans<T: Send>(
+    plans: &'static [Plan],
+    f: impl Fn(usize, &'static Plan) -> T + Sync,
+) -> Vec<T> {
+    if ntt_threads() <= 1 || plans.len() < 2 {
+        return plans.iter().enumerate().map(|(k, p)| f(k, p)).collect();
+    }
+    let mut slots: Vec<Option<T>> = (0..plans.len()).map(|_| None).collect();
+    std::thread::scope(|sc| {
+        let f = &f;
+        for (slot, (k, plan)) in slots.iter_mut().zip(plans.iter().enumerate()) {
+            sc.spawn(move || *slot = Some(f(k, plan)));
+        }
+    });
+    slots
+        .into_iter()
+        .map(|s| s.expect("every prime slot is filled by its thread"))
+        .collect()
+}
+
 // ─── The CRT accumulator ─────────────────────────────────────────────────────
 
 /// Two's-complement 256-bit integer: enough for `|c[k]| ≤ 2^210` and for the
@@ -421,21 +479,40 @@ fn crt_reconstruct_with<const L: usize>(
     n: usize,
     c: &CrtConst<L>,
 ) -> Vec<IntN<L>> {
-    (0..n)
-        .map(|k| {
-            let mut x = IntN::<L>::from_hi_lo(0, residues[0][k] as u128);
-            for (i, res) in residues.iter().enumerate().skip(1) {
-                let p = c.ps[i];
-                let xi = x.mod_u64(p);
-                let t = mulmod(submod(res[k] % p, xi, p), c.inv_prefix[i], p);
-                x = x.wrapping_add(c.prefix[i].mul_u64(t));
-            }
-            if !x.ult(c.half) {
-                x = x.wrapping_sub(c.modulus);
-            }
-            x
-        })
-        .collect()
+    // Garner reconstruction is a pure map over coefficients — each `k` reads
+    // its own residues and nothing else — so it splits across threads by
+    // coefficient range with no interaction. Worth doing separately from the
+    // per-prime parallelism: once the transforms are threaded, this is what is
+    // left of decryption, and Amdahl makes it the ceiling.
+    let at = |k: usize| -> IntN<L> {
+        let mut x = IntN::<L>::from_hi_lo(0, residues[0][k] as u128);
+        for (i, res) in residues.iter().enumerate().skip(1) {
+            let p = c.ps[i];
+            let xi = x.mod_u64(p);
+            let t = mulmod(submod(res[k] % p, xi, p), c.inv_prefix[i], p);
+            x = x.wrapping_add(c.prefix[i].mul_u64(t));
+        }
+        if !x.ult(c.half) {
+            x = x.wrapping_sub(c.modulus);
+        }
+        x
+    };
+    let threads = ntt_threads();
+    // Below a few hundred coefficients the spawn cost outweighs the work; the
+    // test rings (n=64) live down there.
+    if threads <= 1 || n < 512 {
+        return (0..n).map(at).collect();
+    }
+    let chunk = n.div_ceil(threads);
+    let mut parts: Vec<Vec<IntN<L>>> = (0..n.div_ceil(chunk)).map(|_| Vec::new()).collect();
+    std::thread::scope(|sc| {
+        let at = &at;
+        for (i, slot) in parts.iter_mut().enumerate() {
+            let (lo, hi) = (i * chunk, ((i + 1) * chunk).min(n));
+            sc.spawn(move || *slot = (lo..hi).map(at).collect());
+        }
+    });
+    parts.concat()
 }
 
 fn crt_reconstruct(residues: &[Vec<u64>], n: usize) -> Vec<I256> {
@@ -457,8 +534,7 @@ fn reduce_mod(v: &[i128], p: u64) -> Vec<u64> {
 pub fn exact_negacyclic_product(a: &[i128], b: &[i128], n: usize) -> Vec<I256> {
     assert_eq!(a.len(), n);
     assert_eq!(b.len(), n);
-    let mut residues: Vec<Vec<u64>> = Vec::with_capacity(NUM_PRIMES);
-    for plan in plans_for(n) {
+    let residues = map_plans(plans_for(n), |_, plan| {
         let p = plan.p;
         let mut fa = reduce_mod(a, p);
         let mut fb = reduce_mod(b, p);
@@ -468,8 +544,8 @@ pub fn exact_negacyclic_product(a: &[i128], b: &[i128], n: usize) -> Vec<I256> {
             fa[i] = mulmod(fa[i], fb[i], p);
         }
         plan.inverse(&mut fa);
-        residues.push(fa);
-    }
+        fa
+    });
     crt_reconstruct(&residues, n)
 }
 
@@ -482,8 +558,7 @@ pub fn exact_negacyclic_product(a: &[i128], b: &[i128], n: usize) -> Vec<I256> {
 pub fn exact_negacyclic_product_pre(ta: &Transformed, b: &[i128], n: usize) -> Vec<I256> {
     assert_eq!(ta.n, n);
     assert_eq!(b.len(), n);
-    let mut residues: Vec<Vec<u64>> = Vec::with_capacity(NUM_PRIMES);
-    for (k, plan) in plans_for(n).iter().enumerate() {
+    let residues = map_plans(plans_for(n), |k, plan| {
         let p = plan.p;
         let fa = &ta.res[k];
         let mut fb = reduce_mod(b, p);
@@ -492,8 +567,8 @@ pub fn exact_negacyclic_product_pre(ta: &Transformed, b: &[i128], n: usize) -> V
             fb[i] = mulmod(fa[i], fb[i], p);
         }
         plan.inverse(&mut fb);
-        residues.push(fb);
-    }
+        fb
+    });
     crt_reconstruct(&residues, n)
 }
 
@@ -562,14 +637,11 @@ pub struct Transformed {
 
 /// Forward-transform centered coefficients once, for reuse.
 pub fn forward_transform(a: &[i128], n: usize) -> Transformed {
-    let res = plans_for(n)
-        .iter()
-        .map(|plan| {
-            let mut f = reduce_mod(a, plan.p);
-            plan.forward(&mut f);
-            f
-        })
-        .collect();
+    let res = map_plans(plans_for(n), |_, plan| {
+        let mut f = reduce_mod(a, plan.p);
+        plan.forward(&mut f);
+        f
+    });
     Transformed { n, res }
 }
 
@@ -606,8 +678,7 @@ pub fn exact_bfv_tensor_pre(
 ) -> (Vec<I256>, Vec<I256>, Vec<I256>) {
     assert_eq!(ta0.n, n);
     assert_eq!(ta1.n, n);
-    let (mut r0, mut r1, mut r2) = (Vec::new(), Vec::new(), Vec::new());
-    for (k, plan) in plans_for(n).iter().enumerate() {
+    let per = map_plans(plans_for(n), |k, plan| {
         let p = plan.p;
         let fa0 = &ta0.res[k];
         let fa1 = &ta1.res[k];
@@ -623,15 +694,9 @@ pub fn exact_bfv_tensor_pre(
         plan.inverse(&mut d0);
         plan.inverse(&mut d1);
         plan.inverse(&mut d2);
-        r0.push(d0);
-        r1.push(d1);
-        r2.push(d2);
-    }
-    (
-        crt_reconstruct(&r0, n),
-        crt_reconstruct(&r1, n),
-        crt_reconstruct(&r2, n),
-    )
+        (d0, d1, d2)
+    });
+    crt_three(per, n)
 }
 
 /// The RLWE tensor with **both** operands already forward-transformed.
@@ -652,8 +717,7 @@ pub fn exact_bfv_tensor_pre_pre(
     assert_eq!(ta1.n, n);
     assert_eq!(tb0.n, n);
     assert_eq!(tb1.n, n);
-    let (mut r0, mut r1, mut r2) = (Vec::new(), Vec::new(), Vec::new());
-    for (k, plan) in plans_for(n).iter().enumerate() {
+    let per = map_plans(plans_for(n), |k, plan| {
         let p = plan.p;
         let (fa0, fa1) = (&ta0.res[k], &ta1.res[k]);
         let (fb0, fb1) = (&tb0.res[k], &tb1.res[k]);
@@ -665,15 +729,49 @@ pub fn exact_bfv_tensor_pre_pre(
         plan.inverse(&mut d0);
         plan.inverse(&mut d1);
         plan.inverse(&mut d2);
+        (d0, d1, d2)
+    });
+    crt_three(per, n)
+}
+
+/// Transpose the per-prime tensor residues into the three components and
+/// reconstruct each.
+///
+/// The three reconstructions are independent, so they run concurrently too —
+/// on the `--precompute` path every forward transform has already been hoisted
+/// into the session preamble, which leaves the inverse transforms and *this*
+/// as the whole of the online multiply.
+#[allow(clippy::type_complexity)]
+fn crt_three(
+    per: Vec<(Vec<u64>, Vec<u64>, Vec<u64>)>,
+    n: usize,
+) -> (Vec<I256>, Vec<I256>, Vec<I256>) {
+    let (mut r0, mut r1, mut r2) = (
+        Vec::with_capacity(per.len()),
+        Vec::with_capacity(per.len()),
+        Vec::with_capacity(per.len()),
+    );
+    for (d0, d1, d2) in per {
         r0.push(d0);
         r1.push(d1);
         r2.push(d2);
     }
-    (
-        crt_reconstruct(&r0, n),
-        crt_reconstruct(&r1, n),
-        crt_reconstruct(&r2, n),
-    )
+    if ntt_threads() <= 1 {
+        return (
+            crt_reconstruct(&r0, n),
+            crt_reconstruct(&r1, n),
+            crt_reconstruct(&r2, n),
+        );
+    }
+    let (mut c0, mut c1, mut c2) = (Vec::new(), Vec::new(), Vec::new());
+    std::thread::scope(|sc| {
+        let h0 = sc.spawn(|| crt_reconstruct(&r0, n));
+        let h1 = sc.spawn(|| crt_reconstruct(&r1, n));
+        c2 = crt_reconstruct(&r2, n);
+        c0 = h0.join().expect("crt thread panicked");
+        c1 = h1.join().expect("crt thread panicked");
+    });
+    (c0, c1, c2)
 }
 
 #[cfg(test)]

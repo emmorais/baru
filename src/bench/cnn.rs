@@ -919,15 +919,31 @@ fn mpc_conv_relu_pool(
                 })
                 .collect();
             let import_ms = ms(t);
-            let t = Instant::now();
-            let relu = fused_relu_rescale(be, &vs, shift, nbits, nonlin);
-            let relu_ms = ms(t);
+            // Max-pool BEFORE the nonlinearity, not after.
+            //
+            // `relu∘rescale` is monotonic non-decreasing, so it commutes with
+            // `max`:  maxpool(f(v)) == f(maxpool(v)).  Pooling first shrinks
+            // the ReLU layer by `POOL²` — 4× here — and the comparisons the
+            // pool itself costs are unchanged, so this is a strict reduction
+            // in nonlinearity work, not a trade.
+            //
+            // Two things make it safe. The comparison now sees *pre*-activation
+            // values, which can be negative: `lt` is the MSB of `a − b`, i.e.
+            // signed, so that is fine. And `a − b` must stay inside the
+            // two's-complement range — it does, because `nbits` is calibrated
+            // as `max_abs.bit_length() + 2` over exactly these values, so
+            // |a|,|b| < 2^(nbits−2) and |a−b| < 2^(nbits−1). Those two bits of
+            // headroom are what this relies on; shrinking them would break it.
+            //
             // `maxpool2d` reduces to `lt_batch`, which the backend flag above
             // has already routed — the gadget itself is protocol-agnostic.
             let t = Instant::now();
-            let (pooled, _) = maxpool2d(be, &relu, conv_shape, POOL, POOL);
+            let (pooled, _) = maxpool2d(be, &vs, conv_shape, POOL, POOL);
             let pool_ms = ms(t);
-            let comps = pooled.iter().map(|p| be.my_additive_component(p)).collect::<Vec<Fr>>();
+            let t = Instant::now();
+            let relu = fused_relu_rescale(be, &pooled, shift, nbits, nonlin);
+            let relu_ms = ms(t);
+            let comps = relu.iter().map(|p| be.my_additive_component(p)).collect::<Vec<Fr>>();
             (comps, MpcPhases { import_ms, relu_ms, pool_ms, ..Default::default() })
         }
     });
@@ -1774,6 +1790,75 @@ pub fn run_cli(args: &[String]) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Why the nonlinearity is a garbled *comparator* plus an **arithmetic**
+    /// select, rather than one fused garbled max-of-4.
+    ///
+    /// Measured 2026-08-01 at N=5256 (the pool's comparison count for
+    /// pneumonia), solving the two-point cost model:
+    ///
+    /// | | |
+    /// |---|---|
+    /// | `lt_batch` (19 AND + 1-bit Y2A) | 43.1 ms |
+    /// | `mul_batch` (Beaver select) | 5.1 ms |
+    /// | `relu_gc` (31 AND + 12-bit Y2A) | 68.4 ms |
+    /// | ⇒ per AND-gate column | **2.28 ms** |
+    /// | ⇒ per Y2A output bit | **≈ 0** |
+    ///
+    /// So the cost is **proportional to AND-gate count**; the Y2A conversion is
+    /// free and the Beaver select is 11% of an `lt`+`mul` pair. That kills the
+    /// obvious fusion: a garbled max-of-4 would replace three cheap arithmetic
+    /// selects with three garbled muxes, taking a 2×2 window from 88 AND gates
+    /// to 148 — **1.68× more work** to remove 11%. The current split is right,
+    /// and this probe is what says so.
+    ///
+    /// It also says where a real win must come from: 158 144 AND gates per
+    /// inference is the whole nonlinearity budget, so beating it means not
+    /// garbling the comparison at all (Falcon's wrap-based DReLU), not
+    /// rearranging what is garbled.
+    #[test]
+    #[ignore] // profiling probe, real 3-party transport
+    fn profile_lt_versus_mul_under_gc() {
+        const N: usize = 5256; // the pool's comparison count for pneumonia
+        let (out, _) = run_parties(NetworkProfile::INSTANT, |me| {
+            move |be: &mut TransportBackend<MpcTransport>| {
+                be.set_gc_nonlinearities(true);
+                let a: Vec<ShareRef> =
+                    (0..N).map(|i| be.share_secret(if me == 0 { i as u128 % 977 } else { 0 }, 20, 0)).collect();
+                let b: Vec<ShareRef> =
+                    (0..N).map(|i| be.share_secret(if me == 0 { i as u128 % 613 } else { 0 }, 20, 0)).collect();
+                let pairs: Vec<(ShareRef, ShareRef)> =
+                    a.iter().cloned().zip(b.iter().cloned()).collect();
+
+                let t = Instant::now();
+                let conds = be.lt_batch(&pairs);
+                let lt_ms = ms(t);
+
+                let mul_pairs: Vec<(ShareRef, ShareRef)> = conds
+                    .iter()
+                    .zip(a.iter().zip(b.iter()))
+                    .map(|(c, (x, y))| (c.clone(), be.sub(y, x)))
+                    .collect();
+                let t = Instant::now();
+                let _ = be.mul_batch(&mul_pairs);
+                let mul_ms = ms(t);
+
+                let t = Instant::now();
+                let _ = be.relu_gc_batch(&a, 20, 8);
+                let relu_ms = ms(t);
+                (lt_ms, mul_ms, relu_ms)
+            }
+        });
+        let (lt, mul, relu) = out[0];
+        println!(
+            "\n  N={N}\n  lt_batch  (garbled comparator + Y2A) : {lt:.1} ms\n  \
+             mul_batch (Beaver select)            : {mul:.1} ms\n  \
+             relu_gc   (comparator+rescale + Y2A) : {relu:.1} ms\n  \
+             -> Beaver select is {:.0}% of an lt+mul pair, so fusing max-of-4 into\n     \
+             one garbled circuit trades 88 AND gates/window for 148 — a loss.\n",
+            mul / (lt + mul) * 100.0
+        );
+    }
 
     #[test]
     #[ignore] // uses the real 3-party transport

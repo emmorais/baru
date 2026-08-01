@@ -1064,13 +1064,54 @@ baru bench-medmnist --dataset all --hybrid 3 --both
 | float accuracy of the same net | 84.78% | 81.03% |
 | majority-class baseline | 62.50% | 18.48% |
 | published ResNet-18 (28×28) | 0.854 | 0.935 |
-| encrypted == plaintext diagnosis | 3/3 | 3/3 |
+| 95% CI on the full-test figure | [81.7, 87.4] | [80.6, 81.8] |
+| **AUC, full test set** | **0.9314** | **0.9590** (macro OvR) |
+| published ResNet-18 AUC | 0.944 | 0.997 |
+| **balanced accuracy, full test set** | **80.64%** | **80.49%** |
+| sensitivity / specificity | 97.18% / **64.10%** | — |
+| encrypted == plaintext diagnosis | **300/300** | **300/300** |
 | FHE bootstraps | 0 | 0 |
-| latency/diagnosis, `a2b` | 5.71 s | 5.95 s |
-| + `--gc` | 4.94 s | 5.05 s |
-| + `--precompute` (**online**) | **2.90 s** | **3.00 s** |
-| offline, per query | 2.03 s | 2.04 s |
-| online at WAN (`--rtt-ms 20 --bandwidth-mbps 1000`) | 5.00 s | 5.30 s |
+
+The AUC and balanced-accuracy rows were measured against the real MedMNIST test
+splits from these exact committed weights, not from a regeneration — and
+recomputing accuracy the same way reproduced 84.78% / 81.18% to six decimals,
+which is what ties them to these weights.
+
+**Read the sensitivity/specificity row before quoting the accuracy.** Pneumonia's
+test set is ~60% positive, and the model earns its 84.78% largely by
+over-calling disease: it catches 97.18% of pneumonia but clears only 64.10% of
+healthy scans. Balanced accuracy is 80.64%, not 84.78%. Organa's weakest classes
+are kidney-left and spleen at 64% recall each. None of this is a cryptographic
+result — it is what the 53 k-parameter model does — but reporting accuracy alone
+would overstate it.
+
+Latencies **re-measured 2026-08-01, Apple M1 Pro (8 cores), 20 images/config**.
+The previous revision of this table carried 5.71 / 4.94 / 2.90 s, which had gone
+stale: the session-key hoists of 2026-07-30 (`3cd9fe4`) refreshed `README.md`
+and [private-inference-performance.md](private-inference-performance.md) to
+488 ms but never reached this table. The check that this is a code change and
+not a faster machine: HEAD-before-optimisation measures **488 ms** here, exactly
+the figure that commit recorded.
+
+| | pneumonia | organa |
+|---|---|---|
+| latency/diagnosis, `a2b` | 1.63 s | 1.74 s |
+| + `--gc` | 0.88 s | 0.90 s |
+| + `--precompute`, **single core** | 0.435 s | 0.460 s |
+| + **4 NTT threads** (**online**) | **0.268 s** | **0.291 s** |
+| offline, **per query** (mask pool, cannot be amortised) | 0.14 s/image | 0.14 s/image |
+| online at WAN (`--rtt-ms 20 --bandwidth-mbps 1000`) | 2.65 s | 2.81 s |
+| party-to-party traffic (`--gc`) | 61 msgs, 10.1 MB | 76 msgs, 11.3 MB |
+
+Both a single-core and a threaded figure are quoted deliberately: the threading
+is in the multi-modular NTT (independent primes, plus a pure-map CRT), is
+bit-identical to the serial path, and is disabled by `BARU_NTT_THREADS=1`. A
+wall-clock number that silently depends on core count cannot be compared against
+published work, so the comparable one stays measurable.
+
+Quote the online figure *with* the per-query offline one: 0.32 s/image of mask
+generation must happen for every query and only moves off the critical path, so
+"0.41 s per diagnosis" is the latency, not the work.
 
 Three readings. **Quantisation and encryption are both free**: the integer net
 tracks its float parent to within 0.2 points (agreeing on 99.7% / 98.7% of test
@@ -1086,14 +1127,29 @@ this is what stops the model getting wider, and it is a packing question, not a
 limit of the no-bootstrap construction: it relaxes at `n = 8192` or by
 splitting channels across ciphertexts. Only then does the depth-1 noise budget
 bind, on the activation magnitude. The result is enough to match published
-ResNet-18 on pneumonia and 12 points short of it on the 11-class organ task. And **the cost centre is FHE**: of the
-2.90 s chest-X-ray diagnosis, **2.13 s (73%) is FHE arithmetic** and 0.76 s is
-the whole MPC segment (import 0.02 s, ReLU 0.51 s, pool 0.21 s, argmax 0.01 s).
-A diagnosis used to take ~33 s: the batched scheme-switch import took it to
-5.71 s, garbled nonlinearities (`--gc`) to 4.94 s, and preprocessed masks
-(`--precompute`) to **2.90 s online** — an 11× reduction with the construction
-unchanged. Anyone optimising further should go to `fhe::bfv`, not the MPC layer.
-On a wide-area link a diagnosis is 5.00 s — the pipeline is not round-bound, and
+ResNet-18 on pneumonia and 12 points short of it on the 11-class organ task.
+
+And **the cost centre is the MPC nonlinearities again**: of the 268 ms
+chest-X-ray diagnosis, 99 ms is FHE (mul 44, decrypt 45, re-encrypt 10) and
+**168 ms (63%) is the MPC segment** (import 22, ReLU 38, pool 69, argmax 8).
+That is the fourth time the answer has flipped, which is the point: *which side
+dominates* has a half-life of about one optimisation, so no plan should rest on
+it. A diagnosis used to take ~33 s: the batched scheme-switch import took it to
+5.71 s, garbled nonlinearities (`--gc`) to 4.94 s, preprocessed masks
+(`--precompute`) to 2.90 s, the fixed-key AES gate hash and the three
+session-key hoists to 488 ms, **commuting the ReLU past the max-pool to 435 ms**,
+and **threading the multi-modular NTT to 268 ms on four cores** — 123× in total,
+with the construction unchanged and every step exact.
+
+That last step is worth stating as an identity rather than a tuning result:
+`relu∘rescale` is monotonic non-decreasing, so it commutes with `max`, and
+pooling *first* shrinks the ReLU layer by `POOL²` = 4× at no cost to the pool
+itself. It is exact, not approximate — the bit-exactness tests are unchanged.
+It buys 1.17× here and 1.38× on the `a2b` path, where the nonlinearity is the
+dominant cost rather than a sixth of it.
+
+Anyone optimising further should go to `fhe::bfv`, not the MPC layer. On a
+wide-area link a diagnosis is 2.65 s — the pipeline is not round-bound, and
 garbling is worth 2.0× on the MPC segment there.
 
 The same swap applies to the linear-discriminator demo:

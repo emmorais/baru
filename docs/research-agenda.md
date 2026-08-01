@@ -870,6 +870,21 @@ everything is "planned" cannot express priority.
   roadmap's P1 list). That would turn the crossover *point* from a prediction resting
   on measured inputs into a measured crossover.
 
+* **GPU offload for the NTT — wanted, but Amdahl says wait.** The multi-modular
+  NTT is the classic GPU target and the per-prime structure that made threading
+  free (§3.5 of [private-inference-performance.md](private-inference-performance.md))
+  maps to a GPU just as cleanly. The reason it is parked: after threading, FHE is
+  **37% of the online latency** (99 ms of 268), so a GPU that made FHE *free*
+  would buy 1.59× and no more, while the MPC nonlinearities that now dominate
+  (63%) are garbled circuits — the thing GPUs are worst at. Two conditions would
+  flip this, and both should be checked before any CUDA/Metal is written:
+  (a) moving past 28×28, where `n` grows to 8192+ and the transforms dominate
+  again; (b) *throughput* rather than latency — batched serving amortises kernel
+  launch and PCIe transfer, which at `n = 4096` for a single image would likely
+  eat the win outright. Prior art to price against first: CryptGPU and Piranha
+  put 3-party MPC itself on the GPU, which is a different and possibly better
+  bet than accelerating our FHE half.
+
 * **Secret-index array access, priced** — *ahead of ORAM, and cheap.* CirC
   (`docs/related-work.md` §2) implements exactly the two cases either side of the
   ORAM line: a public index compiles away, a secret index becomes an `n`-way mux

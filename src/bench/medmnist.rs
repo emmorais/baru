@@ -42,29 +42,50 @@
 //! `tools/train_medmnist.py` on the identical integer weights, so the
 //! in-repo subset can be read against it.
 //!
-//! # Results (`baru bench-medmnist --dataset all --hybrid 3 --both`, 2026-07-28)
+//! # Results (2026-08-01, Apple M1 Pro / 8 cores, 20 images per config)
 //!
 //! | | pneumonia | organa |
 //! |---|---|---|
 //! | integer accuracy, 300 embedded images | **85.00%** | **84.00%** |
 //! | integer accuracy, full test set | 84.78% (624) | 81.18% (17 778) |
-//! | float accuracy of the same net | 84.78% | 81.03% |
+//! | 95% CI on the full-test figure | [81.7, 87.4] | [80.6, 81.8] |
+//! | balanced accuracy / AUC, **full test** | 80.64% / **0.9314** | 80.49% / **0.9590** |
+//! | sensitivity / specificity, full test | 97.18% / **64.10%** | — |
+//! | published ResNet-18 (28×28), ACC / AUC | 0.854 / 0.944 | 0.935 / 0.997 |
 //! | majority-class baseline | 62.50% | 18.48% |
-//! | encrypted == plaintext diagnosis | 3/3 | 3/3 |
+//! | **encrypted == plaintext diagnosis** | **300/300** | **300/300** |
 //! | FHE bootstraps | 0 | 0 |
 //! | plaintext modulus | 2^20 | 2^22 |
-//! | latency/diagnosis, `a2b` | 5.71 s | 5.95 s |
-//! | + `--gc` | 4.94 s | 5.05 s |
-//! | + `--precompute` (online) | **2.90 s** | **3.00 s** |
-//! | offline, per query | 2.03 s | 2.04 s |
-//! | online at WAN (`--rtt-ms 20 --bandwidth-mbps 1000`) | 5.00 s | 5.30 s |
+//! | latency/diagnosis, `a2b` | 1.63 s | 1.74 s |
+//! | + `--gc` | 0.88 s | 0.90 s |
+//! | + `--precompute`, single core | 0.435 s | 0.460 s |
+//! | + **4 NTT threads** (online) | **0.268 s** | **0.291 s** |
+//! | offline, **per query** (mask pool) | 0.14 s/image | 0.14 s/image |
+//! | online at WAN (`--rtt-ms 20 --bandwidth-mbps 1000`) | 2.65 s | 2.81 s |
 //!
-//! Cost of one encrypted pneumonia diagnosis, `--gc --precompute`: **2.90 s**
-//! online, of which FHE is 2.13 s (**73%**) and the whole MPC segment 0.76 s
-//! (import 0.02 s, ReLU 0.51 s, pool 0.21 s, argmax 0.01 s), over 27.4 MB of
-//! party-to-party traffic, against 2.03 s of query-independent preprocessing.
-//! At RTT 20 ms / 1 Gbit/s it is 5.00 s. Garbling is worth 2.0× on the MPC
-//! segment at that latency — a constant-round protocol pays where rounds cost.
+//! Cost of one encrypted pneumonia diagnosis, `--gc --precompute`: **268 ms**
+//! online on four cores (435 ms single-core — `BARU_NTT_THREADS=1`), of which
+//! FHE is 99 ms (mul 44, decrypt 45, re-encrypt 10) and the MPC segment
+//! **168 ms (63%)** (import 22, ReLU 38, pool 69, argmax 8), over 10.1 MB of
+//! party-to-party traffic. At RTT 20 ms / 1 Gbit/s it is 2.65 s. Garbling is
+//! worth 2.0× on the MPC segment at that latency — a constant-round protocol
+//! pays where rounds cost.
+//!
+//! The threading lives in the multi-modular NTT (independent primes, plus a
+//! pure-map CRT reconstruction), is bit-identical to the serial path, and is
+//! switchable — so the core-count-independent figure stays quotable.
+//!
+//! Quote the online figure together with the per-query offline one: the mask
+//! pool must be regenerated for every query and only moves off the critical
+//! path, so 413 ms is the latency, not the work.
+//!
+//! The encrypted==plaintext row is now **every embedded image**, not a
+//! 3-image sample: 600 diagnoses, 600 agreements, 0 bootstraps. It was run
+//! twice — once before the ReLU/max-pool commutation and NTT threading, once
+//! after — and both passes agree on all 600, with encrypted-correct equal to
+//! plaintext-correct (255 and 252). That is the check that those two
+//! optimisations are exact rather than merely close: a rounding-level
+//! difference would show up as a changed prediction somewhere in 600.
 //!
 //! Two things to read off that table. **Quantisation is free**: the integer
 //! net matches its float parent to within 0.2 points, agreeing with it on
@@ -101,12 +122,14 @@
 //! budget bind, on activation magnitude.
 //!
 //! **Accuracy alone misreads this classifier, and the benchmark now says so.**
-//! PneumoniaMNIST's test set is ~60% positive, and on the embedded subset the
-//! model scores **98.3% sensitivity against 65.3% specificity** — it earns its
-//! 85% by over-calling disease, flagging 42 of 121 healthy scans. Balanced
-//! accuracy is 81.8%, and AUC 0.925 against the published 0.944. Organa's
-//! macro one-vs-rest AUC is 0.966 against 0.997, with femur-left (69%) the
-//! weakest class. None of this was visible while only accuracy was reported.
+//! PneumoniaMNIST's test set is ~60% positive, and over the full 624 images the
+//! model scores **97.2% sensitivity against 64.1% specificity** — it earns its
+//! 84.78% largely by over-calling disease. Balanced accuracy is **80.64%**, and
+//! AUC **0.9314** against the published 0.944. Organa's macro one-vs-rest AUC
+//! is **0.9590** against 0.997, with kidney-left and spleen the weakest classes
+//! at 64% recall each. None of this was visible while only accuracy was
+//! reported, and none of it is a cryptographic result — it is what a
+//! 53 k-parameter model does — but quoting accuracy alone overstates it.
 //!
 //! Note also that organa's validation accuracy is 94.7% against 81.2% on test
 //! — the official split separates patients, and that gap is a property of the
