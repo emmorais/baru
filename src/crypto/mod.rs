@@ -7,6 +7,7 @@ pub mod garbled;
 pub mod gc_protocol;
 pub mod arith;
 pub mod bits;
+pub mod field;
 pub mod identity;
 pub mod net;
 pub mod protocol;
