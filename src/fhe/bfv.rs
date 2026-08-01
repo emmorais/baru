@@ -773,6 +773,79 @@ mod tests {
     /// Measure the ACTUAL post-multiply noise budget of a depth-1 ct×ct
     /// product — the number that gates threshold decryption with smudging
     /// (`docs/malicious-hybrid.md` §6). Prints, does not assert a bound, since
+    /// The same measurement at **n=8192**, which is the parameter set
+    /// `fhe::boundary` recommends once the input-boundary proof's soundness
+    /// slack is charged against the smudging budget (§6b/§6c of
+    /// `docs/malicious-hybrid.md`).
+    ///
+    /// That recommendation previously rested on a *model* of how `|e_mult|`
+    /// grows with the ring dimension. This measures it, and then feeds the
+    /// measured value through the same budget calculation the model used — so
+    /// the parameter choice is backed by a number rather than an inference.
+    #[test]
+    fn measures_post_multiply_noise_at_n8192() {
+        use crate::fhe::boundary::achievable_lambda;
+        use crate::fhe::boundary_proof::{WellFormedProof, HONEST_BOUND, MIN_REPS};
+
+        let log2_t = 20u32;
+        let p = BfvParams { n: 8192, log2_q: 120, log2_t };
+        let s = Bfv::new(p);
+        let (ck, pk) = s.keygen();
+        let t = p.t();
+        let mut rng = rand::thread_rng();
+        let m1: Vec<u64> = (0..p.n).map(|_| rng.gen::<u64>() % t).collect();
+        let m2: Vec<u64> = (0..p.n)
+            .map(|_| (rng.gen_range(-8i64..=8)).rem_euclid(t as i64) as u64)
+            .collect();
+        let c = s.mul(&s.encrypt_poly(&pk, &m1), &s.encrypt_poly(&pk, &m2));
+
+        let sk = s.bundle(&ck).s;
+        let mask = p.q_mask();
+        let mut acc = c.c.last().unwrap().clone();
+        for ci in c.c.iter().rev().skip(1) {
+            acc = poly_mul_mod(&acc, &sk, &p);
+            acc = poly_add(&acc, ci, mask);
+        }
+        let m_true = s.decrypt_poly(&ck, &c);
+        let delta = 1u128 << p.delta_shift();
+        let mut max_noise: i128 = 0;
+        for (&accv, &mv) in acc.iter().zip(&m_true) {
+            let dm = delta.wrapping_mul(mv as u128) & mask;
+            let noise = center(accv.wrapping_sub(dm) & mask, &p).unsigned_abs() as i128;
+            max_noise = max_noise.max(noise);
+        }
+        let noise_bits = (max_noise as f64).log2().ceil() as u32;
+
+        // The whole chain, with every term measured or enforced in code.
+        let slack = WellFormedProof::slack_bits(p.n, HONEST_BOUND, MIN_REPS);
+        let lambda = achievable_lambda(&p, noise_bits, slack);
+        println!(
+            "n=8192 q=2^120 t=2^20: |e_mult|≈2^{noise_bits}, boundary-proof slack {slack} bits, \
+             achievable lambda = {lambda}"
+        );
+
+        // Correctness at these parameters means the noise sits below q/2t, so
+        // the rounding recovers the plaintext. (Checking the *value* would need
+        // the negacyclic convolution of the two plaintexts — BFV multiply is a
+        // polynomial product, not elementwise; an earlier version of this test
+        // asserted the elementwise product and failed for that reason.)
+        let ceiling = crate::fhe::boundary::correctness_ceiling_bits(&p);
+        assert!(
+            noise_bits < ceiling,
+            "noise 2^{noise_bits} must stay under the correctness bound 2^{ceiling}"
+        );
+
+        // **The measured conclusion, which corrects an earlier inference.**
+        // `boundary::smallest_ring_for` previously proposed n=8192 with
+        // q=2^190. That modulus is not representable: this BFV stores q in a
+        // u128, so log2 q <= 127. At the largest modulus the implementation can
+        // actually hold, a realistic boundary proof leaves lambda = 30, not 40.
+        assert!(
+            (28..=32).contains(&lambda),
+            "expected lambda around 30 at the largest representable modulus, got {lambda}"
+        );
+    }
+
     /// the point is to read the measured value into the parameter analysis.
     #[test]
     fn measures_post_multiply_noise_budget() {

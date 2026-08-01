@@ -70,6 +70,8 @@ pub mod ntt;
 /// CRT slot packing — `n` independent values per ciphertext, for the
 /// elementwise products [`crate::mpcc::lowgear`] needs.
 pub mod slots;
+pub mod boundary;
+pub mod boundary_proof;
 pub mod threshold;
 /// Runtime switch choosing which implementation computes the ring products
 /// every FHE scheme here depends on ([`ntt`], or [`ntl`] when built in).

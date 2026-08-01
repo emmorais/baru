@@ -80,19 +80,33 @@ post-quantum TLS transports.
 | Layer | Location | What it provides |
 |---|---|---|
 | **Interpreter** | `src/interpreter/` | Lisp parser, AST, trampolined evaluator, REPL, pluggable `Backend` |
-| **MPC** | `src/crypto/` | ABY3 replicated shares, **triple-free** multiplication, bit decomposition, batched primitives, in-process and TCP transports |
+| **MPC** | `src/crypto/` | ABY3 replicated shares, **triple-free** multiplication, bit decomposition, batched primitives, in-process and TCP transports. **Malicious security with abort** (`crypto::aby3_verify`, `interpreter::malicious_backend`) |
 | **FHE** | `src/fhe/` | BFV and BGV (secure, depth-1, no eval keys), TFHE-rs, SEAL CKKS (+ exact mock twins), multi-modular NTT, CRT slot packing |
-| **Hybrid** | `src/hybrid/` | MPC ↔ FHE scheme switching in both directions; re-encryption as a bootstrapping alternative |
+| **Hybrid** | `src/hybrid/` | MPC ↔ FHE scheme switching in both directions; re-encryption as a bootstrapping alternative; threshold-key switch with derandomized, checkable operations (`hybrid::threshold_switch`) |
 | **ZKP** | `src/zkp/` | Expression → circuit compiler, **real Binius64 prover/verifier** (`zkp::binius_real`; arithmetic, signed comparisons, `if`, `let`), proof serialization. The legacy `binius64_backend` is a retained placeholder that proves nothing — see the ZKP note below |
 | **Gadgets** | `src/gadgets/` | UC-composable MPC building blocks: `relu`, `maxpool2d`, `argmax`, `dense`, `conv2d` — each bit-exact against a plaintext reference |
 | **MPC compiler** | `src/mpcc/` | Backend-aware circuit IR, rewrite rules, cost models, protocol registry (dealer / Shamir / Semi2k / LowGear), executable VM |
-| **Primitives** | `src/ot/`, `src/psi/`, `src/pir/` | Chou–Orlandi + IKNP OT, DH-PSI, single-server BFV PIR — all measured, including where they lose |
+| **Primitives** | `src/ot/`, `src/psi/`, `src/pir/` | Chou–Orlandi + IKNP OT (with KOS check and Schnorr PoK), DH-PSI (with a batched DLEQ proof), single-server BFV PIR — all measured, including where they lose |
 | **ML plumbing** | `src/ml/`, `src/precompile/` | Model import + Q16.16 quantization with an accuracy report; champion-dispatched batched gadgets |
 | **Node** | `src/bin/tcp_party.rs` | Multi-party node: a distributed MPC evaluator over real sockets (plaintext TCP or optional PQ-TLS) |
 
 The interpreter's `Backend` trait bridges the layers: every arithmetic or
 comparison operation on a shared value dispatches through a backend that runs the
 appropriate protocol round.
+
+### Security posture
+
+Every engine **attests** what it actually implements
+(`crypto::attestations` — one table, readable in a sitting), and asking a
+session for more than an engine attests is an error rather than a silent
+downgrade. Today exactly one engine attests malicious security:
+`MaliciousBackend`, the ABY3 layer, secure **with abort** against one corrupt
+party in three. Everything else is semi-honest and says why, naming the specific
+gap.
+
+That gate is deliberate. The malicious upgrade landed in stages, and a
+half-finished stage must not be mistakable for a finished one — by a caller, a
+benchmark, or a paper table.
 
 ---
 
@@ -113,6 +127,8 @@ the corrections behind each row are in [`docs/experiments.md`](docs/experiments.
 | Our NTT vs NTL+GMP | **1.8× faster** at every size (after the Shoup butterfly rewrite) | `bench-polymul` |
 | Triples from SHE vs from OT | **192 B/triple** vs 3074, and ~28× faster | `bench-triples` |
 | Compiler vs expert hand-written network | **0.38×** the interactive calls, **0.49×** the messages | `bench-compiled-nn` |
+| **Cost of active security** (malicious ABY3, with abort) | comparisons: **2.63×** bytes but only **1.06×** rounds, **1.23×** wall clock on a WAN | `bench-malicious` |
+| **Proving** a Q16.16 quantized neuron (784 inputs) | **32 ms** prove, **4.8 ms** verify, 112 KB proof; constraints linear in width, proof size far sublinear | `bench-zkp-layer` |
 
 Honest negatives are first-class here and kept alongside the wins: PIR loses to
 downloading the database by 13×; hybrid-TFHE does not pay; faster ring arithmetic

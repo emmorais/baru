@@ -292,6 +292,134 @@ revealed and the flooding requirement collapses. This is the SPDZ/Overdrive
 "distributed decryption to shares" trick; adapting it to our mask-and-open
 switch (which currently *does* open `v + r`) is the way to keep λ = 80 at
 n=4096 if the 3× ciphertext of n=8192 is unwelcome.
+### 6b. The boundary proof's soundness slack is paid out of the smudging budget
+
+**Added 2026-07-31, and it changes the parameter conclusion of §6a.**
+
+§6a measured `|e_mult|` and found ~40 bits of smudging headroom at n=4096,
+concluding the parameters were fine. That analysis assumed **honest inputs** —
+which is precisely what the boundary proof exists to stop assuming.
+
+Every practical lattice Σ-protocol is *relaxed*: the extractor recovers a
+witness whose norm exceeds the honest one by a slack factor, from the challenge
+difference and from rejection sampling. A verifier accepting such a proof is
+accepting inputs with noise up to `2^slack · B`. That slack does not stay at the
+boundary — the depth-1 multiply is linear in each operand's noise, so it passes
+straight through to the magnitude threshold decryption must hide:
+
+> **Each bit of soundness slack in the boundary proof costs one bit of
+> statistical security in the threshold decryption.**
+
+Computed by `fhe::boundary::achievable_lambda`, with the one-for-one relation
+pinned by a test. The consequences:
+
+| boundary proof slack | λ achievable at n=4096, q=2^100, t=2^20 |
+|---|---|
+| 0 (idealised) | ~38–40 |
+| 2^10 (tight Σ-protocol) | ~28 |
+| 2^20 (typical) | ~18 |
+
+So **n=4096 supports a conservative λ only with an unusually tight proof**.
+§6a's "fits at n=4096, no parameter change needed" is correct for honest inputs
+and optimistic for the malicious setting the rest of this document is about.
+
+> **Corrected by measurement (§6d).** This section originally concluded "n=8192
+> makes the combination comfortable". That was inferred, and it was wrong: the
+> modulus it assumed (q=2^190) is not representable by this implementation, and
+> the measured result at the largest one that is leaves **λ = 30, not 40**.
+
+The design constraint for whoever builds the proof is
+`max_tolerable_slack_bits`, which answers the only question that matters: *how
+loose may this proof be?* At n=4096 targeting λ=30, the answer is about 8 bits.
+
+This is a conclusion neither analysis reaches alone; it only appears when the
+boundary proof and the threshold decryption are budgeted together.
+
+### 6c. Implementing the boundary proof: rejection sampling is a grinding oracle
+
+**Added 2026-07-31.** `fhe::boundary_proof` implements §4.4 as a Σ-protocol
+over the ring with Fiat–Shamir and rejection sampling (the Lyubashevsky shape).
+Two things went wrong while building it, both of which an implementation can
+have while passing every obvious test.
+
+**1. Global retry makes parallel repetitions unreachable.** Fiat–Shamir derives
+all challenges from all commitments at once, so a rejection *anywhere* forces
+the whole proof to restart. With a mask width of `M = 3n·B` — the value that
+gives a comfortable per-coefficient acceptance rate — overall acceptance is
+`0.37^reps`: at 8 repetitions, about one attempt in three thousand, and the
+prover appears to hang. The mask must be sized against `n · reps`, not `n`.
+
+**2. The retry loop grinds the challenge.** This is the serious one. A rejected
+transcript is discarded and the masks resampled, which resamples the
+commitments and therefore *the challenges*. If the challenge vector ever comes
+out all-zero, every response is a pure mask: no witness is ever added, nothing
+is rejected, and **the transcript verifies while proving nothing**. An honest
+prover reaches that state by accident in about `2^reps` attempts; a malicious
+one aims for it.
+
+At `reps = 8` this was reproducible in seconds. The prover "proved" a
+ciphertext whose noise was `2^40` times the permitted bound — precisely the
+malformed input the boundary exists to reject — and the verifier accepted.
+
+So with binary challenges, `reps` is **not** a soundness-error knob to set to
+taste; it is a *grinding-resistance* parameter and must equal the security
+level. `MIN_REPS = 128` is enforced by both prover and verifier — the verifier
+side matters, since accepting a short proof is accepting a forgery.
+
+**Cost.** 128 repetitions × 4 response polynomials. The slack this construction
+achieves is ~25 bits, which §6b prices: it does not fit at n=4096, and n=8192 is
+the parameter set that absorbs it. The proof is charged once per input
+ciphertext, never per operation, which remains the crisp contrast with
+single-server verifiable FHE.
+
+**Status.** This is a working, tested implementation of the relation, not a
+production-hardened proof system: the security argument above is a sketch, the
+constant-time behaviour of the sampler has not been audited, and the `n=8192`
+parameter recommendation follows from §6b's model rather than from a fresh
+noise measurement at that dimension. It closes §4.4 as *implemented and
+testable*, not as *reviewed*.
+
+### 6d. Measured at n=8192 — and the binding constraint is the modulus, not the ring
+
+**Added 2026-07-31.** §6b concluded that n=8192 would absorb the boundary
+proof's slack. That was a model, and measuring it produced two corrections.
+
+**1. The recommended parameters were not representable.**
+`boundary::smallest_ring_for` proposed `n = 8192, q = 2^190`. This BFV holds the
+modulus in a `u128` (`q_mask` is `(1 << log2_q) - 1`), so `log2 q ≤ 127` and the
+proposal overflows on construction. The search now caps at
+`MAX_REPRESENTABLE_LOG2_Q` and returns `None` when a target is unreachable —
+`None` being a real answer, not an invitation to take the largest entry.
+
+**So the binding constraint is the modulus representation, not the ring
+dimension.** Going further needs multi-precision or RNS arithmetic, which is an
+implementation change rather than a parameter choice.
+
+**2. The achievable λ is 30, not 40.** Measured at the largest representable
+parameter set (`bfv::tests::measures_post_multiply_noise_at_n8192`):
+
+```
+n=8192, q=2^120, t=2^20
+  |e_mult|              2^41      (measured)
+  boundary-proof slack  26 bits   (from the real construction, §6c)
+  achievable lambda     30
+```
+
+λ = 30 is a usable statistical security parameter, and it is what this
+construction actually delivers today. It is **not** the λ = 40 §6a reported for
+honest inputs, and the gap is entirely the price of the boundary proof.
+
+To reach λ = 40 one of three things has to change: a tighter proof (smaller
+slack), a multi-precision modulus (bigger budget), or accepting a smaller `t`.
+Stating which is a parameter decision for the paper, not a caveat to bury.
+
+**Method note.** The first version of this measurement asserted that the
+decrypted product equalled the elementwise product of the two plaintexts. It
+does not — BFV multiplication is a *polynomial* (negacyclic) product, and the
+whole packing scheme in the main paper depends on exactly that. Correctness at
+these parameters is now checked as "the noise stays under q/2t", which is what
+correctness means here.
+
 - **Noise analysis under adversarial inputs.** §4.4 argues malformed inputs are
   excluded by the boundary ZK, so honest noise bounds hold. This needs to be
   made rigorous: the ZKPoK's noise bound must be tight enough that the
@@ -341,7 +469,7 @@ n=4096 if the 3× ciphertext of n=8192 is unwelcome.
    a flooding term. §4.1–4.3 are done; §4.4 (the boundary proof) is what remains,
    and it is now the *only* thing between this and a malicious attestation.
 2. Pin the boundary ZKPoK: which lattice proof, what noise bound, what cost per
-   input. (Now the top open item.)
+   input. (Still the top open item — but the *bound* is now pinned; see §6b.)
 3. Write the ideal functionality `F_infer` and the simulator for the one
    malicious party, formally, to confirm §5 holds without a hidden selective-
    failure channel.

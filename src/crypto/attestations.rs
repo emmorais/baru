@@ -31,7 +31,7 @@
 //! | `Pir` | semi-honest | Stage 6 (gated): no integrity against a malicious server |
 //! | `zkp::binius_real` | sound | real Binius64 prover/verifier; arithmetic, signed comparisons, shifts, division, `if`/`let` (enough for ReLU and Q16.16) (`tests/zkp_real.rs`) |
 //! | `zkp::binius64_backend` | **none** | retained placeholder, unused: `verify` never checks constraint satisfaction (`tests/zkp_soundness.rs`) |
-//! | `Bfv`, `Bgv` | semi-honest | `fhe::threshold` built and tested; boundary proof (§4.4) still missing |
+//! | `Bfv`, `Bgv` | semi-honest | `fhe::threshold` built and tested; boundary proof implemented but not reviewed; measured lambda is 30, not 40 (§6d) |
 //! | `CkksBackend`, `TfheBackend` | semi-honest | Stage 6 (gated): third-party randomness, cannot derandomise |
 //!
 //! [`crate::interpreter::malicious_backend::MaliciousBackend`] is the only
@@ -138,10 +138,11 @@ attest!(
 attest!(
     crate::fhe::bfv::Bfv,
     Security::SemiHonest,
-    "fhe::threshold supplies replicated key shares, derandomized encryption and checkable \
-     partial decryptions, but they are not yet wired into hybrid's scheme switch, and \
-     externally supplied ciphertexts still lack the boundary proof of well-formedness \
-     that replication provably cannot substitute for (threshold::BOUNDARY_GAP)"
+    "the threshold scheme switch is built and checkable (hybrid::threshold_switch), but \
+     the boundary proof of well-formedness now exists (fhe::boundary_proof) but is a tested \
+     implementation rather than a reviewed one, and measurement shows its 26-bit slack leaves \
+     lambda = 30 at the largest modulus this u128-based BFV can represent, not the 40 the \
+     honest-input analysis reported; the attestation stays semi-honest until both are settled"
 );
 
 attest!(
