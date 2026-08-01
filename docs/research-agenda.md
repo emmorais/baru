@@ -150,9 +150,14 @@ section was written. See
 and for what to optimise next.
 
 **The model, not the crypto, is the accuracy ceiling.** This is a 2-conv
-classifier sized to fit the depth-1 noise budget; it matches published
-ResNet-18 on pneumonia and gives up 12 points on organa. Saying so is stronger
-than quietly reporting only the dataset where a small model wins.
+classifier sized to the envelope the pipeline allows: at most three convs
+before 3×3 valid convolution exhausts a 28×28 input, at most 12 channels out of
+the first conv before the Cheetah packing passes `n = 4096` at the second
+conv's 13×13 input, and activations inside the depth-1 noise budget. It matches
+published ResNet-18 on pneumonia and gives up 12 points on organa. Saying so is
+stronger than quietly reporting only the dataset where a small model wins — and
+worth separating: the width limit is a *packing* question that relaxes at
+`n = 8192`, not a limit of the no-bootstrap construction.
 
 **Two methodological traps, both hit and both fixed.** The quantisation gain is
 chosen on the *validation* split, never on test. And the gain is not free in

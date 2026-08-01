@@ -290,6 +290,28 @@ impl CnnModel {
         self.dense_w.len()
     }
 
+    /// The layer stack as a one-line string, read off the model itself.
+    ///
+    /// How many convs and hidden dense layers there are is a property of the
+    /// trained weights (the trainer's `--conv`/`--fc`), not of this code, so a
+    /// benchmark banner that spells the architecture out as a literal goes
+    /// stale the moment a deeper model is trained — the same drift the
+    /// generated weight files exist to prevent.
+    pub fn architecture(&self) -> String {
+        let mut s = format!(
+            "1×{0}×{0} → conv({1}, {K}×{K}) → ReLU → pool",
+            self.d,
+            self.out_channels()
+        );
+        for cl in &self.extra_conv {
+            s += &format!(" → conv({}, {K}×{K}) → ReLU → pool", cl.out_c());
+        }
+        for (w, _) in &self.hidden {
+            s += &format!(" → dense(→{}) → ReLU", w.len());
+        }
+        s + &format!(" → dense(→{}) → argmax", self.nclasses())
+    }
+
     fn conv_dot(&self, input: &[i64], oc: usize, oy: usize, ox: usize) -> i64 {
         let mut acc = 0i64;
         for ky in 0..K {
@@ -303,6 +325,19 @@ impl CnnModel {
     /// Exact plaintext forward pass mirroring the hybrid's fused semantics.
     /// Returns `(class, max_abs_intermediate)`.
     pub fn forward(&self, input: &[i64]) -> (usize, i64) {
+        let (logits, max_abs) = self.forward_logits(input);
+        (crate::gadgets::argmax_ref(&logits), max_abs)
+    }
+
+    /// As [`CnnModel::forward`], but returning the raw output-layer logits
+    /// rather than just the argmax.
+    ///
+    /// Ranking metrics need a score, not a decision: AUC — the metric MedMNIST
+    /// leads with — is a property of how the logits *order* the test set, and
+    /// is invisible to a benchmark that only ever sees `argmax`. The encrypted
+    /// pipeline deliberately reveals only the class, so this is a
+    /// plaintext-side measurement of the same weights.
+    pub fn forward_logits(&self, input: &[i64]) -> (Vec<i64>, i64) {
         let oh = self.conv_shape.h;
         let out_c = self.out_channels();
         let mut max_abs = input.iter().map(|v| v.abs()).max().unwrap_or(0);
@@ -382,7 +417,7 @@ impl CnnModel {
                 v
             })
             .collect();
-        (crate::gadgets::argmax_ref(&logits), max_abs)
+        (logits, max_abs)
     }
 
 }

@@ -1076,9 +1076,17 @@ Three readings. **Quantisation and encryption are both free**: the integer net
 tracks its float parent to within 0.2 points (agreeing on 99.7% / 98.7% of test
 predictions), and the encrypted pipeline reproduces the plaintext diagnosis
 bit-exactly — privacy costs wall-clock, not accuracy. **The model, not the
-crypto, is the ceiling**: this 2-conv classifier is sized to fit the depth-1
-noise budget, enough to match published ResNet-18 on pneumonia and 12 points
-short of it on the 11-class organ task. And **the cost centre is FHE**: of the
+crypto, is the ceiling**: this 2-conv classifier is sized to the envelope the
+pipeline allows, which is three constraints and not one. Spatially, 3×3 valid
+convolution and floor-pooling take 28 → 13 → 5 → 1, so a 28×28 input admits at
+most three convs. By *packing*, the Cheetah layout needs `2·in_c·H·W ≲ n`, so
+at the second conv's 13×13 input the first conv may emit at most **12**
+channels before the product degree passes `n = 4096` (16 would need 5266) —
+this is what stops the model getting wider, and it is a packing question, not a
+limit of the no-bootstrap construction: it relaxes at `n = 8192` or by
+splitting channels across ciphertexts. Only then does the depth-1 noise budget
+bind, on the activation magnitude. The result is enough to match published
+ResNet-18 on pneumonia and 12 points short of it on the 11-class organ task. And **the cost centre is FHE**: of the
 2.90 s chest-X-ray diagnosis, **2.13 s (73%) is FHE arithmetic** and 0.76 s is
 the whole MPC segment (import 0.02 s, ReLU 0.51 s, pool 0.21 s, argmax 0.01 s).
 A diagnosis used to take ~33 s: the batched scheme-switch import took it to

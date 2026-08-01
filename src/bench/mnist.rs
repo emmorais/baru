@@ -67,17 +67,23 @@ fn load_model() -> (CnnModel, Vec<Vec<i64>>, Vec<u8>) {
     let images: Vec<Vec<i64>> = data::TEST_IMAGES.iter().map(|im| im.to_vec()).collect();
     let labels: Vec<u8> = data::TEST_LABELS.to_vec();
     let kernels: Vec<Vec<i64>> = data::KERNELS.iter().map(|k| k.to_vec()).collect();
-    let extra_conv = vec![ConvLayer {
-        kernels: data::CONV2_W.iter().map(|r| r.to_vec()).collect(),
-        cbias: data::CONV2_B.to_vec(),
-        in_c: data::CONV2_IN_C,
-        in_h: data::CONV2_IN_H,
-        in_w: data::CONV2_IN_W,
-    }];
+    // Read the conv stack through the generated accessor rather than naming
+    // individual layer constants: how many conv layers there are is the
+    // trainer's `--conv` choice, and the model is indifferent to it.
+    let extra_conv: Vec<ConvLayer> = data::extra_conv_layers()
+        .into_iter()
+        .map(|(kernels, cbias, in_c, in_h, in_w)| ConvLayer {
+            kernels,
+            cbias,
+            in_c,
+            in_h,
+            in_w,
+        })
+        .collect();
     let hidden: Vec<(Vec<Vec<i64>>, Vec<i64>)> = data::hidden_layers();
     let dense_w: Vec<Vec<i64>> = data::DENSE_W.iter().map(|r| r.to_vec()).collect();
     let model = CnnModel::from_trained(
-        28,
+        data::D,
         kernels,
         data::CBIAS.to_vec(),
         extra_conv,
@@ -92,6 +98,9 @@ fn load_model() -> (CnnModel, Vec<Vec<i64>>, Vec<u8>) {
 
 #[derive(Debug, Serialize)]
 pub struct MnistReport {
+    /// The layer stack, read off the trained weights rather than restated as a
+    /// literal here — depth is the trainer's choice, not this file's.
+    pub architecture: String,
     pub n_test: usize,
     pub plaintext_correct: usize,
     pub plaintext_accuracy: f64,
@@ -138,6 +147,7 @@ pub fn run(hybrid_n: usize, profile: NetworkProfile) -> MnistReport {
     }
 
     MnistReport {
+        architecture: model.architecture(),
         n_test: images.len(),
         plaintext_correct,
         plaintext_accuracy: plaintext_correct as f64 / images.len() as f64,
@@ -192,12 +202,7 @@ pub fn run_cli(args: &[String]) -> Result<(), String> {
     }
 
     println!("Private CNN on real MNIST — trained weights, real test digits, ZERO bootstraps");
-    println!(
-        "architecture: 1×28×28 → conv({}, 3×3) → ReLU → pool → conv({}, 3×3) → ReLU → pool → dense(→{}) → ReLU → dense(→10) → argmax",
-        data::OC,
-        data::CONV2_W.len(),
-        data::HN
-    );
+    println!("architecture: {}", r.architecture);
     println!();
     println!(
         "  plaintext-integer accuracy : {}/{} = {:.2}%  (this in-repo subset)",

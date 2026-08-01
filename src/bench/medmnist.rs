@@ -32,6 +32,11 @@
 //!   against `forward`, so every encrypted prediction *equals* the plaintext
 //!   one; the subset run demonstrates that on real medical images rather than
 //!   asserting it.
+//! - **Balanced accuracy, AUC, per-class recall and a Wilson interval**
+//!   ([`crate::bench::metrics`]). Accuracy alone is not enough to judge a
+//!   *medical* classifier and on these weights actively misleads: see the
+//!   sensitivity/specificity note below. AUC also puts this model on the
+//!   metric MedMNIST's own tables lead with, which accuracy cannot.
 //!
 //! The full-test-set number in each weight file was measured offline by
 //! `tools/train_medmnist.py` on the identical integer weights, so the
@@ -80,13 +85,33 @@
 //! should read that number and go to `fhe::bfv`, not here.
 //!
 //! **The model, not the crypto, is the accuracy ceiling.** Published
-//! ResNet-18 at 28×28 reaches 0.854 / 0.935 on these two datasets; this net
-//! is a 2-conv, 24 k-parameter classifier sized to fit the depth-1 noise
-//! budget, and it lands at 0.848 / 0.812. Pneumonia is essentially at the
-//! published number; organa gives up 12 points to depth. Note also that
-//! organa's validation accuracy is 94.7% against 81.2% on test — the official
-//! split separates patients, and that gap is a property of the dataset, not
-//! of the quantisation (the gain was chosen on validation, never on test).
+//! ResNet-18 at 28×28 reaches 0.854 / 0.935 ACC on these two datasets; this
+//! net is a 2-conv, **53 k-parameter** classifier and it lands at 0.848 /
+//! 0.812. On pneumonia that is *statistically indistinguishable* — 84.78% on
+//! 624 images carries a 95% Wilson interval of [81.7, 87.4], which contains
+//! 0.854 — so the honest claim is indistinguishability, not parity. On organa
+//! the 12-point gap is real: [80.6, 81.8] on 17 778 images excludes 0.935.
+//!
+//! Three limits set that ceiling, and the noise budget is only the third.
+//! *Spatially*, 3×3 valid convolution plus floor-pooling takes 28 → 13 → 5 → 1,
+//! so at most three convs fit. *By packing*, `2·in_c·H·W ≲ n` means the first
+//! conv may emit at most **12** channels before the second conv's 13×13 input
+//! passes `n = 4096` — this, not the noise budget, is what stops the model
+//! getting wider, and it relaxes at `n = 8192`. Only then does the depth-1
+//! budget bind, on activation magnitude.
+//!
+//! **Accuracy alone misreads this classifier, and the benchmark now says so.**
+//! PneumoniaMNIST's test set is ~60% positive, and on the embedded subset the
+//! model scores **98.3% sensitivity against 65.3% specificity** — it earns its
+//! 85% by over-calling disease, flagging 42 of 121 healthy scans. Balanced
+//! accuracy is 81.8%, and AUC 0.925 against the published 0.944. Organa's
+//! macro one-vs-rest AUC is 0.966 against 0.997, with femur-left (69%) the
+//! weakest class. None of this was visible while only accuracy was reported.
+//!
+//! Note also that organa's validation accuracy is 94.7% against 81.2% on test
+//! — the official split separates patients, and that gap is a property of the
+//! dataset, not of the quantisation (the gain was chosen on validation, never
+//! on test).
 //!
 //! Honest scope, to be repeated in the paper: MedMNIST is pre-processed and
 //! small, and clinical imaging is 512³ volumes. The claim here is about *cost
@@ -102,6 +127,11 @@ use serde::Serialize;
 
 use crate::bench::cnn::{run_cnn_hybrid_in_session, CnnModel, CnnSession, ConvLayer, Nonlin};
 use crate::bench::comm::NetworkProfile;
+use crate::bench::metrics::ClassificationMetrics;
+
+/// One conv layer past the first, exactly as the generated weight files hand
+/// it over: `(kernels[out_c][in_c·K·K], bias[out_c], in_c, in_h, in_w)`.
+pub type ExtraConv = (Vec<Vec<i64>>, Vec<i64>, usize, usize, usize);
 
 /// A trained, quantised CNN plus the real test images it was measured on, in
 /// the form the generated weight files hand over. One struct per dataset,
@@ -110,10 +140,16 @@ pub struct TrainedCnn {
     pub dataset: &'static str,
     pub task: &'static str,
     pub class_names: Vec<&'static str>,
+    /// Side length of the square, single-channel input the model expects.
+    pub d: usize,
     pub kernels: Vec<Vec<i64>>,
     pub cbias: Vec<i64>,
-    /// `(kernels[out_c][in_c·K·K], bias, in_c, in_h, in_w)` for the second conv.
-    pub conv2: (Vec<Vec<i64>>, Vec<i64>, usize, usize, usize),
+    /// The conv layers *after* the first, in order — the first is kept apart
+    /// as `kernels`/`cbias` because it is the single-channel one the Cheetah
+    /// packing sees. Each is `(kernels[out_c][in_c·K·K], bias, in_c, in_h,
+    /// in_w)`. Arbitrary length: the trainer's `--conv` decides how many, and
+    /// every one is just another FHE conv + MPC nonlinearity + scheme switch.
+    pub extra_conv: Vec<ExtraConv>,
     pub hidden: Vec<(Vec<Vec<i64>>, Vec<i64>)>,
     pub dense_w: Vec<Vec<i64>>,
     pub dense_b: Vec<i64>,
@@ -121,6 +157,18 @@ pub struct TrainedCnn {
     pub images: Vec<Vec<i64>>,
     pub labels: Vec<u8>,
     pub full_test_accuracy: f64,
+    /// Accuracy of the float net these weights were quantised from, over the
+    /// same full test set — the baseline that says whether quantisation cost
+    /// anything. `None` in weight files generated before the trainer recorded
+    /// it; regenerate the file to populate it rather than filling it in by
+    /// hand, which is exactly the drift these generated files exist to avoid.
+    pub float_test_accuracy: Option<f64>,
+    /// Balanced accuracy and AUC over the FULL test set, measured by the
+    /// trainer. The benchmark can only compute these on the embedded subset,
+    /// and these are the numbers that belong in a paper. `None` in weight
+    /// files generated before the trainer measured them.
+    pub full_balanced_accuracy: Option<f64>,
+    pub full_auc: Option<f64>,
     pub majority_baseline: f64,
     pub full_test_n: usize,
 }
@@ -130,18 +178,20 @@ impl TrainedCnn {
     /// activation range over the embedded images, exactly as the synthetic
     /// model does, so it fits the depth-1 noise budget.
     pub fn model(&self) -> CnnModel {
-        let (w, b, in_c, in_h, in_w) = &self.conv2;
         CnnModel::from_trained(
-            28,
+            self.d,
             self.kernels.clone(),
             self.cbias.clone(),
-            vec![ConvLayer {
-                kernels: w.clone(),
-                cbias: b.clone(),
-                in_c: *in_c,
-                in_h: *in_h,
-                in_w: *in_w,
-            }],
+            self.extra_conv
+                .iter()
+                .map(|(w, b, in_c, in_h, in_w)| ConvLayer {
+                    kernels: w.clone(),
+                    cbias: b.clone(),
+                    in_c: *in_c,
+                    in_h: *in_h,
+                    in_w: *in_w,
+                })
+                .collect(),
             self.hidden.clone(),
             self.dense_w.clone(),
             self.dense_b.clone(),
@@ -184,11 +234,27 @@ pub fn load(name: &str) -> Result<TrainedCnn, String> {
 pub struct MedMnistReport {
     pub dataset: String,
     pub task: String,
+    /// The layer stack, read off this dataset's trained weights. Per-report
+    /// rather than a single banner: each dataset carries its own weight file,
+    /// so with depth free they need not share an architecture.
+    pub architecture: String,
+    pub class_names: Vec<String>,
     pub nclasses: usize,
     pub n_test: usize,
     pub plaintext_correct: usize,
     pub plaintext_accuracy: f64,
+    /// Per-class recall, confusion, balanced accuracy, AUC and a Wilson
+    /// interval over the embedded subset. Accuracy alone cannot distinguish a
+    /// balanced classifier from one that over-predicts the majority class,
+    /// which on an imbalanced medical set is the difference that matters.
+    pub metrics: ClassificationMetrics,
     pub full_test_accuracy: f64,
+    /// Full-test balanced accuracy and AUC, when the weight file records them.
+    pub full_balanced_accuracy: Option<f64>,
+    pub full_auc: Option<f64>,
+    /// The float parent's accuracy on the same test set, when the weight file
+    /// records it — the baseline that says whether quantisation cost anything.
+    pub float_test_accuracy: Option<f64>,
     pub full_test_n: usize,
     pub majority_baseline: f64,
     pub hybrid_evaluated: usize,
@@ -245,13 +311,17 @@ pub fn run(
     let model = data.model();
     let t0 = Instant::now();
 
-    // Plaintext-integer accuracy over every embedded test image.
-    let preds: Vec<usize> = data.images.iter().map(|img| model.forward(img).0).collect();
-    let plaintext_correct = preds
+    // Plaintext-integer scoring over every embedded test image. Logits rather
+    // than the argmax alone, because AUC is a property of the ranking and is
+    // invisible to a benchmark that only ever sees the decision.
+    let logits: Vec<Vec<i64>> = data
+        .images
         .iter()
-        .zip(&data.labels)
-        .filter(|(p, &l)| **p == l as usize)
-        .count();
+        .map(|img| model.forward_logits(img).0)
+        .collect();
+    let preds: Vec<usize> = logits.iter().map(|l| crate::gadgets::argmax_ref(l)).collect();
+    let metrics = ClassificationMetrics::compute(&logits, &data.labels, model.nclasses());
+    let plaintext_correct = metrics.correct;
 
     // Encrypted accuracy on a subset: each hybrid prediction must equal the
     // plaintext one (bit-exact), and we count how many hit the true label.
@@ -286,11 +356,17 @@ pub fn run(
     Ok(MedMnistReport {
         dataset: data.dataset.to_string(),
         task: data.task.to_string(),
+        architecture: model.architecture(),
+        class_names: data.class_names.iter().map(|s| s.to_string()).collect(),
         nclasses: model.nclasses(),
         n_test: data.images.len(),
         plaintext_correct,
         plaintext_accuracy: plaintext_correct as f64 / data.images.len() as f64,
+        metrics,
         full_test_accuracy: data.full_test_accuracy,
+        full_balanced_accuracy: data.full_balanced_accuracy,
+        full_auc: data.full_auc,
+        float_test_accuracy: data.float_test_accuracy,
         full_test_n: data.full_test_n,
         majority_baseline: data.majority_baseline,
         hybrid_evaluated: hybrid_n,
@@ -416,17 +492,104 @@ fn print_report(r: &MedMnistReport) {
         r.task,
         r.nclasses
     );
+    println!("  architecture               : {}", r.architecture);
+    let m = &r.metrics;
     println!(
-        "  plaintext-integer accuracy : {}/{} = {:.2}%  (this in-repo subset)",
+        "  plaintext-integer accuracy : {}/{} = {:.2}%  95% CI [{:.1}, {:.1}]  (in-repo subset)",
         r.plaintext_correct,
         r.n_test,
-        r.plaintext_accuracy * 100.0
+        r.plaintext_accuracy * 100.0,
+        m.accuracy_ci.0 * 100.0,
+        m.accuracy_ci.1 * 100.0
     );
+    // Balanced accuracy is printed next to accuracy, never instead of it: the
+    // gap between the two IS the imbalance, and hiding either one hides it.
+    println!(
+        "  balanced accuracy          : {:.2}%  (mean per-class recall, subset)",
+        m.balanced_accuracy * 100.0
+    );
+    match m.auc {
+        Some(a) if r.nclasses == 2 => {
+            println!("  AUC                        : {a:.4}  (subset)")
+        }
+        Some(a) => println!("  AUC (macro one-vs-rest)    : {a:.4}  (subset)"),
+        None => println!("  AUC                        : undefined (a class has no support)"),
+    }
+    if let (Some(sens), Some(spec)) = (m.sensitivity, m.specificity) {
+        let tp = m.confusion[1][1];
+        let fn_ = m.confusion[1][0];
+        let tn = m.confusion[0][0];
+        let fp = m.confusion[0][1];
+        println!(
+            "  sensitivity / specificity  : {:.2}% / {:.2}%   (TP {tp} FN {fn_} TN {tn} FP {fp})",
+            sens * 100.0,
+            spec * 100.0
+        );
+        // The asymmetry is the finding, so it is stated rather than left for
+        // the reader to derive from four counts.
+        if (sens - spec).abs() > 0.15 {
+            let (weak, n_missed) = if sens < spec {
+                ("misses disease", fn_)
+            } else {
+                ("over-calls disease", fp)
+            };
+            println!(
+                "    ^ SKEWED by {:.0} points — the model {weak} ({n_missed} of {} in that class); \
+                 read balanced accuracy, not accuracy",
+                (sens - spec).abs() * 100.0,
+                if sens < spec { m.per_class_n[1] } else { m.per_class_n[0] }
+            );
+        }
+    }
+    // Per-class recall, worst first: on an 11-way task a single collapsed
+    // class is invisible in the mean but is exactly what a clinician would
+    // care about.
+    if r.nclasses > 2 {
+        let mut by_recall: Vec<usize> = (0..r.nclasses).filter(|&c| m.per_class_n[c] > 0).collect();
+        by_recall.sort_by(|&a, &b| m.per_class_recall[a].total_cmp(&m.per_class_recall[b]));
+        let worst: Vec<String> = by_recall
+            .iter()
+            .take(3)
+            .map(|&c| {
+                format!(
+                    "{} {:.0}% (n={})",
+                    r.class_names.get(c).map(|s| s.as_str()).unwrap_or("?"),
+                    m.per_class_recall[c] * 100.0,
+                    m.per_class_n[c]
+                )
+            })
+            .collect();
+        println!("  weakest classes (recall)   : {}", worst.join(", "));
+    }
     println!(
         "  full test set ({:>6})     : {:.2}%  (identical weights, measured offline)",
         r.full_test_n,
         r.full_test_accuracy * 100.0
     );
+    // Full-test balanced accuracy / AUC come from the trainer, which is the
+    // only side that sees the whole test set. Absent until a file is
+    // regenerated — printed as a gap, never inferred from the subset.
+    match (r.full_balanced_accuracy, r.full_auc) {
+        (None, None) => println!(
+            "    (full-test balanced accuracy and AUC not recorded — regenerate \
+             the weight file to measure them)"
+        ),
+        (bal, a) => {
+            let bal = bal.map_or("—".to_string(), |b| format!("{:.2}%", b * 100.0));
+            let a = a.map_or("—".to_string(), |v| format!("{v:.4}"));
+            println!("    full-test balanced accuracy {bal}, AUC {a}");
+        }
+    }
+    // Only printed when the weight file recorded it: the point of the line is
+    // that quantisation is free, and an absent number must read as "not
+    // measured" rather than be quietly filled in from somewhere else.
+    if let Some(f) = r.float_test_accuracy {
+        println!(
+            "  float parent, same net     : {:.2}%  (quantisation cost: {:+.2} points)",
+            f * 100.0,
+            (r.full_test_accuracy - f) * 100.0
+        );
+    }
     println!(
         "  majority-class baseline    : {:.2}%",
         r.majority_baseline * 100.0
@@ -573,10 +736,7 @@ pub fn run_cli(args: &[String]) -> Result<(), String> {
     }
 
     println!("Private diagnosis on MedMNIST v2 — trained weights, real biomedical");
-    println!("images, exact-and-bootstrap-free hybrid pipeline");
-    println!(
-        "architecture: 1×28×28 → conv(8,3×3) → ReLU → pool → conv(16,3×3) → ReLU → pool\n              → dense(400→128) → ReLU → dense(128→classes) → argmax\n"
-    );
+    println!("images, exact-and-bootstrap-free hybrid pipeline\n");
     for r in &reports {
         print_report(r);
     }

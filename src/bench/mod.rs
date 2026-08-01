@@ -970,6 +970,7 @@ pub mod zkp_layer;
 pub mod deep_nn;
 pub mod layer;
 pub mod medmnist;
+pub mod metrics;
 pub mod mixed_layer;
 pub mod net;
 pub mod ot;

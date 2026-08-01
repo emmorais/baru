@@ -8,9 +8,42 @@ weight file in the repo can be regenerated from this one script.  Emits
 examples/data/<name>_cnn.rs in exactly the integer fixed-point scheme
 `CnnModel::forward` (src/bench/cnn.rs) evaluates.
 
-Architecture (fixed by the Rust side: K=3, POOL=2, one extra conv, one hidden FC):
-    1x28x28 -> conv(OC,3x3) -> ReLU -> pool2 -> conv(C2,3x3) -> ReLU -> pool2
-            -> dense(->HN) -> ReLU -> dense(->NCLASSES) -> argmax
+Architecture.  The Rust side fixes K=3 and POOL=2 and nothing else: `CnnModel`
+carries `extra_conv: Vec<ConvLayer>` and `hidden: Vec<(W, b)>`, so the conv
+stack and the dense stack are both free.  `--conv` and `--fc` set them:
+
+    1x28x28 -> [conv(c,3x3) -> ReLU -> pool2]*   for c in --conv
+            -> [dense(->h)  -> ReLU]*            for h in --fc
+            -> dense(->NCLASSES) -> argmax
+
+`--conv 8,16 --fc 128` (the default) is the shallow net the first round of
+`bench-medmnist` numbers were measured on, kept as the default so every weight
+file already in the repo regenerates unchanged.  Deeper/wider stacks are what
+`--conv 32,64 --fc 256,128` and friends are for.
+
+Three limits bind, and they bind for different reasons.
+
+*Spatially*, 3x3 valid convolution and floor-pooling take 28 -> 13 -> 5 -> 1,
+so three convs is the most a 28x28 input admits and the third leaves no spatial
+extent at all.  `conv_shapes` refuses the rest.
+
+*By packing*, the Cheetah-style conv packing encodes a whole layer into one
+polynomial, so the product degree must stay under the ring dimension (4096).
+That binds on input channels times spatial extent and bites hardest at the
+SECOND conv, where the channels have grown but the image has been pooled only
+once: at 13x13 it admits at most 12 input channels, so `--conv 16,32` is
+already too wide even though it trains perfectly well.  `check_packing`
+refuses it up front, since otherwise the failure surfaces twenty minutes later
+from inside the FHE code.
+
+*Numerically*, every activation has to stay inside the depth-1 FHE plaintext
+modulus (2^30 at n=4096, q=2^100), and a wider layer sums more terms into each
+accumulator -- so capacity is capped by the noise budget, not by memory.
+`pick_gain` rejects any quantisation that crosses that line.
+
+The last two mean a net can train fine in float and still be refused here.
+That refusal is a result, not a bug: report it rather than lowering `shift`
+until it passes.
 
 Quantisation.  The deployed integer net keeps every activation at the *input*
 scale (pixels are raw 0..255), which fixes the mapping from float weights
@@ -36,12 +69,22 @@ Get the data:
               curl -sLo mnist/$f.gz \
                 "https://ossci-datasets.s3.amazonaws.com/mnist/$f.gz"; done
 
+RGB datasets.  Four of the twelve MedMNIST v2 2D sets ship (N,28,28,3):
+Path, Derma, Blood, Retina.  The FHE conv packing assumes a single input
+channel, so those are folded to luminance (ITU-R BT.601: 0.299R+0.587G+
+0.114B, rounded to uint8) before anything else happens.  That is a real
+change to the task -- colour carries diagnostic signal in dermatoscopy and
+histology -- so the generated file records it and the accuracy must be read
+against a grayscale baseline, never against the published RGB ResNet-18.
+
 Usage: python3 tools/train_medmnist.py <npz|mnist-dir> <rust-out>
          [--epochs N] [--n-test N] [--test-order first|random] [--linear]
+         [--conv 8,16] [--fc 128] [--gains none,64,128] [--device auto|cpu|mps]
 """
 import argparse
 import gzip
 import json
+import math
 import os
 import sys
 
@@ -50,7 +93,73 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-OC, C2, HN, K, POOL, SHIFT = 8, 16, 128, 3, 2, 8
+K, POOL, SHIFT = 3, 2, 8
+# The default stack, kept so the weight files already in the repo regenerate
+# byte-identically.  `--conv`/`--fc` override both.
+DEFAULT_CONV, DEFAULT_FC = [8, 16], [128]
+# The gain ladder swept on validation; `None` is "no rescale at all".
+DEFAULT_GAINS = (None, 64.0, 128.0, 256.0, 512.0)
+# BT.601 luminance, the fold applied to the four RGB MedMNIST sets.
+LUMA = np.array([0.299, 0.587, 0.114])
+# The BFV ring dimension the hybrid pipeline runs at (n=4096, q=2^100).
+RING_N = 4096
+
+
+def packing_degree(in_c, h, w):
+    """Highest coefficient the packed convolution product can touch.
+
+    A line-for-line mirror of `ConvShape::required_degree`
+    (src/fhe/conv_pack.rs).  The Cheetah-style packing puts a whole conv layer
+    into one polynomial, so this has to stay under `RING_N` or negacyclic
+    wraparound folds garbage onto the coefficients the output is read from."""
+    hw = h * w
+    max_x = in_c * hw - 1
+    max_w = (in_c - 1) * hw + (K - 1) * w + (K - 1)
+    return max_x + max_w
+
+
+def check_packing(shapes):
+    """Refuse a conv stack the *encrypted* pipeline could not run.
+
+    A third limit, independent of the other two: it binds on input channels
+    times spatial extent, so it bites hardest at the second conv, where the
+    channel count has grown but the image has only been pooled once.  Checked
+    up front rather than after training, because otherwise the refusal arrives
+    twenty minutes late and from the middle of the FHE code."""
+    for i, (in_c, h, w) in enumerate(shapes):
+        deg = packing_degree(in_c, h, w)
+        if deg < RING_N:
+            continue
+        room = max((c for c in range(1, in_c) if packing_degree(c, h, w) < RING_N),
+                   default=0)
+        where = ("its input is a single channel, so the spatial extent alone is "
+                 "too large") if room == 0 else (
+                     f"at {h}x{w} the packing admits at most {room} input "
+                     f"channels, so conv {i - 1} must output at most {room}")
+        sys.exit(
+            f"conv {i} cannot be run under FHE: a {in_c}x{h}x{w} input packs to "
+            f"degree {deg}, and the BFV ring dimension is {RING_N}. {where}. "
+            f"(This is the packing limit, not the noise budget -- the model "
+            f"would train and score fine in plaintext.)"
+        )
+
+
+def conv_shapes(d, convs):
+    """Spatial shape entering each conv, and the flattened feature width.
+
+    Returns `([(in_c, in_h, in_w), ...], flat)`.  Mirrors `CnnModel::forward`
+    exactly: 3x3 valid convolution then floor max-pool by 2, per layer."""
+    shapes, c, h, w = [], 1, d, d
+    for oc in convs:
+        if h < K or w < K:
+            sys.exit(
+                f"conv stack {convs} does not fit a {d}x{d} input: layer with "
+                f"{oc} channels sees {h}x{w}, smaller than the {K}x{K} kernel"
+            )
+        shapes.append((c, h, w))
+        h, w = (h - K + 1) // POOL, (w - K + 1) // POOL
+        c = oc
+    return shapes, c * h * w
 
 # ─── data loading: MedMNIST .npz, or a directory of MNIST idx.gz files ───────
 
@@ -100,34 +209,131 @@ def load_dataset(path, val_frac=1 / 12):
     }
 
 
+def to_grayscale(d):
+    """Fold any (N,h,w,3) split to (N,h,w) luminance.  Returns `(d, folded)`.
+
+    Four of the twelve MedMNIST v2 2D sets ship RGB, and the FHE conv packing
+    assumes a single input channel, so colour has to go before anything else
+    looks at the data.  BT.601, rounded back to uint8 so the integer net still
+    sees raw 0..255 pixels.  `folded` propagates into the generated file: an
+    accuracy measured after this fold is not comparable to a published RGB
+    number, and the file has to say so."""
+    folded = False
+    for k in ("train_images", "val_images", "test_images"):
+        a = d[k]
+        if a.ndim == 4 and a.shape[-1] == 3:
+            d[k] = np.rint(a.astype(np.float64) @ LUMA).clip(0, 255).astype(np.uint8)
+            folded = True
+        elif a.ndim == 4 and a.shape[-1] == 1:
+            d[k] = a[..., 0]
+        elif a.ndim != 3:
+            sys.exit(f"{k}: expected (N,h,w), (N,h,w,1) or (N,h,w,3), got {a.shape}")
+    return d, folded
+
+
+def parse_widths(s, flag, allow_empty):
+    """Parse a `--conv`/`--fc` comma-separated width list."""
+    s = s.strip()
+    if not s:
+        if allow_empty:
+            return []
+        sys.exit(f"{flag}: needs at least one layer")
+    try:
+        vals = [int(tok) for tok in s.split(",")]
+    except ValueError:
+        sys.exit(f"{flag}: expected comma-separated integers, got {s!r}")
+    if any(v <= 0 for v in vals):
+        sys.exit(f"{flag}: widths must be positive, got {vals}")
+    return vals
+
+
+def parse_gains(s, default):
+    """Parse the `--gains` ladder.  `none` is the no-rescale candidate."""
+    if not s.strip():
+        return default
+    out = []
+    for tok in s.split(","):
+        tok = tok.strip()
+        if tok.lower() in ("none", "raw"):
+            out.append(None)
+            continue
+        try:
+            g = float(tok)
+        except ValueError:
+            sys.exit(f"--gains: expected numbers or 'none', got {tok!r}")
+        if g <= 0:
+            sys.exit(f"--gains: gains must be positive, got {g}")
+        out.append(g)
+    return tuple(out)
+
+
+def pick_device(choice):
+    """Resolve `--device`.  Only the float training runs here; the integer
+    reference is numpy on the CPU either way, and it is the integer model that
+    is deployed, so the device can never change the reported result."""
+    if choice == "auto":
+        if torch.backends.mps.is_available():
+            return torch.device("mps")
+        return torch.device("cpu")
+    if choice == "mps" and not torch.backends.mps.is_available():
+        sys.exit("--device mps: no MPS backend available on this machine")
+    return torch.device(choice)
+
+
 class Net(nn.Module):
     """Exactly the layer stack CnnModel::forward implements (bias everywhere,
-    valid padding, floor pooling)."""
+    valid padding, floor pooling), at whatever depth/width `convs` and `fcs`
+    ask for."""
 
-    def __init__(self, nclasses):
+    def __init__(self, nclasses, convs=None, fcs=None, d=28):
         super().__init__()
-        self.c1 = nn.Conv2d(1, OC, K)
-        self.c2 = nn.Conv2d(OC, C2, K)
-        self.fc1 = nn.Linear(C2 * 5 * 5, HN)
-        self.fc2 = nn.Linear(HN, nclasses)
+        convs = list(convs or DEFAULT_CONV)
+        fcs = list(fcs or DEFAULT_FC)
+        shapes, flat = conv_shapes(d, convs)
+        self.convs = nn.ModuleList(
+            nn.Conv2d(in_c, oc, K) for (in_c, _, _), oc in zip(shapes, convs)
+        )
+        widths = [flat] + fcs
+        self.fcs = nn.ModuleList(
+            nn.Linear(a, b) for a, b in zip(widths[:-1], widths[1:])
+        )
+        self.out = nn.Linear(widths[-1], nclasses)
 
     def forward(self, x):
-        x = F.max_pool2d(F.relu(self.c1(x)), POOL, POOL)  # 26 -> 13
-        x = F.max_pool2d(F.relu(self.c2(x)), POOL, POOL)  # 11 -> 5 (floor)
-        x = F.relu(self.fc1(x.flatten(1)))
-        return self.fc2(x)
+        for c in self.convs:
+            x = F.max_pool2d(F.relu(c(x)), POOL, POOL)
+        x = x.flatten(1)
+        for fc in self.fcs:
+            x = F.relu(fc(x))
+        return self.out(x)
+
+    def n_params(self):
+        return sum(p.numel() for p in self.parameters())
 
 
 # ─── integer reference: a line-for-line mirror of CnnModel::forward ──────────
 
 
 def int_forward(img, q):
-    """img: (28,28) int64 raw pixels. Returns (class, max_abs)."""
+    """img: (d,d) int64 raw pixels. Returns (class, max_abs)."""
+    logits, max_abs = int_logits(img, q, want_max=True)
+    return int(np.argmax(logits)), max_abs
+
+
+def int_logits(img, q, want_max=False):
+    """img: (d,d) int64 raw pixels. Returns the output-layer logits.
+
+    A line-for-line mirror of `CnnModel::forward_logits` over `q`'s conv stack
+    (`q["conv"]`, a list of `(w, b)`) and dense stack (`q["fc"]`, the hidden
+    layers, then `q["out"]`).  With `want_max`, also returns the largest
+    intermediate magnitude, which is what sizes the plaintext modulus."""
     x = img.astype(np.int64)
     max_abs = int(np.abs(x).max())
 
-    def conv(inp, w, b, in_c, in_h, in_w, out_c):
+    def conv(inp, w, b):
         nonlocal max_abs
+        in_c, in_h, in_w = inp.shape
+        out_c = w.shape[0]
         oh, ow = in_h - K + 1, in_w - K + 1
         # im2col over (in_c, ky, kx) -- the same index order the Rust uses.
         cols = np.empty((in_c * K * K, oh * ow), dtype=np.int64)
@@ -147,14 +353,18 @@ def int_forward(img, q):
         out = a[:, : oh * POOL, : ow * POOL].reshape(c, oh, POOL, ow, POOL)
         return out.max(axis=(2, 4))
 
-    a = pool(conv(x[None, :, :], q["k1"], q["b1"], 1, 28, 28, OC))
-    a = pool(conv(a, q["k2"], q["b2"], OC, a.shape[1], a.shape[2], C2))
-    h = q["w3"] @ a.reshape(-1) + q["b3"]
-    max_abs = max(max_abs, int(np.abs(h).max()))
-    h = np.where(h >= 0, h >> SHIFT, 0)
-    logits = q["w4"] @ h + q["b4"]
+    a = x[None, :, :]
+    for w, b in q["conv"]:
+        a = pool(conv(a, w, b))
+    h = a.reshape(-1)
+    for w, b in q["fc"]:
+        h = w @ h + b
+        max_abs = max(max_abs, int(np.abs(h).max()))
+        h = np.where(h >= 0, h >> SHIFT, 0)
+    w, b = q["out"]
+    logits = w @ h + b
     max_abs = max(max_abs, int(np.abs(logits).max()))
-    return int(np.argmax(logits)), max_abs
+    return (logits, max_abs) if want_max else logits
 
 
 def quantise(net, gain_target=None):
@@ -174,10 +384,10 @@ def quantise(net, gain_target=None):
     needs no compensation at all -- which is also why it must get one.
     Forgetting that starves the logit weights to zero and the classifier
     collapses to its majority class."""
-    W = [p.detach().numpy().astype(np.float64) for p in
-         (net.c1.weight, net.c2.weight, net.fc1.weight, net.fc2.weight)]
-    B = [p.detach().numpy().astype(np.float64) for p in
-         (net.c1.bias, net.c2.bias, net.fc1.bias, net.fc2.bias)]
+    layers = list(net.convs) + list(net.fcs) + [net.out]
+    n_conv = len(net.convs)
+    W = [p.weight.detach().cpu().numpy().astype(np.float64) for p in layers]
+    B = [p.bias.detach().cpu().numpy().astype(np.float64) for p in layers]
 
     if gain_target is not None:
         for l in range(len(W)):
@@ -189,17 +399,20 @@ def quantise(net, gain_target=None):
                 W[l + 1] /= g
 
     s = 1 << SHIFT
-    q = {
-        "k1": np.rint(W[0].reshape(OC, K * K) * s).astype(np.int64),
-        "b1": np.rint(B[0] * 255.0).astype(np.int64),
-        "k2": np.rint(W[1].reshape(C2, OC * K * K) * s).astype(np.int64),
-        "b2": np.rint(B[1] * 255.0).astype(np.int64),
-        "w3": np.rint(W[2] * s).astype(np.int64),
-        "b3": np.rint(B[2] * 255.0 * s).astype(np.int64),
-        "w4": np.rint(W[3] * s).astype(np.int64),
-        "b4": np.rint(B[3] * 255.0 * s).astype(np.int64),
-    }
-    return q
+    # Conv bias is `round(B*255)` because `forward` adds `cbias << shift`;
+    # dense bias is `round(B*255*2^shift)` because `forward` adds it raw.
+    # Same quantity, applied at the two places the Rust shifts differently.
+    conv = [
+        (np.rint(W[l].reshape(W[l].shape[0], -1) * s).astype(np.int64),
+         np.rint(B[l] * 255.0).astype(np.int64))
+        for l in range(n_conv)
+    ]
+    dense = [
+        (np.rint(W[l] * s).astype(np.int64),
+         np.rint(B[l] * 255.0 * s).astype(np.int64))
+        for l in range(n_conv, len(W))
+    ]
+    return {"conv": conv, "fc": dense[:-1], "out": dense[-1]}
 
 
 def score_int(q, imgs_u8, labels, progress_every=0):
@@ -215,10 +428,127 @@ def score_int(q, imgs_u8, labels, progress_every=0):
     return float((preds == labels).mean()), max_abs, preds
 
 
-def pick_gain(net, xva_u8, yva, targets=(None, 64.0, 128.0, 256.0, 512.0)):
+def score_logits(q, imgs_u8, progress_every=0):
+    """Raw output-layer logits per image -- what ranking metrics need.
+
+    Kept separate from `score_int` because AUC is a property of the *ordering*
+    the logits induce, not of the argmax, and the argmax is all the deployed
+    encrypted pipeline ever reveals."""
+    out = []
+    for i, im in enumerate(imgs_u8):
+        out.append(int_logits(im, q))
+        if progress_every and (i + 1) % progress_every == 0:
+            print(f"    logit-scored {i + 1}/{len(imgs_u8)}", flush=True)
+    return np.array(out, dtype=np.int64)
+
+
+def auc(scores, positive):
+    """AUC via Mann-Whitney U over average ranks.
+
+    Rank-based with tie-averaging because these logits are integers and
+    genuinely tie; counting a tie as a win would inflate the number.  Returns
+    None when one class is absent, where AUC is undefined."""
+    positive = np.asarray(positive, dtype=bool)
+    n_pos, n_neg = int(positive.sum()), int((~positive).sum())
+    if n_pos == 0 or n_neg == 0:
+        return None
+    order = np.argsort(scores, kind="mergesort")
+    s = np.asarray(scores)[order]
+    ranks = np.empty(len(s), dtype=np.float64)
+    i = 0
+    while i < len(s):
+        j = i
+        while j + 1 < len(s) and s[j + 1] == s[i]:
+            j += 1
+        ranks[i : j + 1] = (i + j) / 2.0 + 1.0
+        i = j + 1
+    r = np.empty(len(s), dtype=np.float64)
+    r[order] = ranks
+    u = r[positive].sum() - n_pos * (n_pos + 1) / 2.0
+    return float(u / (n_pos * n_neg))
+
+
+def wilson(k, n, z=1.96):
+    """95% Wilson score interval -- correct near p=1 where the normal
+    approximation escapes [0,1]."""
+    if n == 0:
+        return (0.0, 0.0)
+    p = k / n
+    d = 1.0 + z * z / n
+    c = (p + z * z / (2 * n)) / d
+    h = z * math.sqrt(p * (1 - p) / n + z * z / (4 * n * n)) / d
+    return (max(0.0, c - h), min(1.0, c + h))
+
+
+def full_metrics(logits, labels, nclasses):
+    """The metrics the benchmark reports, over the FULL test set.
+
+    Mirrors `src/bench/metrics.rs` so the two agree; the Rust side can only see
+    the embedded subset, so these are the numbers that belong in a paper."""
+    preds = logits.argmax(axis=1)
+    conf = np.zeros((nclasses, nclasses), dtype=np.int64)
+    for t, p in zip(labels, preds):
+        conf[t, p] += 1
+    support = conf.sum(axis=1)
+    recall = np.divide(np.diag(conf), support,
+                       out=np.full(nclasses, np.nan), where=support > 0)
+    present = recall[~np.isnan(recall)]
+    correct = int(np.diag(conf).sum())
+    if nclasses == 2:
+        a = auc(logits[:, 1] - logits[:, 0], labels == 1)
+    else:
+        per = [auc(logits[:, c], labels == c) for c in range(nclasses)]
+        per = [x for x in per if x is not None]
+        a = float(np.mean(per)) if per else None
+    return {
+        "n": int(len(labels)),
+        "accuracy": correct / len(labels),
+        "accuracy_ci": wilson(correct, len(labels)),
+        "balanced_accuracy": float(present.mean()) if len(present) else float("nan"),
+        "auc": a,
+        "per_class_recall": recall.tolist(),
+        "per_class_n": support.tolist(),
+        "sensitivity": float(recall[1]) if nclasses == 2 else None,
+        "specificity": float(recall[0]) if nclasses == 2 else None,
+        "confusion": conf.tolist(),
+    }
+
+
+def report_metrics(m, names):
+    """Print the full-test metrics, calling out an imbalance rather than
+    leaving it for the reader to derive from the confusion matrix."""
+    lo, hi = m["accuracy_ci"]
+    print(f"  accuracy          : {m['accuracy'] * 100:.2f}%  "
+          f"95% CI [{lo * 100:.1f}, {hi * 100:.1f}]  (n={m['n']})")
+    print(f"  balanced accuracy : {m['balanced_accuracy'] * 100:.2f}%")
+    print(f"  AUC               : "
+          + ("undefined" if m["auc"] is None else f"{m['auc']:.4f}")
+          + ("" if len(names) == 2 else "  (macro one-vs-rest)"))
+    if m["sensitivity"] is not None:
+        sens, spec = m["sensitivity"], m["specificity"]
+        print(f"  sensitivity/spec  : {sens * 100:.2f}% / {spec * 100:.2f}%")
+        if abs(sens - spec) > 0.15:
+            side = "misses disease" if sens < spec else "over-calls disease"
+            print(f"    ^ SKEWED by {abs(sens - spec) * 100:.0f} points -- the model "
+                  f"{side}; quote balanced accuracy, not accuracy")
+    else:
+        order = np.argsort([r if not math.isnan(r) else 2 for r in m["per_class_recall"]])
+        worst = ", ".join(
+            f"{names[c]} {m['per_class_recall'][c] * 100:.0f}% (n={m['per_class_n'][c]})"
+            for c in order[:3]
+        )
+        print(f"  weakest classes   : {worst}")
+
+
+def pick_gain(net, xva_u8, yva, targets=DEFAULT_GAINS):
     """Choose the quantisation gain on the VALIDATION split (never on test),
     rejecting any candidate whose activations pass the 2^28 the depth-1 noise
-    budget allows."""
+    budget allows.
+
+    Wider nets sum more terms per accumulator and so overflow at gains the
+    default sweep never goes below; `--gains` extends the ladder downwards for
+    them.  The default is left exactly as it was, so the weight files already
+    in the repo still regenerate to the same bytes."""
     best = None
     for t in targets:
         q = quantise(net, t)
@@ -251,69 +581,148 @@ def rust_array(name, rows, elem_ty, static_=True):
 
 
 def emit(path, q, images, labels, meta):
+    """Write the generated weight file for a conv stack of any depth/width.
+
+    The first conv is emitted as `KERNELS`/`CBIAS` -- `TrainedCnn` keeps it
+    separate because it is the single-channel one the Cheetah packing sees --
+    and convs 1.. as `CONV1_W`/`CONV1_B`/..., hidden dense layers as
+    `FC0_W`/`FC0_B`/..., the output layer as `DENSE_W`/`DENSE_B`.  The
+    `trained()` constructor at the bottom assembles them into the shape
+    `TrainedCnn` takes.  Each extra conv's input shape is baked in as a
+    constant rather than recomputed in Rust, so the two sides cannot silently
+    disagree about where pooling floors."""
+    convs, fcs, (out_w, out_b) = q["conv"], q["fc"], q["out"]
+    shapes = meta["conv_shapes"]  # [(in_c, in_h, in_w)] per conv layer
+    # Wrapped by hand rather than with textwrap: the stages are the natural
+    # break points, and a deep stack on one line is unreadable in the header.
+    stages = (
+        [f"1x{meta['d']}x{meta['d']}"]
+        + [f"conv({w.shape[0]},{K}x{K}) -> ReLU>>{SHIFT} -> pool" for w, _ in convs]
+        + [f"dense(->{w.shape[0]}) -> ReLU>>{SHIFT}" for w, _ in fcs]
+        + [f"dense(->{meta['nclasses']}) -> argmax"]
+    )
+    lines, cur = [], "// Architecture: "
+    for i, st in enumerate(stages):
+        piece = st if i == 0 else f" -> {st}"
+        if len(cur) + len(piece) > 76 and cur.strip() != "// Architecture:":
+            lines.append(cur)
+            cur = f"//   -> {st}"
+        else:
+            cur += piece
+    lines.append(cur)
+    arch = "\n".join(lines)
+    fm = meta["full_metrics"]
+    auc_lit = "None" if fm["auc"] is None else f"Some({fm['auc']:.6f})"
+    auc_txt = "undefined" if fm["auc"] is None else f"{fm['auc']:.4f}"
     o = []
-    o.append(f"""// GENERATED - do not edit. Trained + quantised two-conv CNN on
+    o.append(f"""// GENERATED - do not edit. Trained + quantised {len(convs)}-conv CNN on
 // {meta['dataset']} ({meta['provenance']}), plus a real test subset.
 // See tools/train_medmnist.py.
 //
 // Task: {meta['task']}
-// Architecture: 1x28x28 -> conv({OC},3x3) -> ReLU>>{SHIFT} -> pool
-//   -> conv({C2},3x3) -> ReLU>>{SHIFT} -> pool -> dense(400->{HN})
-//   -> ReLU>>{SHIFT} -> dense({HN}->{meta['nclasses']}) -> argmax
+{arch}
+// Parameters: {meta['n_params']}
+// Quantisation gain: {meta['gain']}; the largest activation over the full test
+// set needs 2^{meta['act_bits']} of the 2^30 the depth-1 FHE plaintext modulus allows
+// (max |activation| = {meta['max_abs']})
 // Full {meta['n_full']}-image integer test accuracy: {meta['full_acc'] * 100:.2f}%
-// (majority-class baseline {meta['baseline'] * 100:.2f}%)
+// 95% CI [{fm['accuracy_ci'][0] * 100:.2f}, {fm['accuracy_ci'][1] * 100:.2f}]
+// (float parent {meta['float_acc'] * 100:.2f}%, majority-class baseline {meta['baseline'] * 100:.2f}%)
+// Balanced accuracy {fm['balanced_accuracy'] * 100:.2f}%, AUC {auc_txt} — read these
+// rather than accuracy when the test set is imbalanced.{meta['gray_note']}
 
 pub const DATASET: &str = "{meta['dataset']}";
 pub const TASK: &str = "{meta['task']}";
 pub const FULL_TEST_ACCURACY: f64 = {meta['full_acc']:.6f};
+/// Accuracy of the float net these weights were quantised from, on the same
+/// full test set. `None` in weight files generated before the trainer
+/// recorded it; regenerate to populate.
+pub const FLOAT_TEST_ACCURACY: Option<f64> = Some({meta['float_acc']:.6f});
+/// Metrics over the FULL test set, which only the trainer can see — the
+/// benchmark itself is limited to the embedded subset. Accuracy alone cannot
+/// distinguish a balanced classifier from one riding the majority class, so
+/// balanced accuracy and AUC are recorded alongside it. `None` in weight files
+/// generated before the trainer measured them.
+pub const FULL_BALANCED_ACCURACY: Option<f64> = Some({meta['full_metrics']['balanced_accuracy']:.6f});
+pub const FULL_AUC: Option<f64> = {auc_lit};
 pub const MAJORITY_BASELINE: f64 = {meta['baseline']:.6f};
 pub const FULL_TEST_N: usize = {meta['n_full']};
-pub const OC: usize = {OC};
+pub const D: usize = {meta['d']};
 pub const K: usize = {K};
 pub const NCLASSES: usize = {meta['nclasses']};
-pub const HN: usize = {HN};
 pub const SHIFT: u32 = {SHIFT};
-pub const CONV2_IN_C: usize = {OC};
-pub const CONV2_IN_H: usize = 13;
-pub const CONV2_IN_W: usize = 13;
+/// Output channels of the first conv (the one the Cheetah packing sees as
+/// single-channel input); the rest are read off each layer's weight array.
+pub const OC: usize = {convs[0][0].shape[0]};
 pub const CLASS_NAMES: [&str; {meta['nclasses']}] = [{
     ", ".join('"' + c + '"' for c in meta['class_names'])
 }];
 """)
-    o.append(rust_array("KERNELS", q["k1"], "i64"))
-    o.append(rust_array("CBIAS", q["b1"], "i64", static_=False))
-    o.append(rust_array("CONV2_W", q["k2"], "i64"))
-    o.append(rust_array("CONV2_B", q["b2"], "i64", static_=False))
-    o.append(rust_array("FC1_W", q["w3"], "i64"))
-    o.append(rust_array("FC1_B", q["b3"], "i64"))
-    o.append(rust_array("DENSE_W", q["w4"], "i64"))
-    o.append(rust_array("DENSE_B", q["b4"], "i64"))
+    # Conv stack. Layer 0 is the single-channel first conv `TrainedCnn` keeps
+    # separate (KERNELS/CBIAS); layers 1.. are the multi-channel extras.
+    o.append(rust_array("KERNELS", convs[0][0], "i64"))
+    o.append(rust_array("CBIAS", convs[0][1], "i64", static_=False))
+    for i, (w, b) in enumerate(convs[1:], start=1):
+        in_c, in_h, in_w = shapes[i]
+        o.append(f"""
+pub const CONV{i}_IN_C: usize = {in_c};
+pub const CONV{i}_IN_H: usize = {in_h};
+pub const CONV{i}_IN_W: usize = {in_w};
+""")
+        o.append(rust_array(f"CONV{i}_W", w, "i64"))
+        o.append(rust_array(f"CONV{i}_B", b, "i64", static_=False))
+    for i, (w, b) in enumerate(fcs):
+        o.append(rust_array(f"FC{i}_W", w, "i64"))
+        o.append(rust_array(f"FC{i}_B", b, "i64"))
+    o.append(rust_array("DENSE_W", out_w, "i64"))
+    o.append(rust_array("DENSE_B", out_b, "i64"))
     o.append(f"""
 pub const N_TEST: usize = {len(labels)};
 """)
     o.append(rust_array("TEST_LABELS", labels, "u8"))
     o.append(rust_array("TEST_IMAGES", [im.reshape(-1) for im in images], "i64"))
-    o.append("""
+
+    extra = ",\n".join(
+        f"""        (
+            CONV{i}_W.iter().map(|r| r.to_vec()).collect(),
+            CONV{i}_B.to_vec(),
+            CONV{i}_IN_C,
+            CONV{i}_IN_H,
+            CONV{i}_IN_W,
+        )"""
+        for i in range(1, len(convs))
+    )
+    hidden = ",\n".join(
+        f"        (FC{i}_W.iter().map(|r| r.to_vec()).collect(), FC{i}_B.to_vec())"
+        for i in range(len(fcs))
+    )
+    o.append(f"""
+/// The conv layers after the first, in order. Each is
+/// `(kernels[out_c][in_c*K*K], bias[out_c], in_c, in_h, in_w)`; every one is
+/// another FHE conv + MPC nonlinearity + scheme switch, and no bootstrap.
+pub fn extra_conv_layers() -> Vec<(Vec<Vec<i64>>, Vec<i64>, usize, usize, usize)> {{
+    vec![
+{extra}
+    ]
+}}
+
 /// Hidden dense layers in order, each `(weights[out][in], bias[out])`.
-pub fn hidden_layers() -> Vec<(Vec<Vec<i64>>, Vec<i64>)> {
-    vec![(FC1_W.iter().map(|r| r.to_vec()).collect(), FC1_B.to_vec())]
-}
+pub fn hidden_layers() -> Vec<(Vec<Vec<i64>>, Vec<i64>)> {{
+    vec![
+{hidden}
+    ]
+}}
 
 /// Everything `bench-medmnist` needs, in the crate's normalised form.
-pub fn trained() -> crate::bench::medmnist::TrainedCnn {
-    crate::bench::medmnist::TrainedCnn {
+pub fn trained() -> crate::bench::medmnist::TrainedCnn {{
+    crate::bench::medmnist::TrainedCnn {{
         dataset: DATASET,
         task: TASK,
         class_names: CLASS_NAMES.to_vec(),
+        d: D,
         kernels: KERNELS.iter().map(|k| k.to_vec()).collect(),
         cbias: CBIAS.to_vec(),
-        conv2: (
-            CONV2_W.iter().map(|r| r.to_vec()).collect(),
-            CONV2_B.to_vec(),
-            CONV2_IN_C,
-            CONV2_IN_H,
-            CONV2_IN_W,
-        ),
+        extra_conv: extra_conv_layers(),
         hidden: hidden_layers(),
         dense_w: DENSE_W.iter().map(|r| r.to_vec()).collect(),
         dense_b: DENSE_B.to_vec(),
@@ -321,10 +730,13 @@ pub fn trained() -> crate::bench::medmnist::TrainedCnn {
         images: TEST_IMAGES.iter().map(|im| im.to_vec()).collect(),
         labels: TEST_LABELS.to_vec(),
         full_test_accuracy: FULL_TEST_ACCURACY,
+        float_test_accuracy: FLOAT_TEST_ACCURACY,
+        full_balanced_accuracy: FULL_BALANCED_ACCURACY,
+        full_auc: FULL_AUC,
         majority_baseline: MAJORITY_BASELINE,
         full_test_n: FULL_TEST_N,
-    }
-}
+    }}
+}}
 """)
     with open(path, "w") as f:
         f.write("".join(o))
@@ -486,12 +898,30 @@ def main():
     ap.add_argument("--linear", action="store_true",
                     help="train the single-neuron Q16.16 discriminator that "
                          "examples/mnist.rs runs on TFHE/CKKS (2-class only)")
+    ap.add_argument("--conv", default=",".join(str(c) for c in DEFAULT_CONV),
+                    help="comma-separated conv output channels, one per layer "
+                         f"(default {','.join(str(c) for c in DEFAULT_CONV)}). "
+                         "Each layer is 3x3 valid + ReLU + pool2, so a 28x28 "
+                         "input admits at most three.")
+    ap.add_argument("--fc", default=",".join(str(h) for h in DEFAULT_FC),
+                    help="comma-separated hidden dense widths, one per layer "
+                         f"(default {','.join(str(h) for h in DEFAULT_FC)}); "
+                         "empty string for none")
+    ap.add_argument("--gains", default="",
+                    help="comma-separated quantisation-gain ladder to sweep on "
+                         "validation (default 64,128,256,512 plus the "
+                         "no-rescale case). Wider nets overflow the depth-1 "
+                         "plaintext modulus at those, and want smaller ones.")
+    ap.add_argument("--device", default="auto", choices=("auto", "cpu", "mps"),
+                    help="training device; scoring the integer net is numpy on "
+                         "CPU either way")
     args = ap.parse_args()
 
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
 
     d = load_dataset(args.npz)
+    d, folded = to_grayscale(d)
     xtr = d["train_images"].astype(np.float32) / 255.0
     ytr = d["train_labels"].ravel().astype(np.int64)
     xva = d["val_images"].astype(np.float32) / 255.0
@@ -499,19 +929,36 @@ def main():
     xte_u8 = d["test_images"].astype(np.int64)
     yte = d["test_labels"].ravel().astype(np.int64)
     nclasses = int(ytr.max()) + 1
+    side = xtr.shape[1]
+    if xtr.shape[1] != xtr.shape[2]:
+        sys.exit(f"expected square images, got {xtr.shape[1]}x{xtr.shape[2]}")
     print(f"{args.npz}: train {xtr.shape} val {xva.shape} test {xte_u8.shape}, "
           f"{nclasses} classes", flush=True)
+    if folded:
+        print("RGB input folded to BT.601 luminance: accuracy below is a "
+              "GRAYSCALE result, not comparable to a published RGB number",
+              flush=True)
 
     if args.linear:
+        if side != 28:
+            sys.exit(f"--linear is fixed to 784 raw pixels; this input is {side}x{side}")
         return train_linear(args, d, nclasses)
 
-    net = Net(nclasses)
+    convs = parse_widths(args.conv, "--conv", allow_empty=False)
+    fcs = parse_widths(args.fc, "--fc", allow_empty=True)
+    gains = parse_gains(args.gains, DEFAULT_GAINS)
+    device = pick_device(args.device)
+    shapes, flat = conv_shapes(side, convs)
+    check_packing(shapes)
+    net = Net(nclasses, convs, fcs, side).to(device)
+    print(f"model: conv {convs} -> flat {flat} -> fc {fcs} -> {nclasses}  "
+          f"({net.n_params()} parameters, training on {device.type})", flush=True)
     opt = torch.optim.Adam(net.parameters(), lr=1e-3)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, args.epochs)
-    Xtr = torch.from_numpy(xtr).unsqueeze(1)
-    Ytr = torch.from_numpy(ytr)
-    Xva = torch.from_numpy(xva).unsqueeze(1)
-    Yva = torch.from_numpy(yva)
+    Xtr = torch.from_numpy(xtr).unsqueeze(1).to(device)
+    Ytr = torch.from_numpy(ytr).to(device)
+    Xva = torch.from_numpy(xva).unsqueeze(1).to(device)
+    Yva = torch.from_numpy(yva).to(device)
 
     best, best_state = -1.0, None
     bs = 128
@@ -537,23 +984,35 @@ def main():
     net.load_state_dict(best_state)
     net.eval()
     with torch.no_grad():
-        Xte = torch.from_numpy(xte_u8.astype(np.float32) / 255.0).unsqueeze(1)
-        float_acc = (net(Xte).argmax(1) == torch.from_numpy(yte)).float().mean().item()
+        Xte = torch.from_numpy(xte_u8.astype(np.float32) / 255.0).unsqueeze(1).to(device)
+        float_acc = (
+            (net(Xte).argmax(1).cpu() == torch.from_numpy(yte)).float().mean().item()
+        )
     print(f"float test accuracy: {float_acc * 100:.2f}% (best val {best * 100:.2f}%)",
           flush=True)
 
     # Pick the quantisation gain on validation, then score on the FULL test set.
     print("quantisation gain sweep (validation split):", flush=True)
-    q, gain = pick_gain(net, d["val_images"].astype(np.int64), yva)
+    q, gain = pick_gain(net, d["val_images"].astype(np.int64), yva, gains)
     int_acc, max_abs, preds = score_int(q, xte_u8, yte, progress_every=2000)
     needed = int(max_abs).bit_length() + 2
     baseline = float(np.bincount(yte, minlength=nclasses).max() / len(yte))
     with torch.no_grad():
-        float_preds = net(Xte).argmax(1).numpy()
+        float_preds = net(Xte).argmax(1).cpu().numpy()
     agree = float((preds == float_preds).mean())
     print(f"integer test accuracy: {int_acc * 100:.2f}%  "
           f"(float {float_acc * 100:.2f}%, majority {baseline * 100:.2f}%)")
     print(f"integer/float prediction agreement: {agree * 100:.2f}%")
+
+    # Full-test metrics beyond accuracy. These are the numbers that belong in a
+    # paper: the Rust benchmark can only ever see the embedded subset, and
+    # accuracy alone cannot tell a balanced classifier from one that rides the
+    # majority class -- which on an imbalanced medical set is the whole story.
+    names_for_metrics = (args.classes.split(",") if args.classes
+                         else [str(i) for i in range(nclasses)])
+    print("full-test metrics (integer model):", flush=True)
+    fm = full_metrics(score_logits(q, xte_u8, progress_every=5000), yte, nclasses)
+    report_metrics(fm, names_for_metrics)
     print(f"max |activation| = {max_abs} -> needs 2^{needed} "
           f"({'OK' if needed <= 30 else 'TOO WIDE for the depth-1 noise budget'})")
     if needed > 30:
@@ -579,10 +1038,26 @@ def main():
         ),
         "task": args.task or "classification",
         "nclasses": nclasses,
+        "d": side,
+        "conv_shapes": shapes,
+        "n_params": net.n_params(),
+        "gain": gain,
+        "act_bits": needed,
+        "max_abs": max_abs,
         "full_acc": int_acc,
+        "float_acc": float_acc,
+        "full_metrics": fm,
         "baseline": baseline,
         "n_full": len(xte_u8),
         "class_names": names,
+        # An accuracy measured after the luminance fold is a grayscale result;
+        # the file has to carry that or the number invites a comparison to the
+        # published RGB model that it does not support.
+        "gray_note": (
+            "\n// NOTE: this dataset ships RGB; the input was folded to BT.601 "
+            "luminance\n// before training, so the accuracy above is a GRAYSCALE "
+            "result and must not\n// be read against the published RGB ResNet-18."
+        ) if folded else "",
     }
     emit(args.rust_out, q, [xte_u8[i] for i in sel], yte[sel].astype(np.uint8), meta)
     subset_acc = float((preds[sel] == yte[sel]).mean())
@@ -591,7 +1066,9 @@ def main():
     print(json.dumps({"dataset": meta["dataset"], "int_acc": int_acc,
                       "float_acc": float_acc, "subset_acc": subset_acc,
                       "baseline": baseline, "max_abs": max_abs,
-                      "gain": gain, "agreement": agree}))
+                      "gain": gain, "agreement": agree, "conv": convs,
+                      "fc": fcs, "n_params": net.n_params(),
+                      "grayscale_fold": folded}))
 
 
 if __name__ == "__main__":

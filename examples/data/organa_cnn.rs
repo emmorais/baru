@@ -2,6 +2,13 @@
 // OrganAMNIST (MedMNIST v2, CC BY 4.0), plus a real test subset.
 // See tools/train_medmnist.py.
 //
+// NOTE: this file predates the current generator. It was emitted before the
+// trainer took arbitrary --conv/--fc stacks and before it recorded the float
+// parent's accuracy, so FLOAT_TEST_ACCURACY is None and the header lacks the
+// parameter-count and activation-width lines newer files carry. The weights,
+// images and accuracy figures below are unchanged and still correct; rerun
+// tools/train_medmnist.py against the dataset to pick up the new fields.
+//
 // Task: abdominal CT: 11-organ classification (axial views)
 // Architecture: 1x28x28 -> conv(8,3x3) -> ReLU>>8 -> pool
 //   -> conv(16,3x3) -> ReLU>>8 -> pool -> dense(400->128)
@@ -12,16 +19,28 @@
 pub const DATASET: &str = "OrganAMNIST";
 pub const TASK: &str = "abdominal CT: 11-organ classification (axial views)";
 pub const FULL_TEST_ACCURACY: f64 = 0.811846;
+/// Accuracy of the float net these weights were quantised from, on the same
+/// full test set. `None` here because the generator that produced this file
+/// did not measure it; regenerate to populate rather than copying a number in
+/// by hand.
+pub const FLOAT_TEST_ACCURACY: Option<f64> = None;
+/// Balanced accuracy and AUC over the FULL test set. `None` here because the
+/// generator that produced this file measured neither; regenerate to populate
+/// rather than copying a number in by hand.
+pub const FULL_BALANCED_ACCURACY: Option<f64> = None;
+pub const FULL_AUC: Option<f64> = None;
 pub const MAJORITY_BASELINE: f64 = 0.184779;
 pub const FULL_TEST_N: usize = 17778;
+pub const D: usize = 28;
+/// Output channels of the first conv (the one the Cheetah packing sees as
+/// single-channel input); the rest are read off each layer's weight array.
 pub const OC: usize = 8;
 pub const K: usize = 3;
 pub const NCLASSES: usize = 11;
-pub const HN: usize = 128;
 pub const SHIFT: u32 = 8;
-pub const CONV2_IN_C: usize = 8;
-pub const CONV2_IN_H: usize = 13;
-pub const CONV2_IN_W: usize = 13;
+pub const CONV1_IN_C: usize = 8;
+pub const CONV1_IN_H: usize = 13;
+pub const CONV1_IN_W: usize = 13;
 pub const CLASS_NAMES: [&str; 11] = [
     "bladder",
     "femur-left",
@@ -46,7 +65,7 @@ pub static KERNELS: [[i64; 9]; 8] = [
     [58, 65, 6, 27, 48, 59, 82, -53, -37],
 ];
 pub const CBIAS: [i64; 8] = [27, 118, 60, 131, 9, -111, 10, -81];
-pub static CONV2_W: [[i64; 72]; 16] = [
+pub static CONV1_W: [[i64; 72]; 16] = [
     [
         -7, 34, 30, 0, 24, 17, 12, 7, 11, -5, 18, 15, 18, 18, -7, -3, 17, 12, -30, -28, 9, -12,
         -31, -13, -38, -31, -28, 35, 58, 50, 60, 77, 48, 77, 83, 56, 23, 4, -15, 33, 35, 6, 17, 18,
@@ -144,10 +163,10 @@ pub static CONV2_W: [[i64; 72]; 16] = [
         7, -9, 11, 14,
     ],
 ];
-pub const CONV2_B: [i64; 16] = [
+pub const CONV1_B: [i64; 16] = [
     -7, -4, 15, -28, 15, -5, 7, -13, -13, 19, -12, -9, -16, -23, -8, -5,
 ];
-pub static FC1_W: [[i64; 400]; 128] = [
+pub static FC0_W: [[i64; 400]; 128] = [
     [
         -2, -17, 20, 7, 15, -10, 6, 19, 19, -10, 1, 5, -4, 3, -13, 1, -12, 36, 16, -19, -6, 18, 47,
         11, -37, -2, 4, 7, 18, 17, 1, 5, 0, 15, 24, 1, 4, 8, 12, 25, -2, -6, 12, 17, 14, -4, -14,
@@ -2588,7 +2607,7 @@ pub static FC1_W: [[i64; 400]; 128] = [
         -2, 4, -3, -1, -4, -2, 2, 5, -3, 3, 0,
     ],
 ];
-pub static FC1_B: [i64; 128] = [
+pub static FC0_B: [i64; 128] = [
     1321, -279, -1029, 1505, 846, -385, 688, -523, -4, 44, -242, -245, -71, 492, -306, 933, 325,
     -396, -327, 1410, 62, 200, -49, 813, 70, 21, -16, 9, -155, -366, -1191, 135, 1061, 704, 506,
     96, 836, 1192, 1701, 971, 92, 488, 38, 358, -823, -276, 528, 847, 827, -694, -259, 727, -281,
@@ -15035,9 +15054,24 @@ pub static TEST_IMAGES: [[i64; 784]; 300] = [
     ],
 ];
 
+/// The conv layers after the first, in order. Each is
+/// `(kernels[out_c][in_c*K*K], bias[out_c], in_c, in_h, in_w)`; every one is
+/// another FHE conv + MPC nonlinearity + scheme switch, and no bootstrap.
+pub fn extra_conv_layers() -> Vec<(Vec<Vec<i64>>, Vec<i64>, usize, usize, usize)> {
+    vec![
+        (
+            CONV1_W.iter().map(|r| r.to_vec()).collect(),
+            CONV1_B.to_vec(),
+            CONV1_IN_C,
+            CONV1_IN_H,
+            CONV1_IN_W,
+        )
+    ]
+}
+
 /// Hidden dense layers in order, each `(weights[out][in], bias[out])`.
 pub fn hidden_layers() -> Vec<(Vec<Vec<i64>>, Vec<i64>)> {
-    vec![(FC1_W.iter().map(|r| r.to_vec()).collect(), FC1_B.to_vec())]
+    vec![(FC0_W.iter().map(|r| r.to_vec()).collect(), FC0_B.to_vec())]
 }
 
 /// Everything `bench-medmnist` needs, in the crate's normalised form.
@@ -15046,15 +15080,10 @@ pub fn trained() -> crate::bench::medmnist::TrainedCnn {
         dataset: DATASET,
         task: TASK,
         class_names: CLASS_NAMES.to_vec(),
+        d: D,
         kernels: KERNELS.iter().map(|k| k.to_vec()).collect(),
         cbias: CBIAS.to_vec(),
-        conv2: (
-            CONV2_W.iter().map(|r| r.to_vec()).collect(),
-            CONV2_B.to_vec(),
-            CONV2_IN_C,
-            CONV2_IN_H,
-            CONV2_IN_W,
-        ),
+        extra_conv: extra_conv_layers(),
         hidden: hidden_layers(),
         dense_w: DENSE_W.iter().map(|r| r.to_vec()).collect(),
         dense_b: DENSE_B.to_vec(),
@@ -15062,6 +15091,9 @@ pub fn trained() -> crate::bench::medmnist::TrainedCnn {
         images: TEST_IMAGES.iter().map(|im| im.to_vec()).collect(),
         labels: TEST_LABELS.to_vec(),
         full_test_accuracy: FULL_TEST_ACCURACY,
+        float_test_accuracy: FLOAT_TEST_ACCURACY,
+        full_balanced_accuracy: FULL_BALANCED_ACCURACY,
+        full_auc: FULL_AUC,
         majority_baseline: MAJORITY_BASELINE,
         full_test_n: FULL_TEST_N,
     }
