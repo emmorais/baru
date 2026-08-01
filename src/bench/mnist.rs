@@ -50,6 +50,7 @@ use serde::Serialize;
 
 use crate::bench::cnn::{run_cnn_hybrid, CnnModel, ConvLayer};
 use crate::bench::comm::NetworkProfile;
+use crate::bench::metrics::ClassificationMetrics;
 
 #[path = "../../examples/data/mnist_cnn.rs"]
 #[allow(dead_code)] // generated file exports a few descriptive consts we don't read
@@ -103,6 +104,10 @@ pub struct MnistReport {
     pub architecture: String,
     pub n_test: usize,
     pub plaintext_correct: usize,
+    /// Per-class recall, confusion, balanced accuracy, macro AUC and a Wilson
+    /// interval over the embedded subset — the same set `bench-medmnist`
+    /// reports, so the two benchmarks are read the same way.
+    pub metrics: ClassificationMetrics,
     pub plaintext_accuracy: f64,
     pub full_test_accuracy: f64,
     pub hybrid_evaluated: usize,
@@ -116,20 +121,18 @@ pub fn run(hybrid_n: usize, profile: NetworkProfile) -> MnistReport {
     let (model, images, labels) = load_model();
     let t0 = Instant::now();
 
-    // Plaintext-integer accuracy over every embedded test image.
-    let mut plaintext_correct = 0usize;
-    let preds: Vec<usize> = images
+    // Plaintext-integer scoring over every embedded test image. Logits rather
+    // than the argmax alone so the same metrics `bench-medmnist` reports are
+    // available here: MNIST is near-balanced, so accuracy is not actively
+    // misleading as it is on pneumonia, but a per-class collapse and an
+    // interval on a 300-image subset are worth seeing either way.
+    let logits: Vec<Vec<i64>> = images.iter().map(|img| model.forward_logits(img).0).collect();
+    let preds: Vec<usize> = logits
         .iter()
-        .map(|img| {
-            let (class, _) = model.forward(img);
-            class
-        })
+        .map(|l| crate::gadgets::argmax_ref(l))
         .collect();
-    for (p, &l) in preds.iter().zip(&labels) {
-        if *p == l as usize {
-            plaintext_correct += 1;
-        }
-    }
+    let metrics = ClassificationMetrics::compute(&logits, &labels, model.nclasses());
+    let plaintext_correct = metrics.correct;
 
     // Encrypted accuracy on a subset: prove each hybrid prediction equals the
     // plaintext one (bit-exact) and count how many match the true label.
@@ -150,6 +153,7 @@ pub fn run(hybrid_n: usize, profile: NetworkProfile) -> MnistReport {
         architecture: model.architecture(),
         n_test: images.len(),
         plaintext_correct,
+        metrics,
         plaintext_accuracy: plaintext_correct as f64 / images.len() as f64,
         full_test_accuracy: FULL_TEST_ACCURACY,
         hybrid_evaluated: hybrid_n,
@@ -204,12 +208,22 @@ pub fn run_cli(args: &[String]) -> Result<(), String> {
     println!("Private CNN on real MNIST — trained weights, real test digits, ZERO bootstraps");
     println!("architecture: {}", r.architecture);
     println!();
+    let m = &r.metrics;
     println!(
-        "  plaintext-integer accuracy : {}/{} = {:.2}%  (this in-repo subset)",
+        "  plaintext-integer accuracy : {}/{} = {:.2}%  95% CI [{:.1}, {:.1}]  (in-repo subset)",
         r.plaintext_correct,
         r.n_test,
-        r.plaintext_accuracy * 100.0
+        r.plaintext_accuracy * 100.0,
+        m.accuracy_ci.0 * 100.0,
+        m.accuracy_ci.1 * 100.0
     );
+    println!(
+        "  balanced accuracy          : {:.2}%  (mean per-class recall, subset)",
+        m.balanced_accuracy * 100.0
+    );
+    if let Some(a) = m.auc {
+        println!("  AUC (macro one-vs-rest)    : {a:.4}  (subset)");
+    }
     println!(
         "  full MNIST test set (10 000): {:.2}%  (identical weights, measured offline)",
         r.full_test_accuracy * 100.0
