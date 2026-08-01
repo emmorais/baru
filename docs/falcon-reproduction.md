@@ -665,11 +665,248 @@ does not use.
     **0.444 MB**, consistent given `Π_SS` is not counted here and their ReLU line
     (`4kn`) exceeds our DReLU.
 
-14. **Still open**: whole-ReLU comparison (needs Falcon's truncation on the
-    transport — `truncate_exact` is a local simulation), and an end-to-end run
-    rather than an extrapolation. Note the extrapolation is on firm ground: the
-    per-op costs are measured and stable across n, the op counts are arithmetic,
-    and the linear part is provably the same protocol on both sides. — Falcon
+14. **`Π_Maxpool` on the transport.** ✅ **Done 2026-08-01**
+    (`falcon_mpc::maxpool_batch`). Folds left over each window with one
+    `Π_DReLU` and one `Π_SS` per step, **every window's step `k` batched
+    together** — so a pooling layer costs `arity−1` DReLU rounds regardless of
+    how many windows it has. Value-only, matching what inference needs; the
+    one-hot is training machinery and charging inference for it would overstate
+    the baseline.
+
+15. **Exact truncation on the transport.** ✅ **Done 2026-08-01**
+    (`falcon_mpc::truncate_batch`). Open `c = a + r` from a truncation pair, then
+    `a>>d = (c>>d) − (r>>d) − borrow`. Exact on every input, verified against a
+    plain shift.
+
+    **`Π_PC` cannot serve the borrow, and that is a finding.** It looks like it
+    should: `borrow ⟺ r_lo ≥ c_lo + 1` is exactly `Π_PC`'s shape, secret against
+    public. But `Π_PC` is undefined when its secret equals its public argument,
+    and that case is `r_lo = c_lo + 1` — **precisely the boundary where the
+    borrow flips**. The degenerate input is not rare and cannot be masked away:
+    it *is* the answer. Caught at the first value where it bites (`a = 15`,
+    `d = 4`, `r_lo = 10`, `c_lo + 1 = 10`).
+
+    So the borrow is the sign of `c_lo − r_lo` by bit decomposition, which is
+    exact at equality. Worth recording for the reproduction: **Falcon's own stack
+    needs a comparison primitive `Π_PC` does not provide.** Their paper cites
+    ABY3 for the truncation pair and does not spell this out.
+
+16. **The layer, composed.** ✅ **Done 2026-08-01** (`falcon_mpc::dense_batch`,
+    `layer_batch`). A whole fixed-point block — `ReLU(truncate(W·x, d))` with
+    **secret weights** — runs on the transport and matches integer arithmetic
+    exactly.
+
+    `dense_batch` is Falcon's `Π_MatMul` and Baru's `gadgets::dense`: the *same*
+    RSS protocol, one batched round of `out·in` secret×secret products followed
+    by local sums. That equality is why the linear layers were never the
+    difference between the two systems, and it is why the comparison has always
+    reduced to the nonlinearity.
+
+    Note where the truncation sits — **after the multiplication, not fused into
+    the nonlinearity**. That is Falcon's placement, and it is why a like-for-like
+    comparison against Baru's fused `relu∘rescale` has to be made at the layer
+    rather than the operation.
+
+    **Falcon's inference path is now reproduced in full**, every piece on the
+    real transport and checked against a plaintext reference.
+
+## Applying it to MedMNIST — and the inefficiency that surfaced
+
+MedMNIST is the same shape Falcon targets (28×28, conv→pool→conv→pool→dense),
+so the reproduced stack applies with no new cryptography. Working out the
+comparison exposed a real defect in Baru's own dense layer.
+
+**`gadgets::dense` was resharing per *product*, not per *output*.** In RSS a dot
+product needs one resharing: each party accumulates its cross-terms locally,
+adds one α, and sends a single element. Falcon's table says exactly this —
+`MatMul (x×y)(y×z) = k·x·z`, where `x·z` counts *outputs*. Baru batched all
+`out×in` products into one round (correct, and already a large win over the
+per-element form) but still reshared each product separately.
+
+On the MedMNIST CNN that is **239 520 products against 7 474 outputs — 32×**.
+
+Fixed 2026-08-01 (`aby3_protocol::dot_batch_party`, `Backend::dot_batch`,
+`gadgets::dense`). The trait default composes `mul_batch` with local addition, so
+every other backend is unchanged; `TransportBackend` overrides it. Measured on
+`bench-abstraction`'s 8×64 dense: **46 636 → 38 572 bytes**, the saving exactly
+`512 − 8 = 504` elements × 16 B, with the round count untouched. The gadget
+library now *beats* the hand-batched baseline it previously only matched.
+
+### The comparison, per party
+
+| | linear | nonlinear | total |
+|---|---|---|---|
+| Baru RSS + wrap3, **before** the fix | 0.958 MB | 0.377 MB | 1.335 MB |
+| Baru RSS + wrap3, **after** | **0.030 MB** | 0.377 MB | **0.407 MB** |
+| Falcon | 0.030 MB | 0.377 MB | 0.407 MB |
+| Baru today (FHE + GC), *measured* | — | — | **10.1 MB** |
+
+**The fix closes the linear-layer gap entirely — the reproduced stack is now at
+communication parity with Falcon on MedMNIST**, and both are ~25× leaner than
+Baru's current FHE+GC pipeline.
+
+Latency is closer than communication: ~7 136 DReLUs at ~0.043 ms each is ≈307 ms
+in this Rust simulation against Baru's measured 268 ms — roughly a wash *here*,
+though Falcon's optimised C++ would be well ahead of both. Accuracy is identical;
+both are exact on the same integer model.
+
+Note the fix does **not** move `bench-medmnist`'s current numbers: that pipeline
+uses FHE for its linear layers, so `gadgets::dense` is not on its path. It pays
+off for the all-RSS route, which is the one now worth building.
+
+### ⚠️ Measured end to end, and the estimate above was wrong by 33×
+
+`baru bench-falcon --net` runs the MedMNIST shape entirely in RSS —
+`conv(8) → conv(16) → dense(128) → dense(2)`, secret weights, truncation and
+ReLU after every linear layer. Measured, per party:
+
+| | | |
+|---|---|---|
+| linear (7 474 outputs × 16 B) | 0.120 MB | 0.9% |
+| DReLU (7 136 × 52.8 B) | 0.377 MB | 2.8% |
+| **truncation** (7 474 × ~1 717 B) | **12.832 MB** | **96.3%** |
+| **total** | **13.328 MB** | |
+
+**The 0.407 MB figure predicted above is wrong.** It counted linear and DReLU and
+**omitted truncation entirely**, and it assumed 4-byte ring elements where the
+wire carries 16. Both errors were mine; the measurement is what caught them.
+
+**Truncation is 96% of an all-RSS fixed-point network.** Not the nonlinearity —
+truncation, because our exact borrow is a 9-bit `a2b`, and every linear output
+needs one. That reframes the whole comparison: the operation worth optimising in
+this design is the one nobody was looking at.
+
+It also sharpens a question about Falcon. They report 0.74 MB for LeNet while
+insisting on *exact* truncation after every multiplication. If their truncation
+cost anything like ours, that budget would be gone many times over — so their
+construction must be far cheaper than an `a2b` borrow. The paper cites ABY3's
+Fig. 3 rather than spelling it out, and **reproducing their cost now depends on
+reading that construction**, not on anything left in their own text.
+
+### Fixed: 13.328 → 1.378 MB/party (9.7×)
+
+The diagnosis pointed at one thing — the borrow's 9-bit `a2b` was ~108 ring
+elements at `u128`, so **1 728 B carrying 54 B of content**.
+
+The earlier attempt to narrow `a2b` failed because its bit-shares are
+*arithmetic*-encoded and feed wide multiplications on the `lt`/`max2` path. But
+that is a property of the **consumer**, not the protocol, and truncation's
+consumer is different: the borrow is read purely as a bit (`& 1`, then a `Z_2`
+input to `Π_SS`) and never multiplied by a wide operand. So the narrowing is
+safe *here* precisely where it was unsafe *there* — the same shape of argument
+as the doubling that discharges `Π_PC`'s degenerate input.
+
+`a2b_batch_party_at` carries the bit-shares at a caller-chosen width, with the
+precondition stated on the function and `wire_bits ≥ 2` asserted (the XOR
+encoding evaluates `a+b−2ab`, so one bit is not enough room even though the
+value is). Truncation asks for 4.
+
+The same reasoning then applies to everything else in `falcon_mpc`, which is
+`l_bits`-consistent end to end: `dot_batch_party_at` and `mul_batch_party_at`
+carry the linear layers and the selects at 32 bits rather than 128.
+
+| | MB/party | |
+|---|---|---|
+| start (everything at `u128`) | 13.328 | |
+| narrow the borrow's `a2b` to 4 bits | 2.326 | 5.7× |
+| narrow linear + selects to `l_bits` | **1.378** | 1.7× |
+| | | **9.7× total** |
+
+All 63 exactness tests still pass, including `transport_truncation_is_exact` —
+the narrowing changes what goes on the wire, not what is computed.
+
+**Remaining gap to Falcon: 1.378 MB against 0.740 MB**, and theirs is for the
+*larger* LeNet. So there is roughly another 2× to find, and truncation is still
+the largest term. Whether their construction avoids the borrow comparison
+entirely is the open question, and it is answerable only from ABY3's Fig. 3.
+
+## Falcon as a selectable backend (2026-08-01)
+
+Falcon is now a **nonlinearity mode**, not a parallel system:
+`NonlinMode::{A2b, Gc, Falcon}` on `TransportBackend`, selectable as
+`--falcon` wherever `--gc` already was.
+
+That shape is forced by the finding this whole exercise produced: Falcon and
+Baru share the replicated sharing *and the linear layer* unchanged —
+`Π_MatMul` is `gadgets::dense`. The **only** thing that ever differed is the
+comparison, so the only thing worth swapping is the comparison. Everything that
+reduces to `lt_batch` — ReLU, max-pool, argmax — changes protocol for free.
+
+`every_nonlinearity_mode_computes_the_same_comparison` asserts the three are
+interchangeable before any cost is quoted.
+
+### Measured on MedMNIST, one encrypted diagnosis
+
+| mode | messages | traffic | latency | matches plaintext |
+|---|---|---|---|---|
+| `a2b` | 114 | 29.9 MB | 2367 ms | ✅ |
+| `--gc` | 61 | 10.1 MB | 489 ms | ✅ |
+| `--falcon` | 128 | **8.5 MB** | 1112 ms | ✅ |
+
+**Falcon is the lowest-bandwidth route and `gc` the lowest-latency one** — 1.2×
+fewer bytes against 2.3× more time. Neither dominates, which is exactly the
+crossover the cost model exists to decide, now backed by three interchangeable
+implementations rather than an argument.
+
+### Two things it needed, both worth naming
+
+**Output encoding.** `drelu_batch` produces a `Z_2` bit; every consumer of
+`lt_batch` expects an *arithmetic* share it can multiply by a wide operand.
+Lifting the bit is `Π_SS`, so that select is a real cost of interchangeability,
+not an artefact.
+
+**⚠️ Preprocessing is dealt, not generated.** `Π_WA` needs a mask with its bits
+shared over `Z_p` and its own `wrap3`, and `δ = wrap3(x₁,x₂,x₃)` is derivable by
+no party. Falcon generates these interactively (their Fig. 6); here they come
+from a common seed, so **all three parties can reconstruct the mask**. The
+online protocol and its costs are real; the offline phase is not yet. This is
+the same disclosed caveat the repo already carries for dealer-based BFV keygen,
+and it is the one thing between `NonlinMode::Falcon` and a deployable protocol.
+
+## What remains
+
+- **An end-to-end LeNet run** rather than a per-op extrapolation. Everything it
+  needs exists; what is missing is the convolution *packing* (expressing conv as
+  a matmul over patches) and the harness, neither of which is new protocol.
+- **The measured crossover**, which is the contribution *on top of* the
+  reproduction: `wrap3` and garbled circuits win on different axes (~30× bytes
+  versus ~5× wall-clock), so the right nonlinearity depends on RTT and
+  bandwidth. Falcon fixes the choice; Baru has a cost model whose purpose is
+  making it. Sweeping `NetworkProfile` over the four routes turns that into a
+  measured boundary rather than a claim.
+
+## Strategy from here (2026-08-01)
+
+FHE does not win in this setting and garbled circuits do not either, so the plan
+is to **match Falcon's approach first, then build on it**. What that needs, and
+what it does not:
+
+| piece | state |
+|---|---|
+| `Π_PC`, `Π_WA`, `Π_DReLU`, `Π_SS`, `Π_ReLU` | ✅ on transport, validated |
+| `Π_Maxpool` | ✅ on transport |
+| MatMul | ✅ already — `gadgets::dense` is the same RSS protocol |
+| truncation | local simulation only |
+| network runner | not started |
+
+**Where parity actually stands.** On communication we are already there:
+~0.44 MB/party extrapolated against Falcon's reported 0.74 MB. On *compute* we
+are not — sign extraction runs at ~0.043 ms each, so LeNet's 8 044 DReLUs come
+to ~350 ms against Falcon's 47 ms total. That gap is Rust-in-simulation versus
+optimised C++ on a LAN, not protocol, but it is real and should not be papered
+over when the reproduction is written up.
+
+**And the "something new" is already visible in the measurements.** The four-way
+benchmark shows `wrap3` and garbled circuits winning on *different axes* —
+garbling is ~5× faster in wall-clock while sending ~30× more. Falcon always uses
+`wrap3`. Baru has a cost model (`mpcc::assign`) whose entire purpose is choosing
+per operation, and now has measured costs for all three nonlinearity routes. So
+the contribution on top of the reproduction is:
+
+> given a deployment's RTT and bandwidth, **pick** the nonlinearity protocol
+> rather than fixing it — with the crossover measured, not modelled.
+
+That is a claim the reproduction makes possible and that Falcon cannot make. — Falcon
    hand-written, Baru gadgets, Baru compiled — over the same transport, with
    message and byte counts, exactly as `bench-compiled-nn` does. All three
    checked against one plaintext reference; a cost comparison between routes

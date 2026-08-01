@@ -96,7 +96,8 @@ fn variant_tags() -> &'static VariantTags {
         VariantTags {
             ring: tag_of(&crate::crypto::net::MpcMsg::TaggedZBatch {
                 base_op_id: 0,
-                values: Vec::new(),
+                bits: 0,
+                data: Vec::new(),
             }),
             gc: tag_of(&crate::crypto::net::MpcMsg::GcFromGarbler {
                 op_id: 0,

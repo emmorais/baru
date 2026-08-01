@@ -901,7 +901,7 @@ fn mpc_conv_relu_pool(
         let conv_masks = conv_masks.clone();
         let cbias = cbias.clone();
         move |be: &mut TransportBackend<MpcTransport>| {
-            be.set_gc_nonlinearities(nonlin == Nonlin::Gc);
+            be.set_nonlin(nonlin.mode());
             // Reconstruct + bias every conv output locally (share_secret / add
             // are communication-free), then run the whole ReLU layer as one
             // batched a2b + one batched multiply, then max-pool.
@@ -1094,6 +1094,11 @@ fn fused_relu_rescale(
         // One garble round for the whole layer, versus ~log(nbits) rounds of
         // decomposition plus a batched multiply for the sign gate.
         Nonlin::Gc => be.relu_gc_batch(vs, nbits, shift as usize),
+        // Falcon has no fused relu∘rescale: its ReLU and its truncation are
+        // separate protocols. Routing the fused form through the generic
+        // `lt`-based path keeps the semantics identical, at the cost of not
+        // exercising `Π_ReLU` directly — see `falcon-reproduction.md`.
+        Nonlin::Falcon => fused_relu_rescale_batch(be, vs, shift, nbits),
     }
 }
 
@@ -1187,13 +1192,27 @@ pub enum Nonlin {
     A2b,
     /// Three-party garbled circuits, one round per layer.
     Gc,
+    /// Falcon's `wrap3` sign extraction over `Z_p` — the lowest-bandwidth of
+    /// the three, and the one a bandwidth-bound deployment should pick.
+    Falcon,
 }
 
 impl Nonlin {
+    /// The backend switch this selects.
+    pub fn mode(self) -> crate::interpreter::transport_backend::NonlinMode {
+        use crate::interpreter::transport_backend::NonlinMode as M;
+        match self {
+            Nonlin::A2b => M::A2b,
+            Nonlin::Gc => M::Gc,
+            Nonlin::Falcon => M::Falcon,
+        }
+    }
+
     pub fn label(self) -> &'static str {
         match self {
             Nonlin::A2b => "a2b (batched bit decomposition)",
             Nonlin::Gc => "gc (3-party garbled, constant-round)",
+            Nonlin::Falcon => "falcon (wrap3 over Z_p, lowest bandwidth)",
         }
     }
 }
@@ -1414,7 +1433,7 @@ pub fn run_cnn_hybrid_in_session(
             let hidden_masks = hidden_masks.clone();
             let hidden_b = hidden_b.clone();
             move |be: &mut TransportBackend<MpcTransport>| {
-                be.set_gc_nonlinearities(nonlin == Nonlin::Gc);
+                be.set_nonlin(nonlin.mode());
                 let t = Instant::now();
                 let raws = import_raw_batch(be, me, &hidden_open, &hidden_masks, h, nbits);
                 let vs: Vec<ShareRef> = raws
@@ -1477,7 +1496,7 @@ pub fn run_cnn_hybrid_in_session(
             // `argmax` reduces over scalar `lt`, not `lt_batch`, so the GC flag
             // does not reach it — deliberately: it is `nclasses−1` comparisons
             // against a layer's thousands, and the phase breakdown shows it.
-            be.set_gc_nonlinearities(nonlin == Nonlin::Gc);
+            be.set_nonlin(nonlin.mode());
             let raws = import_raw_batch(be, me, &dense_open, &dense_masks, nclasses, nbits);
             let logits: Vec<ShareRef> = raws
                 .iter()
@@ -1626,6 +1645,7 @@ pub fn run_cli(args: &[String]) -> Result<(), String> {
             }
             "--json" => json = true,
             "--gc" => nonlin = Nonlin::Gc,
+            "--falcon" => nonlin = Nonlin::Falcon,
             "--both" => both = true,
             "--precompute" => precompute = true,
             "--img" => {

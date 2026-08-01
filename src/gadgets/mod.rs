@@ -271,30 +271,26 @@ pub fn dense(
         return Vec::new();
     }
     // Every product in the layer is independent of every other, so the whole
-    // weight matrix is **one** batched multiply; only the summation is
-    // sequential, and addition is local (free). The per-element form this
-    // replaced issued `out_dim x in_dim` dependent rounds — on an 8x64 layer,
-    // 14x the messages and 45x the wall-clock at RTT 20 ms for identical
-    // output (`baru bench-abstraction`).
-    let mut pairs = Vec::with_capacity(weights.len() * x.len());
-    for row in weights {
-        for (w, xi) in row.iter().zip(x) {
-            pairs.push((w.clone(), xi.clone()));
-        }
-    }
-    let prods = be.mul_batch(&pairs);
-    weights
+    // weight matrix is **one** batched round; only the summation is sequential,
+    // and addition is local (free). The per-element form this replaced issued
+    // `out_dim x in_dim` dependent rounds — on an 8x64 layer, 14x the messages
+    // and 45x the wall-clock at RTT 20 ms for identical output
+    // (`baru bench-abstraction`).
+    //
+    // `dot_batch`, not `mul_batch`: the round count is the same either way, but
+    // resharing once per **output** instead of once per **product** removes the
+    // `in_dim` factor from the bytes. That is what Falcon's `MatMul = k·x·z`
+    // means, and on the MedMNIST CNN it is 32x — 239 520 products against 7 474
+    // outputs.
+    let nbits = x.first().map(|s| s.nbits).unwrap_or(1);
+    let dots: Vec<Vec<(ShareRef, ShareRef)>> = weights
         .iter()
-        .zip(bias)
-        .enumerate()
-        .map(|(r, (row, b))| {
-            let mut acc = b.clone();
-            for c in 0..row.len().min(x.len()) {
-                acc = be.add(&acc, &prods[r * x.len() + c]);
-            }
-            acc
-        })
-        .collect()
+        .map(|row| row.iter().zip(x).map(|(w, xi)| (w.clone(), xi.clone())).collect())
+        .collect();
+    let prods = be.dot_batch(&dots, nbits);
+    // `prods[r]` is already the whole dot product for row `r`, so only the
+    // bias is left to add — and that is local.
+    prods.iter().zip(bias).map(|(p, b)| be.add(p, b)).collect()
 }
 
 pub fn dense_ref(x: &[i64], weights: &[Vec<i64>], bias: &[i64]) -> Vec<i64> {

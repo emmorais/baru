@@ -355,7 +355,10 @@ pub fn reveal_batch_party<T: Transport>(
 /// recoverable from `r = Σrⱼ`. A reveal that returns only the value would make
 /// the wrap protocol unimplementable without a second exchange.
 /// Pack ring values at `bits` each, little-endian within the stream.
-fn pack_ring(values: &[Fr], bits: u32) -> Vec<u8> {
+///
+/// Public so that tests which tamper with a resharing message can express the
+/// tamper on *values* rather than on the encoding.
+pub fn pack_ring(values: &[Fr], bits: u32) -> Vec<u8> {
     let mut out = vec![0u8; (values.len() * bits as usize).div_ceil(8)];
     for (i, v) in values.iter().enumerate() {
         let base = i * bits as usize;
@@ -368,7 +371,7 @@ fn pack_ring(values: &[Fr], bits: u32) -> Vec<u8> {
     out
 }
 
-fn unpack_ring(data: &[u8], n: usize, bits: u32) -> Vec<Fr> {
+pub fn unpack_ring(data: &[u8], n: usize, bits: u32) -> Vec<Fr> {
     (0..n)
         .map(|i| {
             let base = i * bits as usize;
@@ -509,8 +512,142 @@ fn alpha_ctr(op_id: u64, i: usize) -> u64 {
 /// correctness (it always cancels in the sum) but a privacy leak: two
 /// products sharing an α expose their difference on the wire. See
 /// [`alpha_ctr`] for how collisions are ruled out.
+/// A batch of **dot products**, each resharing **once**.
+///
+/// # Why this is not `mul_batch_party` plus local sums
+///
+/// It computes the same values, and the products are already summed locally in
+/// both — but the resharing granularity differs, and that is the whole cost.
+/// Resharing per product sends one ring element per *multiplication*; resharing
+/// per dot product sends one per *output*. The cross-terms can be accumulated
+/// before the message because summation is local:
+///
+/// ```text
+/// Σₖ (aₖ,ᵢ·bₖ,ᵢ + aₖ,ᵢ·bₖ,ᵢ₊₁ + aₖ,ᵢ₊₁·bₖ,ᵢ) + αᵢ
+/// ```
+///
+/// summed over the three parties is `Σₖ aₖ·bₖ`, with the α telescoping to zero
+/// exactly as for a single product.
+///
+/// This is what Falcon's cost table means by `MatMul (x×y)(y×z) = k·x·z` — `x·z`
+/// is the number of *outputs*, not of products. On the MedMNIST CNN the two
+/// differ by **32×**: 239 520 products against 7 474 outputs.
+///
+/// One α per dot product, not per term: each opened value must be independently
+/// masked, and reusing an α across dots would expose their difference.
+pub fn dot_batch_party<T: Transport>(
+    dots: &[&[(PartyShare, PartyShare)]],
+    base_op_id: u64,
+    me: PartyId,
+    mbx: &Mailbox<T>,
+) -> Vec<PartyShare> {
+    dot_batch_party_at(dots, 128, base_op_id, me, mbx)
+}
+
+/// [`dot_batch_party`] with the resharing carried at `bits`.
+///
+/// Same precondition as [`mul_batch_party_at`]: every consumer of the result
+/// must work at `bits` or below. True throughout `falcon_mpc`, which is
+/// `l_bits`-consistent end to end; not true of the generic backend path, where
+/// widths mix.
+pub fn dot_batch_party_at<T: Transport>(
+    dots: &[&[(PartyShare, PartyShare)]],
+    bits: u32,
+    base_op_id: u64,
+    me: PartyId,
+    mbx: &Mailbox<T>,
+) -> Vec<PartyShare> {
+    if dots.is_empty() {
+        return Vec::new();
+    }
+    let wmask: Fr = if bits >= 128 { Fr::MAX } else { (1u128 << bits) - 1 };
+    let keys = mbx.prf_keys(me);
+    let z_mine: Vec<u128> = dots
+        .iter()
+        .enumerate()
+        .map(|(i, terms)| {
+            let acc = terms.iter().fold(0u128, |acc, (a, b)| {
+                acc.wrapping_add(a.left.wrapping_mul(b.left))
+                    .wrapping_add(a.left.wrapping_mul(b.right))
+                    .wrapping_add(a.right.wrapping_mul(b.left))
+            });
+            acc.wrapping_add(keys.alpha(alpha_ctr(base_op_id, i))) & wmask
+        })
+        .collect();
+
+    mbx.send(
+        (me + N - 1) % N,
+        serialize_msg(&MpcMsg::TaggedZBatch {
+            base_op_id,
+            bits,
+            data: pack_ring(&z_mine, bits),
+        }),
+    );
+    let (_, msg) = mbx
+        .recv_matching(TIMEOUT_MS, |m| {
+            matches!(m, MpcMsg::TaggedZBatch { base_op_id: b, .. } if *b == base_op_id)
+        })
+        .unwrap_or_else(|| panic!("dot_batch_party: timeout on z for op_id={base_op_id}"));
+    let z_next = match msg {
+        MpcMsg::TaggedZBatch { data, bits, .. } => unpack_ring(&data, z_mine.len(), bits),
+        _ => unreachable!("predicate guarantees TaggedZBatch"),
+    };
+    z_mine
+        .into_iter()
+        .zip(z_next)
+        .map(|(left, right)| PartyShare { left, right })
+        .collect()
+}
+
 pub fn mul_batch_party<T: Transport>(
     pairs: &[(PartyShare, PartyShare)],
+    base_op_id: u64,
+    me: PartyId,
+    mbx: &Mailbox<T>,
+) -> Vec<PartyShare> {
+    mul_batch_party_at(pairs, 128, base_op_id, me, mbx)
+}
+
+/// [`mul_batch_party`] with the sharing reduced to `bits` before it goes on the
+/// wire.
+///
+/// # Why the width has to be given, and why it is safe
+///
+/// The resharing message carried a `u128` per product regardless of how wide
+/// the shares actually were. For the bit-level multiplications inside `a2b` —
+/// which is what every comparison and ReLU in this crate bottoms out in — that
+/// is **128 bits on the wire per 1 bit of content**. Measured on sign
+/// extraction: 449 elements per operation, 7 184 wire bytes, ~56 bytes of
+/// content.
+///
+/// Reducing to `bits` is sound because the whole sharing is modulo a power of
+/// two: `2^bits | 2^128`, so a share reduced mod `2^bits` still reconstructs the
+/// value mod `2^bits`, and the α mask stays zero-sum (`F(kᵢ) − F(kᵢ₋₁)` telescopes
+/// under any modulus). Products of reduced shares remain correct mod `2^bits`,
+/// which is all any caller interpreting at that width can observe.
+///
+/// # ⚠️ Not currently usable below 128, and why
+///
+/// Reducing genuinely saves wire bytes — switching `a2b`'s ten internal calls to
+/// `nbits = 32` took sign extraction from 7 184 to 1 796 B, a clean 4×. It also
+/// **breaks the crate**, and the reason is worth recording.
+///
+/// Shares here are full-width `u128` *everywhere*; `nbits` is an
+/// interpretation attached to a `ShareRef`, never enforced on the sharing
+/// itself. Reducing a share's components mod `2^bits` leaves them summing to
+/// `v + k·2^bits` rather than `v` over `Z_{2^128}`. Every operation that stays
+/// within that width is fine — but a *downstream* consumer working at full
+/// width, such as the multiply inside `max2`, then computes on `v + k·2^bits`.
+/// Observed directly: `max2(9, 6)` returned 22 020 105.
+///
+/// So the 4× is real but is not a local change. It needs the sharing to be
+/// consistently modulo `2^nbits` — reduction at every operation and a `reveal`
+/// that masks — which is a crate-wide refactor, not a packing tweak. The
+/// parameter and the packed wire format are kept here so that work has
+/// somewhere to land; **every caller passes 128 today.**
+pub fn mul_batch_party_at<T: Transport>(
+    pairs: &[(PartyShare, PartyShare)],
+    bits: u32,
     base_op_id: u64,
     me: PartyId,
     mbx: &Mailbox<T>,
@@ -520,7 +657,9 @@ pub fn mul_batch_party<T: Transport>(
     }
     assert!(pairs.len() <= MAX_BATCH, "multiplication batch too large for α counters");
     let keys = mbx.prf_keys(me);
-    // Local: three of the nine cross terms, re-randomised by a zero-sum α.
+    let wmask: Fr = if bits >= 128 { Fr::MAX } else { (1u128 << bits) - 1 };
+    // Local: three of the nine cross terms, re-randomised by a zero-sum α, then
+    // reduced to the width actually in use.
     let z_mine: Vec<u128> = pairs
         .iter()
         .enumerate()
@@ -530,6 +669,7 @@ pub fn mul_batch_party<T: Transport>(
                 .wrapping_add(a.left.wrapping_mul(b.right))
                 .wrapping_add(a.right.wrapping_mul(b.left))
                 .wrapping_add(keys.alpha(alpha_ctr(base_op_id, i)))
+                & wmask
         })
         .collect();
 
@@ -538,7 +678,11 @@ pub fn mul_batch_party<T: Transport>(
     // broadcast.
     mbx.send(
         (me + N - 1) % N,
-        serialize_msg(&MpcMsg::TaggedZBatch { base_op_id, values: z_mine.clone() }),
+        serialize_msg(&MpcMsg::TaggedZBatch {
+            base_op_id,
+            bits,
+            data: pack_ring(&z_mine, bits),
+        }),
     );
     let (_, msg) = mbx
         .recv_matching(TIMEOUT_MS, |m| {
@@ -546,7 +690,7 @@ pub fn mul_batch_party<T: Transport>(
         })
         .unwrap_or_else(|| panic!("mul_batch_party: timeout on z for op_id={base_op_id}"));
     let z_next = match msg {
-        MpcMsg::TaggedZBatch { values, .. } => values,
+        MpcMsg::TaggedZBatch { data, bits: b, .. } => unpack_ring(&data, z_mine.len(), b),
         _ => unreachable!("predicate guarantees TaggedZBatch"),
     };
     assert_eq!(z_next.len(), z_mine.len(), "batch length mismatch in resharing");
@@ -748,6 +892,41 @@ pub fn a2b_batch_party<T: Transport>(
     me: PartyId,
     mbx: &Mailbox<T>,
 ) -> Vec<Vec<PartyShare>> {
+    // Full width: the resulting bit-shares may be consumed by *any* downstream
+    // arithmetic, including multiplication against wide operands.
+    a2b_batch_party_at(values, nbits, 128, op_id, me, mbx)
+}
+
+/// [`a2b_batch_party`] with the bit-shares carried at `wire_bits` on the wire.
+///
+/// # When this is safe, and it is a real precondition
+///
+/// A bit-share here is an *arithmetic* sharing of a 0/1 value (`a ⊕ b = a+b−2ab`),
+/// so its components are full-width ring elements even though the value is one
+/// bit. Narrowing them to `wire_bits` keeps the sharing valid **modulo
+/// `2^wire_bits`** and no wider. Every consumer must therefore work at that
+/// width or below.
+///
+/// That is false for the general `lt`/`max2` path — its output bit is
+/// multiplied by a 20-bit operand, and narrowing broke it (`max2(9,6)` returned
+/// 22 020 105). It is **true** for a caller that reads the result purely as a
+/// bit, which is what `falcon_mpc::truncate_batch` does with the borrow.
+///
+/// `wire_bits` must be at least 2: the XOR encoding evaluates `a+b−2ab`, so one
+/// bit is not enough room even though the value is.
+///
+/// Worth the trouble because this dominates: the borrow's 9-bit `a2b` is ~108
+/// ring elements, and at `u128` that is 1 728 B against 54 B of content — 96%
+/// of an all-RSS network's traffic went here.
+pub fn a2b_batch_party_at<T: Transport>(
+    values: &[PartyShare],
+    nbits: usize,
+    wire_bits: u32,
+    op_id: u64,
+    me: PartyId,
+    mbx: &Mailbox<T>,
+) -> Vec<Vec<PartyShare>> {
+    assert!(wire_bits >= 2, "the XOR encoding needs at least two bits of room");
     let count = values.len();
     if count == 0 {
         return Vec::new();
@@ -796,7 +975,7 @@ pub fn a2b_batch_party<T: Transport>(
         }
     }
     let base = take_id(&mut next_id);
-    let pw = mul_batch_party(&pairs, base, me, mbx);
+    let pw = mul_batch_party_at(&pairs, wire_bits, base, me, mbx);
 
     // Round B: xyz for every lane and bit.
     let mut triple = Vec::with_capacity(count * nbits);
@@ -807,7 +986,7 @@ pub fn a2b_batch_party<T: Transport>(
         }
     }
     let base = take_id(&mut next_id);
-    let xyz_all = mul_batch_party(&triple, base, me, mbx);
+    let xyz_all = mul_batch_party_at(&triple, wire_bits, base, me, mbx);
 
     // Per-lane sum and shifted-carry, all local.
     let mut sums = Vec::with_capacity(count);
@@ -835,15 +1014,17 @@ pub fn a2b_batch_party<T: Transport>(
     }
 
     // ── 3. one batched prefix-adder over all lanes ──
-    ppa_add_batch(&sums, &shifts, nbits, &mut next_id, me, mbx)
+    ppa_add_batch(&sums, &shifts, nbits, wire_bits, &mut next_id, me, mbx)
 }
 
 /// Batched [`ppa_add`]: `count` independent `nbits`-wide Kogge–Stone adders,
 /// every layer's products flattened into one multiplication round.
+#[allow(clippy::too_many_arguments)]
 fn ppa_add_batch<T: Transport>(
     u: &[Vec<PartyShare>],
     v: &[Vec<PartyShare>],
     nbits: usize,
+    wire_bits: u32,
     next_id: &mut u64,
     me: PartyId,
     mbx: &Mailbox<T>,
@@ -863,7 +1044,7 @@ fn ppa_add_batch<T: Transport>(
         }
     }
     let base = take_id(next_id);
-    let uv = mul_batch_party(&pairs, base, me, mbx);
+    let uv = mul_batch_party_at(&pairs, wire_bits, base, me, mbx);
     let mut g: Vec<Vec<PartyShare>> =
         (0..count).map(|l| uv[l * nbits..l * nbits + nbits].to_vec()).collect();
     let mut p: Vec<Vec<PartyShare>> = (0..count)
@@ -881,7 +1062,7 @@ fn ppa_add_batch<T: Transport>(
             }
         }
         let base = take_id(next_id);
-        let out = mul_batch_party(&pr, base, me, mbx);
+        let out = mul_batch_party_at(&pr, wire_bits, base, me, mbx);
         let width = nbits - d;
         for lane in 0..count {
             let (mut ng, mut np) = (g[lane].clone(), p[lane].clone());
@@ -906,7 +1087,7 @@ fn ppa_add_batch<T: Transport>(
         }
     }
     let base = take_id(next_id);
-    let prod = mul_batch_party(&pairs, base, me, mbx);
+    let prod = mul_batch_party_at(&pairs, wire_bits, base, me, mbx);
     let width = nbits - 1;
     (0..count)
         .map(|lane| {

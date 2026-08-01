@@ -37,7 +37,7 @@ pub struct TransportBackend<T: Transport> {
     /// constant-round without being rewritten. All parties must agree on the
     /// setting: it changes which protocol runs, hence the id-allocation
     /// sequence the parties execute in lockstep.
-    gc_nonlin: bool,
+    nonlin: NonlinMode,
     /// Batched interactive protocol invocations — every point at which this
     /// party stopped computing and talked to its peers.
     ///
@@ -48,6 +48,110 @@ pub struct TransportBackend<T: Transport> {
     interactive_calls: std::sync::atomic::AtomicUsize,
 }
 
+/// Id space one `lt_falcon_batch` reserves: the inner `Π_WA`, its `Π_PC` tree
+/// and the lifting select each need disjoint operation ids.
+const FALCON_ID_BLOCK: u64 = 4096;
+
+/// Dealt `Π_WA` preprocessing — **a stand-in, not a secure offline phase.**
+///
+/// Derived from a seed every party can compute, so every party can reconstruct
+/// the mask. Falcon generates this interactively (bit composition, bit
+/// injection; their Fig. 6). Replacing this is the one thing standing between
+/// `NonlinMode::Falcon` and a deployable protocol; the online costs it produces
+/// are already real.
+fn falcon_wrap_preproc(
+    base: u64,
+    i: u64,
+    l_bits: u32,
+    me: PartyId,
+) -> crate::crypto::falcon_mpc::WrapPreproc {
+    use crate::crypto::falcon_mpc::WrapPreproc;
+    use crate::crypto::field::Fp;
+    use crate::crypto::fp_protocol::share_component as fp_component;
+    let l = 1u64 << l_bits;
+    let seed = base.wrapping_mul(0x9E37_79B9).wrapping_add(i);
+    let xs = [
+        seed.wrapping_mul(53).wrapping_add(7) % l,
+        seed.wrapping_mul(29).wrapping_add(3) % l,
+        seed.wrapping_mul(17).wrapping_add(5) % l,
+    ];
+    let m: u128 = (1u128 << l_bits) - 1;
+    let x = ((xs[0] as u128 + xs[1] as u128 + xs[2] as u128) & m) as u64;
+    let beta = seed & 1;
+    WrapPreproc {
+        x: PartyShare { left: xs[me % 3] as u128, right: xs[(me + 1) % 3] as u128 },
+        bits: (0..l_bits).map(|k| fp_component(Fp::new((x >> k) & 1), 0, me)).collect(),
+        delta: {
+            let d = crate::crypto::falcon::wrap3(xs[0], xs[1], xs[2], l_bits);
+            [u64::from(me == 0) * d, u64::from(me == 2) * d]
+        },
+        beta_fp: fp_component(Fp::new(beta), 0, me),
+        beta_bit: [u64::from(me == 0) * beta, u64::from(me == 2) * beta],
+        m: fp_component(Fp::ONE, 0, me),
+    }
+}
+
+/// Dealt `Π_SS` preprocessing — same stand-in caveat as
+/// [`falcon_wrap_preproc`].
+fn falcon_sel_preproc(base: u64, i: u64, me: PartyId) -> crate::crypto::falcon_mpc::SelectPreproc {
+    let seed = base.wrapping_mul(0x85EB_CA6B).wrapping_add(i);
+    let c = [seed % 2, (seed / 2) % 2, (seed / 4) % 2];
+    let cbit = (c[0] ^ c[1] ^ c[2]) & 1;
+    let cr = [cbit as u128, 0u128, 0u128];
+    crate::crypto::falcon_mpc::SelectPreproc {
+        c_bit: [c[me % 3], c[(me + 1) % 3]],
+        c_ring: PartyShare { left: cr[me % 3], right: cr[(me + 1) % 3] },
+    }
+}
+
+/// Which protocol backs every comparison — and therefore ReLU, max-pool and
+/// argmax, all of which reduce to `lt_batch`.
+///
+/// The three are interchangeable *functionally* and very different in cost, and
+/// which one wins depends on the deployment rather than on the workload:
+///
+/// | mode | rounds | bytes | wins when |
+/// |---|---|---|---|
+/// | `A2b` | `~log₂ nbits` | high | never, on current measurements |
+/// | `Gc` | 1 | ~30× `Falcon` | latency dominates |
+/// | `Falcon` | `5 + log₂ ℓ` | lowest | bandwidth dominates |
+///
+/// Falcon here means the `wrap3` sign extraction of Wagh et al. (PETS 2021),
+/// reproduced in [`crate::crypto::falcon_mpc`]. It shares this backend's
+/// replicated sharing and linear layer unchanged — the *only* thing it replaces
+/// is the comparison, which is also the only place the two systems ever
+/// differed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum NonlinMode {
+    /// Batched bit decomposition.
+    #[default]
+    A2b,
+    /// Three-party garbled circuits, constant round.
+    Gc,
+    /// Falcon's `wrap3` DReLU over `Z_p`.
+    Falcon,
+}
+
+impl NonlinMode {
+    pub fn label(self) -> &'static str {
+        match self {
+            NonlinMode::A2b => "a2b (batched bit decomposition)",
+            NonlinMode::Gc => "gc (3-party garbled, constant-round)",
+            NonlinMode::Falcon => "falcon (wrap3 over Z_p)",
+        }
+    }
+
+    /// Parse a CLI spelling.
+    pub fn parse(s: &str) -> Option<NonlinMode> {
+        match s {
+            "a2b" => Some(NonlinMode::A2b),
+            "gc" => Some(NonlinMode::Gc),
+            "falcon" => Some(NonlinMode::Falcon),
+            _ => None,
+        }
+    }
+}
+
 impl<T: Transport> TransportBackend<T> {
     pub fn new(me: PartyId, transport: T) -> Self {
         TransportBackend {
@@ -55,7 +159,7 @@ impl<T: Transport> TransportBackend<T> {
             mailbox: Mailbox::new(transport),
             shares: HashMap::new(),
             next_id: 1,
-            gc_nonlin: false,
+            nonlin: NonlinMode::A2b,
             interactive_calls: std::sync::atomic::AtomicUsize::new(0),
         }
     }
@@ -70,16 +174,112 @@ impl<T: Transport> TransportBackend<T> {
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
-    /// Enable/disable the garbled-circuit route for batched comparisons — see
-    /// the `gc_nonlin` field. Set it identically on every party, before any
-    /// operation that would diverge.
+    /// Enable/disable the garbled-circuit route for batched comparisons.
+    /// Retained as the historical two-way switch; [`Self::set_nonlin`] is the
+    /// general form.
     pub fn set_gc_nonlinearities(&mut self, on: bool) {
-        self.gc_nonlin = on;
+        self.nonlin = if on { NonlinMode::Gc } else { NonlinMode::A2b };
     }
 
     /// Whether batched comparisons currently take the Yao leg.
     pub fn gc_nonlinearities(&self) -> bool {
-        self.gc_nonlin
+        self.nonlin == NonlinMode::Gc
+    }
+
+    /// Choose which comparison protocol backs every `lt`-derived operation.
+    ///
+    /// Must be set identically on every party, before any operation that would
+    /// diverge: the modes execute different id-allocation sequences.
+    pub fn set_nonlin(&mut self, mode: NonlinMode) {
+        self.nonlin = mode;
+    }
+
+    pub fn nonlin(&self) -> NonlinMode {
+        self.nonlin
+    }
+
+    /// Falcon's `wrap3` DReLU as a drop-in for `lt_batch`.
+    ///
+    /// `lt(a,b)` is `MSB(a−b)`, i.e. the complement of `DReLU(a−b)`, so this is
+    /// one `drelu_batch` plus a local inversion.
+    ///
+    /// # Two things this has to reconcile
+    ///
+    /// **Output encoding.** `drelu_batch` yields a `Z_2` bit, while every
+    /// consumer of `lt_batch` — `max2_batch`, ReLU, argmax — expects an
+    /// *arithmetic* share it can multiply by a wide operand. Lifting the bit
+    /// into the ring is exactly `Π_SS`, so that select is a genuine cost of
+    /// making Falcon interchangeable here, not an artefact.
+    ///
+    /// **Preprocessing.** `Π_WA` needs a random mask `x` with its bits shared
+    /// over `Z_p` and its own `wrap3` — and `δ = wrap3(x₁,x₂,x₃)` is not
+    /// derivable by any party, since each is missing a summand. Falcon
+    /// generates these with an interactive offline phase (bit composition and
+    /// bit injection, their Fig. 6). **Here they are dealt from a common seed,
+    /// which is a stand-in and not secure**: all three parties can reconstruct
+    /// the mask. The *online* protocol is real and its costs are real; the
+    /// offline correlated randomness is not yet. This is the same disclosed
+    /// caveat the repo already carries for dealer-based BFV key generation.
+    fn lt_falcon_batch(&mut self, pairs: &[(ShareRef, ShareRef)]) -> Vec<ShareRef> {
+        use crate::crypto::falcon_mpc::{drelu_batch, select_batch};
+        let nbits = pairs.iter().map(|(a, b)| a.nbits.max(b.nbits)).max().unwrap() as u32;
+        let mask: Fr = if nbits >= 128 { Fr::MAX } else { (1u128 << nbits) - 1 };
+        let n = pairs.len();
+
+        let diffs: Vec<PartyShare> = pairs
+            .iter()
+            .map(|(a, b)| {
+                let (pa, pb) = (self.get_cloned(a), self.get_cloned(b));
+                PartyShare {
+                    left: pa.left.wrapping_sub(pb.left) & mask,
+                    right: pa.right.wrapping_sub(pb.right) & mask,
+                }
+            })
+            .collect();
+
+        let base = self.alloc_block(FALCON_ID_BLOCK);
+        let wp: Vec<_> =
+            (0..n).map(|i| falcon_wrap_preproc(base, i as u64, nbits, self.me)).collect();
+        let sp: Vec<_> = (0..n).map(|i| falcon_sel_preproc(base, i as u64, self.me)).collect();
+        let bits = drelu_batch(&diffs, &wp, nbits, base, self.me, &self.mailbox);
+
+        // Lift `Z_2 → Z_L` so the result composes like an `a2b` output.
+        let zeros = vec![PartyShare { left: 0, right: 0 }; n];
+        let ones: Vec<PartyShare> = (0..n)
+            .map(|_| PartyShare {
+                left: Fr::from(self.me == 0),
+                right: Fr::from(self.me == 2),
+            })
+            .collect();
+        let sp2: Vec<_> = (0..n)
+            .map(|i| crate::crypto::falcon_mpc::SelectPreproc {
+                c_bit: sp[i].c_bit,
+                c_ring: sp[i].c_ring.clone(),
+            })
+            .collect();
+        let drelu = select_batch(
+            &zeros,
+            &ones,
+            &bits,
+            &sp2,
+            nbits,
+            base + FALCON_ID_BLOCK / 2,
+            self.me,
+            &self.mailbox,
+        );
+
+        // lt = 1 − DReLU, with the public 1 in a single component.
+        drelu
+            .into_iter()
+            .map(|d| {
+                let ps = PartyShare {
+                    left: Fr::from(self.me == 0).wrapping_sub(d.left) & mask,
+                    right: Fr::from(self.me == 2).wrapping_sub(d.right) & mask,
+                };
+                let id = self.alloc_id();
+                self.store(id, ps, 1, 0)
+            })
+            .collect()
     }
 
     fn alloc_id(&mut self) -> u64 {
@@ -97,6 +297,28 @@ impl<T: Transport> TransportBackend<T> {
         id
     }
 
+    /// Store a share.
+    ///
+    /// # Why the components are *not* reduced to `nbits`
+    ///
+    /// Tempting, and it would let the wire encoding narrow — worth 4× on the
+    /// `a2b` path (7 184 → 1 796 B per sign extraction, measured). It is wrong,
+    /// and the reason is a conflation in [`ShareRef`] worth naming.
+    ///
+    /// `nbits` records the width of the **value**, not the modulus of the
+    /// **sharing**. Those differ: `lt` yields a one-bit value and stores it with
+    /// `nbits = 1`, but that share is then multiplied by a 20-bit operand. Its
+    /// components must therefore be valid modulo `2^20`, not `2^1`. Reduce them
+    /// to one bit and the sharing sums to `1 + 2k`, so the product comes out as
+    /// `v + 2kv` — silently wrong, and only at the *consumer*.
+    ///
+    /// Both experiments hit this: narrowing inside `a2b` broke `max2(9,6)`
+    /// (22 020 105 instead of 9), and narrowing here broke the CNN pipeline
+    /// (`encrypted class 5 != plaintext 7`). Same root cause both times.
+    ///
+    /// **The packing win is real but needs `ShareRef` to carry the sharing
+    /// modulus separately from the value width**, and every operation to respect
+    /// it. That is a deliberate refactor, not a masking tweak.
     fn store(&mut self, id: u64, ps: PartyShare, nbits: usize, owner: usize) -> ShareRef {
         self.shares.insert(id, ps);
         ShareRef {
@@ -250,6 +472,30 @@ impl<T: Transport + 'static> Backend for TransportBackend<T> {
     /// Real batched multiplication: one communication round for the whole
     /// batch (`aby3_protocol::mul_batch_party`), instead of one round per
     /// pair via the trait's default loop-over-`mul` implementation.
+    /// One resharing per dot product rather than per product — see
+    /// [`crate::crypto::aby3_protocol::dot_batch_party`].
+    fn dot_batch(&mut self, dots: &[Vec<(ShareRef, ShareRef)>], nbits: usize) -> Vec<ShareRef> {
+        self.note_interactive();
+        if dots.is_empty() {
+            return Vec::new();
+        }
+        let base_op_id = self.alloc_id();
+        let owned: Vec<Vec<(PartyShare, PartyShare)>> = dots
+            .iter()
+            .map(|d| d.iter().map(|(a, b)| (self.get_cloned(a), self.get_cloned(b))).collect())
+            .collect();
+        let refs: Vec<&[(PartyShare, PartyShare)]> = owned.iter().map(|v| v.as_slice()).collect();
+        let results =
+            crate::crypto::aby3_protocol::dot_batch_party(&refs, base_op_id, self.me, &self.mailbox);
+        results
+            .into_iter()
+            .map(|ps| {
+                let id = self.alloc_id();
+                self.store(id, ps, nbits, 0)
+            })
+            .collect()
+    }
+
     fn mul_batch(&mut self, pairs: &[(ShareRef, ShareRef)]) -> Vec<ShareRef> {
         self.note_interactive();
         if pairs.is_empty() {
@@ -354,8 +600,10 @@ impl<T: Transport + 'static> Backend for TransportBackend<T> {
         if pairs.is_empty() {
             return Vec::new();
         }
-        if self.gc_nonlin {
-            return self.lt_gc_batch(pairs);
+        match self.nonlin {
+            NonlinMode::Gc => return self.lt_gc_batch(pairs),
+            NonlinMode::Falcon => return self.lt_falcon_batch(pairs),
+            NonlinMode::A2b => {}
         }
         // Each comparison is the MSB of `a − b`; batch all the decompositions
         // into one `a2b_batch` so the whole set costs ~9 rounds, not `9·len`.

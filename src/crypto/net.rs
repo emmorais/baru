@@ -121,7 +121,11 @@ pub enum MpcMsg {
     /// multiplication) plus `TaggedDEBatch` (2 opened).
     TaggedZBatch {
         base_op_id: u64,
-        values: Vec<u128>,
+        /// Width each value is packed at. The protocol works modulo `2^bits`,
+        /// so anything wider is padding — and for the bit-level multiplications
+        /// inside `a2b` the honest width is **1**, not 128.
+        bits: u32,
+        data: Vec<u8>,
     },
 
     /// Resharing values for a batch of multiplications over the small prime

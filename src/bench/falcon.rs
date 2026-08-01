@@ -336,16 +336,246 @@ pub fn run(n: usize, l_bits: u32, profile: NetworkProfile) -> FalconReport {
     FalconReport { n, l_bits, routes, agree }
 }
 
-const USAGE: &str = "usage: baru bench-falcon [--n N] [--bits L] [--json]
+/// Cost of one MedMNIST-shaped inference done **entirely in RSS**, Falcon's way.
+#[derive(Debug, Serialize)]
+pub struct NetReport {
+    pub l_bits: u32,
+    pub conv_outputs: usize,
+    pub drelus: usize,
+    pub messages: u64,
+    pub bytes: u64,
+    /// Of `bytes`, the linear layers.
+    pub linear_bytes: u64,
+    pub ms: f64,
+}
+
+/// Run the MedMNIST CNN's *shape* end to end in RSS and measure it.
+///
+/// `1×28×28 → conv(8,3×3) → trunc → ReLU → pool → conv(16,3×3) → trunc → ReLU
+/// → pool → dense(→128) → trunc → ReLU → dense(→C)`, secret weights throughout
+/// — the same architecture `bench-medmnist` runs on the FHE hybrid, so the two
+/// numbers are directly comparable.
+///
+/// This measures **cost, not accuracy**: weights and input are deterministic
+/// stand-ins, because what is in question is the protocol's traffic, and the
+/// arithmetic is already checked exactly by
+/// `a_whole_fixed_point_layer_matches_plaintext` and the per-protocol tests.
+/// Quoting an accuracy from this would be meaningless.
+pub fn run_net(l_bits: u32, d: u32, classes: usize, profile: NetworkProfile) -> NetReport {
+    use crate::bench::comm::CountingTransport;
+    use crate::crypto::falcon_mpc::{conv_batch, dense_batch};
+
+    let handles = InprocHandle::create(3);
+    let mut comm = None;
+    let mut joins = Vec::new();
+    let mut lin_handle = None;
+    for h in handles {
+        let counted = CountingTransport::new(h, 3);
+        if comm.is_none() {
+            comm = Some(counted.handle());
+            lin_handle = Some(counted.handle());
+        }
+        joins.push(std::thread::spawn(move || {
+            let mbx = Mailbox::new(counted);
+            let me = mbx.id();
+            let sh = |v: u64| {
+                let s = [v / 3, v / 3, v - 2 * (v / 3)];
+                PartyShare { left: s[me % 3] as u128, right: s[(me + 1) % 3] as u128 }
+            };
+            let mut op = 1u64;
+            let mut bump = |n: u64| {
+                let o = op;
+                op += n;
+                o
+            };
+
+            // conv1: 1×28×28 → 8×26×26
+            let img: Vec<PartyShare> = (0..28 * 28).map(|i| sh((i % 7) as u64)).collect();
+            let k1: Vec<Vec<PartyShare>> =
+                (0..8).map(|o| (0..9).map(|t| sh(((o + t) % 3) as u64)).collect()).collect();
+            let c1 = conv_batch(&img, &k1, 1, 28, 28, 3, l_bits, bump(64), me, &mbx);
+            let a1 = nonlin(&c1, d, l_bits, &mut bump, me, &mbx);
+            let p1 = pool2x2(&a1, 8, 26, 26, l_bits, &mut bump, me, &mbx);
+
+            // conv2: 8×13×13 → 16×11×11
+            let k2: Vec<Vec<PartyShare>> =
+                (0..16).map(|o| (0..72).map(|t| sh(((o + t) % 3) as u64)).collect()).collect();
+            let c2 = conv_batch(&p1, &k2, 8, 13, 13, 3, l_bits, bump(64), me, &mbx);
+            let a2 = nonlin(&c2, d, l_bits, &mut bump, me, &mbx);
+            let p2 = pool2x2(&a2, 16, 11, 11, l_bits, &mut bump, me, &mbx);
+
+            // dense 400→128, then 128→C
+            let w1: Vec<Vec<PartyShare>> = (0..128)
+                .map(|o| (0..p2.len()).map(|t| sh(((o + t) % 3) as u64)).collect())
+                .collect();
+            let z1 = dense_batch(&p2, &w1, l_bits, bump(64), me, &mbx);
+            let h1 = nonlin(&z1, d, l_bits, &mut bump, me, &mbx);
+            let w2: Vec<Vec<PartyShare>> =
+                (0..classes).map(|o| (0..128).map(|t| sh(((o + t) % 3) as u64)).collect()).collect();
+            dense_batch(&h1, &w2, l_bits, bump(64), me, &mbx).len()
+        }));
+    }
+    let t0 = Instant::now();
+    for j in joins {
+        j.join().expect("party panicked");
+    }
+    let ms = t0.elapsed().as_secs_f64() * 1000.0;
+    let s = comm.unwrap().stats();
+    let _ = (lin_handle, profile);
+
+    let conv_outputs = 8 * 26 * 26 + 16 * 11 * 11 + 128 + classes;
+    let drelus = (8 * 13 * 13 + 16 * 5 * 5 + 128) + 3 * (8 * 13 * 13 + 16 * 5 * 5);
+    NetReport {
+        l_bits,
+        conv_outputs,
+        drelus,
+        messages: s.messages,
+        bytes: s.bytes,
+        linear_bytes: conv_outputs as u64 * (l_bits as u64 / 8),
+        ms,
+    }
+}
+
+/// truncate → ReLU, the fixed-point block after every linear layer.
+fn nonlin<T: crate::crypto::net::Transport>(
+    z: &[PartyShare],
+    d: u32,
+    l_bits: u32,
+    bump: &mut impl FnMut(u64) -> u64,
+    me: PartyId,
+    mbx: &Mailbox<T>,
+) -> Vec<PartyShare> {
+    use crate::crypto::falcon_mpc::{relu_batch, truncate_batch, TruncPreproc};
+    let n = z.len();
+    let l = 1u64 << l_bits;
+    let tp: Vec<TruncPreproc> = (0..n)
+        .map(|i| {
+            let r = ((i as u64).wrapping_mul(41) % (l / 8)) + 1;
+            let three = |v: u64| {
+                let s = [v, 0, 0];
+                PartyShare { left: s[me % 3] as u128, right: s[(me + 1) % 3] as u128 }
+            };
+            let rs = [r / 3, r / 3, r - 2 * (r / 3)];
+            TruncPreproc {
+                r: PartyShare { left: rs[me % 3] as u128, right: rs[(me + 1) % 3] as u128 },
+                r_shifted: three(r >> d),
+                r_lo: three(r & ((1u64 << d) - 1)),
+                sel: sel_pre(9000 + i as u64, l_bits, me),
+            }
+        })
+        .collect();
+    let t = truncate_batch(z, &tp, d, l_bits, bump(256), me, mbx);
+    let wp: Vec<_> = (0..n).map(|i| wrap_preproc(7000 + i as u64, l_bits, me)).collect();
+    let sp: Vec<_> = (0..n).map(|i| sel_pre(8000 + i as u64, l_bits, me)).collect();
+    relu_batch(&t, &wp, &sp, l_bits, bump(256), me, mbx)
+}
+
+/// 2×2 max-pool over a `c×h×w` activation map, floor semantics.
+#[allow(clippy::too_many_arguments)]
+fn pool2x2<T: crate::crypto::net::Transport>(
+    a: &[PartyShare],
+    c: usize,
+    h: usize,
+    w: usize,
+    l_bits: u32,
+    bump: &mut impl FnMut(u64) -> u64,
+    me: PartyId,
+    mbx: &Mailbox<T>,
+) -> Vec<PartyShare> {
+    use crate::crypto::falcon_mpc::maxpool_batch;
+    let (oh, ow) = (h / 2, w / 2);
+    let mut windows = Vec::with_capacity(c * oh * ow);
+    for ch in 0..c {
+        for oy in 0..oh {
+            for ox in 0..ow {
+                windows.push(
+                    (0..2)
+                        .flat_map(|dy| (0..2).map(move |dx| (dy, dx)))
+                        .map(|(dy, dx)| a[(ch * h + 2 * oy + dy) * w + 2 * ox + dx].clone())
+                        .collect::<Vec<_>>(),
+                );
+            }
+        }
+    }
+    let nw = windows.len();
+    let wp: Vec<Vec<_>> = (0..nw)
+        .map(|i| (0..3).map(|k| wrap_preproc((i * 11 + k) as u64, l_bits, me)).collect())
+        .collect();
+    let sp: Vec<Vec<_>> = (0..nw)
+        .map(|i| (0..3).map(|k| sel_pre((i * 13 + k) as u64, l_bits, me)).collect())
+        .collect();
+    maxpool_batch(&windows, &wp, &sp, l_bits, bump(1024), me, mbx)
+}
+
+fn sel_pre(seed: u64, l_bits: u32, me: PartyId) -> crate::crypto::falcon_mpc::SelectPreproc {
+    let c = [seed % 2, (seed / 2) % 2, (seed / 4) % 2];
+    let cbit = (c[0] ^ c[1] ^ c[2]) & 1;
+    let cr = [cbit as u128, 0, 0];
+    let _ = l_bits;
+    crate::crypto::falcon_mpc::SelectPreproc {
+        c_bit: [c[me % 3], c[(me + 1) % 3]],
+        c_ring: PartyShare { left: cr[me % 3], right: cr[(me + 1) % 3] },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::interpreter::transport_backend::NonlinMode;
+
+    /// The three comparison backends must be **interchangeable**: same inputs,
+    /// same bits out, whichever protocol runs underneath.
+    ///
+    /// This is what makes `NonlinMode` a choice rather than three separate
+    /// systems — and it is the check that has to pass before any cost
+    /// comparison between them means anything.
+    #[test]
+    #[ignore] // real 3-party transport
+    fn every_nonlinearity_mode_computes_the_same_comparison() {
+        const NBITS: usize = 20;
+        let l = 1i128 << NBITS;
+        let cases: Vec<(i128, i128)> =
+            vec![(5, 3), (3, 5), (0, 0), (-7, 2), (2, -7), (-1, -1), (100, -100), (-100, 100)];
+        let want: Vec<u64> = cases.iter().map(|&(a, b)| u64::from(a < b)).collect();
+
+        let mut seen = Vec::new();
+        for mode in [NonlinMode::A2b, NonlinMode::Gc, NonlinMode::Falcon] {
+            let cs = cases.clone();
+            let (out, _) = run_parties(NetworkProfile::INSTANT, move |_me| {
+                let cs = cs.clone();
+                move |be: &mut TransportBackend<MpcTransport>| {
+                    be.set_nonlin(mode);
+                    let enc = |v: i128| ((v + l) % l) as u128;
+                    let pairs: Vec<_> = cs
+                        .iter()
+                        .map(|&(a, b)| {
+                            (be.share_public(enc(a), NBITS), be.share_public(enc(b), NBITS))
+                        })
+                        .collect();
+                    let bits = be.lt_batch(&pairs);
+                    bits.iter().map(|x| be.reveal(x, None)).collect::<Vec<_>>()
+                }
+            });
+            let got: Vec<u64> = out[0].iter().map(|&v| (v & 1) as u64).collect();
+            assert_eq!(got, want, "{} disagreed with plaintext (a < b)", mode.label());
+            seen.push(got);
+        }
+        assert!(seen.windows(2).all(|w| w[0] == w[1]), "modes must agree with each other");
+    }
+}
+
+const USAGE: &str = "usage: baru bench-falcon [--n N] [--bits L] [--net] [--json]
 
 Falcon's sign extraction against Baru's own routes, on one transport.
   --n N      how many signs to extract in one batch (default 1024)
   --bits L   ring width (default 32, Falcon's own)
+  --net      instead: one MedMNIST-shaped inference, entirely in RSS
   --json     machine-readable output
 ";
 
 pub fn run_cli(args: &[String]) -> Result<(), String> {
     let (mut n, mut bits, mut json) = (1024usize, 32u32, false);
+    let mut net = false;
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -353,6 +583,7 @@ pub fn run_cli(args: &[String]) -> Result<(), String> {
             "--bits" => {
                 bits = it.next().ok_or("--bits needs a value")?.parse().map_err(|_| "bad --bits")?
             }
+            "--net" => net = true,
             "--json" => json = true,
             "-h" | "--help" => {
                 println!("{USAGE}");
@@ -360,6 +591,29 @@ pub fn run_cli(args: &[String]) -> Result<(), String> {
             }
             other => return Err(format!("unknown arg {other}\n\n{USAGE}")),
         }
+    }
+    if net {
+        let r = run_net(bits, 8, 2, NetworkProfile::INSTANT);
+        if json {
+            println!("{}", serde_json::to_string_pretty(&r).map_err(|e| e.to_string())?);
+            return Ok(());
+        }
+        println!("MedMNIST-shaped inference, entirely in RSS (Falcon's approach)");
+        println!("  1x28x28 -> conv(8) -> conv(16) -> dense(128) -> dense(2), secret weights\n");
+        println!("  ring width       : {} bits", r.l_bits);
+        println!("  linear outputs   : {}", r.conv_outputs);
+        println!("  DReLUs           : {}", r.drelus);
+        println!("  messages         : {}", r.messages);
+        println!("  bytes (per party): {:.3} MB", r.bytes as f64 / 1e6);
+        println!("  wall clock       : {:.0} ms\n", r.ms);
+        println!("  bench-medmnist (FHE + GC), measured: 10.1 MB, 268 ms");
+        println!("  Falcon, LeNet-scale reported       :  0.74 MB,  47 ms");
+        println!(
+            "\n  Cost only: weights and input are stand-ins. The arithmetic is\n  \
+             checked exactly by the protocol tests; an accuracy from this run\n  \
+             would mean nothing."
+        );
+        return Ok(());
     }
     let r = run(n, bits, NetworkProfile::INSTANT);
     if json {

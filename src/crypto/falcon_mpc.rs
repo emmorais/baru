@@ -27,7 +27,7 @@
 //! so that "compiled vs hand-written" is a fair fight rather than a comparison
 //! against a straw baseline.
 
-use crate::crypto::aby3_protocol::{mul_batch_party, reveal_components_packed_party, PartyShare};
+use crate::crypto::aby3_protocol::{reveal_components_packed_party, PartyShare};
 use crate::crypto::falcon;
 use crate::crypto::field::{Fp, FpShare};
 use crate::crypto::types::Fr;
@@ -451,7 +451,7 @@ pub fn select_batch<T: Transport>(
         })
         .collect();
     let pairs: Vec<(PartyShare, PartyShare)> = diffs.into_iter().zip(d).collect();
-    let prod = mul_batch_party(&pairs, base_op_id + 1, me, mbx);
+    let prod = crate::crypto::aby3_protocol::mul_batch_party_at(&pairs, l_bits, base_op_id + 1, me, mbx);
     prod.into_iter()
         .zip(x)
         .map(|(pz, xi)| PartyShare {
@@ -481,6 +481,383 @@ pub fn relu_batch<T: Transport>(
     let zeros = vec![PartyShare { left: 0, right: 0 }; a.len()];
     // b = 1 means a ≥ 0, so the selected value is `a`; b = 0 selects zero.
     select_batch(&zeros, a, &bits, sel_pre, l_bits, base_op_id + 32, me, mbx)
+}
+
+/// `Π_Maxpool` (Algorithm 4) over the transport, **value only**.
+///
+/// Folds left over each window: one `Π_DReLU` on the running difference, then
+/// one `Π_SS` to keep the larger. `n−1` of each per window, with every window's
+/// step `k` batched together — so a whole pooling layer costs `n−1` DReLU
+/// rounds, not `windows × (n−1)`.
+///
+/// The one-hot `e_k` Falcon also returns is omitted: it exists to route
+/// gradients in training, and charging inference for it would overstate the
+/// baseline. See [`crate::crypto::falcon::maxpool_value_only`].
+///
+/// # Input bound
+///
+/// `Π_DReLU` is applied to `max − aᵢ`, so `|aᵢ| < L/4` keeps that difference
+/// inside the signed window — the same headroom Baru's own `nbits` calibration
+/// carries for its comparisons.
+#[allow(clippy::too_many_arguments)]
+pub fn maxpool_batch<T: Transport>(
+    windows: &[Vec<PartyShare>],
+    wrap_pre: &[Vec<WrapPreproc>],
+    sel_pre: &[Vec<SelectPreproc>],
+    l_bits: u32,
+    base_op_id: u64,
+    me: PartyId,
+    mbx: &Mailbox<T>,
+) -> Vec<PartyShare> {
+    let w = windows.len();
+    if w == 0 {
+        return Vec::new();
+    }
+    let arity = windows[0].len();
+    assert!(arity >= 1, "a pooling window needs at least one element");
+    assert!(
+        windows.iter().all(|win| win.len() == arity),
+        "all windows must have the same arity so their folds stay in lockstep"
+    );
+    let mask: Fr = (1u128 << l_bits) - 1;
+
+    let mut running: Vec<PartyShare> = windows.iter().map(|win| win[0].clone()).collect();
+    let mut op = base_op_id;
+    for k in 1..arity {
+        // Step k of every window at once — this is what keeps a pooling layer's
+        // round count independent of how many windows it has.
+        let diffs: Vec<PartyShare> = running
+            .iter()
+            .zip(windows)
+            .map(|(m, win)| PartyShare {
+                left: m.left.wrapping_sub(win[k].left) & mask,
+                right: m.right.wrapping_sub(win[k].right) & mask,
+            })
+            .collect();
+        let wp: Vec<WrapPreproc> = (0..w).map(|i| clone_wrap(&wrap_pre[i][k - 1])).collect();
+        let bits = drelu_batch(&diffs, &wp, l_bits, op, me, mbx);
+        op += PC_ID_BLOCK;
+
+        let candidates: Vec<PartyShare> = windows.iter().map(|win| win[k].clone()).collect();
+        let sp: Vec<SelectPreproc> = (0..w)
+            .map(|i| SelectPreproc {
+                c_bit: sel_pre[i][k - 1].c_bit,
+                c_ring: sel_pre[i][k - 1].c_ring.clone(),
+            })
+            .collect();
+        // b = 1 means running ≥ candidate, so keep the running max.
+        running = select_batch(&candidates, &running, &bits, &sp, l_bits, op, me, mbx);
+        op += PC_ID_BLOCK;
+    }
+    running
+}
+
+fn clone_wrap(p: &WrapPreproc) -> WrapPreproc {
+    WrapPreproc {
+        x: p.x.clone(),
+        bits: p.bits.clone(),
+        delta: p.delta,
+        beta_fp: p.beta_fp,
+        beta_bit: p.beta_bit,
+        m: p.m,
+    }
+}
+
+/// Preprocessing for one exact truncation by `d` bits.
+///
+/// A truncation pair `(r, r>>d)` — ABY3's `Π_trunc2` — plus the bits of `r mod
+/// 2^d` over `Z_p`, which is what makes the borrow computable.
+pub struct TruncPreproc {
+    pub r: PartyShare,
+    pub r_shifted: PartyShare,
+    /// Ring shares of `r mod 2^d` — the low bits the borrow compares against.
+    ///
+    /// A *ring* sharing, not `Z_p` bit-shares, because the borrow cannot use
+    /// `Π_PC`: see [`truncate_batch`].
+    pub r_lo: PartyShare,
+    pub sel: SelectPreproc,
+}
+
+/// Exact truncation by `d` bits, batched — Falcon's "exact yet expensive"
+/// variant, on the transport.
+///
+/// ```text
+/// c = a + r  (opened)
+/// a>>d = (c>>d) − (r>>d) − borrow,   borrow = 1 ⟺ c_lo < r_lo
+/// ```
+///
+/// `c_lo` is public once `c` is opened but **`r_lo` is secret**, so the borrow
+/// is a secure comparison — one per truncation, and every fixed-point multiply
+/// needs a truncation. That is the entire reason Falcon calls this expensive,
+/// and the reason it buys `ℓ = 32` instead of 64.
+///
+/// # Why the borrow does **not** use `Π_PC`
+///
+/// It looks like it should: `borrow ⟺ r_lo > c_lo ⟺ r_lo ≥ c_lo + 1`, which is
+/// `Π_PC`'s exact shape — secret `r_lo`, public `c_lo + 1`. But `Π_PC` is
+/// undefined when its secret equals its public argument
+/// ([`crate::crypto::field::private_compare`]), and here that is `r_lo = c_lo+1`
+/// — **precisely the boundary where the borrow flips**. The degenerate input is
+/// not rare and not avoidable by masking: it is the answer.
+///
+/// Caught by `transport_truncation_is_exact` at the first value where it bites
+/// (`a = 15`, `d = 4`, `r_lo = 10`, `c_lo + 1 = 10`).
+///
+/// So the borrow is taken as the sign of `c_lo − r_lo` via bit decomposition,
+/// which is exact at equality. Worth noting for the reproduction: Falcon's own
+/// stack needs a comparison primitive that `Π_PC` does not provide.
+///
+/// The resulting bit is lifted into the ring with `Π_SS`, which is how a `Z_2`
+/// value becomes subtractable from a `Z_L` one without a conversion protocol.
+///
+/// Requires `a + r` not to wrap, which the preprocessing controls by keeping
+/// the mask below `L − max|a|`.
+#[allow(clippy::too_many_arguments)]
+pub fn truncate_batch<T: Transport>(
+    a: &[PartyShare],
+    pre: &[TruncPreproc],
+    d: u32,
+    l_bits: u32,
+    base_op_id: u64,
+    me: PartyId,
+    mbx: &Mailbox<T>,
+) -> Vec<PartyShare> {
+    let n = a.len();
+    assert_eq!(pre.len(), n, "one truncation pair per value");
+    if n == 0 {
+        return Vec::new();
+    }
+    let mask: Fr = (1u128 << l_bits) - 1;
+    let dmask: u64 = (1u64 << d) - 1;
+
+    // 1. Open c = a + r.
+    let masked: Vec<PartyShare> = a
+        .iter()
+        .zip(pre)
+        .map(|(av, p)| PartyShare {
+            left: av.left.wrapping_add(p.r.left) & mask,
+            right: av.right.wrapping_add(p.r.right) & mask,
+        })
+        .collect();
+    let comps = reveal_components_packed_party(&masked, l_bits, base_op_id, me, mbx);
+    let c: Vec<u64> = comps
+        .iter()
+        .map(|k| ((k[0].wrapping_add(k[1]).wrapping_add(k[2])) & mask) as u64)
+        .collect();
+
+    // 2. borrow = sign of (c_lo − r_lo), taken over d+1 bits so the difference
+    //    has room to go negative. Exact at equality, which Π_PC is not.
+    let w = d as usize + 1;
+    let diffs: Vec<PartyShare> = c
+        .iter()
+        .zip(pre)
+        .map(|(&ci, p)| {
+            let lo = (ci & dmask) as Fr;
+            let pub0 = if me == 0 { lo } else { 0 };
+            let pub1 = if me == 2 { lo } else { 0 };
+            PartyShare {
+                left: pub0.wrapping_sub(p.r_lo.left) & ((1u128 << w) - 1),
+                right: pub1.wrapping_sub(p.r_lo.right) & ((1u128 << w) - 1),
+            }
+        })
+        .collect();
+    // Narrow: the borrow is read purely as a bit (`& 1` below and then a
+    // Z_2 input to Π_SS), never multiplied by a wide operand, so the
+    // bit-shares only have to be valid mod 2^4. That precondition is what
+    // makes the narrowing safe here and not in the general `lt` path — and it
+    // is worth 32x, because this a2b was 96% of an all-RSS network.
+    let bits = crate::crypto::aby3_protocol::a2b_batch_party_at(
+        &diffs,
+        w,
+        4,
+        base_op_id + 1,
+        me,
+        mbx,
+    );
+    let borrow_bits: Vec<[u64; 2]> = bits
+        .iter()
+        .map(|bv| {
+            let msb = &bv[w - 1];
+            [(msb.left & 1) as u64, (msb.right & 1) as u64]
+        })
+        .collect();
+
+    // 3. Lift the borrow into the ring with Π_SS: select between 0 and 1.
+    let zeros = vec![PartyShare { left: 0, right: 0 }; n];
+    let ones: Vec<PartyShare> = (0..n)
+        .map(|_| PartyShare {
+            left: Fr::from(me == 0),
+            right: Fr::from(me == 2),
+        })
+        .collect();
+    let sel: Vec<SelectPreproc> = pre
+        .iter()
+        .map(|p| SelectPreproc { c_bit: p.sel.c_bit, c_ring: p.sel.c_ring.clone() })
+        .collect();
+    let borrow = select_batch(
+        &zeros,
+        &ones,
+        &borrow_bits,
+        &sel,
+        l_bits,
+        base_op_id + 2 + PC_ID_BLOCK,
+        me,
+        mbx,
+    );
+
+    // 4. out = (c>>d) − (r>>d) − borrow, with the public term in component 0.
+    (0..n)
+        .map(|i| {
+            let hi = (c[i] >> d) as Fr;
+            let pub0 = if me == 0 { hi } else { 0 };
+            let pub1 = if me == 2 { hi } else { 0 };
+            PartyShare {
+                left: pub0
+                    .wrapping_sub(pre[i].r_shifted.left)
+                    .wrapping_sub(borrow[i].left)
+                    & mask,
+                right: pub1
+                    .wrapping_sub(pre[i].r_shifted.right)
+                    .wrapping_sub(borrow[i].right)
+                    & mask,
+            }
+        })
+        .collect()
+}
+
+/// A convolution with **secret** kernels, as one batched dot product per output.
+///
+/// `im2col` in shares: the patch gather is pure indexing and costs nothing, so a
+/// conv layer is a matmul whose output count is `out_c · oh · ow` and whose
+/// inner length is `in_c · K · K`. One `dot_batch_party` round, one ring element
+/// per output — the same accounting Falcon's `MatMul = k·x·z` gives.
+///
+/// `input` is `[in_c][in_h][in_w]` row-major; `kernels[oc]` is
+/// `[in_c · K · K]` in the same `(ic, ky, kx)` order the plaintext reference
+/// uses, so the two cannot disagree about the flatten.
+#[allow(clippy::too_many_arguments)]
+pub fn conv_batch<T: Transport>(
+    input: &[PartyShare],
+    kernels: &[Vec<PartyShare>],
+    in_c: usize,
+    in_h: usize,
+    in_w: usize,
+    k: usize,
+    l_bits: u32,
+    base_op_id: u64,
+    me: PartyId,
+    mbx: &Mailbox<T>,
+) -> Vec<PartyShare> {
+    let (oh, ow) = (in_h - k + 1, in_w - k + 1);
+    let mut dots: Vec<Vec<(PartyShare, PartyShare)>> = Vec::with_capacity(kernels.len() * oh * ow);
+    for kern in kernels {
+        for oy in 0..oh {
+            for ox in 0..ow {
+                let mut terms = Vec::with_capacity(in_c * k * k);
+                for ic in 0..in_c {
+                    for ky in 0..k {
+                        for kx in 0..k {
+                            let w = &kern[(ic * k + ky) * k + kx];
+                            let x = &input[(ic * in_h + oy + ky) * in_w + ox + kx];
+                            terms.push((w.clone(), x.clone()));
+                        }
+                    }
+                }
+                dots.push(terms);
+            }
+        }
+    }
+    let refs: Vec<&[(PartyShare, PartyShare)]> = dots.iter().map(|d| d.as_slice()).collect();
+    crate::crypto::aby3_protocol::dot_batch_party_at(&refs, l_bits, base_op_id, me, mbx)
+}
+
+/// Everything one dense→truncate→ReLU layer consumes from preprocessing.
+pub struct LayerPreproc {
+    pub trunc: Vec<TruncPreproc>,
+    pub wrap: Vec<WrapPreproc>,
+    pub sel: Vec<SelectPreproc>,
+}
+
+/// One fixed-point layer, the whole of Falcon's inference block:
+/// `ReLU(truncate(W·x, d))`.
+///
+/// The truncation is where Falcon puts it — after the multiplication, not fused
+/// into the nonlinearity — which is why a like-for-like comparison against
+/// Baru's fused `relu∘rescale` has to be made at the *layer*, not the operation.
+///
+/// Rounds: 1 (matmul) + truncation + `5 + log₂ ℓ` (ReLU). All batched across the
+/// layer's width, so the count is independent of how wide it is.
+#[allow(clippy::too_many_arguments)]
+pub fn layer_batch<T: Transport>(
+    x: &[PartyShare],
+    w: &[Vec<PartyShare>],
+    pre: &LayerPreproc,
+    d: u32,
+    l_bits: u32,
+    base_op_id: u64,
+    me: PartyId,
+    mbx: &Mailbox<T>,
+) -> Vec<PartyShare> {
+    let z = dense_batch(x, w, l_bits, base_op_id, me, mbx);
+    let t = truncate_batch(&z, &pre.trunc, d, l_bits, base_op_id + 4 * PC_ID_BLOCK, me, mbx);
+    relu_batch(
+        &t,
+        &pre.wrap,
+        &pre.sel,
+        l_bits,
+        base_op_id + 8 * PC_ID_BLOCK,
+        me,
+        mbx,
+    )
+}
+
+/// A dense layer with **secret** weights: `out[j] = Σ_k w[j][k] · x[k]`.
+///
+/// This is Falcon's `Π_MatMul` and Baru's `gadgets::dense` — the *same* RSS
+/// protocol, which is why the linear layers were never the difference between
+/// the two systems. Every product is secret×secret, so the whole layer is one
+/// batched multiplication round followed by local sums: `out·in` elements on
+/// the wire, one round, whatever the shape.
+///
+/// The bias is added locally by the caller if wanted; a public constant costs
+/// nothing.
+pub fn dense_batch<T: Transport>(
+    x: &[PartyShare],
+    w: &[Vec<PartyShare>],
+    l_bits: u32,
+    base_op_id: u64,
+    me: PartyId,
+    mbx: &Mailbox<T>,
+) -> Vec<PartyShare> {
+    let inn = x.len();
+    assert!(w.iter().all(|row| row.len() == inn), "weight rows must match the input width");
+    if w.is_empty() {
+        return Vec::new();
+    }
+    let mask: Fr = (1u128 << l_bits) - 1;
+    let mut pairs = Vec::with_capacity(w.len() * inn);
+    for row in w {
+        for (wk, xk) in row.iter().zip(x) {
+            pairs.push((wk.clone(), xk.clone()));
+        }
+    }
+    let prods = crate::crypto::aby3_protocol::mul_batch_party_at(
+        &pairs, l_bits, base_op_id, me, mbx,
+    );
+    w.iter()
+        .enumerate()
+        .map(|(j, _)| {
+            let mut acc = PartyShare { left: 0, right: 0 };
+            for k in 0..inn {
+                let p = &prods[j * inn + k];
+                acc = PartyShare {
+                    left: acc.left.wrapping_add(p.left) & mask,
+                    right: acc.right.wrapping_add(p.right) & mask,
+                };
+            }
+            acc
+        })
+        .collect()
 }
 
 /// Rounds one [`private_compare`] costs at bit-width `ℓ`: one batched multiply
@@ -998,6 +1375,226 @@ mod tests {
                 "ReLU at {i} (signed {})",
                 crate::crypto::falcon::signed(i as u64, LB)
             );
+        }
+    }
+
+    /// `Π_Maxpool` over the transport must return the true maximum of each 2×2
+    /// window under the signed reading — the pooling the CNN benchmarks use.
+    ///
+    /// Inputs are held to `|a| < L/4` so `max − aᵢ` stays in the signed window,
+    /// the bound the function documents.
+    #[test]
+    #[ignore] // real 3-party transport
+    fn transport_maxpool_returns_the_window_max() {
+        const LB: u32 = 8;
+        let l = 1i128 << LB;
+        // Every 4-tuple from a coarse grid inside ±L/4.
+        let grid: Vec<i128> = (-(l / 4) + 1..l / 4).step_by(11).collect();
+        let mut plain: Vec<[i128; 4]> = Vec::new();
+        for &a in &grid {
+            for &b in &grid {
+                for &c in &grid {
+                    for &d in &grid {
+                        plain.push([a, b, c, d]);
+                    }
+                }
+            }
+        }
+        let expected: Vec<i128> = plain.iter().map(|w| *w.iter().max().unwrap()).collect();
+        let nwin = plain.len();
+
+        let out = run3(move |me, mbx| {
+            let windows: Vec<Vec<PartyShare>> = plain
+                .iter()
+                .map(|w| {
+                    w.iter()
+                        .map(|&v| {
+                            let l = 1i128 << LB;
+                            let e = ((v + l) % l) as u64;
+                            let s = [e / 3, e / 3, e - 2 * (e / 3)];
+                            PartyShare {
+                                left: s[me % 3] as u128,
+                                right: s[(me + 1) % 3] as u128,
+                            }
+                        })
+                        .collect()
+                })
+                .collect();
+            let wrap_pre: Vec<Vec<WrapPreproc>> = (0..nwin)
+                .map(|i| {
+                    (0..3).map(|k| preproc_seeded((i * 7 + k) as u64, LB, me)).collect()
+                })
+                .collect();
+            let sel_pre: Vec<Vec<SelectPreproc>> = (0..nwin)
+                .map(|i| (0..3).map(|k| sel_preproc((i * 5 + k) as u64, LB, me)).collect())
+                .collect();
+            maxpool_batch(&windows, &wrap_pre, &sel_pre, LB, PC_ID_BLOCK, me, mbx)
+        });
+
+        let mask = (1u128 << LB) - 1;
+        for (i, want) in expected.iter().enumerate() {
+            let v = ((out[0][i].left + out[1][i].left + out[2][i].left) & mask) as u64;
+            assert_eq!(
+                crate::crypto::falcon::signed(v, LB),
+                *want,
+                "window {i}: max should be {want}"
+            );
+        }
+    }
+
+    /// `preproc` with a caller-chosen seed, for tests that need several
+    /// independent bundles per element.
+    fn preproc_seeded(seed: u64, l_bits: u32, me: PartyId) -> WrapPreproc {
+        let l = 1u64 << l_bits;
+        preproc(
+            [
+                seed.wrapping_mul(53).wrapping_add(7) % l,
+                seed.wrapping_mul(29).wrapping_add(3) % l,
+                seed.wrapping_mul(17).wrapping_add(5) % l,
+            ],
+            seed & 1,
+            l_bits,
+            me,
+        )
+    }
+
+    /// Exact truncation on the transport must equal a plain arithmetic shift,
+    /// on every value — no probability, no off-by-one.
+    ///
+    /// That is the whole point of the borrow: without it the result is wrong on
+    /// roughly half the inputs (measured in
+    /// `probabilistic_truncation_is_off_by_one_about_half_the_time`), and the
+    /// guard bits an approximate scheme needs are what Falcon spends its smaller
+    /// ring on.
+    #[test]
+    #[ignore] // real 3-party transport
+    fn transport_truncation_is_exact() {
+        const LB: u32 = 12;
+        const D: u32 = 4;
+        let l = 1u64 << LB;
+        // Keep a + r inside the ring, which the preprocessing controls.
+        let vals: Vec<u64> = (0..l / 2).step_by(3).collect();
+        let expected: Vec<u64> = vals.iter().map(|&v| v >> D).collect();
+        let n = vals.len();
+
+        let out = run3(move |me, mbx| {
+            let a: Vec<PartyShare> = vals
+                .iter()
+                .map(|&v| {
+                    let s = [v / 3, v / 3, v - 2 * (v / 3)];
+                    PartyShare { left: s[me % 3] as u128, right: s[(me + 1) % 3] as u128 }
+                })
+                .collect();
+            let pre: Vec<TruncPreproc> = (0..n)
+                .map(|i| {
+                    let l = 1u64 << LB;
+                    // Mask small enough that a + r cannot wrap.
+                    let r = ((i as u64).wrapping_mul(37) % (l / 4)) + 1;
+                    let rs = [r / 3, r / 3, r - 2 * (r / 3)];
+                    let sh = r >> D;
+                    let ss = [sh, 0, 0];
+                    TruncPreproc {
+                        r: PartyShare {
+                            left: rs[me % 3] as u128,
+                            right: rs[(me + 1) % 3] as u128,
+                        },
+                        r_shifted: PartyShare {
+                            left: ss[me % 3] as u128,
+                            right: ss[(me + 1) % 3] as u128,
+                        },
+                        r_lo: {
+                            let lo = r & ((1u64 << D) - 1);
+                            let ls = [lo, 0, 0];
+                            PartyShare {
+                                left: ls[me % 3] as u128,
+                                right: ls[(me + 1) % 3] as u128,
+                            }
+                        },
+                        sel: sel_preproc(i as u64, LB, me),
+                    }
+                })
+                .collect();
+            truncate_batch(&a, &pre, D, LB, PC_ID_BLOCK, me, mbx)
+        });
+
+        let mask = (1u128 << LB) - 1;
+        for (i, want) in expected.iter().enumerate() {
+            let got = ((out[0][i].left + out[1][i].left + out[2][i].left) & mask) as u64;
+            assert_eq!(got, *want, "truncating value {} by {D}", i * 3);
+        }
+    }
+
+    /// A whole fixed-point layer end to end — `ReLU(truncate(W·x, d))` — against
+    /// a plaintext reference computing the same thing.
+    ///
+    /// This is the reproduction's closing check: matmul, truncation and ReLU
+    /// composed on the real transport, with secret weights, and the answer
+    /// matching integer arithmetic exactly. Anything that only works in
+    /// isolation fails here.
+    #[test]
+    #[ignore] // real 3-party transport
+    fn a_whole_fixed_point_layer_matches_plaintext() {
+        const LB: u32 = 16;
+        const D: u32 = 3;
+        const IN: usize = 6;
+        const OUT: usize = 5;
+        let l = 1u64 << LB;
+
+        // Small non-negative values so W·x stays well inside the ring and the
+        // truncation's `a + r` cannot wrap — the stated preconditions.
+        let xv: Vec<u64> = (0..IN as u64).map(|k| k * 3 + 1).collect();
+        let wv: Vec<Vec<u64>> =
+            (0..OUT).map(|j| (0..IN).map(|k| ((j * 2 + k) % 5) as u64).collect()).collect();
+        let expected: Vec<u64> = wv
+            .iter()
+            .map(|row| {
+                let z: u64 = row.iter().zip(&xv).map(|(a, b)| a * b).sum();
+                z >> D // all non-negative, so ReLU is the identity here
+            })
+            .collect();
+
+        let out = run3(move |me, mbx| {
+            let share = |v: u64| {
+                let s = [v / 3, v / 3, v - 2 * (v / 3)];
+                PartyShare { left: s[me % 3] as u128, right: s[(me + 1) % 3] as u128 }
+            };
+            let x: Vec<PartyShare> = xv.iter().map(|&v| share(v)).collect();
+            let w: Vec<Vec<PartyShare>> =
+                wv.iter().map(|r| r.iter().map(|&v| share(v)).collect()).collect();
+            let pre = LayerPreproc {
+                trunc: (0..OUT)
+                    .map(|i| {
+                        let r = ((i as u64).wrapping_mul(41) % (l / 8)) + 1;
+                        let rs = [r / 3, r / 3, r - 2 * (r / 3)];
+                        let sh = r >> D;
+                        let lo = r & ((1u64 << D) - 1);
+                        TruncPreproc {
+                            r: PartyShare {
+                                left: rs[me % 3] as u128,
+                                right: rs[(me + 1) % 3] as u128,
+                            },
+                            r_shifted: PartyShare {
+                                left: [sh, 0, 0][me % 3] as u128,
+                                right: [sh, 0, 0][(me + 1) % 3] as u128,
+                            },
+                            r_lo: PartyShare {
+                                left: [lo, 0, 0][me % 3] as u128,
+                                right: [lo, 0, 0][(me + 1) % 3] as u128,
+                            },
+                            sel: sel_preproc(1000 + i as u64, LB, me),
+                        }
+                    })
+                    .collect(),
+                wrap: (0..OUT).map(|i| preproc_seeded(2000 + i as u64, LB, me)).collect(),
+                sel: (0..OUT).map(|i| sel_preproc(3000 + i as u64, LB, me)).collect(),
+            };
+            layer_batch(&x, &w, &pre, D, LB, PC_ID_BLOCK, me, mbx)
+        });
+
+        let mask = (1u128 << LB) - 1;
+        for (j, want) in expected.iter().enumerate() {
+            let got = ((out[0][j].left + out[1][j].left + out[2][j].left) & mask) as u64;
+            assert_eq!(got, *want, "layer output {j}");
         }
     }
 

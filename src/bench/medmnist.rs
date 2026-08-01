@@ -728,6 +728,7 @@ pub fn run_cli(args: &[String]) -> Result<(), String> {
             }
             "--json" => json = true,
             "--gc" => nonlin = Nonlin::Gc,
+            "--falcon" => nonlin = Nonlin::Falcon,
             "--both" => both = true,
             "--precompute" => precompute = true,
             "--rtt-ms" => {

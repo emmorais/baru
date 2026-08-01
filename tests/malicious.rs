@@ -215,6 +215,22 @@ fn honest_run_agrees_and_does_not_abort() {
     }
 }
 
+/// Rebuild a resharing message with `f` applied to every value.
+///
+/// The payload is bit-packed, so a tamper has to unpack, act on the values, and
+/// repack — expressing the attack on what the protocol carries rather than on
+/// how it is encoded.
+fn tamper(base_op_id: u64, bits: u32, data: &[u8], f: impl Fn(u128) -> u128) -> MpcMsg {
+    let n = data.len() * 8 / bits as usize;
+    let vals: Vec<u128> =
+        baru::crypto::aby3_protocol::unpack_ring(data, n, bits).into_iter().map(f).collect();
+    MpcMsg::TaggedZBatch {
+        base_op_id,
+        bits,
+        data: baru::crypto::aby3_protocol::pack_ring(&vals, bits),
+    }
+}
+
 /// The central case: a corrupt party adds an offset to its resharing message.
 /// Nothing can recompute `z_i`, so only the MAC check can catch this.
 #[test]
@@ -223,17 +239,24 @@ fn corrupted_multiplication_is_caught() {
         let rule = Arc::new(|_to: PartyId, m: &MpcMsg| match m {
             MpcMsg::TaggedZBatch {
                 base_op_id,
-                values,
-            } if *base_op_id == 20 => Some(MpcMsg::TaggedZBatch {
-                base_op_id: *base_op_id,
+                bits,
+                data,
+            } if *base_op_id == 20 => {
                 // Offset the *value* half of the batch only, leaving the MAC
                 // half consistent — the subtle attack, not a blunt one.
-                values: values
-                    .iter()
-                    .enumerate()
-                    .map(|(i, v)| if i == 0 { v.wrapping_add(1) } else { *v })
-                    .collect(),
-            }),
+                let n = data.len() * 8 / *bits as usize;
+                let vals: Vec<u128> =
+                    baru::crypto::aby3_protocol::unpack_ring(data, n, *bits)
+                        .into_iter()
+                        .enumerate()
+                        .map(|(i, v)| if i == 0 { v.wrapping_add(1) } else { v })
+                        .collect();
+                Some(MpcMsg::TaggedZBatch {
+                    base_op_id: *base_op_id,
+                    bits: *bits,
+                    data: baru::crypto::aby3_protocol::pack_ring(&vals, *bits),
+                })
+            }
             _ => None,
         });
         let results = run_with(6, 7, Some((corrupt, rule)), Some(1));
@@ -257,11 +280,8 @@ fn corrupted_multiplication_is_caught() {
 #[test]
 fn an_error_that_cannot_change_the_result_is_not_claimed_to_be_caught() {
     let rule = Arc::new(|_to: PartyId, m: &MpcMsg| match m {
-        MpcMsg::TaggedZBatch { base_op_id, values } if *base_op_id == 20 => {
-            Some(MpcMsg::TaggedZBatch {
-                base_op_id: *base_op_id,
-                values: values.iter().map(|v| v.wrapping_add(1u128 << 100)).collect(),
-            })
+        MpcMsg::TaggedZBatch { base_op_id, bits, data } if *base_op_id == 20 => {
+            Some(tamper(*base_op_id, *bits, data, |v| v.wrapping_add(1u128 << 100)))
         }
         _ => None,
     });
@@ -353,11 +373,8 @@ fn a_reveal_lie_told_to_only_the_non_holder_is_caught_by_the_transcript() {
 #[test]
 fn abort_is_a_result_not_a_panic() {
     let rule = Arc::new(|_to: PartyId, m: &MpcMsg| match m {
-        MpcMsg::TaggedZBatch { base_op_id, values } if *base_op_id == 20 => {
-            Some(MpcMsg::TaggedZBatch {
-                base_op_id: *base_op_id,
-                values: values.iter().map(|v| v.wrapping_add(1)).collect(),
-            })
+        MpcMsg::TaggedZBatch { base_op_id, bits, data } if *base_op_id == 20 => {
+            Some(tamper(*base_op_id, *bits, data, |v| v.wrapping_add(1)))
         }
         _ => None,
     });
@@ -444,11 +461,8 @@ fn pair_based_macs_give_a_correct_honest_run() {
 #[test]
 fn cheating_in_pair_generation_is_caught() {
     let rule = Arc::new(|_to: PartyId, m: &MpcMsg| match m {
-        MpcMsg::TaggedZBatch { base_op_id, values } if *base_op_id == 10 => {
-            Some(MpcMsg::TaggedZBatch {
-                base_op_id: *base_op_id,
-                values: values.iter().map(|v| v.wrapping_add(1)).collect(),
-            })
+        MpcMsg::TaggedZBatch { base_op_id, bits, data } if *base_op_id == 10 => {
+            Some(tamper(*base_op_id, *bits, data, |v| v.wrapping_add(1)))
         }
         _ => None,
     });
@@ -613,11 +627,8 @@ fn cheating_inside_bit_decomposition_is_caught() {
     // Corrupt the carry-save round of the first decomposition (op ids are
     // allocated from 1_000 upward inside `a2b_batch_checked`).
     let rule = Arc::new(|_to: PartyId, m: &MpcMsg| match m {
-        MpcMsg::TaggedZBatch { base_op_id, values } if *base_op_id > 1_000 && *base_op_id < 5_000 => {
-            Some(MpcMsg::TaggedZBatch {
-                base_op_id: *base_op_id,
-                values: values.iter().map(|v| v.wrapping_add(1)).collect(),
-            })
+        MpcMsg::TaggedZBatch { base_op_id, bits, data } if *base_op_id > 1_000 && *base_op_id < 5_000 => {
+            Some(tamper(*base_op_id, *bits, data, |v| v.wrapping_add(1)))
         }
         _ => None,
     });
