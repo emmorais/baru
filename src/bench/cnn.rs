@@ -1215,6 +1215,15 @@ impl Nonlin {
             Nonlin::Falcon => "falcon (wrap3 over Z_p, lowest bandwidth)",
         }
     }
+
+    /// The bare protocol name, for table headers where [`label`] would not fit.
+    pub fn short(self) -> &'static str {
+        match self {
+            Nonlin::A2b => "a2b",
+            Nonlin::Gc => "gc",
+            Nonlin::Falcon => "falcon",
+        }
+    }
 }
 
 pub fn run_cnn_hybrid(model: &CnnModel, input: &[i64], profile: NetworkProfile) -> CnnRun {

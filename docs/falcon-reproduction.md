@@ -863,17 +863,82 @@ online protocol and its costs are real; the offline phase is not yet. This is
 the same disclosed caveat the repo already carries for dealer-based BFV keygen,
 and it is the one thing between `NonlinMode::Falcon` and a deployable protocol.
 
+## The measured crossover (2026-08-01)
+
+This is the contribution *on top of* the reproduction, and it is now measured
+rather than argued. Both routes compute the same MedMNIST diagnosis bit-exactly;
+only the nonlinearity protocol differs.
+
+```
+baru bench-medmnist --dataset pneumonia --hybrid 1 --sweep
+```
+
+`--sweep` builds **one** model and **one** `CnnSession` for the entire grid, so
+keygen and the encrypted weights are identical across cells and only the
+protocol and the network vary; every cell is checked against the plaintext
+argmax and the table refuses to print clean if any disagreed. Latency per
+encrypted diagnosis, ms, `--precompute` on (so these are *online* figures):
+
+| RTT | 1000 | 100 | 40 | 30 | 20 | 15 | 10 | 7 | 5 Mbps |
+|---|---|---|---|---|---|---|---|---|---|
+| **0 ms** gc | **638** | **3227** | **6554** | **8511** | 12357 | 16215 | 23915 | 33751 | 46869 |
+| **0 ms** falcon | 1279 | 3528 | 6750 | 8583 | **12167** | **15740** | **22828** | **31804** | **43794** |
+| **20 ms** gc | **2411** | **4839** | **8395** | **10292** | **14174** | **18046** | 25594 | 35618 | 48659 |
+| **20 ms** falcon | 3873 | 6276 | 9585 | 11393 | 14998 | 18431 | **25543** | **34588** | **46850** |
+
+**The boundary is in bandwidth, and it moves with RTT.** Falcon wins below
+**20–30 Mbps at RTT 0** and below **10–15 Mbps at RTT 20 ms**; garbled circuits
+win above. Higher RTT shifts the crossover *down* — it shrinks the region where
+Falcon wins. Brackets, not interpolated points: those are the grid spacings
+actually measured.
+
+The 30 Mbps cell at RTT 0 is the boundary itself and behaves like it — across
+repeat runs the winner flips (8511 vs 8583 one run, 8621 vs 8614 the next, a
+0.1% spread). Neither ordering there should be quoted as a result; the finding
+is that the two protocols are indistinguishable at that point, which is what a
+crossover *is*.
+
+### Why, and the check that it is not a coincidence
+
+At 1 Gbit/s and RTT 0 the two differ almost entirely in compute: 638 ms for `gc`
+against 1279 ms for `falcon`. So Falcon starts **~641 ms behind** and pays a
+further **67 messages** of round latency, against which it saves **1.6 MB**.
+Break-even is where the byte saving pays both back:
+
+| | predicted | measured |
+|---|---|---|
+| RTT 0 ms | 20.0 Mbps | 20–30 Mbps |
+| RTT 20 ms | 6.5 Mbps | 10–15 Mbps |
+
+Right ballpark, right direction, right RTT-dependence. Falcon does consistently
+a little better than the linear prediction, and the reason is structural rather
+than noise: `NetworkProfile` charges per *round*, not per message, and Falcon's
+67 extra messages batch into fewer than 67 extra rounds — so the true RTT
+penalty is smaller than `67 × RTT`, which is exactly the direction of the
+residual, and it grows with RTT (as the 6.5-vs-12 row shows) precisely because
+that is the term being over-charged.
+
+### What this licenses saying
+
+> Given a deployment's RTT and bandwidth, **pick** the nonlinearity protocol
+> rather than fixing it — with the crossover measured, not modelled.
+
+Falcon always uses `wrap3`. Baru has three interchangeable implementations of
+the same comparison and a cost model whose purpose is choosing between them, so
+this is a claim the reproduction makes possible and Falcon cannot make.
+
+Two honest limits on it. The compute term is Rust-in-simulation against what
+optimised C++ would do, and it is the term that sets the RTT-0 intercept — a
+faster `Π_PC` moves the crossover right. And `a2b` is dominated everywhere here,
+so the practical choice is two-way, not three-way.
+
 ## What remains
 
 - **An end-to-end LeNet run** rather than a per-op extrapolation. Everything it
   needs exists; what is missing is the convolution *packing* (expressing conv as
   a matmul over patches) and the harness, neither of which is new protocol.
-- **The measured crossover**, which is the contribution *on top of* the
-  reproduction: `wrap3` and garbled circuits win on different axes (~30× bytes
-  versus ~5× wall-clock), so the right nonlinearity depends on RTT and
-  bandwidth. Falcon fixes the choice; Baru has a cost model whose purpose is
-  making it. Sweeping `NetworkProfile` over the four routes turns that into a
-  measured boundary rather than a claim.
+- **A real offline phase** for the Falcon backend (see the caveat above) — the
+  one thing between `NonlinMode::Falcon` and something deployable.
 
 ## Strategy from here (2026-08-01)
 
@@ -900,17 +965,16 @@ over when the reproduction is written up.
 benchmark shows `wrap3` and garbled circuits winning on *different axes* —
 garbling is ~5× faster in wall-clock while sending ~30× more. Falcon always uses
 `wrap3`. Baru has a cost model (`mpcc::assign`) whose entire purpose is choosing
-per operation, and now has measured costs for all three nonlinearity routes. So
-the contribution on top of the reproduction is:
+per operation, and now has measured costs for all three nonlinearity routes.
 
-> given a deployment's RTT and bandwidth, **pick** the nonlinearity protocol
-> rather than fixing it — with the crossover measured, not modelled.
+That is the crossover, and it is measured — see [The measured
+crossover](#the-measured-crossover-2026-08-01) above.
 
-That is a claim the reproduction makes possible and that Falcon cannot make. — Falcon
-   hand-written, Baru gadgets, Baru compiled — over the same transport, with
-   message and byte counts, exactly as `bench-compiled-nn` does. All three
-   checked against one plaintext reference; a cost comparison between routes
-   computing different things is meaningless.
+The remaining internal comparison is the three construction routes — Falcon
+hand-written, Baru gadgets, Baru compiled — over the same transport, with
+message and byte counts, exactly as `bench-compiled-nn` does. All three checked
+against one plaintext reference; a cost comparison between routes computing
+different things is meaningless.
 
 ## What must be true for the result to mean anything
 

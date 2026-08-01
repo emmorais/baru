@@ -427,6 +427,148 @@ pub fn run(
     })
 }
 
+/// One cell of the crossover sweep: a network condition, a nonlinearity, and
+/// what that combination cost per encrypted diagnosis.
+pub struct SweepCell {
+    pub rtt_ms: u64,
+    pub bandwidth_mbps: f64,
+    pub nonlin: Nonlin,
+    pub ms: f64,
+    pub messages: f64,
+    pub bytes: f64,
+    /// Every cell recomputes the same diagnosis; if one disagrees with the
+    /// plaintext argmax the whole row is meaningless, so it is carried here
+    /// rather than assumed.
+    pub matches_plaintext: bool,
+}
+
+/// Sweep network conditions across nonlinearity protocols to find where the
+/// cheaper-in-bytes route overtakes the cheaper-in-time one.
+///
+/// This is the measurement that justifies Baru *choosing* a nonlinearity rather
+/// than fixing one, so it takes care to be a fair comparison: **one** model and
+/// **one** [`CnnSession`] for the entire grid, so keygen and the encrypted
+/// weights are identical across cells and only the protocol and the network
+/// vary. The plaintext reference is computed once and every cell is checked
+/// against it — a latency comparison between routes computing different things
+/// would be worthless.
+pub fn sweep_crossover(
+    name: &str,
+    hybrid_n: usize,
+    rtts: &[u64],
+    bws: &[f64],
+    protocols: &[Nonlin],
+) -> Result<Vec<SweepCell>, String> {
+    let data = load(name)?;
+    let model = data.model();
+    let hybrid_n = hybrid_n.min(data.images.len()).max(1);
+    let plain: Vec<usize> = data
+        .images
+        .iter()
+        .take(hybrid_n)
+        .map(|img| crate::gadgets::argmax_ref(&model.forward_logits(img).0))
+        .collect();
+    let session = CnnSession::new(&model, true);
+
+    let mut cells = Vec::new();
+    for &rtt in rtts {
+        for &bw in bws {
+            let profile = NetworkProfile::fixed_latency(std::time::Duration::from_micros(
+                rtt * 500,
+            ))
+            .with_bandwidth(bw * 1e6 / 8.0);
+            for &p in protocols {
+                let mut tot = CnnTotals::default();
+                let mut ok = true;
+                for (img, &want) in data.images.iter().take(hybrid_n).zip(&plain) {
+                    let run = run_cnn_hybrid_in_session(&session, &model, img, profile, p, true);
+                    ok &= run.class == want;
+                    tot.add(&run);
+                }
+                let per = tot.mean(hybrid_n);
+                cells.push(SweepCell {
+                    rtt_ms: rtt,
+                    bandwidth_mbps: bw,
+                    nonlin: p,
+                    ms: per.total_ms,
+                    messages: per.messages,
+                    bytes: per.bytes,
+                    matches_plaintext: ok,
+                });
+            }
+        }
+    }
+    Ok(cells)
+}
+
+/// Print the sweep as a latency grid, then name the bandwidth at which the
+/// winner changes for each RTT — the number the whole experiment is for.
+fn print_sweep(cells: &[SweepCell], rtts: &[u64], bws: &[f64], protocols: &[Nonlin]) {
+    println!("crossover sweep — ms per encrypted diagnosis, * marks the winner\n");
+    let mismatched = cells.iter().filter(|c| !c.matches_plaintext).count();
+    if mismatched > 0 {
+        println!("  ⚠️  {mismatched} cell(s) disagreed with the plaintext argmax — DO NOT quote\n");
+    }
+    let at = |r: u64, b: f64, p: Nonlin| {
+        cells
+            .iter()
+            .find(|c| c.rtt_ms == r && c.bandwidth_mbps == b && c.nonlin == p)
+            .map(|c| c.ms)
+    };
+    for &rtt in rtts {
+        println!("  RTT {rtt} ms");
+        print!("    {:<10}", "Mbps");
+        for p in protocols {
+            print!("{:>12}", p.short());
+        }
+        println!();
+        for &bw in bws {
+            print!("    {bw:<10.0}");
+            let best = protocols
+                .iter()
+                .filter_map(|&p| at(rtt, bw, p))
+                .fold(f64::INFINITY, f64::min);
+            for &p in protocols {
+                match at(rtt, bw, p) {
+                    Some(ms) if ms == best => print!("{:>12}", format!("*{ms:.0}")),
+                    Some(ms) => print!("{ms:>12.0}"),
+                    None => print!("{:>12}", "-"),
+                }
+            }
+            println!();
+        }
+        // The crossover itself: the bracket in which the winner changes.
+        // Reported as the grid interval actually measured, not interpolated
+        // into a false-precision single number.
+        if protocols.len() == 2 {
+            let winner = |bw: f64| match (at(rtt, bw, protocols[0]), at(rtt, bw, protocols[1])) {
+                (Some(a), Some(b)) => Some(if a <= b { protocols[0] } else { protocols[1] }),
+                _ => None,
+            };
+            let mut sorted: Vec<f64> = bws.to_vec();
+            sorted.sort_by(|a, b| b.total_cmp(a));
+            let flip = sorted
+                .windows(2)
+                .find(|w| winner(w[0]) != winner(w[1]) && winner(w[1]).is_some());
+            match flip {
+                Some(w) => println!(
+                    "    → crossover between {:.0} and {:.0} Mbps: {} wins above, {} below\n",
+                    w[1],
+                    w[0],
+                    winner(w[0]).map(|p| p.short()).unwrap_or("?"),
+                    winner(w[1]).map(|p| p.short()).unwrap_or("?"),
+                ),
+                None => println!(
+                    "    → no crossover in this range: {} wins throughout\n",
+                    winner(sorted[0]).map(|p| p.short()).unwrap_or("?")
+                ),
+            }
+        } else {
+            println!();
+        }
+    }
+}
+
 /// Running totals over the encrypted runs, so the report can quote a mean
 /// per-image cost rather than a sum that silently depends on `--hybrid N`.
 #[derive(Default)]
@@ -517,6 +659,11 @@ options:
                   offline phase, so the reported latency is ONLINE latency
   --rtt-ms N            round-trip latency between parties (default 0)
   --bandwidth-mbps X    link bandwidth in Mbit/s (default: unlimited)
+  --sweep         measure the CROSSOVER: run every (rtt, bandwidth) pair over
+                  the gc and falcon nonlinearities from one shared session and
+                  report which wins where. Add --both to include a2b.
+  --rtt-list A,B        sweep grid, ms          (default 0,20)
+  --bw-list A,B         sweep grid, Mbit/s      (default 1000,100,60,40,30,20,15,10)
   --json          machine-readable output
   -h, --help      this message
 ";
@@ -706,6 +853,13 @@ fn print_report(r: &MedMnistReport) {
     );
 }
 
+/// Parse a comma-separated numeric list for the sweep grid flags.
+fn parse_list<T: std::str::FromStr>(s: &str) -> Result<Vec<T>, String> {
+    s.split(',')
+        .map(|p| p.trim().parse().map_err(|_| format!("bad list entry {p:?}")))
+        .collect()
+}
+
 pub fn run_cli(args: &[String]) -> Result<(), String> {
     let mut dataset = "pneumonia".to_string();
     let mut hybrid_n = 5usize;
@@ -715,10 +869,20 @@ pub fn run_cli(args: &[String]) -> Result<(), String> {
     let mut precompute = false;
     let mut rtt_ms = 0u64;
     let mut bandwidth_mbps: Option<f64> = None;
+    let mut sweep = false;
+    let mut rtt_list: Vec<u64> = vec![0, 20];
+    let mut bw_list: Vec<f64> = vec![1000.0, 100.0, 60.0, 40.0, 30.0, 20.0, 15.0, 10.0];
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
             "--dataset" => dataset = it.next().ok_or("--dataset needs a value")?.clone(),
+            "--sweep" => sweep = true,
+            "--rtt-list" => {
+                rtt_list = parse_list(it.next().ok_or("--rtt-list needs a value")?)?;
+            }
+            "--bw-list" => {
+                bw_list = parse_list(it.next().ok_or("--bw-list needs a value")?)?;
+            }
             "--hybrid" => {
                 hybrid_n = it
                     .next()
@@ -759,6 +923,23 @@ pub fn run_cli(args: &[String]) -> Result<(), String> {
     } else {
         vec![dataset]
     };
+
+    if sweep {
+        // Only the two routes that are ever competitive: a2b is dominated at
+        // every point measured, so including it would pad the grid by half
+        // with cells nobody would choose.
+        let protocols = if both {
+            vec![Nonlin::A2b, Nonlin::Gc, Nonlin::Falcon]
+        } else {
+            vec![Nonlin::Gc, Nonlin::Falcon]
+        };
+        for n in &names {
+            println!("=== {n} ===");
+            let cells = sweep_crossover(n, hybrid_n, &rtt_list, &bw_list, &protocols)?;
+            print_sweep(&cells, &rtt_list, &bw_list, &protocols);
+        }
+        return Ok(());
+    }
 
     let protocols: Vec<Nonlin> = if both {
         vec![Nonlin::A2b, Nonlin::Gc]
@@ -839,6 +1020,8 @@ mod tests {
                 (Nonlin::A2b, false),
                 (Nonlin::Gc, false),
                 (Nonlin::Gc, true),
+                (Nonlin::Falcon, false),
+                (Nonlin::Falcon, true),
             ] {
                 let r = run(name, 2, NetworkProfile::INSTANT, nonlin, precompute).unwrap();
                 assert_eq!(
@@ -851,6 +1034,43 @@ mod tests {
                     "{name}: per-image latency must be measured, not defaulted"
                 );
             }
+        }
+    }
+
+    /// The crossover sweep is only meaningful if every cell computes the *same*
+    /// diagnosis — a latency comparison between protocols that disagree is
+    /// worthless. This asserts that, and that the network profile is actually
+    /// being applied (a lower bandwidth must cost more time), which is the way
+    /// a sweep would silently degenerate into measuring nothing.
+    #[test]
+    #[ignore] // runs the real BFV × ABY3 hybrid; slow in debug
+    fn sweep_cells_agree_and_respond_to_bandwidth() {
+        let protocols = [Nonlin::Gc, Nonlin::Falcon];
+        let cells = sweep_crossover("pneumonia", 1, &[0], &[1000.0, 10.0], &protocols).unwrap();
+        assert_eq!(cells.len(), 4);
+        for c in &cells {
+            assert!(
+                c.matches_plaintext,
+                "{:?} at {} Mbps disagreed with the plaintext argmax",
+                c.nonlin, c.bandwidth_mbps
+            );
+        }
+        for p in protocols {
+            let fast = cells
+                .iter()
+                .find(|c| c.nonlin == p && c.bandwidth_mbps == 1000.0)
+                .unwrap();
+            let slow = cells
+                .iter()
+                .find(|c| c.nonlin == p && c.bandwidth_mbps == 10.0)
+                .unwrap();
+            assert!(
+                slow.ms > fast.ms,
+                "{p:?}: 10 Mbps ({:.0} ms) must cost more than 1000 Mbps ({:.0} ms) — \
+                 the bandwidth profile is not being applied",
+                slow.ms,
+                fast.ms
+            );
         }
     }
 }
