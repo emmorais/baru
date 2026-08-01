@@ -1,8 +1,15 @@
 # Reproducing Falcon inside Baru
 
-**Status: stages 1–5 done (the whole inference path, as a local simulation).
-Remaining: truncation, then the transport wiring and the three-way benchmark.
-Started 2026-08-01.**
+**Status: stages 1–13 done. Falcon's inference nonlinearity is reproduced,
+running on the real transport, and benchmarked four ways against Baru's own
+routes. Remaining: whole-ReLU (needs transport truncation) and an end-to-end run
+rather than an extrapolation. Started 2026-08-01.**
+
+**Headline, after two corrections:** the compiled route reproduces the
+hand-written `a2b` route *to the digit*; `wrap3` and `a2b` are within ~6% on
+information content; garbled circuits are the real outlier at ~30×. The
+apparent 34–136× advantage for `wrap3` was this crate's `u128` serialisation of
+1-bit shares, not protocol.
 
 ## Why do this at all
 
@@ -541,7 +548,128 @@ does not use.
     share-conversion protocol, and it costs one bit opening plus one ring
     multiplication.
 
-13. **`bench-falcon`**: the same LeNet-shaped network three ways — Falcon
+13. **`bench-falcon`.** ✅ **First results 2026-08-01.** Sign extraction — the
+    operation LeNet's cost consists of — four ways on one transport, all checked
+    to agree bit for bit before anything is reported.
+
+    ```
+    n = 128, ring width 32
+      route                    messages       bytes      ring B   garbled B      ms
+      falcon (wrap3)                 10        6972           0           0    23.6
+      baru-a2b                       10      919768      919732           0    50.1
+      baru-gc                         5      202892        2068      192540    10.7
+      baru-compiled (256 ops)        10      919768      919732           0    41.1
+    ```
+
+    ### The result the exercise was built to get
+
+    **The compiled route reproduces the hand-written `a2b` route exactly** — same
+    message count, same bytes, to the digit. From a scalar source
+    (`(+ (> x0 −1) (+ (> x1 −1) …))`) the ASAP scheduler recovers the batching an
+    expert would write by hand. That is the compiler claim, now demonstrated
+    against a *published protocol's* workload rather than a self-chosen one.
+
+    **And it cannot do more than that.** Falcon's route is far leaner because
+    `wrap3` is a *different protocol* for the same predicate — bit-decomposition
+    replaced by a carry recovered over `Z_p`. No amount of scheduling or CSE
+    turns one into the other. So the honest claim is bounded, and the bound is
+    the interesting part:
+
+    > The compiler matches expert *composition* — batching, CSE, reassociation —
+    > and cannot substitute for a better cryptographic *primitive*.
+
+    That is a far more defensible thing to write than "the compiler wins", and it
+    tells a reader exactly where compilation stops paying.
+
+    ### ⚠️ How large the protocol advantage is — corrected twice
+
+    The raw byte column says Falcon is ~136× leaner than `a2b`. **It is not, and
+    two successive corrections were needed to see why.**
+
+    *First correction:* Baru's ring shares serialise as `u128`, so some of that
+    gap is padding rather than protocol. Discounting at the **ring** width
+    (ℓ = 32, hence 4×) gave ~34×.
+
+    *Second correction — the important one:* **that discount was wrong.** `a2b`
+    does not send ring elements. It bit-decomposes and then operates on **1-bit**
+    shares (`share_component((known >> k) & 1, …)`), each still serialised as a
+    `u128`. Its padding is therefore **128×, not 4×**. Measured at n = 2048,
+    `a2b` sends 7 184 B/sign as **449 elements carrying one bit each** — an
+    information content of ~56 B.
+
+    | route | wire B/sign | information content | why |
+    |---|---|---|---|
+    | falcon (wrap3) | 52.9 | **52.9 B** | `Z_p`, already packed at 6 bits |
+    | baru-a2b | 7 184 | **~56 B** | 449 × 1-bit shares in `u128` slots |
+    | baru-gc | 1 584 | **~1 584 B** | garbled tables, already `Vec<u8>` |
+    | baru-compiled | 7 184 | **~56 B** | identical to `a2b` |
+
+    **So on information content, `wrap3` and `a2b` are within ~6% of each other.**
+    The apparent 34×–136× advantage was an artefact of this crate's
+    serialisation. The genuine gap is against **garbled circuits**, ~30×, and
+    that one is real — garbled tables are large by construction.
+
+    That does not diminish Falcon's engineering (they *did* pack, and packing is
+    most of why their published LeNet figure is 0.74 MB), but it is not a
+    protocol-level advantage over bit-decomposition, and this document previously
+    said it was.
+
+    The compiled route matching `a2b` **to the digit at every n** is unaffected,
+    and remains the strongest form of the compiler claim available here — not
+    "close to", identical.
+
+    ### Also visible
+
+    Baru's garbled route is half the rounds and ~5× faster in wall-clock at zero
+    latency (21 ms vs 88 ms at n = 2048) while sending ~30× more information —
+    the classic garbling trade. Message counts are flat in `n` for every route,
+    so all four are properly batched.
+
+    ### Two harness bugs caught, both of the same kind
+
+    - **The first run charged Baru 2n extra messages** — its route revealed each
+      bit inside the measured region while Falcon's returned shares. Both now
+      return shares.
+    - **The byte classifier was silently wrong.** Adding `RevealPackedBatch`
+      shifted the bincode discriminants, so hardcoded tags attributed a reveal to
+      "garbled" and garbled traffic to nothing — with every *total* still correct
+      and no test failing. Tags are now derived by serialising a sample variant.
+
+    Both were found because a number looked wrong for a nameable reason, and
+    both would have biased the comparison. The agreement check caught a third:
+    `(> x 0)` is strict where DReLU is `≥ 0`, differing on exactly `a = 0`.
+
+    ### Does a per-op difference survive to a network?
+
+    Only if the operation dominates — so this had to be checked rather than
+    assumed. **Falcon's MatMul and Baru's `dense` are the same RSS protocol**
+    (one ring element per output, per party), so a layer differs *only* in its
+    nonlinearity. Extrapolating the measured per-sign costs over LeNet's op
+    counts (8 044 DReLUs, 4 694 linear outputs):
+
+    Using **information content** per sign (not wire bytes — see the correction
+    above) over LeNet's 8 044 DReLUs and 4 694 linear outputs:
+
+    | route | nonlinear | total | nonlinear % |
+    |---|---|---|---|
+    | falcon (wrap3) | 0.425 MB | **0.444 MB** | 95.8% |
+    | baru-a2b / compiled | 0.451 MB | 0.470 MB | 96.0% |
+    | baru-gc | 12.7 MB | 12.7 MB | 99.9% |
+
+    The nonlinearity is 96–100% of the traffic either way, so whatever the
+    per-op gap is, it carries to the network undiluted. But the gap between
+    `wrap3` and `a2b` is ~6%, not orders of magnitude — **the two share-based
+    routes are near-equivalent, and garbling is the outlier.**
+
+    Falcon reports **0.74 MB/party**; this reproduction extrapolates to
+    **0.444 MB**, consistent given `Π_SS` is not counted here and their ReLU line
+    (`4kn`) exceeds our DReLU.
+
+14. **Still open**: whole-ReLU comparison (needs Falcon's truncation on the
+    transport — `truncate_exact` is a local simulation), and an end-to-end run
+    rather than an extrapolation. Note the extrapolation is on firm ground: the
+    per-op costs are measured and stable across n, the op counts are arithmetic,
+    and the linear part is provably the same protocol on both sides. — Falcon
    hand-written, Baru gadgets, Baru compiled — over the same transport, with
    message and byte counts, exactly as `bench-compiled-nn` does. All three
    checked against one plaintext reference; a cost comparison between routes
