@@ -20,8 +20,56 @@ add another generated file, add its command below in the same breath.
 hand-written (extracted from `tests/nn.rs`), not trained, so there is nothing
 to regenerate. It exists to exercise the circuit, not to classify well.
 
-Requires `torch` and `numpy`. Training is CPU-only and takes minutes
-(pneumonia) to ~20 min (organa, 34 561 images × 45 epochs).
+The three CNN files above were emitted before the trainer took `--conv`/`--fc`
+and before it recorded the float parent's accuracy, so each carries
+`FLOAT_TEST_ACCURACY = None` and `bench-medmnist` omits the float-parent line
+for them. Rerunning the command in the table populates it. The number is
+deliberately not filled in by hand: a hand-maintained copy of a measured value
+is exactly the drift these generated files exist to prevent.
+
+Requires `torch` and `numpy`. Training takes minutes (pneumonia) to ~20 min
+(organa, 34 561 images × 45 epochs); `--device` picks the backend and defaults
+to Apple MPS when available. Only the float training runs there — the integer
+reference is numpy on the CPU either way, and it is the integer model that gets
+deployed, so the device can never move the reported number.
+
+## Choosing the architecture
+
+The Rust side fixes only K=3 and POOL=2: `CnnModel` carries `extra_conv` and
+`hidden` as arbitrary-length `Vec`s, so conv depth and dense depth are data,
+not code. `--conv 8,16 --fc 128` is the default and reproduces the files above;
+`--conv 32,64 --fc 256,128` and friends go deeper.
+
+Three different limits bind, and it is worth knowing which one you hit:
+
+- **Spatially**, 3×3 valid convolution plus floor-pooling takes 28 → 13 → 5 → 1,
+  so a 28×28 input admits at most three convs and the third leaves no extent at
+  all. A stack that does not fit is refused with the offending layer named.
+- **By packing**, the Cheetah-style conv packing encodes a whole layer into one
+  polynomial, so the product degree must stay under the ring dimension (4096).
+  This binds on *input channels × spatial extent*, so it bites hardest at the
+  **second** conv, where the channels have grown but the image has been pooled
+  only once: at 13×13 the packing admits at most **12** input channels. So
+  `--conv 16,32` is already too wide — it trains and scores fine in plaintext
+  and cannot be run encrypted at all. `check_packing` mirrors
+  `ConvShape::required_degree` and refuses it before training starts, rather
+  than letting it surface twenty minutes later from inside the FHE code.
+- **Numerically**, every activation must stay inside the depth-1 FHE plaintext
+  modulus, and a wider layer sums more terms into each accumulator — so capacity
+  is capped by the noise budget, not by memory. `--gains` extends the sweep
+  downwards for wide nets that overflow at the default ladder.
+
+The last two mean a net that trains fine in float can still be refused. **That
+refusal is a result — report it rather than lowering `shift` until it passes.**
+Going deeper is the way to spend the budget that is left: `--conv 8,12,32` is
+three convs, runs encrypted bit-exactly, and needs no bootstrap.
+
+Four of the twelve MedMNIST v2 2D sets ship RGB (Path, Derma, Blood, Retina).
+The FHE conv packing assumes one input channel, so those are folded to BT.601
+luminance before training. That is a real change to the task — colour carries
+diagnostic signal in dermatoscopy and histology — so the run says so, the
+generated file records it, and the accuracy must be read against a grayscale
+baseline, never against the published RGB ResNet-18.
 
 ## Getting the data
 
@@ -72,3 +120,33 @@ a post-processing detail but part of the model:
 Each run prints the sweep, the integer-vs-float accuracy and the
 integer/float prediction agreement. If the integer accuracy sits at the
 majority-class baseline, it is the output-layer gain.
+
+## Metrics: why accuracy is not enough
+
+The run also reports **balanced accuracy, AUC, per-class recall, a confusion
+matrix and a 95% Wilson interval** over the full test set, and records balanced
+accuracy and AUC into the weight file. This is not decoration — on this repo's
+own pneumonia weights, accuracy actively misleads:
+
+| | |
+|---|---|
+| accuracy | 84.78% (test set is ~60% positive) |
+| sensitivity / specificity | **98.3% / 65.3%** |
+| balanced accuracy | 81.8% |
+| AUC | 0.925 (published ResNet-18: 0.944) |
+
+The model earns its accuracy largely by over-calling disease — it flags 42 of
+121 healthy scans. Accuracy cannot see that; balanced accuracy and the
+confusion matrix can, and the trainer now shouts when sensitivity and
+specificity diverge by more than 15 points.
+
+AUC matters for a second reason: MedMNIST's published tables lead with it, so a
+benchmark reporting only accuracy cannot be placed against them on their own
+headline metric. AUC needs a *score*, so the trainer scores logits
+(`int_logits`) rather than just the argmax — which is all the deployed
+encrypted pipeline ever reveals.
+
+`src/bench/metrics.rs` mirrors these definitions on the Rust side so
+`bench-medmnist` reports the same quantities on the embedded subset. The two
+implementations were cross-checked by embedding a whole test set and confirming
+they agree to the digit.

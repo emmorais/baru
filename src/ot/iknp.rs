@@ -41,7 +41,7 @@
 //! `H` must be correlation-robust: the sender evaluates it at `qⁱ` and
 //! `qⁱ ⊕ s` for a single fixed `s` across every row, so a plain
 //! collision-resistant hash is not enough in general. SHA-256 with per-row
-//! domain separation is the standard practical choice and what [`super::hash_block`]
+//! domain separation is the standard practical choice and what `super::hash_block`
 //! does.
 //!
 //! Against a **malicious receiver** this is broken, by design of the original
@@ -55,7 +55,8 @@
 use rand::Rng;
 
 use super::{
-    base, hash_block, pack_bits, xor_block, BitColumns, Block, OtTraffic, KAPPA, KAPPA_BYTES,
+    base, gf128_mul, hash_block, pack_bits, xor_block, BitColumns, Block, OtTraffic, KAPPA,
+    KAPPA_BYTES,
 };
 
 const DOMAIN: &[u8] = b"baru/ot/iknp/v1";
@@ -222,6 +223,82 @@ impl ExtSender {
     }
 }
 
+// ─── KOS15 consistency check ─────────────────────────────────────────────────
+
+/// Extra random OTs appended before the check.
+///
+/// The check opens a random linear combination of the receiver's choice bits.
+/// Without padding, that combination would be a nontrivial function of the
+/// *real* choices and would leak. Appending `KAPPA` rows with uniformly random
+/// choice bits makes the opened value uniform and independent of the real ones,
+/// at a cost that vanishes as `m` grows.
+pub const KOS_PAD: usize = KAPPA;
+
+/// The receiver's answer to the sender's challenge.
+///
+/// `x = Σ χᵢ·rᵢ` and `t = Σ χᵢ·tᵢ`, both in `GF(2^128)` — two blocks total,
+/// whatever `m` is, so the check is O(1) in communication.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KosResponse {
+    pub x: Block,
+    pub t: Block,
+}
+
+impl KosResponse {
+    pub fn bytes(&self) -> usize {
+        2 * KAPPA_BYTES
+    }
+}
+
+/// Expand the sender's challenge seed into per-row coefficients.
+///
+/// The seed is chosen by the **sender**, and only after the columns have
+/// arrived. That ordering is the whole point: a receiver that could predict the
+/// coefficients could choose inconsistent columns whose inconsistency the
+/// combination cancels.
+fn challenge(seed: &Block, i: usize) -> Block {
+    hash_block(b"baru/ot/kos/chi", i, seed)
+}
+
+impl ExtReceiver {
+    /// Answer the sender's challenge.
+    pub fn kos_response(&self, seed: &Block) -> KosResponse {
+        let mut x = [0u8; KAPPA_BYTES];
+        let mut t = [0u8; KAPPA_BYTES];
+        for i in 0..self.t.len() {
+            let chi = challenge(seed, i);
+            // rᵢ ∈ {0,1}, so the scalar product is an XOR when the bit is set.
+            if self.choices[i] {
+                x = xor_block(&x, &chi);
+            }
+            t = xor_block(&t, &gf128_mul(&chi, &self.t.row(i)));
+        }
+        KosResponse { x, t }
+    }
+}
+
+impl ExtSender {
+    /// Verify the receiver used one consistent choice vector across all columns.
+    ///
+    /// Because `qᵢ = tᵢ ⊕ (rᵢ·s)` for an honest receiver, summing against the
+    /// challenge gives `Σχᵢqᵢ = Σχᵢtᵢ ⊕ (Σχᵢrᵢ)·s = t ⊕ x·s`. A receiver that
+    /// used a different `r` in different columns cannot satisfy this except
+    /// with probability `2^-128` over the sender's choice of challenge.
+    ///
+    /// This is what closes the attack the module header describes: without it a
+    /// malicious receiver recovers the sender's `s` bit by bit, which breaks
+    /// every OT the extension produces.
+    pub fn kos_verify(&self, seed: &Block, resp: &KosResponse) -> bool {
+        let mut q = [0u8; KAPPA_BYTES];
+        for i in 0..self.q.len() {
+            let chi = challenge(seed, i);
+            q = xor_block(&q, &gf128_mul(&chi, &self.q.row(i)));
+        }
+        let expected = xor_block(&resp.t, &gf128_mul(&resp.x, &self.s));
+        q == expected
+    }
+}
+
 /// Result of an end-to-end extension run.
 pub struct Extended {
     /// `(y0_i, y1_i)` the sender holds.
@@ -261,6 +338,199 @@ pub fn simulate(choices: &[bool]) -> Result<Extended, String> {
         },
         base_bytes,
     })
+}
+
+/// Run the extension **with the KOS15 consistency check**, in process.
+///
+/// Differs from [`simulate`] in three ways, all of them required for the check
+/// to mean anything:
+///
+/// 1. `KOS_PAD` extra OTs with random choice bits are appended, so the opened
+///    linear combination is independent of the real choices;
+/// 2. the sender draws its challenge **after** the columns arrive;
+/// 3. the outputs are truncated back to `choices.len()`, so the padding is
+///    invisible to callers.
+///
+/// Returns `Err` if the check fails — that is a detected cheating receiver, not
+/// a protocol error.
+pub fn simulate_checked(choices: &[bool]) -> Result<Extended, String> {
+    let mut rng = rand::thread_rng();
+    let m = choices.len();
+    if m == 0 {
+        return Err("IKNP needs at least one output OT".to_string());
+    }
+
+    let mut padded = choices.to_vec();
+    padded.extend((0..KOS_PAD).map(|_| rng.gen::<bool>()));
+
+    let s_bits: Vec<bool> = (0..KAPPA).map(|_| rng.gen::<bool>()).collect();
+    let (base_sender, setup) = base::Sender::new(&mut rng);
+    let (base_receiver, base_choices) = base::Receiver::new(&setup, &s_bits, &mut rng)?;
+    let base_keys = base_sender.keys(&base_choices)?;
+    let base_out: Vec<Block> = base_receiver.keys().to_vec();
+    let base_bytes = setup.bytes() + base_choices.bytes();
+
+    let (ext_receiver, cols) = ExtReceiver::new(&padded, &base_keys)?;
+    let ext_sender = ExtSender::new(&s_bits, &base_out, &cols)?;
+
+    // The challenge is sampled here — after the columns exist — on purpose.
+    let mut seed = [0u8; KAPPA_BYTES];
+    rng.fill(&mut seed);
+    let resp = ext_receiver.kos_response(&seed);
+    if !ext_sender.kos_verify(&seed, &resp) {
+        return Err("KOS consistency check failed: receiver used inconsistent columns".to_string());
+    }
+
+    let mut sender_out = ext_sender.outputs();
+    let mut receiver_out = ext_receiver.outputs();
+    sender_out.truncate(m);
+    receiver_out.truncate(m);
+
+    Ok(Extended {
+        sender: sender_out,
+        receiver: receiver_out,
+        traffic: OtTraffic {
+            sender_to_receiver: setup.bytes() + KAPPA_BYTES, // + challenge seed
+            receiver_to_sender: base_choices.bytes() + cols.bytes() + resp.bytes(),
+            // S, R, columns, challenge, response.
+            rounds: 5,
+        },
+        base_bytes,
+    })
+}
+
+#[cfg(test)]
+mod kos_tests {
+    use super::*;
+
+    fn gf(b: u128) -> Block {
+        b.to_le_bytes()
+    }
+
+    #[test]
+    fn gf128_is_a_field_on_the_cases_the_check_relies_on() {
+        let one = gf(1);
+        let a = gf(0x0123_4567_89ab_cdef_fedc_ba98_7654_3210);
+        assert_eq!(gf128_mul(&a, &one), a, "1 must be the identity");
+        assert_eq!(gf128_mul(&one, &a), a, "multiplication must commute with 1");
+        assert_eq!(gf128_mul(&a, &gf(0)), gf(0), "0 must annihilate");
+
+        // Distributivity over XOR is exactly what the linear-combination
+        // argument in `kos_verify` depends on.
+        let b = gf(0xdead_beef_dead_beef_0000_0000_0000_0001);
+        let c = gf(0x9999_8888_7777_6666_5555_4444_3333_2222);
+        let lhs = gf128_mul(&a, &xor_block(&b, &c));
+        let rhs = xor_block(&gf128_mul(&a, &b), &gf128_mul(&a, &c));
+        assert_eq!(lhs, rhs, "multiplication must distribute over XOR");
+    }
+
+    #[test]
+    fn checked_extension_agrees_with_the_unchecked_one() {
+        let choices: Vec<bool> = (0..64).map(|i| i % 3 == 0).collect();
+        let out = simulate_checked(&choices).expect("honest run must pass the check");
+        assert_eq!(out.receiver.len(), choices.len(), "padding must be hidden");
+        assert_eq!(out.sender.len(), choices.len());
+        for (i, &c) in choices.iter().enumerate() {
+            let expected = if c { out.sender[i].1 } else { out.sender[i].0 };
+            assert_eq!(
+                out.receiver[i], expected,
+                "OT {i} delivered the wrong string"
+            );
+        }
+    }
+
+    /// Run one extension with `corrupt_cols` columns tampered with, and report
+    /// whether the sender's check rejected.
+    fn cheat_is_caught(corrupt_cols: &[usize]) -> bool {
+        let mut rng = rand::thread_rng();
+        let choices: Vec<bool> = (0..32).map(|_| rng.gen()).collect();
+
+        let s_bits: Vec<bool> = (0..KAPPA).map(|_| rng.gen::<bool>()).collect();
+        let (base_sender, setup) = base::Sender::new(&mut rng);
+        let (base_receiver, base_choices) =
+            base::Receiver::new(&setup, &s_bits, &mut rng).expect("base ot");
+        let base_keys = base_sender.keys(&base_choices).expect("base keys");
+        let base_out: Vec<Block> = base_receiver.keys().to_vec();
+
+        let (ext_receiver, mut cols) = ExtReceiver::new(&choices, &base_keys).expect("extend");
+        for &j in corrupt_cols {
+            cols.cols[j][0] ^= 0xff;
+        }
+        let ext_sender = ExtSender::new(&s_bits, &base_out, &cols).expect("sender");
+
+        let mut seed = [0u8; KAPPA_BYTES];
+        rng.fill(&mut seed);
+        let resp = ext_receiver.kos_response(&seed);
+        !ext_sender.kos_verify(&seed, &resp)
+    }
+
+    /// The attack the module header describes: a receiver that uses a different
+    /// choice-bit vector in different columns. Without the check this leaks the
+    /// sender's `s` bit by bit.
+    ///
+    /// Corrupting many columns is caught with overwhelming probability — each
+    /// one independently has a `1/2` chance of mattering (see
+    /// [`a_single_corrupted_column_is_a_one_bit_guess`]), so 40 of them leave a
+    /// `2^-40` escape probability.
+    #[test]
+    fn inconsistent_columns_are_rejected() {
+        let cols: Vec<usize> = (0..40).collect();
+        assert!(
+            cheat_is_caught(&cols),
+            "a receiver deviating across 40 columns must be caught"
+        );
+    }
+
+    /// **A property of KOS worth stating rather than hiding.**
+    ///
+    /// Tampering with a *single* column is invisible exactly when the sender's
+    /// `s_j = 0`, because then `q_j = G(k0_j)` and the transmitted column is
+    /// never read. So a one-column deviation is a **one-bit guess at `s`** that
+    /// succeeds with probability `1/2` — and when it succeeds, the sender's view
+    /// is genuinely unaffected, so there is nothing to detect.
+    ///
+    /// This is not a weakness of the implementation; it is why KOS is stated as
+    /// "the receiver may guess `k` bits of `s`, succeeding with probability
+    /// `2^-k`", and why an aborting sender must not be restarted with the same
+    /// `s`. A test asserting single-column detection would be asserting
+    /// something false — it was, and it failed intermittently until this was
+    /// understood.
+    #[test]
+    fn a_single_corrupted_column_is_a_one_bit_guess() {
+        let trials = 60;
+        let caught = (0..trials).filter(|_| cheat_is_caught(&[5])).count();
+        // Binomial(60, 1/2): the chance of falling outside 12..48 is far below
+        // any tolerable flake rate, while the interval is wide enough that the
+        // test is not itself flaky.
+        assert!(
+            (12..=48).contains(&caught),
+            "expected roughly half of single-column cheats to be caught, got {caught}/{trials}"
+        );
+    }
+
+    #[test]
+    fn an_honest_transcript_verifies() {
+        let mut rng = rand::thread_rng();
+        let choices: Vec<bool> = (0..48).map(|_| rng.gen()).collect();
+
+        let s_bits: Vec<bool> = (0..KAPPA).map(|_| rng.gen::<bool>()).collect();
+        let (base_sender, setup) = base::Sender::new(&mut rng);
+        let (base_receiver, base_choices) =
+            base::Receiver::new(&setup, &s_bits, &mut rng).expect("base ot");
+        let base_keys = base_sender.keys(&base_choices).expect("base keys");
+        let base_out: Vec<Block> = base_receiver.keys().to_vec();
+
+        let (ext_receiver, cols) = ExtReceiver::new(&choices, &base_keys).expect("extend");
+        let ext_sender = ExtSender::new(&s_bits, &base_out, &cols).expect("sender");
+
+        let mut seed = [0u8; KAPPA_BYTES];
+        rng.fill(&mut seed);
+        let resp = ext_receiver.kos_response(&seed);
+        assert!(
+            ext_sender.kos_verify(&seed, &resp),
+            "honest run must verify"
+        );
+    }
 }
 
 /// The IKNP extension as an [`super::OtProtocol`].

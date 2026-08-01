@@ -31,7 +31,7 @@ use serde::Serialize;
 use crate::fhe::circuit_emitter::evaluate_fhe;
 use crate::fhe::{FheBackend, MockFheBackend, TfheBackend};
 use crate::interpreter::{parse, Participant, Types};
-use crate::zkp::binius64_backend::Binius64Backend;
+use crate::zkp::binius_real::Binius64Real;
 use crate::zkp::circuit_compiler::CircuitCompiler;
 use crate::zkp::ZKPBackend;
 
@@ -384,18 +384,41 @@ fn run_fhe_real<B: crate::fhe::RealFheBackend>(
 
 fn run_zkp(expr: &str, inputs: &[(String, i64)]) -> BackendReport {
     let mut t = Timer::new();
-    let be = Binius64Backend::new();
+    let be = Binius64Real::new();
     let parsed = parse(expr).unwrap_or_else(|e| panic!("parse error: {}", e));
     let private_vars: Vec<String> = inputs.iter().map(|(k, _)| k.clone()).collect();
 
-    let circuit = t.phase("compile", || {
-        be.compile_circuit(&parsed, &private_vars)
-            .unwrap_or_else(|e| panic!("compile: {}", e))
-    });
+    // The real backend refuses expressions it cannot compile soundly (`if`,
+    // comparisons, division). Report that as a limitation of the backend rather
+    // than panicking: the placeholder this replaced "supported" them only by
+    // never checking anything, and a benchmark that hid the difference would be
+    // reintroducing exactly that dishonesty.
+    let compiled = t.phase("compile", || be.compile_circuit(&parsed, &private_vars));
+    let circuit = match compiled {
+        Ok(c) => c,
+        Err(e) => {
+            return BackendReport {
+                backend: "zkp-binius64".into(),
+                total_micros: t.total().as_micros(),
+                phases: t.phases,
+                result: None,
+                ok: None,
+                notes: vec![],
+                error: Some(format!("unsupported by the binius64 circuit fragment: {e}")),
+            }
+        }
+    };
 
     let private_values: HashMap<String, i64> =
         inputs.iter().map(|(k, v)| (k.clone(), *v)).collect();
-    let public_values: HashMap<String, i64> = HashMap::new();
+    // The statement a proof establishes is "the circuit evaluates to *this*",
+    // so the claimed output is part of the public input. A prover always knows
+    // it — it holds the witness.
+    let mut public_values: HashMap<String, i64> = HashMap::new();
+    let claimed = be
+        .evaluate(&circuit, &private_values, &public_values)
+        .unwrap_or_else(|e| panic!("evaluate: {}", e));
+    public_values.insert(crate::zkp::binius_real::OUTPUT_NAME.to_string(), claimed);
 
     let proof = t.phase("prove", || {
         be.prove(&circuit, &private_values, &public_values)
@@ -756,12 +779,7 @@ pub fn run_cli(args: &[String]) -> Result<(), String> {
 /// Failed backends are recorded too, with the error in `notes`: "TFHE ran out
 /// of memory on this shape" is a result worth keeping, and silently dropping it
 /// would make the store's coverage look better than it is.
-fn persist(
-    reports: &[CaseReport],
-    spec: &str,
-    tags: &[String],
-    iters: u32,
-) -> Result<(), String> {
+fn persist(reports: &[CaseReport], spec: &str, tags: &[String], iters: u32) -> Result<(), String> {
     use crate::db::{Metric, Run};
 
     let mut store = crate::db::open(spec)?;
@@ -782,7 +800,8 @@ fn persist(
             run.config.insert("expr".into(), report.expr.clone());
             run.config.insert("iters".into(), iters.to_string());
             for (name, value) in &report.inputs {
-                run.config.insert(format!("input.{}", name), value.to_string());
+                run.config
+                    .insert(format!("input.{}", name), value.to_string());
             }
             if let Some(r) = b.result {
                 run.config.insert("result".into(), r.to_string());
@@ -857,19 +876,52 @@ mod tests {
         vec![Backend::Plain, Backend::Mpc, Backend::FheMock, Backend::Zkp]
     }
 
+    /// The nonlinear cases must now compile on the ZKP backend.
+    ///
+    /// Before the circuit fragment gained comparisons and `if`, `relu` and `max`
+    /// were reported as unsupported — the real proof system refused them while
+    /// the placeholder it replaced "supported" them only by never checking
+    /// anything. This pins the improvement so it cannot silently regress.
+    #[test]
+    fn the_zkp_backend_can_prove_the_nonlinear_cases() {
+        for name in ["relu", "max"] {
+            let case = SUITE
+                .iter()
+                .find(|c| c.name == name)
+                .unwrap_or_else(|| panic!("no {name} case"));
+            let report = run_case(case, &[Backend::Zkp], 1);
+            let zkp = report
+                .backends
+                .iter()
+                .find(|b| b.backend.starts_with("zkp"))
+                .expect("zkp backend ran");
+            assert!(
+                zkp.error.is_none(),
+                "case {name} must now compile on the ZKP backend: {:?}",
+                zkp.error
+            );
+            assert_eq!(zkp.ok, Some(true), "case {name} must verify");
+        }
+    }
+
     #[test]
     fn suite_runs_on_fast_backends() {
         for case in SUITE {
             let report = run_case(case, &fast_backends(), 1);
             assert!(report.baseline.is_some(), "case {}: no baseline", case.name);
             for b in &report.backends {
-                assert!(
-                    b.error.is_none(),
-                    "case {} backend {}: {:?}",
-                    case.name,
-                    b.backend,
-                    b.error
-                );
+                // A backend may honestly decline a case it cannot compile
+                // soundly; that is a reported limitation, not a failure. Only
+                // *unexpected* errors fail the suite.
+                if let Some(err) = &b.error {
+                    assert!(
+                        err.contains("unsupported by the binius64 circuit fragment"),
+                        "case {} backend {}: {err}",
+                        case.name,
+                        b.backend
+                    );
+                    continue;
+                }
                 if b.backend != "plain" {
                     assert_eq!(
                         b.ok,
@@ -903,25 +955,29 @@ mod tests {
 pub mod abstraction;
 pub mod backend_aware;
 pub mod circuit;
-pub mod compiled_nn;
 pub mod ckks_compare;
+pub mod cnn;
 pub mod cohort;
 pub mod cohort_eval;
-pub mod cnn;
-pub mod gc_compare;
+pub mod comm;
+pub mod compiled_nn;
 pub mod deep_nn;
+pub mod falcon;
+pub mod fhe_innerprod;
+pub mod gc_compare;
+pub mod hybrid_nn;
 pub mod layer;
+pub mod malicious;
 pub mod medmnist;
+pub mod metrics;
 pub mod mixed_layer;
+pub mod mnist;
 pub mod net;
+pub mod nn;
 pub mod ot;
 pub mod pir;
 pub mod polymul;
 pub mod psi;
-pub mod mnist;
-pub mod fhe_innerprod;
-pub mod comm;
-pub mod hybrid_nn;
-pub mod nn;
 pub mod train;
 pub mod triples;
+pub mod zkp_layer;

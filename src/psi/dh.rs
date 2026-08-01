@@ -35,6 +35,7 @@
 //! is ample for set sizes here) to cut a third off the traffic. Not done, so the
 //! reported bytes are the untruncated construction rather than a best case.
 
+use curve25519_dalek::constants::RISTRETTO_BASEPOINT_TABLE;
 use curve25519_dalek::ristretto::{CompressedRistretto, RistrettoPoint};
 use curve25519_dalek::scalar::Scalar;
 use rand::seq::SliceRandom;
@@ -95,6 +96,126 @@ impl Flight {
     }
 }
 
+// ─── Proof of a consistent exponent ──────────────────────────────────────────
+
+/// A batched Chaum–Pedersen proof that the sender raised **every** item of the
+/// receiver's flight to the *same* exponent.
+///
+/// # What this does and does not defend against
+///
+/// DH-PSI here is one-sided: the receiver learns the intersection and the
+/// sender learns nothing at all. So a deviating sender cannot break the
+/// receiver's *privacy* — it can only corrupt the receiver's *output*, by
+/// raising different items to different exponents so that chosen items fail to
+/// match.
+///
+/// It is worth being precise about how much that matters, because it is easy to
+/// overstate. A sender that uses inconsistent exponents on **its own** flight
+/// `A` is doing something indistinguishable from submitting a smaller set, and
+/// input substitution is unavoidable in any PSI — no proof can stop a party
+/// lying about what it holds. That case therefore needs no defence.
+///
+/// The case that does need one is the **response**: `AB_i = B_i^α`. There the
+/// sender is operating on the *receiver's* items, and inconsistency silently
+/// removes chosen elements from the receiver's answer. This proof closes
+/// exactly that, and the module claims nothing beyond it.
+///
+/// Cost is `O(1)` in set size — one commitment pair and one scalar for the
+/// whole flight, not per item.
+#[derive(Debug, Clone, Copy)]
+pub struct ExponentProof {
+    t1: [u8; POINT_BYTES],
+    t2: [u8; POINT_BYTES],
+    z: [u8; 32],
+}
+
+impl ExponentProof {
+    pub fn bytes(&self) -> usize {
+        2 * POINT_BYTES + 32
+    }
+}
+
+/// Per-item weights for the batched check, bound to the whole transcript so the
+/// sender cannot choose its deviation after seeing them.
+fn batch_weights(b: &Flight, ab: &Flight) -> Vec<Scalar> {
+    use sha2::{Digest, Sha256};
+    let mut seed = Sha256::new();
+    seed.update(b"baru/psi/dh/batch/v1");
+    for p in &b.0 {
+        seed.update(p);
+    }
+    for p in &ab.0 {
+        seed.update(p);
+    }
+    let seed = seed.finalize();
+    (0..b.0.len())
+        .map(|i| {
+            let mut h = Sha256::new();
+            h.update(seed);
+            h.update((i as u64).to_le_bytes());
+            let d = h.finalize();
+            let mut wide = [0u8; 64];
+            wide[..32].copy_from_slice(&d);
+            Scalar::from_bytes_mod_order_wide(&wide)
+        })
+        .collect()
+}
+
+fn dleq_challenge(
+    s: &RistrettoPoint,
+    p: &RistrettoPoint,
+    q: &RistrettoPoint,
+    t1: &RistrettoPoint,
+    t2: &RistrettoPoint,
+) -> Scalar {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(b"baru/psi/dh/dleq/v1");
+    for pt in [s, p, q, t1, t2] {
+        h.update(pt.compress().as_bytes());
+    }
+    let d = h.finalize();
+    let mut wide = [0u8; 64];
+    wide[..32].copy_from_slice(&d);
+    Scalar::from_bytes_mod_order_wide(&wide)
+}
+
+/// Verify that `ab` is `b` raised uniformly to the exponent committed in `s`.
+pub fn verify_exponent(
+    s_commitment: &[u8; POINT_BYTES],
+    b: &Flight,
+    ab: &Flight,
+    proof: &ExponentProof,
+) -> Result<(), String> {
+    if b.0.len() != ab.0.len() {
+        return Err("response length does not match the challenge flight".to_string());
+    }
+    let s = CompressedRistretto(*s_commitment)
+        .decompress()
+        .ok_or("exponent commitment is not a valid point")?;
+    let t1 = CompressedRistretto(proof.t1)
+        .decompress()
+        .ok_or("proof commitment t1 is invalid")?;
+    let t2 = CompressedRistretto(proof.t2)
+        .decompress()
+        .ok_or("proof commitment t2 is invalid")?;
+    let z = Option::<Scalar>::from(Scalar::from_canonical_bytes(proof.z))
+        .ok_or("proof scalar is not canonical")?;
+
+    let bs = decompress(&b.0)?;
+    let abs = decompress(&ab.0)?;
+    let w = batch_weights(b, ab);
+    let p: RistrettoPoint = bs.iter().zip(&w).map(|(pt, wi)| pt * wi).sum();
+    let q: RistrettoPoint = abs.iter().zip(&w).map(|(pt, wi)| pt * wi).sum();
+
+    let e = dleq_challenge(&s, &p, &q, &t1, &t2);
+    if RISTRETTO_BASEPOINT_TABLE * &z == t1 + s * e && p * z == t2 + q * e {
+        Ok(())
+    } else {
+        Err("sender used inconsistent exponents across items".to_string())
+    }
+}
+
 /// The party that holds `A` and learns nothing.
 pub struct Sender {
     alpha: Scalar,
@@ -117,6 +238,44 @@ impl Sender {
         let points = decompress(&b.0)?;
         let doubled: Vec<RistrettoPoint> = points.iter().map(|p| p * self.alpha).collect();
         Ok(Flight(compress(&doubled)))
+    }
+
+    /// Public commitment `S = G^α` to the exponent this sender uses. Ship it
+    /// once, alongside the first flight; [`verify_exponent`] checks the
+    /// response against it.
+    pub fn exponent_commitment(&self) -> [u8; POINT_BYTES] {
+        (RISTRETTO_BASEPOINT_TABLE * &self.alpha)
+            .compress()
+            .to_bytes()
+    }
+
+    /// [`Sender::respond`] plus a proof that every item used the same `α`.
+    pub fn respond_proved(
+        &self,
+        b: &Flight,
+        rng: &mut impl Rng,
+    ) -> Result<(Flight, ExponentProof), String> {
+        let ab = self.respond(b)?;
+        let bs = decompress(&b.0)?;
+        let abs = decompress(&ab.0)?;
+        let w = batch_weights(b, &ab);
+        let p: RistrettoPoint = bs.iter().zip(&w).map(|(pt, wi)| pt * wi).sum();
+        let q: RistrettoPoint = abs.iter().zip(&w).map(|(pt, wi)| pt * wi).sum();
+
+        let k = random_scalar(rng);
+        let t1 = RISTRETTO_BASEPOINT_TABLE * &k;
+        let t2 = p * k;
+        let s = RISTRETTO_BASEPOINT_TABLE * &self.alpha;
+        let e = dleq_challenge(&s, &p, &q, &t1, &t2);
+        let z = k + e * self.alpha;
+        Ok((
+            ab,
+            ExponentProof {
+                t1: t1.compress().to_bytes(),
+                t2: t2.compress().to_bytes(),
+                z: z.to_bytes(),
+            },
+        ))
     }
 }
 
@@ -161,6 +320,68 @@ impl Receiver {
             .filter(|(_, mine)| theirs.contains(*mine))
             .map(|(item, _)| item.clone())
             .collect())
+    }
+}
+
+#[cfg(test)]
+mod exponent_proof_tests {
+    use super::*;
+
+    fn items(n: usize, tag: u8) -> Vec<Vec<u8>> {
+        (0..n).map(|i| vec![tag, i as u8]).collect()
+    }
+
+    #[test]
+    fn an_honest_response_proves_a_consistent_exponent() {
+        let mut rng = rand::thread_rng();
+        let (sender, _a) = Sender::new(&items(8, 1), &mut rng);
+        let (_receiver, b) = Receiver::new(&items(6, 1), &mut rng);
+        let (ab, proof) = sender.respond_proved(&b, &mut rng).expect("respond");
+        assert!(verify_exponent(&sender.exponent_commitment(), &b, &ab, &proof).is_ok());
+    }
+
+    /// The attack the proof exists to stop: raise one of the receiver's items to
+    /// a different exponent so it silently drops out of the intersection.
+    #[test]
+    fn a_single_inconsistent_item_is_caught() {
+        let mut rng = rand::thread_rng();
+        let (sender, _a) = Sender::new(&items(8, 1), &mut rng);
+        let (_receiver, b) = Receiver::new(&items(6, 1), &mut rng);
+        let (mut ab, proof) = sender.respond_proved(&b, &mut rng).expect("respond");
+
+        // Replace one response point with the same item under a different
+        // exponent — exactly "use α' for item 3".
+        let rogue = random_scalar(&mut rng);
+        let bs = decompress(&b.0).expect("decompress");
+        ab.0[3] = (bs[3] * rogue).compress().to_bytes();
+
+        assert!(
+            verify_exponent(&sender.exponent_commitment(), &b, &ab, &proof).is_err(),
+            "an inconsistent exponent must be caught"
+        );
+    }
+
+    #[test]
+    fn a_proof_does_not_transfer_to_a_different_commitment() {
+        let mut rng = rand::thread_rng();
+        let (sender, _a) = Sender::new(&items(4, 1), &mut rng);
+        let (other, _a2) = Sender::new(&items(4, 2), &mut rng);
+        let (_receiver, b) = Receiver::new(&items(4, 1), &mut rng);
+        let (ab, proof) = sender.respond_proved(&b, &mut rng).expect("respond");
+        assert!(verify_exponent(&other.exponent_commitment(), &b, &ab, &proof).is_err());
+    }
+
+    #[test]
+    fn the_proved_response_still_computes_the_right_intersection() {
+        let mut rng = rand::thread_rng();
+        let a_items = items(8, 1);
+        let b_items: Vec<Vec<u8>> = items(4, 1).into_iter().chain(items(3, 9)).collect();
+        let (sender, a) = Sender::new(&a_items, &mut rng);
+        let (receiver, b) = Receiver::new(&b_items, &mut rng);
+        let (ab, proof) = sender.respond_proved(&b, &mut rng).expect("respond");
+        verify_exponent(&sender.exponent_commitment(), &b, &ab, &proof).expect("proof");
+        let got = receiver.intersect(&a, &ab).expect("intersect");
+        assert_eq!(got, items(4, 1), "proving must not change the result");
     }
 }
 

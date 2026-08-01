@@ -70,6 +70,40 @@ pub enum MpcMsg {
         value: u128,
     },
 
+    /// A whole batch of reveal contributions in one message — the batched form
+    /// of [`MpcMsg::RevealShare`], used by the malicious layer.
+    ///
+    /// Bit decomposition attaches a MAC to every leaf, and each attachment
+    /// needs one opening. Unbatched that would be one round *per leaf* —
+    /// thousands for a single layer — which would dwarf the protocol it is
+    /// protecting. Batched it is one round for the whole decomposition.
+    RevealShareBatch {
+        base_id: u64,
+        values: Vec<u128>,
+    },
+
+    /// One party's accumulated pairwise transcript hash, exchanged once at the
+    /// deferred check point (`crate::crypto::aby3_verify`).
+    ///
+    /// `toward_next` says which of the sender's two transcripts this is: the one
+    /// it keeps with its successor (`true`) or its predecessor (`false`). The
+    /// receiver compares it against the matching transcript of its own.
+    ViewHash {
+        toward_next: bool,
+        digest: [u8; 32],
+    },
+
+    /// Commitment to this party's contribution to the verification coin flip.
+    /// Sent by every party before any seed is opened, so the public challenge
+    /// coefficients cannot be biased by whoever speaks last.
+    CoinCommit {
+        digest: [u8; 32],
+    },
+
+    /// Opening of a [`MpcMsg::CoinCommit`].
+    CoinOpen {
+        seed: [u8; 32],
+    },
 
     /// One-time PRF key handshake. Party `i` samples `k_i` and sends it to
     /// party `i+1`, so each adjacent pair ends up sharing a key that the
@@ -86,7 +120,41 @@ pub enum MpcMsg {
     /// multiplication) plus `TaggedDEBatch` (2 opened).
     TaggedZBatch {
         base_op_id: u64,
-        values: Vec<u128>,
+        /// Width each value is packed at. The protocol works modulo `2^bits`,
+        /// so anything wider is padding — and for the bit-level multiplications
+        /// inside `a2b` the honest width is **1**, not 128.
+        bits: u32,
+        data: Vec<u8>,
+    },
+
+    /// Resharing values for a batch of multiplications over the small prime
+    /// field `Z_p` (`crate::crypto::fp_protocol`). Same one-directed-message
+    /// pattern as [`MpcMsg::TaggedZBatch`], but **one byte per element** rather
+    /// than sixteen: Falcon's `p` is 37 and this crate's is 67, so a field
+    /// element is a byte.
+    ///
+    /// That width is not a micro-optimisation — Falcon's headline advantage over
+    /// prior work is communication volume, so carrying its field traffic in
+    /// `u128` slots would overstate its cost by 16× and make any comparison
+    /// against it meaningless.
+    TaggedFpBatch {
+        base_op_id: u64,
+        values: Vec<u8>,
+    },
+
+    /// A batched reveal whose payload is packed at the share's **actual** width
+    /// rather than padded to `u128`.
+    ///
+    /// [`MpcMsg::RevealShareBatch`] carries `Vec<u128>` — 16 bytes per element
+    /// whatever `nbits` is, so at `nbits = 20` it is 84% padding and at `ℓ = 32`
+    /// still 75%. That is invisible in a protocol whose traffic is dominated by
+    /// something else, and badly misleading in one whose traffic *is* the
+    /// reveals. Falcon's wrap3 opens one ring value per DReLU, so the width has
+    /// to be honest for the comparison to mean anything.
+    RevealPackedBatch {
+        base_id: u64,
+        bits: u32,
+        data: Vec<u8>,
     },
 
     /// One garbler's contribution in the 3-party (two-garbler) garbled-circuit
@@ -119,6 +187,70 @@ impl PrfKeys {
     /// `α₀+α₁+α₂ = 0` — while no single party can predict any other's α.
     pub fn alpha(&self, ctr: u64) -> u128 {
         prf(&self.mine, ctr).wrapping_sub(prf(&self.prev, ctr))
+    }
+
+    /// The same zero-sum correlated randomness, but in `Z_p` — what a
+    /// replicated multiplication over a *prime field* needs
+    /// (`crate::crypto::fp_protocol`, for Falcon's private compare).
+    ///
+    /// [`Self::alpha`] cannot be reused by reduction: three values summing to
+    /// zero mod `2^128` do **not** sum to zero mod `p`. What carries over is the
+    /// *construction* — the telescoping difference `F(kᵢ) − F(kᵢ₋₁)` sums to
+    /// zero in any group, so the subtraction is simply done in the field.
+    ///
+    /// The reduction of a uniform `u128` mod `p` is biased by about `2^-121`,
+    /// which is negligible and is the same bias the rest of the crate accepts
+    /// when deriving small values from a PRF.
+    pub fn alpha_mod(&self, ctr: u64, p: u64) -> u64 {
+        let a = (prf(&self.mine, ctr) % p as u128) as u64;
+        let b = (prf(&self.prev, ctr) % p as u128) as u64;
+        if a >= b {
+            a - b
+        } else {
+            a + p - b
+        }
+    }
+
+    /// A replicated sharing of a **fresh uniform value nobody knows**, for
+    /// counter `ctr`, with *no communication*.
+    ///
+    /// The same pairwise keys that make [`Self::alpha`] free also make this
+    /// free, and it is the reason the malicious upgrade needs no dealer and no
+    /// extra round to obtain its MAC key.
+    ///
+    /// The component assignment is forced by what each key is shared with.
+    /// `prev` is the key party `i` shares with `i−1`, so `F(prev, ctr)` is known
+    /// to exactly `{P_{i−1}, P_i}` — which is precisely the pair that must hold
+    /// additive component `i` under replicated sharing (`P_i` as `left`,
+    /// `P_{i−1}` as `right`). Symmetrically `F(mine, ctr)` is component `i+1`,
+    /// this party's `right`. So
+    ///
+    /// ```text
+    /// rᵢ = F(k_{i−1,i}, ctr)      known to P_{i−1}, P_i
+    /// ```
+    ///
+    /// is a consistent replicated sharing across all three parties, and no
+    /// single party can predict the component it does not hold.
+    ///
+    /// `ctr` must not collide with counters used for [`Self::alpha`]; callers
+    /// take their counters from disjoint domains (see
+    /// `aby3_verify::VERIFY_CTR_BASE`).
+    pub fn random_share(&self, ctr: u64) -> (u128, u128) {
+        (prf(&self.prev, ctr), prf(&self.mine, ctr))
+    }
+
+    /// [`Self::random_share`] in `Z_p`.
+    ///
+    /// Note the contrast with [`Self::alpha_mod`], which is easy to conflate:
+    /// that one is a *difference* of the two PRFs, because it must sum to zero
+    /// across parties; this one is the two PRFs themselves, because it must
+    /// reconstruct to a uniform value nobody knows. Using the zero-sum form here
+    /// would produce a sharing of zero.
+    pub fn random_share_mod(&self, ctr: u64, p: u64) -> (u64, u64) {
+        (
+            (prf(&self.prev, ctr) % p as u128) as u64,
+            (prf(&self.mine, ctr) % p as u128) as u64,
+        )
     }
 }
 
@@ -443,7 +575,7 @@ pub(crate) fn read_frames<S: Read>(
 impl TcpTransport {
     /// Create a new TcpTransport for participant `id` with a list of addresses
     /// (one address per party, length == nparties). This starts a listener
-    /// thread bound to addrs[id].
+    /// thread bound to `addrs[id]`.
     pub fn new(id: PartyId, addrs: Vec<String>) -> Self {
         let inbox = Arc::new(Mutex::new(VecDeque::new()));
         let peers_seen = Arc::new(Mutex::new(HashSet::new()));

@@ -38,7 +38,11 @@ fn share_vec<T: Transport>(
     vals.iter()
         .enumerate()
         .map(|(i, &v)| {
-            let val = if me == 0 { (v as i128 & mask) as u128 } else { 0 };
+            let val = if me == 0 {
+                (v as i128 & mask) as u128
+            } else {
+                0
+            };
             share_input(val, base + i as u64, 0, me, mbx)
         })
         .collect()
@@ -51,7 +55,9 @@ fn gc_lt_over_tcp_3party() {
     let nbits = 20usize;
     let a_vals = vec![3i64, -4, 100, -100, 7, 500, -500, 0];
     let b_vals = vec![5i64, -4, 99, -50, 7, -500, 500, 1];
-    let want: Vec<u128> = (0..a_vals.len()).map(|i| (a_vals[i] < b_vals[i]) as u128).collect();
+    let want: Vec<u128> = (0..a_vals.len())
+        .map(|i| (a_vals[i] < b_vals[i]) as u128)
+        .collect();
 
     let mut handles = Vec::new();
     for me in 0..3usize {
@@ -89,7 +95,10 @@ fn gc_relu_over_tcp_3party() {
     let nbits = 20usize;
     let shift = 8usize;
     let vals = vec![0i64, 100, -1, -4000, 1 << 17, 12345, -12345, 65536];
-    let want: Vec<i64> = vals.iter().map(|&v| if v >= 0 { v >> shift } else { 0 }).collect();
+    let want: Vec<i64> = vals
+        .iter()
+        .map(|&v| if v >= 0 { v >> shift } else { 0 })
+        .collect();
 
     let mut handles = Vec::new();
     for me in 0..3usize {
@@ -113,7 +122,11 @@ fn gc_relu_over_tcp_3party() {
                     let raw = reveal(s, rid + i as u64, None, me, &mbx);
                     let m = (1i128 << nbits) - 1;
                     let x = raw as i128 & m;
-                    if x >= (1i128 << (nbits - 1)) { (x - (1i128 << nbits)) as i64 } else { x as i64 }
+                    if x >= (1i128 << (nbits - 1)) {
+                        (x - (1i128 << nbits)) as i64
+                    } else {
+                        x as i64
+                    }
                 })
                 .collect();
             assert_eq!(out, want, "party {me}: gc_relu over TCP");

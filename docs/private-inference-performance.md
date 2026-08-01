@@ -87,11 +87,71 @@ on the critical path, and the speed of the ring arithmetic underneath.
 | batched garbled `y2a` (§3.3b) | 1.00 s | 379 725 → 61 messages |
 | fixed-key AES gate hash (§3.3) | 542 ms | 178 ns → 5 ns per hash |
 | prepared decryption key (§3.3d) | 508 ms | key transformed once per session |
-| prepared encryption key (§3.3e) | **488 ms** | public key too; mask pool −30% |
+| prepared encryption key (§3.3e) | 488 ms | public key too; mask pool −30% |
+| ReLU commuted past max-pool (§3.4) | 435 ms | monotone ⇒ `maxpool∘f = f∘maxpool`; 4× fewer ReLUs |
+| per-prime + CRT threading (§3.5) | **268 ms** | 4 cores; single-core stays 435 ms |
 
-**The composition inverted twice in one day.** It was 26% MPC; after §3.1–§3.2
+### §3.4 — commuting the ReLU past the max-pool (488 → 413 ms)
+
+An algebraic identity rather than a tuning result, and the only entry here that
+reduces *work* rather than moving or amortising it. `relu∘rescale` is monotonic
+non-decreasing, so it commutes with `max`:
+
+```
+maxpool(relu(v >> s))  ==  relu(maxpool(v) >> s)
+```
+
+Pooling first shrinks the ReLU layer by `POOL²` — 7472 → 1880 ReLUs here — and
+costs the pool nothing, since it performs the same comparisons either way. It
+is exact; the bit-exactness tests are untouched.
+
+Two preconditions, both checked rather than assumed. The comparison now sees
+*pre*-activation values, which can be negative — fine, because `lt` is the MSB
+of `a − b`, i.e. signed. And `a − b` must stay inside the two's-complement
+range — it does, because `nbits` is calibrated as `max_abs.bit_length() + 2`
+over exactly these values, so |a−b| < 2^(nbits−1). **Those two bits of headroom
+are load-bearing**: narrowing the calibration would break this silently.
+
+Worth 1.17× on `--gc --precompute` (where the nonlinearity is a sixth of the
+cost) and **1.38× on the `a2b` path**, 2234 → 1624 ms, where it dominates.
+
+### §3.5 — threading the multi-modular NTT (435 → 268 ms on 4 cores)
+
+The only parallelism in this crate that needs no argument. The multi-modular
+decomposition gives each prime its own reduction, its own pair of transforms and
+its own residue vector, sharing nothing mutable; Garner reconstruction is a pure
+map over coefficients. Both are threaded — per prime in `map_plans`, per
+coefficient range in `crt_reconstruct_with` — and results land in fixed slots,
+so the output is **bit-identical to the serial path whatever the scheduler
+does**. The `--ignored` exactness suite passes under both.
+
+This is *why it is here and not in the evaluator's channel loop*: that loop
+draws masks from an RNG stream whose order is part of the protocol, so
+parallelising it would mean either changing the protocol or replaying the
+stream. The NTT has no such structure.
+
+| | single core | 4 threads |
+|---|---|---|
+| ct×ct multiply | 126 ms | **44 ms** |
+| decrypt | 119 ms | **45 ms** |
+| FHE total | 266 ms | **99 ms** |
+| **online latency** | **435 ms** | **268 ms** |
+| per-query mask pool (offline) | 317 ms | 137 ms |
+
+Threading the transforms alone gave only 1.65× on decrypt — Garner was then the
+Amdahl ceiling, which is why the CRT is threaded separately.
+
+**Report both numbers.** A wall-clock figure that silently depends on core count
+is not comparable against published work, so `BARU_NTT_THREADS=1` keeps the
+single-core path runnable and the tables above quote it.
+
+**The composition inverted twice in one day** — and a third time since. It was
+26% MPC; after §3.1–§3.2
 made FHE ~3× cheaper it became 69% MPC; then §3.3/§3.3b took the garbled ReLU
-from 526 ms to 124 ms and it is **55% FHE again** (269 ms of 488). The lesson is
+from 526 ms to 124 ms and it is **55% FHE again** (269 ms of 488); after §3.4
+more so still, **64% FHE**; and after §3.5 it is **63% MPC** (168 ms of 268),
+because threading cut FHE 2.7× and left the nonlinearities untouched. Four
+inversions. The lesson is
 not any one of those numbers — it is that *"which side dominates"* has a
 half-life of about one optimisation, so any plan resting on it should be
 re-derived rather than inherited.

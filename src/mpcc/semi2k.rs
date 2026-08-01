@@ -43,7 +43,10 @@
 //!   terms. Two is the interesting dishonest-majority case and the setting the
 //!   hybrid literature (Gazelle, Delphi, Cheetah) works in.
 //! * **Semi-honest.** No MACs, no sacrifice — this is Semi2k, not SPDZ2k. A
-//!   malicious party can deviate freely.
+//!   malicious party can deviate freely. [`crate::mpcc::spdz2k`] is the
+//!   authenticated upgrade; it keeps this engine as the baseline the MAC
+//!   overhead is measured against, and pays for the `s` extra ring bits that
+//!   make a MAC over `Z_2^k` sound at all.
 //! * The OT is [`crate::ot::iknp`], which has **no KOS consistency check**, so this
 //!   inherits that limitation and cannot be cited as maliciously secure.
 //! * Random bits are drawn locally and counted, exactly as `DealerEngine` does —

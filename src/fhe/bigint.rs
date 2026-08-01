@@ -332,8 +332,16 @@ mod tests {
         for seed in 1..300u64 {
             let (a, b) = (sample_i128(seed, 100), sample_i128(seed * 7 + 1, 100));
             let (x, y) = (I256::from_i128(a), I256::from_i128(b));
-            assert_eq!(x.wrapping_add(y), I256::from_i128(a.wrapping_add(b)), "{a}+{b}");
-            assert_eq!(x.wrapping_sub(y), I256::from_i128(a.wrapping_sub(b)), "{a}-{b}");
+            assert_eq!(
+                x.wrapping_add(y),
+                I256::from_i128(a.wrapping_add(b)),
+                "{a}+{b}"
+            );
+            assert_eq!(
+                x.wrapping_sub(y),
+                I256::from_i128(a.wrapping_sub(b)),
+                "{a}-{b}"
+            );
             assert_eq!(x.wrapping_neg(), I256::from_i128(-a), "-{a}");
             assert_eq!(x.is_negative(), a < 0);
             assert_eq!(x.is_zero(), a == 0);
@@ -356,9 +364,17 @@ mod tests {
                     let neg = a < 0;
                     let mag = a.unsigned_abs();
                     let r = (mag + (1u128 << (sh - 1))) >> sh;
-                    if neg { -(r as i128) } else { r as i128 }
+                    if neg {
+                        -(r as i128)
+                    } else {
+                        r as i128
+                    }
                 };
-                assert_eq!(I256::from_i128(a).shr_round(sh), I256::from_i128(want), "{a} >> {sh}");
+                assert_eq!(
+                    I256::from_i128(a).shr_round(sh),
+                    I256::from_i128(want),
+                    "{a} >> {sh}"
+                );
             }
         }
     }
@@ -368,7 +384,11 @@ mod tests {
         let p = 9_223_372_036_854_497_281u64; // one of ntt.rs's primes
         for seed in 1..200u64 {
             let a = sample_i128(seed, 100).unsigned_abs() as i128;
-            assert_eq!(I256::from_i128(a).mod_u64(p), (a % p as i128) as u64, "{a} mod p");
+            assert_eq!(
+                I256::from_i128(a).mod_u64(p),
+                (a % p as i128) as u64,
+                "{a} mod p"
+            );
         }
     }
 
@@ -432,8 +452,14 @@ mod tests {
             assert_eq!(plus_one, I256::one().shl(bits), "low_mask({bits})");
             // Masking is idempotent and kills everything above `bits`.
             assert_eq!(m.bitand(m), m);
-            assert!(I256::one().shl(bits).bitand(m).is_zero(), "bit {bits} must be masked off");
-            assert_eq!(I256::one().shl(bits - 1).bitand(m), I256::one().shl(bits - 1));
+            assert!(
+                I256::one().shl(bits).bitand(m).is_zero(),
+                "bit {bits} must be masked off"
+            );
+            assert_eq!(
+                I256::one().shl(bits - 1).bitand(m),
+                I256::one().shl(bits - 1)
+            );
         }
     }
 
@@ -461,7 +487,10 @@ mod tests {
             assert_eq!(bincode::deserialize::<I256>(&bytes).unwrap(), v);
         }
         let w = I512::one().shl(400);
-        assert_eq!(bincode::deserialize::<I512>(&bincode::serialize(&w).unwrap()).unwrap(), w);
+        assert_eq!(
+            bincode::deserialize::<I512>(&bincode::serialize(&w).unwrap()).unwrap(),
+            w
+        );
         // A sequence of the wrong length must be rejected, not silently padded.
         let short = bincode::serialize(&vec![1u64, 2]).unwrap();
         assert!(bincode::deserialize::<I256>(&short).is_err());

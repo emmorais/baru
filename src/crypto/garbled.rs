@@ -356,13 +356,20 @@ impl Garbler {
                 let (u0, v0) = if carry_const0 {
                     (x0[i], y0[i])
                 } else {
-                    (self.xor_gate(&x0[i], &carry0), self.xor_gate(&y0[i], &carry0))
+                    (
+                        self.xor_gate(&x0[i], &carry0),
+                        self.xor_gate(&y0[i], &carry0),
+                    )
                 };
                 let (and0, table) = self.and_gate_t(&u0, &v0, g);
                 tables.push(table);
                 gate_tweaks.push(g);
                 g += 2;
-                carry0 = if carry_const0 { and0 } else { self.xor_gate(&and0, &carry0) };
+                carry0 = if carry_const0 {
+                    and0
+                } else {
+                    self.xor_gate(&and0, &carry0)
+                };
                 carry_const0 = false;
             }
         }
@@ -383,7 +390,14 @@ impl Garbler {
         }
         let out_masks = out0.iter().map(lsb).collect();
 
-        ReluGarbling { x0, y0, tables, gate_tweaks, out0, out_masks }
+        ReluGarbling {
+            x0,
+            y0,
+            tables,
+            gate_tweaks,
+            out0,
+            out_masks,
+        }
     }
 }
 
@@ -393,8 +407,12 @@ impl Garbler {
 /// correctness against the plaintext `MSB(x+y)`.
 pub fn eval_comparator(g: &Garbler, c: &ComparatorGarbling, x: u128, y: u128, b: usize) -> bool {
     // Active input labels (in a real run these arrive on the wire).
-    let xa: Vec<Label> = (0..b).map(|i| g.active(&c.x0[i], (x >> i) & 1 == 1)).collect();
-    let ya: Vec<Label> = (0..b).map(|i| g.active(&c.y0[i], (y >> i) & 1 == 1)).collect();
+    let xa: Vec<Label> = (0..b)
+        .map(|i| g.active(&c.x0[i], (x >> i) & 1 == 1))
+        .collect();
+    let ya: Vec<Label> = (0..b)
+        .map(|i| g.active(&c.y0[i], (y >> i) & 1 == 1))
+        .collect();
 
     let mut carry = ZERO;
     let mut carry_const0 = true;
@@ -408,7 +426,11 @@ pub fn eval_comparator(g: &Garbler, c: &ComparatorGarbling, x: u128, y: u128, b:
             v = eval_xor(&ya[i], &carry);
         }
         let and = eval_and(&u, &v, &c.tables[i], c.gate_tweaks[i]);
-        carry = if carry_const0 { and } else { eval_xor(&and, &carry) };
+        carry = if carry_const0 {
+            and
+        } else {
+            eval_xor(&and, &carry)
+        };
         carry_const0 = false;
     }
     let msb = eval_xor(&eval_xor(&xa[b - 1], &ya[b - 1]), &carry);
@@ -425,8 +447,12 @@ pub fn eval_relu_rescale(
     b: usize,
     shift: usize,
 ) -> Vec<bool> {
-    let xa: Vec<Label> = (0..b).map(|i| g.active(&c.x0[i], (x >> i) & 1 == 1)).collect();
-    let ya: Vec<Label> = (0..b).map(|i| g.active(&c.y0[i], (y >> i) & 1 == 1)).collect();
+    let xa: Vec<Label> = (0..b)
+        .map(|i| g.active(&c.x0[i], (x >> i) & 1 == 1))
+        .collect();
+    let ya: Vec<Label> = (0..b)
+        .map(|i| g.active(&c.y0[i], (y >> i) & 1 == 1))
+        .collect();
     let mut sa = vec![ZERO; b];
     let mut carry = ZERO;
     let mut carry_const0 = true;
@@ -445,7 +471,11 @@ pub fn eval_relu_rescale(
             };
             let and = eval_and(&u, &v, &c.tables[ti], c.gate_tweaks[ti]);
             ti += 1;
-            carry = if carry_const0 { and } else { eval_xor(&and, &carry) };
+            carry = if carry_const0 {
+                and
+            } else {
+                eval_xor(&and, &carry)
+            };
             carry_const0 = false;
         }
     }
@@ -454,7 +484,12 @@ pub fn eval_relu_rescale(
     let width = b - shift;
     (0..width)
         .map(|j| {
-            let o = eval_and(&keep, &sa[shift + j], &c.tables[ti + j], c.gate_tweaks[ti + j]);
+            let o = eval_and(
+                &keep,
+                &sa[shift + j],
+                &c.tables[ti + j],
+                c.gate_tweaks[ti + j],
+            );
             lsb(&o)
         })
         .collect()
@@ -468,7 +503,11 @@ pub fn relu_stats(n: usize, b: usize, shift: usize) -> GcStats {
     let and_gates = n * ((b - 1) + (b - shift));
     let table_bytes = and_gates * 2 * 16;
     let input_label_bytes = n * (2 * b) * 16;
-    GcStats { and_gates, wire_bytes: table_bytes + input_label_bytes, rounds: 1 }
+    GcStats {
+        and_gates,
+        wire_bytes: table_bytes + input_label_bytes,
+        rounds: 1,
+    }
 }
 
 /// Cost of garbling + evaluating `n` independent `b`-bit comparisons in the
@@ -528,14 +567,18 @@ mod tests {
         let mut g = Garbler::new(777);
         let c = g.garble_relu_rescale(b, shift);
         let signed = |v: u128| -> i128 {
-            if v >> (b - 1) & 1 == 1 { v as i128 - (1i128 << b) } else { v as i128 }
+            if v >> (b - 1) & 1 == 1 {
+                v as i128 - (1i128 << b)
+            } else {
+                v as i128
+            }
         };
         let cases: &[(u128, u128)] = &[
             (0, 0),
             (100, 50),
-            (mask, 0),            // -1 -> ReLU 0
-            (mask - 3, 1),        // small negative -> 0
-            (1 << (b - 2), 0),    // positive
+            (mask, 0),         // -1 -> ReLU 0
+            (mask - 3, 1),     // small negative -> 0
+            (1 << (b - 2), 0), // positive
             (12345, 20000),
         ];
         for &(x, y) in cases {
@@ -583,7 +626,10 @@ mod tests {
         assert_ne!(hash(&x, 7), hash(&y, 7), "distinct labels must not collide");
         // The tweak enters after the first permutation, so a tweak difference
         // must not be recoverable as a label difference.
-        assert_ne!(xor(&hash(&x, 7), &hash(&x, 8)), xor(&hash(&y, 7), &hash(&y, 8)));
+        assert_ne!(
+            xor(&hash(&x, 7), &hash(&x, 8)),
+            xor(&hash(&y, 7), &hash(&y, 8))
+        );
     }
 
     /// Where the garbled ReLU's time actually goes — the measurement that says
@@ -635,7 +681,10 @@ mod tests {
 
         println!("\n  ReLU layer: n={n}, {b} bits, shift {shift}");
         println!("  AND gates          : {}", st.and_gates);
-        println!("  wire bytes         : {:.2} MB", st.wire_bytes as f64 / 1e6);
+        println!(
+            "  wire bytes         : {:.2} MB",
+            st.wire_bytes as f64 / 1e6
+        );
         println!("  label hash         : {per_hash_ns:.0} ns  (TMMO over fixed-key AES)");
         println!("  garbling  {garble_hashes} hashes : {garble_ms:.0} ms");
         println!("  evaluation {eval_hashes} hashes : {eval_ms:.0} ms");
@@ -704,11 +753,15 @@ mod tests {
         assert_eq!(payload.len(), payload2.len());
 
         println!("\n  --- measured, not modelled ---");
-        println!("  garbling the layer for real : {garble_real_ms:.0} ms  \
-                  (hash model above said {garble_ms:.0})");
-        println!("  building the {:.1} MB payload : {payload_ms:.0} ms unreserved, \
+        println!(
+            "  garbling the layer for real : {garble_real_ms:.0} ms  \
+                  (hash model above said {garble_ms:.0})"
+        );
+        println!(
+            "  building the {:.1} MB payload : {payload_ms:.0} ms unreserved, \
                   {payload_reserved_ms:.0} ms with capacity",
-                 payload_len as f64 / 1e6);
+            payload_len as f64 / 1e6
+        );
         println!(
             "  garble + payload            : {:.0} ms of the 409 ms measured ReLU",
             garble_real_ms + payload_ms

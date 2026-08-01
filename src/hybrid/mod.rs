@@ -97,6 +97,8 @@ use crate::crypto::types::Fr;
 use crate::fhe::backend::{FheBackend, RealFheBackend};
 use crate::interpreter::backend::{Backend, ShareRef};
 
+pub mod threshold_switch;
+
 // ─── FHE capability trait ─────────────────────────────────────────────────────
 
 /// The minimal FHE surface scheme switching needs: encrypt/decrypt `u64`
@@ -421,12 +423,7 @@ mod tests {
         let inputs: [i64; 3] = [4, 5, -6];
         let bias = 1i64;
         // plain: 8 - 15 - 6 + 1 = -12 -> relu = 0
-        let expected_pre = weights
-            .iter()
-            .zip(&inputs)
-            .map(|(w, x)| w * x)
-            .sum::<i64>()
-            + bias;
+        let expected_pre = weights.iter().zip(&inputs).map(|(w, x)| w * x).sum::<i64>() + bias;
         let expected = expected_pre.max(0);
 
         // Phase 1 — FHE linear layer over the encrypted input vector.

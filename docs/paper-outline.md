@@ -21,6 +21,22 @@
 > *structural* (2 ring elements at n=4096 against 1 at n=2048), i.e. the
 > quantified price of security.
 
+> [!IMPORTANT]
+> **Two updates since this outline was written (2026-07-31).**
+>
+> 1. **Malicious security is no longer out of scope.** §8's blanket
+>    "semi-honest, as standard for this line of work" is superseded by **§8b**,
+>    which states what is implemented (ABY3 with abort, ≤1 of 3 corrupt),
+>    what it costs (measured: 2.63× bytes, 1.06× rounds), and what is still
+>    missing (the FHE input-boundary proof; the garbled leg). §8's
+>    single-client-key limitation is also closed — the scheme switch now runs on
+>    a real replicated threshold key.
+> 2. **Every ZKP result predating 2026-07-31 must be withdrawn.** The shipped
+>    `binius64` backend was not a proof system: its verifier never checked
+>    constraint satisfaction, so any accepting proof could be forged without a
+>    witness. It has been replaced with the real Binius64 stack and measured
+>    (E27). Nothing else in this outline depended on it.
+
 Working title candidates:
 - *"The Switch Is the Bootstrap: Unbounded-Depth Private Inference without FHE
   Bootstrapping"*
@@ -228,9 +244,11 @@ model of §5?"
 | E20 | `two_conv_hybrid_matches_plaintext`, `bench-mnist` (two conv) | **a genuine two-convolution CNN, fully encrypted → 98.0% on real MNIST, still zero bootstraps.** Generalised `CnnModel` to an arbitrary stack of conv layers (`extra_conv: Vec<ConvLayer>`) and FC layers (`hidden: Vec<..>`); `run_cnn_hybrid` now composes them by looping the same three-step block (FHE conv/matvec → open → MPC ReLU∘rescale+pool → scheme-switch). The **second convolution is multi-channel** (in_c=8) and packed with the same reversed-axis Cheetah layout — its channels pair off automatically. Architecture: `conv(8)→pool→conv(16)→pool→dense(128)→dense(10)`, i.e. **four encrypted linear layers, three MPC nonlinearities, three scheme switches, 0 bootstraps**. Uniform single-shift conv convention (`cbias<<shift`, rescale `>>shift`) so a `ConvLayer` needs no per-layer special case; only kernel pre-scaling differs at quantise time (conv1 ÷255 for raw pixels). **Full 10 000-image integer accuracy: 98.05%** (nbits=24, within budget); Rust==numpy digit-for-digit (296/300 subset); encrypted==plaintext on every real digit tested (4/4, 0 bootstraps) through all four encrypted layers. Moves the SOTA accuracy column 97.6%→98.0%, ~1% from the ~99% two-party systems whose server sees plaintext weights — while here every layer is ct×ct. *Architecture search finding*: two conv layers (98.05%) beat both wider single-conv (OC=12: 95.7%) and deeper FC (two hidden: 97.9%); spatial depth is what MNIST wanted, and the construction supplies it for free. |
 | E21 | `bench-gc-compare`, `garbled_comparator_matches_plaintext` | **do garbled circuits beat bit decomposition for the comparison?** Built a *real* half-gates garbling engine (`crypto::garbled`): free-XOR (offset R, lsb 1), Zahur–Rosulek–Evans AND gates (2 ciphertexts/gate, SHA-256 as H), a `MSB(x+y)` comparator (`b−1` AND gates, deterministic per-gate tweaks so the evaluator needs none on the wire), bit-exact vs plaintext. Head-to-head **through the identical transport** (both `a2b` and the garbled circuit pay real bincode serialization, message passing, latency injection and byte counting — no measurement asymmetry). **Result (1352 comparisons, 20-bit): a2b 9 rounds / 5.94 MB vs GC 1 round / 1.69 MB (3.5×); measured latency GC wins 4.2× (LAN, RTT 0.1ms) → 4.9× (WAN, RTT 20ms) → 4.3× (WAN 80ms/100Mbps).** GC wins at *every* profile, not just WAN. The enabler is the **3-party honest-majority setting: garbled-circuit input labels are delivered by the co-garbler with no oblivious transfer** (OT is the expensive part of 2-party GC, absent here). Bit-width sweep confirms a2b rounds grow as `⌈log₂ b⌉` while GC stays constant. *Honesty*: the garbling engine, byte and round counts, and the transport measurement are all real and implementation-identical for both methods; the GC path is run 2-party (garbler+evaluator) as a faithful cost proxy for 3PC-no-OT (same tables, same labels, same single round). **Superseded 2026-07-28**: the integration is done (`bench-cnn --gc`, `--both`), and the honest end-to-end figure is smaller than this row implies — the 4.2–4.9× is the *garbling primitive* in isolation; the deployable 3-party protocol including the Y2A return leg is **1.4–1.7×**, worth 1.9× on the CNN's MPC segment. This row also called garbled comparison "the highest-value remaining MPC optimization", which was **wrong**: 94% of the MPC segment was an unbatched scheme-switch import. See [private-inference-performance.md](private-inference-performance.md) §2. |
 | E22 | `garbled_relu_rescale_matches_plaintext`, `bench-gc-compare` (ReLU rows) | **garbled the *whole* fused nonlinearity, not just the comparison.** A garbled `fused ReLU∘rescale` circuit — `out = (v>=0) ? (v>>shift) : 0` for `v = x+y` — as `(b−1)` adder ANDs + `(b−shift)` mux ANDs (NOT is free-XOR: flip the zero-label), bit-exact vs the plaintext fused op. Proves a garbled circuit computes an entire ReLU layer in **one round** (vs a2b's 9-round decomposition + 1-round sign-gate multiply = 10). Measured through the identical transport, charging the GC path one modeled B2A round to return its boolean-shared output to arithmetic for the next FHE switch (the a2b path already lands in arithmetic): **GC ReLU wins 2.7× (LAN) → 3.4× (WAN)** — more conservative than the bare-comparison 3.8–4.5× because it includes the fair B2A cost, and more directly relevant since it is the pipeline's actual operation. *Projection*: the CNN MPC segment is dominated by ReLU + max-pool comparisons, so a 3PC garbled nonlinearity projects to a ~3× MPC-segment speedup; measured integration into `run_cnn_hybrid` (real 3PC label delivery + B2A) is the remaining engineering. |
-| E23 | `bench-medmnist`, `embedded_accuracy_is_reasonable`, `encrypted_matches_plaintext_on_real_scans` | **private *diagnosis*: the same pipeline on real biomedical images.** MedMNIST v2 (CC BY 4.0) ships twelve 2D biomedical datasets at 28×28 — exactly MNIST's shape — so the E20 pipeline runs unchanged on **PneumoniaMNIST** (pediatric chest X-ray, 2 classes) and **OrganAMNIST** (abdominal CT, 11 classes; `NCLASSES`/`OC` became model fields rather than consts to allow it). Full-test-set integer accuracy **84.78%** (624 imgs) and **81.18%** (17 778), against majority-class baselines of 62.50% / 18.48% and published ResNet-18 (28×28) of 0.854 / 0.935 — i.e. at the published number on pneumonia, 12 points short on the 11-class task, the gap being the 2-conv model sized to the depth-1 budget rather than anything cryptographic. Integer==float to within 0.2 points (99.7% / 98.7% prediction agreement) and **encrypted==plaintext on every scan tested (3/3 each, 0 bootstraps)**, so neither the fixed-point scheme nor the encryption costs accuracy; the price is **2.90 s/image online** as of 2026-07-28 (plus ~2.0 s query-independent preprocessing; it was ~33 s when this row was written — see [private-inference-performance.md](private-inference-performance.md)). The linear TFHE/CKKS demo swaps over too (`--example mnist -- --pneumonia`, 1669 gates, bit-identical across plain/mock/ABY3, ~1e-7 under CKKS). *Two methodological notes worth reporting*: the quantisation gain is selected on validation, never test; and it is two-sided — too large overflows the plaintext modulus, too small starves the output layer's weights to zero and collapses the classifier onto its majority class. |
+| E23 | `bench-medmnist`, `embedded_accuracy_is_reasonable`, `encrypted_matches_plaintext_on_real_scans` | **private *diagnosis*: the same pipeline on real biomedical images.** MedMNIST v2 (CC BY 4.0) ships twelve 2D biomedical datasets at 28×28 — exactly MNIST's shape — so the E20 pipeline runs unchanged on **PneumoniaMNIST** (pediatric chest X-ray, 2 classes) and **OrganAMNIST** (abdominal CT, 11 classes; `NCLASSES`/`OC` became model fields rather than consts to allow it). Full-test-set integer accuracy **84.78%** (624 imgs) and **81.18%** (17 778), against majority-class baselines of 62.50% / 18.48% and published ResNet-18 (28×28) of 0.854 / 0.935 — i.e. at the published number on pneumonia, 12 points short on the 11-class task, the gap being the 2-conv model sized to the depth-1 budget rather than anything cryptographic. Integer==float to within 0.2 points (99.7% / 98.7% prediction agreement) and **encrypted==plaintext on every scan tested (3/3 each, 0 bootstraps)**, so neither the fixed-point scheme nor the encryption costs accuracy; the price is **2.90 s/image online** as of 2026-07-28 (plus ~2.0 s query-independent preprocessing; it was ~33 s when this row was written — see [private-inference-performance.md](private-inference-performance.md)). The linear TFHE/CKKS demo swaps over too (`--example mnist -- --pneumonia`, 1669 gates, bit-identical across plain/mock/ABY3, ~1e-7 under CKKS). *Two methodological notes worth reporting*: the quantisation gain is selected on validation, never test; and it is two-sided — too large overflows the plaintext modulus, too small starves the output layer's weights to zero and collapses the classifier onto its majority class. **⚠️ QUALIFIED 2026-07-31 — "sized to the depth-1 budget" attributes the model's size to the wrong constraint.** Three limits bound this model, and the noise budget is only the third. Spatially, 3×3 valid convolution plus floor-pooling takes 28 → 13 → 5 → 1, so a 28×28 input admits at most three convs. By *packing*, the Cheetah layout needs `2·in_c·H·W ≲ n`: at the second conv's 13×13 input the first conv may emit at most **12** channels before the product degree passes `n = 4096` (`--conv 16,32` needs degree 5266 and panics in `hybrid_conv_open`), so **this — not the noise budget — is what stops the model getting wider.** It is a packing question, not a limit of the no-bootstrap construction: it relaxes at `n = 8192` or by splitting channels across ciphertexts, exactly as the CIFAR case in `bench::cnn`'s header notes. `tools/train_medmnist.py` now mirrors `ConvShape::required_degree` in `check_packing` and refuses such a stack before training rather than letting it surface from inside the FHE code twenty minutes later. Depth, meanwhile, really is free: `--conv 8,12,32` is three convs and runs encrypted bit-exactly with 0 bootstraps. |
 | E24 | `bench-mnist` (regenerated), `tools/train_medmnist.py` | **the E20 result made reproducible, and improved in passing.** E20's weights were produced by a numpy script in a scratch directory that was subsequently lost, leaving a trained artifact that could not be retrained — the accuracy column rested on weights nobody could regenerate. The trainer now lives in the repo (`tools/`), reads MNIST idx *and* MedMNIST npz, and reproduces the E20 architecture and quantisation scheme exactly. A fresh 30-epoch run gives **98.89%** on the full 10 000-image test set (was 98.05%), with the embedded 300-image subset **byte-identical** to the original file so the two models are directly comparable, Rust==numpy digit-for-digit (299/300), and encrypted==plaintext (4/4, 0 bootstraps). `FULL_TEST_ACCURACY` is now re-exported *from* the weight file instead of restated in Rust, so the claim cannot drift from the weights again. Moves the SOTA accuracy column 98.0%→98.9%, ~0.1% from the ~99% two-party systems whose server sees plaintext weights. |
 | E25 | `mpcc assign`, `the_model_derives_the_hybrid_split_for_a_neural_layer` | **the cost model independently derives the hybrid architecture — and the depth-1 budget is why it is legal.** `src/mpcc/assign.rs` + `src/mpcc/fhe_cost.rs` assign each operation *kind* to an arithmetic sharing, a binary sharing, or FHE, searching Baru's exact cost model. Inputs are measured only: BFV ct×ct **5.4 ms** and ct 128 KB (`bench-fhe-innerprod`; 20.7 ms when this row was written), TFHE 0.2–0.5 s/gate (`baru bench`), Beaver triples priced from measured OT (`mpcc::ot_cost`), plus two structural facts — BFV is arithmetic-only and depth-1. On one NN layer (256 secret×secret products then a comparison, WAN, 2 parties) the search returns **`mul → fhe`, `cmp-lt → binary`**: the Gazelle/Delphi/Cheetah split, and the one `src/hybrid/` implements by hand, *derived* rather than annotated. 1.26× over the better pure protocol, offline 1.7 MiB → 101 KiB. **The connection to this paper's thesis is causal, not decorative**: at depth 1 a second ciphertext multiplication is *infeasible*, so the only reason FHE can host the layer at all is that the nonlinearity's switch to MPC refreshes the ciphertext. Depth-is-free is the precondition for the assignment, not an optimisation on top of it. There is also a real crossover — 8 and 64-wide layers stay on MPC (batched multiplies cost one round, which FHE cannot amortize a switch against), 256 and 512 move to FHE — so the claim is a *prediction* with a boundary, not a preference. **The boundary moves with the threat model, which is the sharper claim:** under an honest majority (ABY3, multiplication from correlated randomness, zero preprocessing) the layer stays on MPC at *every* width, and `bench-hybrid-nn` confirms it (ABY3 ~775 ms flat in width at WAN, against hybrid-BFV ~1335 ms). Under a dishonest majority (Semi2k, a Beaver triple per multiplication priced from measured OT) FHE takes the layer past ~256 multiplications. That explains why every hybrid FHE+MPC system in the literature is 2-party: Gazelle, Delphi and Cheetah sit in exactly the regime where the model says the hybrid pays. **Gap partly closed same day:** `src/mpcc/semi2k.rs` adds the dishonest-majority baseline — Dealer's online phase with Beaver triples from **real OT** (Gilboa OLE over a new correlated-OT interface, `ot::iknp::correlated`). It calibrates at 0% error online, and its **offline cost is measured at 3104 B/triple against a predicted 3136 — 1%**, which is the figure the crossover claim rests on and was previously derived rather than measured. So the chain is now measured OT → analytic Gilboa count → measured triple cost → crossover, with only the last step still model. **Crossover measured same day** (`baru bench-layer`): one private layer with both operands secret plus a ReLU, MPC costs measured by running the protocols. The hybrid overtakes the deployable dishonest-majority protocol (Semi2k) **from width 64**, and leads 1.75× by width 1024 (692 ms vs 1.21 s) — against a model prediction of 64–256, so the model was slightly conservative. The mechanism is measured, not modelled: Semi2k's real OT preprocessing grows 1000 KiB → 7.2 MiB across the sweep while the hybrid's packed ciphertext stays at 256 KiB. The control carries the argument — `dealer`, which gets triples free by assumption, stays flat and cheapest at every width, so **the entire case for FHE here is the cost of preprocessing, not of computation.** Two comparison errors were caught and fixed in the process, both the same kind: pricing FHE's *linear* part against MPC's *whole layer* (omitting the ReLU that FHE cannot do at all), and computing the crossover against `dealer` (asking whether FHE beats free preprocessing). **The model's form validated same day** (`baru bench-net`): `rounds × latency + bytes / bandwidth` checked against a real loopback TCP socket — worst error 13.6%, under 1% through the middle of both sweeps, with the link's constants measured rather than assumed. So cost really is linear in rounds and linear in bytes with no missing cross-term, which is what licenses computing wall-clock from measured counts. Two methodology errors were caught doing it (probing cold then sweeping warm inflated the latency constant 36%; deriving throughput from one large transfer rather than the sweep's shape biased it high) — the first run blamed the model for both. **Still open, and narrower:** the constants are loopback's (RTT 23 µs), not a WAN's, so a WAN deployment needs its own two constants; and this measures a socket, not a protocol's round *count*, which is `mpcc calibrate`'s 0%. Three modelling errors were found by insisting the model agree with `bench-cnn`'s working hybrid: missing SIMD packing, missing preprocessing cost, and charging a ciphertext per crossing *edge* instead of per crossing value. **⚠️ QUALIFIED 2026-07-30 — the crossover is stated against the WRONG baseline.** This row's conclusion is "the entire case for FHE here is the cost of preprocessing", and the preprocessing it prices MPC with is **OT** (Semi2k, 3136 B/triple). Since `src/mpcc/lowgear.rs` landed there is a *measured*, cheaper dishonest-majority route: **SHE, 416 B/triple at the same 64-bit field — 7.5× fewer bytes** (`baru bench-triples`). `bench-layer` now carries a **measured** `lowgear` row — the protocol runs this layer itself, ReLU included, since its parameters widened to `n = 8192, q = 2^190, t ≈ 2^61` (2026-07-30; before that its ~17-bit field could not bit-decompose and the row had to be *composed* from Semi2k's online phase plus LowGear's offline bytes). Measured at WAN, 2 parties, preprocessing charged per triple **consumed**:
+| E26 | `bench-malicious`, `tests/malicious.rs` | **the cost of active security, measured.** The ABY3 layer upgraded to malicious security with abort (≤1 of 3 corrupt): checked reveal, input-consistency, and a batched ring sacrifice on multiplications. On the comparison workload — the whole nonlinear surface — **2.63× bytes, 1.06× interactive calls, 1.23× wall clock on a 25 ms WAN**; the MAC doubles what is sent but batches into the same round. The ring slack that verification over `Z_2^k` normally requires is **already paid for** by Baru's 128-bit ring: a 64-term dot product of 32-bit values leaves **58 bits of statistical security at no widening cost**. Cheating is driven through the real transport (corrupted resharing, inconsistent dealing, false reveal, cheating inside bit decomposition) and each aborts. En route: found that bit-decomposition MACs **cannot** be produced by multiplication — doing so opens a selective-failure channel that deferring the abort does not close (§8b). |
+| E27 | `bench-zkp-layer`, `tests/zkp_real.rs`, `tests/zkp_soundness.rs` | **the ZKP column, from nothing to a measured layer.** Audit found the shipped `binius64` backend was **not a proof system**: its `verify` never checked constraint satisfaction, so anyone holding the public circuit could forge an accepting proof (demonstrated, not argued, in `zkp_soundness.rs`). Replaced with the real Binius64 stack (`binius_frontend`/`prover`/`verifier`) and extended to the fragment inference needs — signed comparisons, `if`, `let`, arithmetic shifts, division. Proving a **Q16.16 quantized neuron at MNIST input width (784): 32 ms prove, 4.8 ms verify, 112 KB proof**, constraints linear in width and proof size far sublinear. Division needed care: the natural `a = b·q + r` check is satisfiable by a **modular-inverse forgery** because circuit multiplication wraps mod 2⁶⁴; the no-overflow constraint on the 128-bit product closes it, and the forgery is driven through the real prover as a test. **Any ZKP number published before 2026-07-31 should be withdrawn.** |
 
 | width | dealer (lower bound) | semi2k (OT) | **lowgear (SHE)** | hybrid/bfv |
 |---|---|---|---|---|
@@ -249,11 +267,13 @@ model of §5?"
   encrypted; each switch opens only a uniformly-masked value (simulatable).
 - **Gaps in the *implementation* (not the design)**, disclosed as
   limitations:
-  1. The masked decryption uses a **single client key** as a stand-in for
-     threshold decryption. A deployable instantiation secret-shares the FHE
-     key (threshold FHE) so no party can decrypt alone. The data flow is
-     already correct (only masked values are opened); only the key
-     operation is simulated.
+  1. ~~The masked decryption uses a **single client key** as a stand-in for
+     threshold decryption.~~ **Closed 2026-07-31.**
+     `fhe::threshold` + `hybrid::threshold_switch` replicate-share the BFV
+     key across the three parties, and the switch runs on real partial
+     decryptions. The remaining honest caveat is that key *generation* is
+     dealer-based; distributed keygen would remove the dealer from the trust
+     story and does not change the interfaces.
   2. **SI-NTRU is overstretched even at depth 1** — do not claim it secure.
      Fatigue point (ternary) at n=2048 is q ≈ 2^19; the large LTV secret
      f=t·f'+1 raises the effective point to ≈ 2^59; but a single multiply
@@ -271,8 +291,95 @@ model of §5?"
      foundation. **Contribution opportunity**: a head-to-head of
      BGV/BFV/CKKS/NTRU on this minimal-FHE inner product (no relin, no
      bootstrap) — see §7 (E9, planned).
-  3. Malicious security is out of scope (semi-honest, as standard for this
-     line of work).
+  3. ~~Malicious security is out of scope.~~ **Superseded — see §8b.**
+
+## 8b. Malicious security — what is implemented, measured, and still missing
+
+Added 2026-07-31. This section exists because §8 previously declared malicious
+security out of scope, and that is no longer true. It is written to the same
+standard as the rest of the outline: what runs, what is measured, what is
+assumed.
+
+### The claim that can be made
+
+**Security with abort against one actively corrupt party in three**, for the
+MPC layer that computes every nonlinearity. Honest parties either output the
+correct result or abort; the adversary learns nothing either way.
+
+Auditing the semi-honest protocol leaves exactly three deviation points, and all
+three are closed (`crypto::aby3_verify`):
+
+1. **Reveal** — replication makes one of the two receivers able to check each
+   broadcast component for free; the other corroborates through a pairwise
+   transcript hash.
+2. **Input sharing** — both intended holders absorb the dealt component into
+   their shared transcript, catching a dealer that tells two stories.
+3. **Multiplication** — the hard one, since `zᵢ` depends on a share pair no
+   other party holds. Closed by a MAC (`[x], [r·x]`) with a batched ring
+   sacrifice, following Chida et al. in the ring adaptation of Eerikson et al.
+
+### Two results worth putting in the paper
+
+**The ring sacrifice is free at inference widths.** Verifying multiplications
+over `Z_2^k` normally requires widening to `Z_2^{k+s}` for statistical slack.
+Baru already shares over `Z_2^128` while values are Q16.16, so the slack is
+*already paid for*: a 64-term dot product of 32-bit values occupies 70 bits,
+leaving **58 bits of statistical security at no widening cost**. Measured by
+`bench-malicious`, not asserted.
+
+**Active security costs bytes, not rounds.** On the comparison workload — the
+entire nonlinear surface of private inference — the upgrade costs **2.63×
+bytes, 1.06× interactive calls, 1.23× wall clock on a WAN**. The MAC doubles
+what is sent but batches into the same round, and bit decomposition's two extra
+rounds amortise over the batch. See `experiments.md` Part VIII.
+
+### The finding that is a contribution in its own right
+
+**Bit-decomposition MACs cannot be multiplied into existence.** The natural
+construction `[r·x] = [r]·[x]` for the decomposition leaves — which are built
+locally and arrive without MACs — is unsound in a way that *passes every
+functional test*. A corrupt party injects `δ`; the first downstream gate carries
+MAC error `δ·y` with `y` a **secret bit**, so the run aborts when `y = 1` and
+completes when `y = 0`. Whether the computation aborts becomes a function of the
+data: a selective-failure attack that buys one bit of input per abort.
+
+Crucially, **deferring the abort does not stop this**. Batching hides *when* the
+abort happens, not *whether* it happens; those are different channels and only
+the first is closed by batching. We had asserted the opposite before building
+it. The fix is Chida et al.'s pre-verified random pairs, attaching MACs
+affinely so the only place deviation remains possible is input-independent.
+Written up in `malicious-hybrid.md` §4.5a.
+
+### What is *not* claimed
+
+- **The trust threshold is unchanged**: honest majority for both privacy and
+  integrity. Two colluding servers reconstruct every intermediate. The
+  encrypted model is *not* safe under 2-collusion — this was identified and
+  retracted before any code existed (`malicious-hybrid.md` §5).
+- **The FHE boundary is open.** Replication cannot catch a *malformed input
+  ciphertext*: both honest co-holders compute on it faithfully and agree. This
+  is a structural limit of the technique, and it sharpens rather than weakens
+  the positioning — **ZK is needed only at the input boundary, never for the
+  evaluation**, where single-server verifiable FHE needs it over the whole
+  computation. The boundary proof itself is not implemented.
+- **The garbled leg is not malicious.** Its table cross-check is real, but the
+  OT-free construction that makes it fast is exactly what blocks replication
+  from reaching the input labels (`GC_MALICIOUS_GAPS` gives the three-input
+  adder design that would close it). This costs nothing in capability: the
+  `a2b` route already gives maliciously secure comparisons.
+- **SPDZ2k is online-only.** Authenticated triple generation is not
+  implemented; the registry row stays `Planned` rather than claiming a
+  validated cost model.
+
+### Why the claims can be trusted at all
+
+Every engine attests what it implements, and the gate refuses a session that
+asks for more (`crypto::attestations`). Exactly one engine attests malicious
+security. `tests/malicious.rs` drives real attacks over the transport — a
+corrupted product, inconsistent dealing, a false reveal, cheating inside bit
+decomposition — and asserts each aborts.
+
+---
 
 ## 9. Limitations & honest negatives (from the measurements)
 

@@ -61,10 +61,18 @@ impl WideParams {
     /// The deployed set. `n = 8192` and `log q = 190` sit inside the ~218-bit
     /// ceiling for 128-bit RLWE security at that dimension, and
     /// `|c| ≤ n·(q/2)² = 2^392` is inside the 7-prime CRT modulus.
-    pub const DEFAULT: WideParams = WideParams { n: 8192, log2_q: 190, t: 0 };
+    pub const DEFAULT: WideParams = WideParams {
+        n: 8192,
+        log2_q: 190,
+        t: 0,
+    };
 
     /// Small ring for fast tests. **Not secure.**
-    pub const TEST_SMALL: WideParams = WideParams { n: 64, log2_q: 190, t: 3329 };
+    pub const TEST_SMALL: WideParams = WideParams {
+        n: 64,
+        log2_q: 190,
+        t: 3329,
+    };
 
     pub fn q_mask(&self) -> I256 {
         I256::low_mask(self.log2_q)
@@ -85,10 +93,17 @@ impl WideParams {
     /// Reject parameters the arithmetic cannot actually carry.
     pub fn validate(&self) -> Result<(), String> {
         if self.log2_q >= 256 {
-            return Err(format!("log2_q = {} does not fit a 256-bit coefficient", self.log2_q));
+            return Err(format!(
+                "log2_q = {} does not fit a 256-bit coefficient",
+                self.log2_q
+            ));
         }
         if !self.n.is_power_of_two() || self.n > ntt::MAX_N {
-            return Err(format!("n = {} must be a power of two ≤ {}", self.n, ntt::MAX_N));
+            return Err(format!(
+                "n = {} must be a power of two ≤ {}",
+                self.n,
+                ntt::MAX_N
+            ));
         }
         if !crate::fhe::slots::supports_slots(self.n, self.t) {
             return Err(format!(
@@ -127,7 +142,10 @@ fn center(c: I256, p: &WideParams) -> I256 {
 }
 
 fn poly_add(a: &[I256], b: &[I256], mask: I256) -> Poly {
-    a.iter().zip(b).map(|(x, y)| add_mod_q(*x, *y, mask)).collect()
+    a.iter()
+        .zip(b)
+        .map(|(x, y)| add_mod_q(*x, *y, mask))
+        .collect()
 }
 
 /// Negacyclic product mod `q`, via the wide exact product.
@@ -180,7 +198,12 @@ fn sample_uniform_q(n: usize, mask: I256) -> Poly {
     let mut rng = rand::thread_rng();
     (0..n)
         .map(|_| {
-            let limbs = [rng.gen::<u64>(), rng.gen::<u64>(), rng.gen::<u64>(), rng.gen::<u64>()];
+            let limbs = [
+                rng.gen::<u64>(),
+                rng.gen::<u64>(),
+                rng.gen::<u64>(),
+                rng.gen::<u64>(),
+            ];
             I256 { limbs }.bitand(mask)
         })
         .collect()
@@ -229,10 +252,25 @@ impl BgvWide {
         let te = scale_by_t(&sample_ternary(p.n, mask), p);
         let a_s = poly_mul_mod(&a, &s, p);
         let b: Poly = (0..p.n)
-            .map(|i| I256::ZERO.wrapping_sub(a_s[i]).wrapping_sub(te[i]).bitand(mask))
+            .map(|i| {
+                I256::ZERO
+                    .wrapping_sub(a_s[i])
+                    .wrapping_sub(te[i])
+                    .bitand(mask)
+            })
             .collect();
-        let client = bincode::serialize(&KeyBundle { s, b: b.clone(), a: a.clone() }).unwrap();
-        let server = bincode::serialize(&KeyBundle { s: Vec::new(), b, a }).unwrap();
+        let client = bincode::serialize(&KeyBundle {
+            s,
+            b: b.clone(),
+            a: a.clone(),
+        })
+        .unwrap();
+        let server = bincode::serialize(&KeyBundle {
+            s: Vec::new(),
+            b,
+            a,
+        })
+        .unwrap();
         (client, server)
     }
 
@@ -256,7 +294,9 @@ impl BgvWide {
                 ub[i].wrapping_add(te1[i]).wrapping_add(mi).bitand(mask)
             })
             .collect();
-        let c1 = (0..p.n).map(|i| ua[i].wrapping_add(te2[i]).bitand(mask)).collect();
+        let c1 = (0..p.n)
+            .map(|i| ua[i].wrapping_add(te2[i]).bitand(mask))
+            .collect();
         WideCt { c0, c1 }
     }
 
@@ -284,7 +324,10 @@ impl BgvWide {
                 slot.wrapping_add(mi).bitand(mask)
             })
             .collect();
-        WideCt { c0, c1: ct.c1.clone() }
+        WideCt {
+            c0,
+            c1: ct.c1.clone(),
+        }
     }
 
     /// Multiply by a plaintext polynomial. **Depth 0** — the ciphertext degree
@@ -336,7 +379,12 @@ impl BgvWide {
                 // pushing `t·|e|` past `q/2`, which silently corrupted every
                 // triple at the deployed parameters.
                 let mut e = I256 {
-                    limbs: [rng.gen::<u64>(), rng.gen::<u64>(), rng.gen::<u64>(), rng.gen::<u64>()],
+                    limbs: [
+                        rng.gen::<u64>(),
+                        rng.gen::<u64>(),
+                        rng.gen::<u64>(),
+                        rng.gen::<u64>(),
+                    ],
                 }
                 .bitand(I256::low_mask(log2_bound));
                 if rng.gen::<bool>() {
@@ -345,7 +393,10 @@ impl BgvWide {
                 slot.wrapping_add(e.mul_u64(p.t)).bitand(mask)
             })
             .collect();
-        WideCt { c0, c1: ct.c1.clone() }
+        WideCt {
+            c0,
+            c1: ct.c1.clone(),
+        }
     }
 }
 
@@ -362,11 +413,26 @@ mod tests {
     fn parameters_are_validated() {
         assert!(WideParams::TEST_SMALL.validate().is_ok());
         // t not a slot prime
-        assert!(WideParams { t: 3331, ..WideParams::TEST_SMALL }.validate().is_err());
+        assert!(WideParams {
+            t: 3331,
+            ..WideParams::TEST_SMALL
+        }
+        .validate()
+        .is_err());
         // q too wide for a 256-bit coefficient
-        assert!(WideParams { log2_q: 300, ..WideParams::TEST_SMALL }.validate().is_err());
+        assert!(WideParams {
+            log2_q: 300,
+            ..WideParams::TEST_SMALL
+        }
+        .validate()
+        .is_err());
         // n above the NTT's ceiling
-        assert!(WideParams { n: 1 << 20, ..WideParams::TEST_SMALL }.validate().is_err());
+        assert!(WideParams {
+            n: 1 << 20,
+            ..WideParams::TEST_SMALL
+        }
+        .validate()
+        .is_err());
     }
 
     #[test]

@@ -47,19 +47,21 @@
 //!        key decrypts their result.  Less communication than MPC (send once),
 //!        but heavier per-gate computation (bootstrapping).
 
-/// Fixed-width signed integers generic over limb count — the CRT accumulator
-/// for [`ntt`], at both the narrow and wide parameter profiles.
-pub mod bigint;
 pub mod backend;
 pub mod bfv;
 pub mod bgv;
 /// BGV at wide parameters (n=8192, q=2^190, 256-bit coefficients) — the regime
 /// [`crate::mpcc::lowgear`] needs for a field big enough to bit-decompose.
 pub mod bgv_wide;
+/// Fixed-width signed integers generic over limb count — the CRT accumulator
+/// for [`ntt`], at both the narrow and wide parameter profiles.
+pub mod bigint;
+pub mod boundary;
+pub mod boundary_proof;
 pub mod circuit_emitter;
-pub mod conv_pack;
 pub mod ckks_backend;
 pub mod ckks_compare;
+pub mod conv_pack;
 pub mod mock_backend;
 /// NTL+GMP polynomial multiplication — a second implementation of what
 /// [`ntt`] computes, and the differential oracle for it. Opt-in: needs a C++
@@ -67,13 +69,14 @@ pub mod mock_backend;
 #[cfg(feature = "ntl")]
 pub mod ntl;
 pub mod ntt;
+/// Runtime switch choosing which implementation computes the ring products
+/// every FHE scheme here depends on ([`ntt`], or `ntl` when built in).
+pub mod poly;
 /// CRT slot packing — `n` independent values per ciphertext, for the
 /// elementwise products [`crate::mpcc::lowgear`] needs.
 pub mod slots;
-/// Runtime switch choosing which implementation computes the ring products
-/// every FHE scheme here depends on ([`ntt`], or [`ntl`] when built in).
-pub mod poly;
 pub mod tfhe_backend;
+pub mod threshold;
 
 pub use backend::{FheBackend, FheCircuit, RealFheBackend};
 pub use ckks_backend::{CkksBackend, MockCkksBackend};

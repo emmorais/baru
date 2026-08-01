@@ -38,8 +38,8 @@
 //! # REPL commands (party 0)
 //!
 //!   :help                     language reference
-//!   :examples [category]      list examples (optionally filtered)
-//!   :example <n>              run example n
+//!   :examples `[category]`    list examples (optionally filtered)
+//!   :example `<n>`            run example n
 //!   :verbose [on|off]         toggle per-step evaluation tracing
 //!   :quit                     signal all parties to exit
 //!
@@ -67,8 +67,8 @@ use rustyline::error::ReadlineError;
 use rustyline::Editor;
 
 use baru::crypto::net::{
-    deserialize_msg, recv_blocking, recv_forever, serialize_msg, InprocHandle, MpcMsg, TcpTransport,
-    Transport,
+    deserialize_msg, recv_blocking, recv_forever, serialize_msg, InprocHandle, MpcMsg,
+    TcpTransport, Transport,
 };
 use baru::interpreter::{parse, Participant, Types};
 use baru::repl::{print_examples_for, print_examples_list, print_help, ReplHelper, EXAMPLES};

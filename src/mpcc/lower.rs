@@ -29,7 +29,7 @@
 //!
 //! No vectorization: `FlatOp` is scalar, so every instruction comes out with
 //! `width = 1`.  Batching is nonetheless accounted for, because
-//! [`crate::mpcc::schedule`] charges **one round per dependence level**, not one
+//! [`mod@crate::mpcc::schedule`] charges **one round per dependence level**, not one
 //! round per instruction — a 784-lane dot product lowered as 784 scalar `Mul`s
 //! at the same level costs one round, exactly as a batched protocol would run
 //! it.  Turning those into genuine width-784 instructions is a later

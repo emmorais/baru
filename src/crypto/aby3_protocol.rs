@@ -125,8 +125,16 @@ pub fn share_input_batch<T: Transport>(
         let mut rng = rand::thread_rng();
         // Per-peer buffers: peer `i` receives its own component and the
         // component of `i+1`, exactly as in the unbatched protocol.
-        let mut lefts = [Vec::with_capacity(n), Vec::with_capacity(n), Vec::with_capacity(n)];
-        let mut rights = [Vec::with_capacity(n), Vec::with_capacity(n), Vec::with_capacity(n)];
+        let mut lefts = [
+            Vec::with_capacity(n),
+            Vec::with_capacity(n),
+            Vec::with_capacity(n),
+        ];
+        let mut rights = [
+            Vec::with_capacity(n),
+            Vec::with_capacity(n),
+            Vec::with_capacity(n),
+        ];
         let mut mine = Vec::with_capacity(n);
         for &value in values {
             let s0: Fr = rng.gen();
@@ -137,7 +145,10 @@ pub fn share_input_batch<T: Transport>(
                 lefts[i].push(s[i]);
                 rights[i].push(s[(i + 1) % N]);
             }
-            mine.push(PartyShare { left: s[me], right: s[(me + 1) % N] });
+            mine.push(PartyShare {
+                left: s[me],
+                right: s[(me + 1) % N],
+            });
         }
         for i in 0..N {
             if i != me {
@@ -164,8 +175,16 @@ pub fn share_input_batch<T: Transport>(
         let MpcMsg::InputShareBatch { lefts, rights, .. } = m else {
             unreachable!("predicate guarantees InputShareBatch")
         };
-        assert_eq!(lefts.len(), n, "share_input_batch: owner sent a batch of the wrong length");
-        assert_eq!(rights.len(), n, "share_input_batch: owner sent a batch of the wrong length");
+        assert_eq!(
+            lefts.len(),
+            n,
+            "share_input_batch: owner sent a batch of the wrong length"
+        );
+        assert_eq!(
+            rights.len(),
+            n,
+            "share_input_batch: owner sent a batch of the wrong length"
+        );
         lefts
             .into_iter()
             .zip(rights)
@@ -296,6 +315,193 @@ pub fn reveal<T: Transport>(
 /// elements per multiplication and then opened 2 more. Triples are not
 /// merely moved offline here, they are eliminated: there is nothing left to
 /// precompute or distribute.
+/// Open a whole batch of ring shares to every party in **one** directed message
+/// each — the semi-honest counterpart of
+/// [`crate::crypto::aby3_verify::reveal_batch_checked`], which broadcasts and
+/// cross-checks instead.
+///
+/// Party `i` holds `(sᵢ, sᵢ₊₁)` and is missing `sᵢ₊₂`, which party `i+2` holds
+/// as its `left`. So every party sends its `left` to party `i+1` and receives
+/// the one summand it lacks. One round, one message per party, whatever the
+/// batch size.
+///
+/// The batching is the point: [`reveal`] costs `N−1` messages *per value*, so
+/// opening a convolution layer element by element would spend tens of thousands
+/// of round trips on what is structurally a single exchange. `Π_WA` opens one
+/// masked value per DReLU, so without this the wrap protocol's cost would be
+/// dominated by an artefact of the API rather than by the protocol.
+pub fn reveal_batch_party<T: Transport>(
+    shares: &[PartyShare],
+    base_id: u64,
+    me: PartyId,
+    mbx: &Mailbox<T>,
+) -> Vec<Fr> {
+    if shares.is_empty() {
+        return Vec::new();
+    }
+    let mine: Vec<Fr> = shares.iter().map(|s| s.left).collect();
+    mbx.send(
+        (me + 1) % N,
+        serialize_msg(&MpcMsg::RevealShareBatch {
+            base_id,
+            values: mine,
+        }),
+    );
+    let (_, msg) = mbx
+        .recv_matching(
+            TIMEOUT_MS,
+            |m| matches!(m, MpcMsg::RevealShareBatch { base_id: b, .. } if *b == base_id),
+        )
+        .unwrap_or_else(|| panic!("reveal_batch_party: timeout for base_id={base_id}"));
+    let missing = match msg {
+        MpcMsg::RevealShareBatch { values, .. } => values,
+        _ => unreachable!("predicate guarantees RevealShareBatch"),
+    };
+    assert_eq!(missing.len(), shares.len(), "reveal batch length mismatch");
+    shares
+        .iter()
+        .zip(missing)
+        .map(|(s, m)| s.left.wrapping_add(s.right).wrapping_add(m))
+        .collect()
+}
+
+/// Open a batch of ring shares and return the three **additive components** of
+/// each, in canonical party order, rather than only their sum.
+///
+/// Same single directed message as [`reveal_batch_party`] — after the exchange
+/// every party already holds all three summands (`left`, `right`, and the one
+/// received), so the components cost nothing extra. What differs is only what is
+/// returned.
+///
+/// `Π_WA` needs exactly this: its step 3 computes `α = wrap3(r₁, r₂, r₃, L)` "in
+/// the clear", which is a function of the individual summands and *not*
+/// recoverable from `r = Σrⱼ`. A reveal that returns only the value would make
+/// the wrap protocol unimplementable without a second exchange.
+/// Pack ring values at `bits` each, little-endian within the stream.
+///
+/// Public so that tests which tamper with a resharing message can express the
+/// tamper on *values* rather than on the encoding.
+pub fn pack_ring(values: &[Fr], bits: u32) -> Vec<u8> {
+    let mut out = vec![0u8; (values.len() * bits as usize).div_ceil(8)];
+    for (i, v) in values.iter().enumerate() {
+        let base = i * bits as usize;
+        for b in 0..bits as usize {
+            if (v >> b) & 1 == 1 {
+                out[(base + b) / 8] |= 1 << ((base + b) % 8);
+            }
+        }
+    }
+    out
+}
+
+pub fn unpack_ring(data: &[u8], n: usize, bits: u32) -> Vec<Fr> {
+    (0..n)
+        .map(|i| {
+            let base = i * bits as usize;
+            let mut v: Fr = 0;
+            for b in 0..bits as usize {
+                let idx = base + b;
+                if data[idx / 8] >> (idx % 8) & 1 == 1 {
+                    v |= 1 << b;
+                }
+            }
+            v
+        })
+        .collect()
+}
+
+/// [`reveal_components_batch_party`] with the payload packed at `bits`.
+///
+/// Same protocol, honest width. Use this wherever the reveal traffic is a
+/// material share of the total; `RevealShareBatch`'s `u128` payload is 75–84%
+/// padding at the widths this crate actually uses.
+pub fn reveal_components_packed_party<T: Transport>(
+    shares: &[PartyShare],
+    bits: u32,
+    base_id: u64,
+    me: PartyId,
+    mbx: &Mailbox<T>,
+) -> Vec<[Fr; 3]> {
+    if shares.is_empty() {
+        return Vec::new();
+    }
+    let mine: Vec<Fr> = shares.iter().map(|s| s.left).collect();
+    mbx.send(
+        (me + 1) % N,
+        serialize_msg(&MpcMsg::RevealPackedBatch {
+            base_id,
+            bits,
+            data: pack_ring(&mine, bits),
+        }),
+    );
+    let (_, msg) = mbx
+        .recv_matching(
+            TIMEOUT_MS,
+            |m| matches!(m, MpcMsg::RevealPackedBatch { base_id: b, .. } if *b == base_id),
+        )
+        .unwrap_or_else(|| panic!("reveal_components_packed_party: timeout id={base_id}"));
+    let received = match msg {
+        MpcMsg::RevealPackedBatch { data, .. } => unpack_ring(&data, shares.len(), bits),
+        _ => unreachable!("predicate guarantees RevealPackedBatch"),
+    };
+    shares
+        .iter()
+        .zip(received)
+        .map(|(s, got)| {
+            let mut c = [0 as Fr; 3];
+            c[me % N] = s.left;
+            c[(me + 1) % N] = s.right;
+            c[(me + 2) % N] = got;
+            c
+        })
+        .collect()
+}
+
+pub fn reveal_components_batch_party<T: Transport>(
+    shares: &[PartyShare],
+    base_id: u64,
+    me: PartyId,
+    mbx: &Mailbox<T>,
+) -> Vec<[Fr; 3]> {
+    if shares.is_empty() {
+        return Vec::new();
+    }
+    let mine: Vec<Fr> = shares.iter().map(|s| s.left).collect();
+    mbx.send(
+        (me + 1) % N,
+        serialize_msg(&MpcMsg::RevealShareBatch {
+            base_id,
+            values: mine,
+        }),
+    );
+    let (_, msg) = mbx
+        .recv_matching(
+            TIMEOUT_MS,
+            |m| matches!(m, MpcMsg::RevealShareBatch { base_id: b, .. } if *b == base_id),
+        )
+        .unwrap_or_else(|| panic!("reveal_components_batch_party: timeout id={base_id}"));
+    let received = match msg {
+        MpcMsg::RevealShareBatch { values, .. } => values,
+        _ => unreachable!("predicate guarantees RevealShareBatch"),
+    };
+    assert_eq!(received.len(), shares.len(), "reveal batch length mismatch");
+    shares
+        .iter()
+        .zip(received)
+        .map(|(s, got)| {
+            // This party's `left` is component `me`, its `right` component
+            // `me+1`; the value it just received is component `me+2`. Placing
+            // them by index makes every party agree on the ordering, which is
+            // what lets `wrap3` be computed identically everywhere.
+            let mut c = [0 as Fr; 3];
+            c[me % N] = s.left;
+            c[(me + 1) % N] = s.right;
+            c[(me + 2) % N] = got;
+            c
+        })
+        .collect()
+}
+
 pub fn mul_party<T: Transport>(
     a: &PartyShare,
     b: &PartyShare,
@@ -310,7 +516,7 @@ pub fn mul_party<T: Transport>(
 /// Batched [`mul_party`]: one message per party for the whole batch.
 ///
 /// Batches wider than this cannot be given collision-free α counters under
-/// the [`alpha_ctr`] encoding. It is astronomically larger than any real
+/// the `alpha_ctr` encoding. It is astronomically larger than any real
 /// batch (a full network is ~10⁵ multiplications), so the cap only guards a
 /// programming error.
 pub const MAX_BATCH: usize = 1 << 40;
@@ -333,9 +539,148 @@ fn alpha_ctr(op_id: u64, i: usize) -> u64 {
 /// masked by the same randomness. Reusing an α would be harmless for
 /// correctness (it always cancels in the sum) but a privacy leak: two
 /// products sharing an α expose their difference on the wire. See
-/// [`alpha_ctr`] for how collisions are ruled out.
+/// `alpha_ctr` for how collisions are ruled out.
+/// A batch of **dot products**, each resharing **once**.
+///
+/// # Why this is not `mul_batch_party` plus local sums
+///
+/// It computes the same values, and the products are already summed locally in
+/// both — but the resharing granularity differs, and that is the whole cost.
+/// Resharing per product sends one ring element per *multiplication*; resharing
+/// per dot product sends one per *output*. The cross-terms can be accumulated
+/// before the message because summation is local:
+///
+/// ```text
+/// Σₖ (aₖ,ᵢ·bₖ,ᵢ + aₖ,ᵢ·bₖ,ᵢ₊₁ + aₖ,ᵢ₊₁·bₖ,ᵢ) + αᵢ
+/// ```
+///
+/// summed over the three parties is `Σₖ aₖ·bₖ`, with the α telescoping to zero
+/// exactly as for a single product.
+///
+/// This is what Falcon's cost table means by `MatMul (x×y)(y×z) = k·x·z` — `x·z`
+/// is the number of *outputs*, not of products. On the MedMNIST CNN the two
+/// differ by **32×**: 239 520 products against 7 474 outputs.
+///
+/// One α per dot product, not per term: each opened value must be independently
+/// masked, and reusing an α across dots would expose their difference.
+pub fn dot_batch_party<T: Transport>(
+    dots: &[&[(PartyShare, PartyShare)]],
+    base_op_id: u64,
+    me: PartyId,
+    mbx: &Mailbox<T>,
+) -> Vec<PartyShare> {
+    dot_batch_party_at(dots, 128, base_op_id, me, mbx)
+}
+
+/// [`dot_batch_party`] with the resharing carried at `bits`.
+///
+/// Same precondition as [`mul_batch_party_at`]: every consumer of the result
+/// must work at `bits` or below. True throughout `falcon_mpc`, which is
+/// `l_bits`-consistent end to end; not true of the generic backend path, where
+/// widths mix.
+pub fn dot_batch_party_at<T: Transport>(
+    dots: &[&[(PartyShare, PartyShare)]],
+    bits: u32,
+    base_op_id: u64,
+    me: PartyId,
+    mbx: &Mailbox<T>,
+) -> Vec<PartyShare> {
+    if dots.is_empty() {
+        return Vec::new();
+    }
+    let wmask: Fr = if bits >= 128 {
+        Fr::MAX
+    } else {
+        (1u128 << bits) - 1
+    };
+    let keys = mbx.prf_keys(me);
+    let z_mine: Vec<u128> = dots
+        .iter()
+        .enumerate()
+        .map(|(i, terms)| {
+            let acc = terms.iter().fold(0u128, |acc, (a, b)| {
+                acc.wrapping_add(a.left.wrapping_mul(b.left))
+                    .wrapping_add(a.left.wrapping_mul(b.right))
+                    .wrapping_add(a.right.wrapping_mul(b.left))
+            });
+            acc.wrapping_add(keys.alpha(alpha_ctr(base_op_id, i))) & wmask
+        })
+        .collect();
+
+    mbx.send(
+        (me + N - 1) % N,
+        serialize_msg(&MpcMsg::TaggedZBatch {
+            base_op_id,
+            bits,
+            data: pack_ring(&z_mine, bits),
+        }),
+    );
+    let (_, msg) = mbx
+        .recv_matching(
+            TIMEOUT_MS,
+            |m| matches!(m, MpcMsg::TaggedZBatch { base_op_id: b, .. } if *b == base_op_id),
+        )
+        .unwrap_or_else(|| panic!("dot_batch_party: timeout on z for op_id={base_op_id}"));
+    let z_next = match msg {
+        MpcMsg::TaggedZBatch { data, bits, .. } => unpack_ring(&data, z_mine.len(), bits),
+        _ => unreachable!("predicate guarantees TaggedZBatch"),
+    };
+    z_mine
+        .into_iter()
+        .zip(z_next)
+        .map(|(left, right)| PartyShare { left, right })
+        .collect()
+}
+
 pub fn mul_batch_party<T: Transport>(
     pairs: &[(PartyShare, PartyShare)],
+    base_op_id: u64,
+    me: PartyId,
+    mbx: &Mailbox<T>,
+) -> Vec<PartyShare> {
+    mul_batch_party_at(pairs, 128, base_op_id, me, mbx)
+}
+
+/// [`mul_batch_party`] with the sharing reduced to `bits` before it goes on the
+/// wire.
+///
+/// # Why the width has to be given, and why it is safe
+///
+/// The resharing message carried a `u128` per product regardless of how wide
+/// the shares actually were. For the bit-level multiplications inside `a2b` —
+/// which is what every comparison and ReLU in this crate bottoms out in — that
+/// is **128 bits on the wire per 1 bit of content**. Measured on sign
+/// extraction: 449 elements per operation, 7 184 wire bytes, ~56 bytes of
+/// content.
+///
+/// Reducing to `bits` is sound because the whole sharing is modulo a power of
+/// two: `2^bits | 2^128`, so a share reduced mod `2^bits` still reconstructs the
+/// value mod `2^bits`, and the α mask stays zero-sum (`F(kᵢ) − F(kᵢ₋₁)` telescopes
+/// under any modulus). Products of reduced shares remain correct mod `2^bits`,
+/// which is all any caller interpreting at that width can observe.
+///
+/// # ⚠️ Not currently usable below 128, and why
+///
+/// Reducing genuinely saves wire bytes — switching `a2b`'s ten internal calls to
+/// `nbits = 32` took sign extraction from 7 184 to 1 796 B, a clean 4×. It also
+/// **breaks the crate**, and the reason is worth recording.
+///
+/// Shares here are full-width `u128` *everywhere*; `nbits` is an
+/// interpretation attached to a `ShareRef`, never enforced on the sharing
+/// itself. Reducing a share's components mod `2^bits` leaves them summing to
+/// `v + k·2^bits` rather than `v` over `Z_{2^128}`. Every operation that stays
+/// within that width is fine — but a *downstream* consumer working at full
+/// width, such as the multiply inside `max2`, then computes on `v + k·2^bits`.
+/// Observed directly: `max2(9, 6)` returned 22 020 105.
+///
+/// So the 4× is real but is not a local change. It needs the sharing to be
+/// consistently modulo `2^nbits` — reduction at every operation and a `reveal`
+/// that masks — which is a crate-wide refactor, not a packing tweak. The
+/// parameter and the packed wire format are kept here so that work has
+/// somewhere to land; **every caller passes 128 today.**
+pub fn mul_batch_party_at<T: Transport>(
+    pairs: &[(PartyShare, PartyShare)],
+    bits: u32,
     base_op_id: u64,
     me: PartyId,
     mbx: &Mailbox<T>,
@@ -343,9 +688,18 @@ pub fn mul_batch_party<T: Transport>(
     if pairs.is_empty() {
         return Vec::new();
     }
-    assert!(pairs.len() <= MAX_BATCH, "multiplication batch too large for α counters");
+    assert!(
+        pairs.len() <= MAX_BATCH,
+        "multiplication batch too large for α counters"
+    );
     let keys = mbx.prf_keys(me);
-    // Local: three of the nine cross terms, re-randomised by a zero-sum α.
+    let wmask: Fr = if bits >= 128 {
+        Fr::MAX
+    } else {
+        (1u128 << bits) - 1
+    };
+    // Local: three of the nine cross terms, re-randomised by a zero-sum α, then
+    // reduced to the width actually in use.
     let z_mine: Vec<u128> = pairs
         .iter()
         .enumerate()
@@ -355,6 +709,7 @@ pub fn mul_batch_party<T: Transport>(
                 .wrapping_add(a.left.wrapping_mul(b.right))
                 .wrapping_add(a.right.wrapping_mul(b.left))
                 .wrapping_add(keys.alpha(alpha_ctr(base_op_id, i)))
+                & wmask
         })
         .collect();
 
@@ -363,18 +718,27 @@ pub fn mul_batch_party<T: Transport>(
     // broadcast.
     mbx.send(
         (me + N - 1) % N,
-        serialize_msg(&MpcMsg::TaggedZBatch { base_op_id, values: z_mine.clone() }),
+        serialize_msg(&MpcMsg::TaggedZBatch {
+            base_op_id,
+            bits,
+            data: pack_ring(&z_mine, bits),
+        }),
     );
     let (_, msg) = mbx
-        .recv_matching(TIMEOUT_MS, |m| {
-            matches!(m, MpcMsg::TaggedZBatch { base_op_id: b, .. } if *b == base_op_id)
-        })
+        .recv_matching(
+            TIMEOUT_MS,
+            |m| matches!(m, MpcMsg::TaggedZBatch { base_op_id: b, .. } if *b == base_op_id),
+        )
         .unwrap_or_else(|| panic!("mul_batch_party: timeout on z for op_id={base_op_id}"));
     let z_next = match msg {
-        MpcMsg::TaggedZBatch { values, .. } => values,
+        MpcMsg::TaggedZBatch { data, bits: b, .. } => unpack_ring(&data, z_mine.len(), b),
         _ => unreachable!("predicate guarantees TaggedZBatch"),
     };
-    assert_eq!(z_next.len(), z_mine.len(), "batch length mismatch in resharing");
+    assert_eq!(
+        z_next.len(),
+        z_mine.len(),
+        "batch length mismatch in resharing"
+    );
 
     z_mine
         .into_iter()
@@ -395,7 +759,7 @@ pub const A2B_ID_BLOCK: u64 = 64;
 /// `right` by party `owner−1`, so exactly those two parties supply `v` and
 /// the third contributes nothing and learns nothing. This is what makes the
 /// first step of bit decomposition free.
-fn share_component(value: Fr, owner: usize, me: PartyId) -> PartyShare {
+pub(crate) fn share_component(value: Fr, owner: usize, me: PartyId) -> PartyShare {
     PartyShare {
         left: if me == owner { value } else { 0 },
         right: if (me + 1) % N == owner { value } else { 0 },
@@ -428,8 +792,9 @@ fn ppa_add<T: Transport>(
     let base = take_id(next_id);
     let uv = mul_batch_party(&pairs, base, me, mbx);
     let mut g = uv.clone();
-    let mut p: Vec<PartyShare> =
-        (0..nbits).map(|k| xor_from_product(&u[k], &v[k], &uv[k])).collect();
+    let mut p: Vec<PartyShare> = (0..nbits)
+        .map(|k| xor_from_product(&u[k], &v[k], &uv[k]))
+        .collect();
     let p_leaf = p.clone();
 
     let mut d = 1usize;
@@ -458,7 +823,9 @@ fn ppa_add<T: Transport>(
     if nbits == 1 {
         return vec![p_leaf[0].clone()];
     }
-    let pairs: Vec<_> = (1..nbits).map(|k| (p_leaf[k].clone(), g[k - 1].clone())).collect();
+    let pairs: Vec<_> = (1..nbits)
+        .map(|k| (p_leaf[k].clone(), g[k - 1].clone()))
+        .collect();
     let base = take_id(next_id);
     let prod = mul_batch_party(&pairs, base, me, mbx);
     let mut out = Vec::with_capacity(nbits);
@@ -476,7 +843,7 @@ fn ppa_add<T: Transport>(
 /// # Protocol
 ///
 /// 1. **Binary-share the three additive components** — free, via
-///    [`share_component`]: `a = a₀ + a₁ + a₂` and each `aⱼ` is already known
+///    `share_component`: `a = a₀ + a₁ + a₂` and each `aⱼ` is already known
 ///    to exactly the two parties a replicated sharing of it requires.
 /// 2. **Carry-save reduce 3 → 2.** In this arithmetic bit encoding
 ///    `x⊕y⊕z = x+y+z − 2(xy+xz+yz) + 4xyz` and
@@ -514,7 +881,9 @@ pub fn a2b_party<T: Transport>(
             } else {
                 0
             };
-            (0..nbits).map(|k| share_component((known >> k) & 1, j, me)).collect()
+            (0..nbits)
+                .map(|k| share_component((known >> k) & 1, j, me))
+                .collect()
         })
         .collect();
     let (x, y, z) = (&comp[0], &comp[1], &comp[2]);
@@ -532,7 +901,11 @@ pub fn a2b_party<T: Transport>(
     }
     let base = take_id(&mut next_id);
     let pw = mul_batch_party(&pairs, base, me, mbx);
-    let (xy, xz, yz) = (&pw[0..nbits], &pw[nbits..2 * nbits], &pw[2 * nbits..3 * nbits]);
+    let (xy, xz, yz) = (
+        &pw[0..nbits],
+        &pw[nbits..2 * nbits],
+        &pw[2 * nbits..3 * nbits],
+    );
 
     let triple: Vec<_> = (0..nbits).map(|k| (xy[k].clone(), z[k].clone())).collect();
     let base = take_id(&mut next_id);
@@ -573,6 +946,44 @@ pub fn a2b_batch_party<T: Transport>(
     me: PartyId,
     mbx: &Mailbox<T>,
 ) -> Vec<Vec<PartyShare>> {
+    // Full width: the resulting bit-shares may be consumed by *any* downstream
+    // arithmetic, including multiplication against wide operands.
+    a2b_batch_party_at(values, nbits, 128, op_id, me, mbx)
+}
+
+/// [`a2b_batch_party`] with the bit-shares carried at `wire_bits` on the wire.
+///
+/// # When this is safe, and it is a real precondition
+///
+/// A bit-share here is an *arithmetic* sharing of a 0/1 value (`a ⊕ b = a+b−2ab`),
+/// so its components are full-width ring elements even though the value is one
+/// bit. Narrowing them to `wire_bits` keeps the sharing valid **modulo
+/// `2^wire_bits`** and no wider. Every consumer must therefore work at that
+/// width or below.
+///
+/// That is false for the general `lt`/`max2` path — its output bit is
+/// multiplied by a 20-bit operand, and narrowing broke it (`max2(9,6)` returned
+/// 22 020 105). It is **true** for a caller that reads the result purely as a
+/// bit, which is what `falcon_mpc::truncate_batch` does with the borrow.
+///
+/// `wire_bits` must be at least 2: the XOR encoding evaluates `a+b−2ab`, so one
+/// bit is not enough room even though the value is.
+///
+/// Worth the trouble because this dominates: the borrow's 9-bit `a2b` is ~108
+/// ring elements, and at `u128` that is 1 728 B against 54 B of content — 96%
+/// of an all-RSS network's traffic went here.
+pub fn a2b_batch_party_at<T: Transport>(
+    values: &[PartyShare],
+    nbits: usize,
+    wire_bits: u32,
+    op_id: u64,
+    me: PartyId,
+    mbx: &Mailbox<T>,
+) -> Vec<Vec<PartyShare>> {
+    assert!(
+        wire_bits >= 2,
+        "the XOR encoding needs at least two bits of room"
+    );
     let count = values.len();
     if count == 0 {
         return Vec::new();
@@ -598,7 +1009,9 @@ pub fn a2b_batch_party<T: Transport>(
                     } else {
                         0
                     };
-                    (0..nbits).map(|k| share_component((known >> k) & 1, j, me)).collect()
+                    (0..nbits)
+                        .map(|k| share_component((known >> k) & 1, j, me))
+                        .collect()
                 })
                 .collect();
             let mut it = per_owner.into_iter();
@@ -621,7 +1034,7 @@ pub fn a2b_batch_party<T: Transport>(
         }
     }
     let base = take_id(&mut next_id);
-    let pw = mul_batch_party(&pairs, base, me, mbx);
+    let pw = mul_batch_party_at(&pairs, wire_bits, base, me, mbx);
 
     // Round B: xyz for every lane and bit.
     let mut triple = Vec::with_capacity(count * nbits);
@@ -632,14 +1045,18 @@ pub fn a2b_batch_party<T: Transport>(
         }
     }
     let base = take_id(&mut next_id);
-    let xyz_all = mul_batch_party(&triple, base, me, mbx);
+    let xyz_all = mul_batch_party_at(&triple, wire_bits, base, me, mbx);
 
     // Per-lane sum and shifted-carry, all local.
     let mut sums = Vec::with_capacity(count);
     let mut shifts = Vec::with_capacity(count);
     for (lane, (x, y, z)) in comp.iter().enumerate() {
         let b = lane * 3 * nbits;
-        let (xy, xz, yz) = (&pw[b..b + nbits], &pw[b + nbits..b + 2 * nbits], &pw[b + 2 * nbits..b + 3 * nbits]);
+        let (xy, xz, yz) = (
+            &pw[b..b + nbits],
+            &pw[b + nbits..b + 2 * nbits],
+            &pw[b + 2 * nbits..b + 3 * nbits],
+        );
         let xyz = &xyz_all[lane * nbits..lane * nbits + nbits];
         let mut sum = Vec::with_capacity(nbits);
         let mut carry = Vec::with_capacity(nbits);
@@ -660,15 +1077,17 @@ pub fn a2b_batch_party<T: Transport>(
     }
 
     // ── 3. one batched prefix-adder over all lanes ──
-    ppa_add_batch(&sums, &shifts, nbits, &mut next_id, me, mbx)
+    ppa_add_batch(&sums, &shifts, nbits, wire_bits, &mut next_id, me, mbx)
 }
 
 /// Batched [`ppa_add`]: `count` independent `nbits`-wide Kogge–Stone adders,
 /// every layer's products flattened into one multiplication round.
+#[allow(clippy::too_many_arguments)]
 fn ppa_add_batch<T: Transport>(
     u: &[Vec<PartyShare>],
     v: &[Vec<PartyShare>],
     nbits: usize,
+    wire_bits: u32,
     next_id: &mut u64,
     me: PartyId,
     mbx: &Mailbox<T>,
@@ -688,11 +1107,16 @@ fn ppa_add_batch<T: Transport>(
         }
     }
     let base = take_id(next_id);
-    let uv = mul_batch_party(&pairs, base, me, mbx);
-    let mut g: Vec<Vec<PartyShare>> =
-        (0..count).map(|l| uv[l * nbits..l * nbits + nbits].to_vec()).collect();
+    let uv = mul_batch_party_at(&pairs, wire_bits, base, me, mbx);
+    let mut g: Vec<Vec<PartyShare>> = (0..count)
+        .map(|l| uv[l * nbits..l * nbits + nbits].to_vec())
+        .collect();
     let mut p: Vec<Vec<PartyShare>> = (0..count)
-        .map(|l| (0..nbits).map(|k| xor_from_product(&u[l][k], &v[l][k], &uv[l * nbits + k])).collect())
+        .map(|l| {
+            (0..nbits)
+                .map(|k| xor_from_product(&u[l][k], &v[l][k], &uv[l * nbits + k]))
+                .collect()
+        })
         .collect();
     let p_leaf = p.clone();
 
@@ -706,7 +1130,7 @@ fn ppa_add_batch<T: Transport>(
             }
         }
         let base = take_id(next_id);
-        let out = mul_batch_party(&pr, base, me, mbx);
+        let out = mul_batch_party_at(&pr, wire_bits, base, me, mbx);
         let width = nbits - d;
         for lane in 0..count {
             let (mut ng, mut np) = (g[lane].clone(), p[lane].clone());
@@ -731,14 +1155,18 @@ fn ppa_add_batch<T: Transport>(
         }
     }
     let base = take_id(next_id);
-    let prod = mul_batch_party(&pairs, base, me, mbx);
+    let prod = mul_batch_party_at(&pairs, wire_bits, base, me, mbx);
     let width = nbits - 1;
     (0..count)
         .map(|lane| {
             let mut bits = Vec::with_capacity(nbits);
             bits.push(p_leaf[lane][0].clone());
             for (i, k) in (1..nbits).enumerate() {
-                bits.push(xor_from_product(&p_leaf[lane][k], &g[lane][k - 1], &prod[lane * width + i]));
+                bits.push(xor_from_product(
+                    &p_leaf[lane][k],
+                    &g[lane][k - 1],
+                    &prod[lane * width + i],
+                ));
             }
             bits
         })
@@ -778,6 +1206,55 @@ fn party_pairs(s: &crate::crypto::types::Share3) -> Vec<PartyShare> {
 mod tests {
     use super::*;
     use crate::crypto::net::InprocHandle;
+
+    /// The batched reveal must open the same values as the per-share [`reveal`],
+    /// and must do it in **one** message per party rather than `N−1` per value.
+    ///
+    /// The message count is half the point: `Π_WA` opens one masked value per
+    /// DReLU, so an unbatched reveal would make the wrap protocol's cost an
+    /// artefact of the API.
+    #[test]
+    #[ignore] // real 3-party transport
+    fn batched_reveal_matches_the_scalar_one_in_a_single_round() {
+        use crate::bench::comm::CountingTransport;
+        const N_VALS: usize = 512;
+        let secrets: Vec<Fr> = (0..N_VALS as u128)
+            .map(|i| i.wrapping_mul(0x9E37_79B9))
+            .collect();
+        let expected = secrets.clone();
+
+        let handles = InprocHandle::create(3);
+        let mut comm = None;
+        let mut joins = Vec::new();
+        for h in handles {
+            let counted = CountingTransport::new(h, 3);
+            if comm.is_none() {
+                comm = Some(counted.handle());
+            }
+            let secrets = secrets.clone();
+            joins.push(std::thread::spawn(move || {
+                let mbx = Mailbox::new(counted);
+                let me = mbx.id();
+                // Owner 0 supplies each value; sharing a held value is free.
+                let shares: Vec<PartyShare> =
+                    secrets.iter().map(|&v| share_component(v, 0, me)).collect();
+                reveal_batch_party(&shares, 7, me, &mbx)
+            }));
+        }
+        let outs: Vec<Vec<Fr>> = joins
+            .into_iter()
+            .map(|j| j.join().expect("panic"))
+            .collect();
+        for o in &outs {
+            assert_eq!(o, &expected, "every party must open the same values");
+        }
+        let stats = comm.unwrap().stats();
+        assert_eq!(
+            stats.messages, 1,
+            "a batched reveal is one directed message per party, got {}",
+            stats.messages
+        );
+    }
 
     /// Component sharings must be constructible with no communication and
     /// must reconstruct the original additive components. This is what makes
@@ -845,8 +1322,11 @@ mod tests {
         for owner in 0..N {
             let ss = secrets.clone();
             let batched = run_parties(move |me, mbx| {
-                let vals: Vec<Fr> =
-                    if me == owner { ss.clone() } else { vec![0; ss.len()] };
+                let vals: Vec<Fr> = if me == owner {
+                    ss.clone()
+                } else {
+                    vec![0; ss.len()]
+                };
                 let shares = share_input_batch(&vals, 0, owner, me, &mbx);
                 (0..shares.len())
                     .map(|k| reveal(&shares[k], 1000 + k as u64, None, me, &mbx))
@@ -862,7 +1342,10 @@ mod tests {
                     })
                     .collect::<Vec<Fr>>()
             });
-            assert_eq!(batched[0], secrets, "batched sharing must reconstruct the inputs");
+            assert_eq!(
+                batched[0], secrets,
+                "batched sharing must reconstruct the inputs"
+            );
             assert_eq!(
                 batched[0], scalar[0],
                 "batched and scalar input sharing must agree (owner {owner})"
@@ -896,7 +1379,10 @@ mod tests {
         // were a public function of op_id (the old bug's shape), it would be
         // identical regardless of the secret; the α mask must make it differ.
         use crate::crypto::net::PrfKeys;
-        let keys = PrfKeys { mine: [1u8; 32], prev: [2u8; 32] };
+        let keys = PrfKeys {
+            mine: [1u8; 32],
+            prev: [2u8; 32],
+        };
         let z1 = |xr: u128| {
             // party 1 holds (x1,x2),(y1,y2); vary its x-share.
             let a = PartyShare { left: xr, right: 3 };
@@ -907,13 +1393,28 @@ mod tests {
                 .wrapping_add(a.right.wrapping_mul(b.left))
                 .wrapping_add(keys.alpha(100))
         };
-        assert_ne!(z1(11), z1(12), "reshared component must depend on the secret share");
+        assert_ne!(
+            z1(11),
+            z1(12),
+            "reshared component must depend on the secret share"
+        );
         // And the α that masks it is genuinely zero-sum across a key ring.
-        let k0 = PrfKeys { mine: [1u8; 32], prev: [3u8; 32] };
-        let k1 = PrfKeys { mine: [2u8; 32], prev: [1u8; 32] };
-        let k2 = PrfKeys { mine: [3u8; 32], prev: [2u8; 32] };
+        let k0 = PrfKeys {
+            mine: [1u8; 32],
+            prev: [3u8; 32],
+        };
+        let k1 = PrfKeys {
+            mine: [2u8; 32],
+            prev: [1u8; 32],
+        };
+        let k2 = PrfKeys {
+            mine: [3u8; 32],
+            prev: [2u8; 32],
+        };
         assert_eq!(
-            k0.alpha(100).wrapping_add(k1.alpha(100)).wrapping_add(k2.alpha(100)),
+            k0.alpha(100)
+                .wrapping_add(k1.alpha(100))
+                .wrapping_add(k2.alpha(100)),
             0,
             "the three parties' α must cancel"
         );
@@ -927,14 +1428,20 @@ mod tests {
     fn a2b_batch_matches_plaintext() {
         let nbits = 16;
         let vals: Vec<i64> = vec![0, 3, 255, -1, 1024, -300, 4095, -2048];
-        let expected: Vec<u128> =
-            vals.iter().map(|&v| (v as i128).rem_euclid(1i128 << nbits) as u128).collect();
+        let expected: Vec<u128> = vals
+            .iter()
+            .map(|&v| (v as i128).rem_euclid(1i128 << nbits) as u128)
+            .collect();
         let got = run_parties(move |me, mbx| {
             let shares: Vec<PartyShare> = vals
                 .iter()
                 .enumerate()
                 .map(|(i, &v)| {
-                    let fr: Fr = if me == 0 { (v as i128).rem_euclid(1i128 << nbits) as u128 } else { 0 };
+                    let fr: Fr = if me == 0 {
+                        (v as i128).rem_euclid(1i128 << nbits) as u128
+                    } else {
+                        0
+                    };
                     share_input(fr, i as u64, 0, me, &mbx)
                 })
                 .collect();
@@ -944,7 +1451,8 @@ mod tests {
                 .enumerate()
                 .map(|(i, bits)| {
                     bits.iter().enumerate().fold(0u128, |acc, (k, b)| {
-                        acc | ((reveal(b, 20_000 + (i * nbits + k) as u64, None, me, &mbx) & 1) << k)
+                        acc | ((reveal(b, 20_000 + (i * nbits + k) as u64, None, me, &mbx) & 1)
+                            << k)
                     })
                 })
                 .collect::<Vec<u128>>()
@@ -961,7 +1469,11 @@ mod tests {
         let cases: Vec<i64> = vec![0, 1, 2, 5, 255, 1024, 4095, -1, -2, -7, -2048];
         for &v in &cases {
             let out = run_parties(move |me, mbx| {
-                let fr: Fr = if me == 0 { (v as i128).rem_euclid(1i128 << nbits) as u128 } else { 0 };
+                let fr: Fr = if me == 0 {
+                    (v as i128).rem_euclid(1i128 << nbits) as u128
+                } else {
+                    0
+                };
                 let sh = share_input(fr, 0, me, 0, &mbx);
                 let bits = a2b_party(&sh, nbits, 1_000, me, &mbx);
                 bits.iter()

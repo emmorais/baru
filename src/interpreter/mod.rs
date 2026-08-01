@@ -4,6 +4,7 @@ pub mod ast;
 pub mod backend;
 pub mod eval;
 pub mod hashcons;
+pub mod malicious_backend;
 pub mod parser;
 pub mod transport_backend;
 

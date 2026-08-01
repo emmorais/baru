@@ -25,17 +25,22 @@
 //!
 //! # Security notes, stated rather than implied
 //!
-//! * **Semi-honest.** The receiver's `R` is uniform regardless of `c`, so sender
-//!   privacy of the *choice* holds even against a malicious receiver; but this
-//!   implementation does no proof of knowledge, so a malicious sender can send a
-//!   low-order or otherwise malformed `S`. Ristretto is the mitigation that
-//!   matters here — its encoding is canonical and cofactor-free, so there are no
-//!   small-subgroup points to send in the first place.
+//! * **Malicious receiver.** The receiver's `R` is uniform regardless of `c`, so
+//!   sender privacy of the *choice* holds unconditionally.
+//! * **Malformed points.** Ristretto's encoding is canonical and cofactor-free,
+//!   so there are no small-subgroup points to send in the first place, and both
+//!   sides reject anything that fails to decompress. This is handled.
+//! * **Malicious sender.** Chou–Orlandi's argument needs the sender to *know*
+//!   the discrete log of `S`; the original paper left that implicit and the gap
+//!   was later shown to matter. [`Sender::new_proved`] / [`verify_setup`] add
+//!   the Schnorr proof that closes it, at two extra group elements per batch
+//!   (not per OT). The unproved [`Sender::new`] remains for the semi-honest
+//!   measurements.
 //! * **Randomness.** Scalars are drawn as 64 uniform bytes reduced mod `q`
 //!   (`from_bytes_mod_order_wide`), which is unbiased, rather than by rejection
 //!   sampling on 32.
 //! * `a` is reused across a batch of OTs, which is what makes a batch cheap;
-//!   the per-index hash domain separation in [`super::hash_block`] is what keeps
+//!   the per-index hash domain separation in `super::hash_block` is what keeps
 //!   the derived keys independent.
 
 use curve25519_dalek::constants::RISTRETTO_BASEPOINT_TABLE;
@@ -83,10 +88,68 @@ impl Payload {
     }
 }
 
+/// Check a sender's [`SetupProof`] before using its `S`.
+///
+/// Returns `Err` when the proof does not verify, which means the sender does
+/// not know the discrete log of the point it sent — the one deviation left open
+/// to a malicious sender once Ristretto has ruled out malformed encodings.
+pub fn verify_setup(setup: &Setup, proof: &SetupProof) -> Result<(), String> {
+    let s_point = CompressedRistretto(setup.0)
+        .decompress()
+        .ok_or("sender setup is not a valid Ristretto point")?;
+    let t_point = CompressedRistretto(proof.t)
+        .decompress()
+        .ok_or("proof commitment is not a valid Ristretto point")?;
+    let z = Option::<Scalar>::from(Scalar::from_canonical_bytes(proof.z))
+        .ok_or("proof scalar is not canonical")?;
+    let e = schnorr_challenge(&setup.0, &proof.t);
+    if RISTRETTO_BASEPOINT_TABLE * &z == t_point + e * s_point {
+        Ok(())
+    } else {
+        Err("sender's proof of knowledge does not verify".to_string())
+    }
+}
+
 /// Sender state between the two rounds.
 pub struct Sender {
     a: Scalar,
     s_point: RistrettoPoint,
+}
+
+/// A Schnorr proof of knowledge of the sender's `a` in `S = aG`.
+///
+/// Chou–Orlandi's security argument requires the sender to actually *know* the
+/// discrete log of `S`; the original "simplest OT" paper left this implicit and
+/// the gap was later shown to matter. Ristretto already rules out malformed and
+/// small-order points — its encoding is canonical and cofactor-free — so this
+/// proof closes the one deviation that remains for a malicious sender.
+///
+/// Non-interactive by Fiat–Shamir: `e = H(S ‖ T)`, `z = k + e·a`, verified as
+/// `zG = T + e·S`. Two extra points on the wire, once per batch rather than per
+/// OT.
+#[derive(Debug, Clone, Copy)]
+pub struct SetupProof {
+    pub t: [u8; POINT_BYTES],
+    pub z: [u8; 32],
+}
+
+impl SetupProof {
+    pub fn bytes(&self) -> usize {
+        POINT_BYTES + 32
+    }
+}
+
+/// Fiat–Shamir challenge binding the statement to the commitment.
+fn schnorr_challenge(s: &[u8; POINT_BYTES], t: &[u8; POINT_BYTES]) -> Scalar {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(b"baru/ot/base/schnorr/v1");
+    h.update(s);
+    h.update(t);
+    let d = h.finalize();
+    let mut wide = [0u8; 64];
+    wide[..32].copy_from_slice(&d);
+    Scalar::from_bytes_mod_order_wide(&wide)
 }
 
 impl Sender {
@@ -95,6 +158,18 @@ impl Sender {
         let s_point = RISTRETTO_BASEPOINT_TABLE * &a;
         let setup = Setup(s_point.compress().to_bytes());
         (Sender { a, s_point }, setup)
+    }
+
+    /// [`Sender::new`] plus a proof of knowledge of `a` — the malicious-sender
+    /// hardening. The receiver checks it with [`verify_setup`].
+    pub fn new_proved(rng: &mut impl Rng) -> (Self, Setup, SetupProof) {
+        let (sender, setup) = Self::new(rng);
+        let k = random_scalar(rng);
+        let t_point = RISTRETTO_BASEPOINT_TABLE * &k;
+        let t = t_point.compress().to_bytes();
+        let e = schnorr_challenge(&setup.0, &t);
+        let z = k + e * sender.a;
+        (sender, setup, SetupProof { t, z: z.to_bytes() })
     }
 
     /// Derive the two keys per OT from the receiver's points.
@@ -239,6 +314,49 @@ pub fn simulate(
             rounds: 2,
         },
     ))
+}
+
+#[cfg(test)]
+mod proof_tests {
+    use super::*;
+
+    #[test]
+    fn an_honest_setup_proof_verifies() {
+        let mut rng = rand::thread_rng();
+        let (_s, setup, proof) = Sender::new_proved(&mut rng);
+        assert!(verify_setup(&setup, &proof).is_ok());
+    }
+
+    /// A sender that did not generate `S` as `aG` for a known `a` cannot
+    /// produce a proof for it — which is exactly the deviation the proof exists
+    /// to rule out.
+    #[test]
+    fn a_proof_does_not_transfer_to_another_point() {
+        let mut rng = rand::thread_rng();
+        let (_s1, setup1, proof1) = Sender::new_proved(&mut rng);
+        let (_s2, setup2, _proof2) = Sender::new_proved(&mut rng);
+        assert!(
+            verify_setup(&setup2, &proof1).is_err(),
+            "a proof for one point must not verify against another"
+        );
+        assert!(verify_setup(&setup1, &proof1).is_ok(), "control");
+    }
+
+    #[test]
+    fn a_tampered_proof_is_rejected() {
+        let mut rng = rand::thread_rng();
+        let (_s, setup, mut proof) = Sender::new_proved(&mut rng);
+        proof.z[0] ^= 1;
+        assert!(verify_setup(&setup, &proof).is_err());
+    }
+
+    #[test]
+    fn malformed_proof_encodings_are_refused_not_panicked_on() {
+        let mut rng = rand::thread_rng();
+        let (_s, setup, mut proof) = Sender::new_proved(&mut rng);
+        proof.t = [0xff; POINT_BYTES];
+        assert!(verify_setup(&setup, &proof).is_err());
+    }
 }
 
 #[cfg(test)]

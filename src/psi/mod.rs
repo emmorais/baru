@@ -6,14 +6,14 @@
 //! more. The obvious approaches are both wrong:
 //!
 //! * Exchange the raw sets — discloses everything.
-//! * Exchange **hashes** of the sets — [`naive_hash`], and the one people
+//! * Exchange **hashes** of the sets — `naive_hash`, and the one people
 //!   actually ship. Patient identifiers are low-entropy (names, dates, national
 //!   IDs with check digits), so the receiver just enumerates the space and
 //!   inverts the hashes offline. It is not PSI; it is obfuscation.
 //!
 //! # What is implemented: DH-based PSI
 //!
-//! [`dh`] is the Meadows / Huberman–Franklin–Neuman construction over
+//! `dh` is the Meadows / Huberman–Franklin–Neuman construction over
 //! Ristretto255. It needs no oblivious transfer, which is the point of building
 //! it first: the research agenda assumed "PSI (from OT)", and this is the
 //! baseline that assumption has to beat. Whether it does is a cost question, and

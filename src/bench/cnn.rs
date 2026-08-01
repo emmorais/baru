@@ -80,7 +80,7 @@
 //!    16 224 round trips for D=28's 5408-wide conv output. That was 19.1 s of
 //!    a 20.4 s MPC segment — 88% of end-to-end runtime — while the ReLU it
 //!    was importing values for cost 0.6 s. Batching it
-//!    ([`import_raw_batch`]) costs the same bytes in three rounds: 19.1 s →
+//!    (`import_raw_batch`) costs the same bytes in three rounds: 19.1 s →
 //!    8 ms, and end-to-end 21.8 s → 2.6 s.
 //! 3. Only *then* do the comparisons matter, and [`Nonlin::Gc`] takes the
 //!    MPC segment a further 1.9×.
@@ -91,7 +91,7 @@
 //! 5. With MPC down to a fraction, the same breakdown applied to the FHE side
 //!    ([`FhePhases`]) showed **48% of it was encrypting scheme-switch masks**
 //!    — 39 of the inference's 52 encryptions. Masks are uniform and
-//!    query-independent, so `--precompute` ([`MaskPool`]) moves them offline:
+//!    query-independent, so `--precompute` (`MaskPool`) moves them offline:
 //!    online 1979 ms → 1312 ms here, 4.94 s → 2.90 s on the medical model.
 //!
 //! The cost centre is now the **FHE arithmetic proper** — the ct×ct products,
@@ -113,8 +113,8 @@ use serde::Serialize;
 use crate::bench::comm::{CommStats, NetworkProfile};
 use crate::bench::hybrid_nn::{run_parties, sleep_link, MpcTransport};
 use crate::crypto::types::Fr;
-use crate::fhe::conv_pack::{self, ConvShape};
 use crate::fhe::bfv::{Bfv, BfvCt, BfvParams};
+use crate::fhe::conv_pack::{self, ConvShape};
 use crate::gadgets::{argmax, maxpool2d, Chw};
 use crate::interpreter::backend::{Backend, ShareRef};
 use crate::interpreter::transport_backend::TransportBackend;
@@ -155,9 +155,9 @@ impl ConvLayer {
 }
 
 pub struct CnnModel {
-    pub d: usize,        // input side length (1 channel)
+    pub d: usize,               // input side length (1 channel)
     pub kernels: Vec<Vec<i64>>, // first conv: [OC][K*K]
-    pub cbias: Vec<i64>, // [OC]
+    pub cbias: Vec<i64>,        // [OC]
     /// Additional conv layers after the first (each followed by ReLU∘rescale
     /// and max-pool). Empty for the shallow model `bench-cnn` exercises; one
     /// or more for a deeper trained CNN. Every extra conv is one more
@@ -172,7 +172,7 @@ pub struct CnnModel {
     /// MPC ReLU + scheme switch — no bootstrap, at any depth.
     pub hidden: Vec<(Vec<Vec<i64>>, Vec<i64>)>,
     pub dense_w: Vec<Vec<i64>>, // [NCLASSES][flat or last hidden width]
-    pub dense_b: Vec<i64>, // [NCLASSES]
+    pub dense_b: Vec<i64>,      // [NCLASSES]
     pub shift: u32,
     pub nbits: usize,
     pub conv_shape: Chw, // OC × (D-2) × (D-2)
@@ -181,7 +181,10 @@ pub struct CnnModel {
 
 impl CnnModel {
     pub fn random(d: usize, seed: u64) -> (Self, Vec<i64>) {
-        assert!((d - (K - 1)).is_multiple_of(POOL), "conv output side must be even for pooling");
+        assert!(
+            (d - (K - 1)).is_multiple_of(POOL),
+            "conv output side must be even for pooling"
+        );
         let oh = d - (K - 1);
         let ph = oh / POOL;
         let flat = OC * ph * ph;
@@ -208,8 +211,16 @@ impl CnnModel {
             dense_b,
             shift,
             nbits: 20, // provisional; calibrated below
-            conv_shape: Chw { c: OC, h: oh, w: oh },
-            pool_shape: Chw { c: OC, h: ph, w: ph },
+            conv_shape: Chw {
+                c: OC,
+                h: oh,
+                w: oh,
+            },
+            pool_shape: Chw {
+                c: OC,
+                h: ph,
+                w: ph,
+            },
         };
         // Size the plaintext modulus `t = 2^nbits` from the **measured**
         // activation range rather than a hardcoded width. `forward` is pure
@@ -245,9 +256,17 @@ impl CnnModel {
         shift: u32,
         sample_inputs: &[Vec<i64>],
     ) -> Self {
-        assert_eq!(dense_w.len(), dense_b.len(), "dense weights/bias length mismatch");
+        assert_eq!(
+            dense_w.len(),
+            dense_b.len(),
+            "dense weights/bias length mismatch"
+        );
         for (w, b) in &hidden {
-            assert_eq!(w.len(), b.len(), "hidden layer weights/bias length mismatch");
+            assert_eq!(
+                w.len(),
+                b.len(),
+                "hidden layer weights/bias length mismatch"
+            );
         }
         let oc = kernels.len();
         let oh = d - (K - 1);
@@ -262,8 +281,16 @@ impl CnnModel {
             dense_b,
             shift,
             nbits: 20,
-            conv_shape: Chw { c: oc, h: oh, w: oh },
-            pool_shape: Chw { c: oc, h: ph, w: ph },
+            conv_shape: Chw {
+                c: oc,
+                h: oh,
+                w: oh,
+            },
+            pool_shape: Chw {
+                c: oc,
+                h: ph,
+                w: ph,
+            },
         };
         // Calibrate nbits from the worst activation seen over the samples.
         let mut max_abs = 1i64;
@@ -271,7 +298,10 @@ impl CnnModel {
             max_abs = max_abs.max(model.forward(x).1);
         }
         let needed = (64 - (max_abs.max(1) as u64).leading_zeros() as usize) + 2;
-        assert!(needed <= 30, "trained model needs 2^{needed}, past the noise budget");
+        assert!(
+            needed <= 30,
+            "trained model needs 2^{needed}, past the noise budget"
+        );
         model.nbits = needed.max(20);
         model
     }
@@ -290,6 +320,28 @@ impl CnnModel {
         self.dense_w.len()
     }
 
+    /// The layer stack as a one-line string, read off the model itself.
+    ///
+    /// How many convs and hidden dense layers there are is a property of the
+    /// trained weights (the trainer's `--conv`/`--fc`), not of this code, so a
+    /// benchmark banner that spells the architecture out as a literal goes
+    /// stale the moment a deeper model is trained — the same drift the
+    /// generated weight files exist to prevent.
+    pub fn architecture(&self) -> String {
+        let mut s = format!(
+            "1×{0}×{0} → conv({1}, {K}×{K}) → ReLU → pool",
+            self.d,
+            self.out_channels()
+        );
+        for cl in &self.extra_conv {
+            s += &format!(" → conv({}, {K}×{K}) → ReLU → pool", cl.out_c());
+        }
+        for (w, _) in &self.hidden {
+            s += &format!(" → dense(→{}) → ReLU", w.len());
+        }
+        s + &format!(" → dense(→{}) → argmax", self.nclasses())
+    }
+
     fn conv_dot(&self, input: &[i64], oc: usize, oy: usize, ox: usize) -> i64 {
         let mut acc = 0i64;
         for ky in 0..K {
@@ -303,6 +355,19 @@ impl CnnModel {
     /// Exact plaintext forward pass mirroring the hybrid's fused semantics.
     /// Returns `(class, max_abs_intermediate)`.
     pub fn forward(&self, input: &[i64]) -> (usize, i64) {
+        let (logits, max_abs) = self.forward_logits(input);
+        (crate::gadgets::argmax_ref(&logits), max_abs)
+    }
+
+    /// As [`CnnModel::forward`], but returning the raw output-layer logits
+    /// rather than just the argmax.
+    ///
+    /// Ranking metrics need a score, not a decision: AUC — the metric MedMNIST
+    /// leads with — is a property of how the logits *order* the test set, and
+    /// is invisible to a benchmark that only ever sees `argmax`. The encrypted
+    /// pipeline deliberately reveals only the class, so this is a
+    /// plaintext-side measurement of the same weights.
+    pub fn forward_logits(&self, input: &[i64]) -> (Vec<i64>, i64) {
         let oh = self.conv_shape.h;
         let out_c = self.out_channels();
         let mut max_abs = input.iter().map(|v| v.abs()).max().unwrap_or(0);
@@ -347,7 +412,11 @@ impl CnnModel {
             }
             let (p, ps) = crate::gadgets::maxpool2d_ref(
                 &act,
-                Chw { c: cl.out_c(), h: coh, w: cow },
+                Chw {
+                    c: cl.out_c(),
+                    h: coh,
+                    w: cow,
+                },
                 POOL,
                 POOL,
             );
@@ -382,9 +451,8 @@ impl CnnModel {
                 v
             })
             .collect();
-        (crate::gadgets::argmax_ref(&logits), max_abs)
+        (logits, max_abs)
     }
-
 }
 
 // ─── Hybrid FHE matvec + scheme-switch to opened shares ───────────────────────
@@ -418,12 +486,24 @@ fn weight_polys(s: &Bfv, model: &CnnModel) -> Vec<Vec<u64>> {
     let t_mask = s.params.t() - 1;
     let mut out: Vec<Vec<u64>> = Vec::new();
 
-    let conv1 = ConvShape { in_c: 1, h: model.d, w: model.d, kh: K, kw: K };
+    let conv1 = ConvShape {
+        in_c: 1,
+        h: model.d,
+        w: model.d,
+        kh: K,
+        kw: K,
+    };
     for kernel in &model.kernels {
         out.push(conv_pack::pack_kernel(kernel, conv1, n, t_mask));
     }
     for cl in &model.extra_conv {
-        let shape = ConvShape { in_c: cl.in_c, h: cl.in_h, w: cl.in_w, kh: K, kw: K };
+        let shape = ConvShape {
+            in_c: cl.in_c,
+            h: cl.in_h,
+            w: cl.in_w,
+            kh: K,
+            kw: K,
+        };
         for kernel in &cl.kernels {
             out.push(conv_pack::pack_kernel(kernel, shape, n, t_mask));
         }
@@ -476,7 +556,10 @@ impl EncryptedModel {
             .iter()
             .map(|p| s.transform(&s.encrypt_poly_pre(ek, p)))
             .collect();
-        EncryptedModel { cts, offline_ms: ms(t) }
+        EncryptedModel {
+            cts,
+            offline_ms: ms(t),
+        }
     }
 }
 
@@ -495,11 +578,17 @@ struct Weights<'a> {
 
 impl<'a> Weights<'a> {
     fn online() -> Self {
-        Weights { model: None, next: 0 }
+        Weights {
+            model: None,
+            next: 0,
+        }
     }
 
     fn session(model: &'a EncryptedModel) -> Self {
-        Weights { model: Some(model), next: 0 }
+        Weights {
+            model: Some(model),
+            next: 0,
+        }
     }
 
     /// The next weight operand, and the product of it with the pre-transformed
@@ -609,9 +698,8 @@ impl MaskPool {
         let t = Instant::now();
         let triples = (0..count)
             .map(|_| {
-                let plain: [Vec<u64>; 3] = std::array::from_fn(|_| {
-                    (0..n).map(|_| rng.gen::<u64>() & t_mask).collect()
-                });
+                let plain: [Vec<u64>; 3] =
+                    std::array::from_fn(|_| (0..n).map(|_| rng.gen::<u64>() & t_mask).collect());
                 let mut combined: Option<BfvCt> = None;
                 for m in &plain {
                     let enc = s.encrypt_poly_pre(ek, m);
@@ -620,10 +708,17 @@ impl MaskPool {
                         Some(acc) => s.add(&acc, &enc),
                     });
                 }
-                MaskTriple { plain, combined: combined.expect("three parties") }
+                MaskTriple {
+                    plain,
+                    combined: combined.expect("three parties"),
+                }
             })
             .collect();
-        MaskPool { triples, offline_ms: ms(t), drawn: 0 }
+        MaskPool {
+            triples,
+            offline_ms: ms(t),
+            drawn: 0,
+        }
     }
 
     fn draw(&mut self) -> MaskTriple {
@@ -655,7 +750,11 @@ fn masks_src(pool: &mut Option<MaskPool>) -> Masks<'_> {
 fn last_feature_shape(model: &CnnModel) -> Chw {
     let mut shape = model.pool_shape;
     for cl in &model.extra_conv {
-        shape = Chw { c: cl.out_c(), h: cl.out_h() / POOL, w: cl.out_w() / POOL };
+        shape = Chw {
+            c: cl.out_c(),
+            h: cl.out_h() / POOL,
+            w: cl.out_w() / POOL,
+        };
     }
     shape
 }
@@ -710,6 +809,10 @@ impl Masks<'_> {
     }
 }
 
+// The BFV context, its three keys and the two offline sources are each
+// independent here; the network profile and RNG are threaded through every
+// hybrid step alike.
+#[allow(clippy::too_many_arguments)]
 fn hybrid_matvec_open(
     s: &Bfv,
     ek: &crate::fhe::bfv::EncryptKey,
@@ -735,8 +838,7 @@ fn hybrid_matvec_open(
     let mut masks = Vec::with_capacity(weights.len());
     for chunk in weights.chunks(rows_per_chunk) {
         let prod = weights_src.mul_next(s, ek, &cxt, || s.pack_weights(chunk), &mut ph);
-        let (chunk_masks, mask_ct, conv_bytes) =
-            masks_src.take(s, ek, n, t_mask, rng, &mut ph);
+        let (chunk_masks, mask_ct, conv_bytes) = masks_src.take(s, ek, n, t_mask, rng, &mut ph);
         let masked = s.add(&prod, &mask_ct);
         let t = Instant::now();
         let y = s.decrypt_poly_pre(dk, &masked);
@@ -745,7 +847,11 @@ fn hybrid_matvec_open(
         for r in 0..chunk.len() {
             let pos = s.matvec_output_position(in_dim, r);
             opened.push(y[pos]);
-            masks.push([chunk_masks[0][pos], chunk_masks[1][pos], chunk_masks[2][pos]]);
+            masks.push([
+                chunk_masks[0][pos],
+                chunk_masks[1][pos],
+                chunk_masks[2][pos],
+            ]);
         }
     }
     (opened, masks, ph)
@@ -756,6 +862,9 @@ fn hybrid_matvec_open(
 /// pre-activations and per-output masks flattened in `(oc, oy, ox)` order —
 /// the same layout the MPC stage and the plaintext reference use.
 #[allow(clippy::type_complexity)]
+// Same shape as `hybrid_matvec_open`: context, keys, offline sources and the
+// layer's own geometry, none of which group into a cohesive struct.
+#[allow(clippy::too_many_arguments)]
 fn hybrid_conv_open(
     s: &Bfv,
     ek: &crate::fhe::bfv::EncryptKey,
@@ -797,8 +906,7 @@ fn hybrid_conv_open(
 
         // Fresh masks per output channel (reuse across channels would leak
         // the difference of their pre-activations).
-        let (chan_masks, mask_ct, conv_bytes) =
-            masks_src.take(s, ek, n, t_mask, rng, &mut ph);
+        let (chan_masks, mask_ct, conv_bytes) = masks_src.take(s, ek, n, t_mask, rng, &mut ph);
         let masked = s.add(&prod, &mask_ct);
         let t = Instant::now();
         let y = s.decrypt_poly_pre(dk, &masked);
@@ -850,6 +958,9 @@ fn pack_shares_to_fhe(
 /// max-pool — returning each party's additive share components of the pooled
 /// feature map (channel-major) plus the communication cost. Shared by the
 /// first conv and every extra conv layer.
+// The opened conv output, its masks, bias and shape, plus the quantisation
+// shift, ring width, network profile and protocol choice — all independent.
+#[allow(clippy::too_many_arguments)]
 fn mpc_conv_relu_pool(
     conv_open: Vec<u64>,
     conv_masks: Vec<[u64; 3]>,
@@ -866,7 +977,7 @@ fn mpc_conv_relu_pool(
         let conv_masks = conv_masks.clone();
         let cbias = cbias.clone();
         move |be: &mut TransportBackend<MpcTransport>| {
-            be.set_gc_nonlinearities(nonlin == Nonlin::Gc);
+            be.set_nonlin(nonlin.mode());
             // Reconstruct + bias every conv output locally (share_secret / add
             // are communication-free), then run the whole ReLU layer as one
             // batched a2b + one batched multiply, then max-pool.
@@ -884,16 +995,43 @@ fn mpc_conv_relu_pool(
                 })
                 .collect();
             let import_ms = ms(t);
-            let t = Instant::now();
-            let relu = fused_relu_rescale(be, &vs, shift, nbits, nonlin);
-            let relu_ms = ms(t);
+            // Max-pool BEFORE the nonlinearity, not after.
+            //
+            // `relu∘rescale` is monotonic non-decreasing, so it commutes with
+            // `max`:  maxpool(f(v)) == f(maxpool(v)).  Pooling first shrinks
+            // the ReLU layer by `POOL²` — 4× here — and the comparisons the
+            // pool itself costs are unchanged, so this is a strict reduction
+            // in nonlinearity work, not a trade.
+            //
+            // Two things make it safe. The comparison now sees *pre*-activation
+            // values, which can be negative: `lt` is the MSB of `a − b`, i.e.
+            // signed, so that is fine. And `a − b` must stay inside the
+            // two's-complement range — it does, because `nbits` is calibrated
+            // as `max_abs.bit_length() + 2` over exactly these values, so
+            // |a|,|b| < 2^(nbits−2) and |a−b| < 2^(nbits−1). Those two bits of
+            // headroom are what this relies on; shrinking them would break it.
+            //
             // `maxpool2d` reduces to `lt_batch`, which the backend flag above
             // has already routed — the gadget itself is protocol-agnostic.
             let t = Instant::now();
-            let (pooled, _) = maxpool2d(be, &relu, conv_shape, POOL, POOL);
+            let (pooled, _) = maxpool2d(be, &vs, conv_shape, POOL, POOL);
             let pool_ms = ms(t);
-            let comps = pooled.iter().map(|p| be.my_additive_component(p)).collect::<Vec<Fr>>();
-            (comps, MpcPhases { import_ms, relu_ms, pool_ms, ..Default::default() })
+            let t = Instant::now();
+            let relu = fused_relu_rescale(be, &pooled, shift, nbits, nonlin);
+            let relu_ms = ms(t);
+            let comps = relu
+                .iter()
+                .map(|p| be.my_additive_component(p))
+                .collect::<Vec<Fr>>();
+            (
+                comps,
+                MpcPhases {
+                    import_ms,
+                    relu_ms,
+                    pool_ms,
+                    ..Default::default()
+                },
+            )
         }
     });
     // Every party runs the same protocol in lockstep, so party 0's split is
@@ -929,7 +1067,7 @@ pub struct FhePhases {
     /// Decrypting the masked product to open a layer.
     pub decrypt_ms: f64,
     /// Re-encrypting MPC shares back into a ciphertext (the switch's return
-    /// leg, [`pack_shares_to_fhe`]).
+    /// leg, `pack_shares_to_fhe`).
     pub reencrypt_ms: f64,
     /// How many `encrypt_poly` calls the whole inference made, by purpose.
     pub n_weight_enc: usize,
@@ -1007,7 +1145,11 @@ fn import_raw_batch(
         .collect();
     let mut acc: Option<Vec<ShareRef>> = None;
     for owner in 0..3 {
-        let vals: Vec<Fr> = if me == owner { my_comps.clone() } else { vec![0; count] };
+        let vals: Vec<Fr> = if me == owner {
+            my_comps.clone()
+        } else {
+            vec![0; count]
+        };
         let shs = be.share_secret_batch(&vals, nbits, owner);
         acc = Some(match acc {
             None => shs,
@@ -1043,6 +1185,11 @@ fn fused_relu_rescale(
         // One garble round for the whole layer, versus ~log(nbits) rounds of
         // decomposition plus a batched multiply for the sign gate.
         Nonlin::Gc => be.relu_gc_batch(vs, nbits, shift as usize),
+        // Falcon has no fused relu∘rescale: its ReLU and its truncation are
+        // separate protocols. Routing the fused form through the generic
+        // `lt`-based path keeps the semantics identical, at the cost of not
+        // exercising `Π_ReLU` directly — see `falcon-reproduction.md`.
+        Nonlin::Falcon => fused_relu_rescale_batch(be, vs, shift, nbits),
     }
 }
 
@@ -1136,13 +1283,36 @@ pub enum Nonlin {
     A2b,
     /// Three-party garbled circuits, one round per layer.
     Gc,
+    /// Falcon's `wrap3` sign extraction over `Z_p` — the lowest-bandwidth of
+    /// the three, and the one a bandwidth-bound deployment should pick.
+    Falcon,
 }
 
 impl Nonlin {
+    /// The backend switch this selects.
+    pub fn mode(self) -> crate::interpreter::transport_backend::NonlinMode {
+        use crate::interpreter::transport_backend::NonlinMode as M;
+        match self {
+            Nonlin::A2b => M::A2b,
+            Nonlin::Gc => M::Gc,
+            Nonlin::Falcon => M::Falcon,
+        }
+    }
+
     pub fn label(self) -> &'static str {
         match self {
             Nonlin::A2b => "a2b (batched bit decomposition)",
             Nonlin::Gc => "gc (3-party garbled, constant-round)",
+            Nonlin::Falcon => "falcon (wrap3 over Z_p, lowest bandwidth)",
+        }
+    }
+
+    /// The bare protocol name, for table headers where [`Nonlin::label`] would not fit.
+    pub fn short(self) -> &'static str {
+        match self {
+            Nonlin::A2b => "a2b",
+            Nonlin::Gc => "gc",
+            Nonlin::Falcon => "falcon",
         }
     }
 }
@@ -1190,9 +1360,16 @@ impl CnnSession {
     pub fn new(model: &CnnModel, precompute: bool) -> Self {
         // RLWE-secure parameters: n=4096, q=2^100 is at/below the 128-bit bound
         // of ~109 for n=4096 (HomomorphicEncryption.org).
-        let s = Bfv::new(BfvParams { n: 4096, log2_q: 100, log2_t: model.nbits as u32 });
+        let s = Bfv::new(BfvParams {
+            n: 4096,
+            log2_q: 100,
+            log2_t: model.nbits as u32,
+        });
         let n_in = model.d * model.d;
-        assert!((n_in + 1) <= s.params.n, "input too large for coefficient packing");
+        assert!(
+            (n_in + 1) <= s.params.n,
+            "input too large for coefficient packing"
+        );
 
         // Keygen FIRST: everything below must be encrypted under the *same* key
         // the products are, or the masked ciphertext will not decrypt. An early
@@ -1210,7 +1387,14 @@ impl CnnSession {
         let ek = s.encrypt_key(&ck);
         let enc_model = precompute.then(|| EncryptedModel::encrypt(&s, &ek, &polys));
         let dk = s.decrypt_key(&ck);
-        CnnSession { s, dk, ek, enc_model, n_weight_cts, keygen_ms }
+        CnnSession {
+            s,
+            dk,
+            ek,
+            enc_model,
+            n_weight_cts,
+            keygen_ms,
+        }
     }
 
     /// Per-session offline cost: keygen plus, when precomputing, the encrypted
@@ -1262,16 +1446,24 @@ pub fn run_cnn_hybrid_in_session(
     let (mut fhe_ms, mut mpc_ms) = (0.0, 0.0);
     let mut comm = CommStats::default();
     let mut rng = rand::thread_rng();
-    let mut fhe_ph = FhePhases::default();
-    fhe_ph.keygen_ms = session.keygen_ms;
+    let mut fhe_ph = FhePhases {
+        keygen_ms: session.keygen_ms,
+        ..Default::default()
+    };
 
     // ── Offline, before the clock starts ──
     // The masks depend only on the network's *shape*, not on the patient's
     // image, so a deployment generates them while waiting for work. `total_ms`
     // is therefore the latency of a query against a warm server, which is the
     // quantity a deployment is judged on.
-    let mut pool = precompute
-        .then(|| MaskPool::with_len(s, &session.ek, session.n_weight_cts, &mut rand::thread_rng()));
+    let mut pool = precompute.then(|| {
+        MaskPool::with_len(
+            s,
+            &session.ek,
+            session.n_weight_cts,
+            &mut rand::thread_rng(),
+        )
+    });
     let offline_session_ms = session.offline_ms();
     let offline_query_ms = pool.as_ref().map_or(0.0, |p| p.offline_ms);
     let offline_ms = offline_session_ms + offline_query_ms;
@@ -1295,9 +1487,25 @@ pub fn run_cnn_hybrid_in_session(
     // *is* the sliding-window convolution and every output pixel of that
     // channel appears at once. See `fhe::conv_pack`.
     let t0 = Instant::now();
-    let conv1_shape = ConvShape { in_c: 1, h: model.d, w: model.d, kh: K, kw: K };
-    let (conv_open, conv_masks, ph) =
-        hybrid_conv_open(s, &session.ek, &c_input, conv1_shape, &model.kernels, profile, &mut rng, &mut masks_src(&mut pool), &mut weights_src, &session.dk);
+    let conv1_shape = ConvShape {
+        in_c: 1,
+        h: model.d,
+        w: model.d,
+        kh: K,
+        kw: K,
+    };
+    let (conv_open, conv_masks, ph) = hybrid_conv_open(
+        s,
+        &session.ek,
+        &c_input,
+        conv1_shape,
+        &model.kernels,
+        profile,
+        &mut rng,
+        &mut masks_src(&mut pool),
+        &mut weights_src,
+        &session.dk,
+    );
     fhe_ph.add(&ph);
     fhe_ms += t0.elapsed().as_secs_f64() * 1000.0;
 
@@ -1305,11 +1513,17 @@ pub fn run_cnn_hybrid_in_session(
     let t0 = Instant::now();
     let mut phases = MpcPhases::default();
     let (mut per_party_feat, conv_comm, ph) = mpc_conv_relu_pool(
-        conv_open, conv_masks, model.cbias.clone(), model.conv_shape, shift, nbits, profile,
+        conv_open,
+        conv_masks,
+        model.cbias.clone(),
+        model.conv_shape,
+        shift,
+        nbits,
+        profile,
         nonlin,
     );
     phases.add(&ph);
-    comm = CommStats { messages: comm.messages + conv_comm.messages, bytes: comm.bytes + conv_comm.bytes };
+    comm = comm + conv_comm;
     mpc_ms += t0.elapsed().as_secs_f64() * 1000.0;
     let mut feat_shape = model.pool_shape;
 
@@ -1318,32 +1532,63 @@ pub fn run_cnn_hybrid_in_session(
     //    conv is just the same three steps composed again — no bootstrap. ──
     for cl in &model.extra_conv {
         let tc = Instant::now();
-        let (c_conv_in, _, ph) = pack_shares_to_fhe(s, &session.ek, &per_party_feat, t_mask, profile);
+        let (c_conv_in, _, ph) =
+            pack_shares_to_fhe(s, &session.ek, &per_party_feat, t_mask, profile);
         fhe_ph.add(&ph);
-        let shape = ConvShape { in_c: cl.in_c, h: cl.in_h, w: cl.in_w, kh: K, kw: K };
-        let (co, cm, ph) =
-            hybrid_conv_open(s, &session.ek, &c_conv_in, shape, &cl.kernels, profile, &mut rng, &mut masks_src(&mut pool), &mut weights_src, &session.dk);
+        let shape = ConvShape {
+            in_c: cl.in_c,
+            h: cl.in_h,
+            w: cl.in_w,
+            kh: K,
+            kw: K,
+        };
+        let (co, cm, ph) = hybrid_conv_open(
+            s,
+            &session.ek,
+            &c_conv_in,
+            shape,
+            &cl.kernels,
+            profile,
+            &mut rng,
+            &mut masks_src(&mut pool),
+            &mut weights_src,
+            &session.dk,
+        );
         fhe_ph.add(&ph);
         fhe_ms += tc.elapsed().as_secs_f64() * 1000.0;
 
         let tm = Instant::now();
-        let out_shape = Chw { c: cl.out_c(), h: cl.out_h(), w: cl.out_w() };
-        let (feat2, comm2, ph2) =
-            mpc_conv_relu_pool(co, cm, cl.cbias.clone(), out_shape, shift, nbits, profile, nonlin);
-        phases.add(&ph2);
-        comm = CommStats {
-            messages: comm.messages + comm2.messages,
-            bytes: comm.bytes + comm2.bytes,
+        let out_shape = Chw {
+            c: cl.out_c(),
+            h: cl.out_h(),
+            w: cl.out_w(),
         };
+        let (feat2, comm2, ph2) = mpc_conv_relu_pool(
+            co,
+            cm,
+            cl.cbias.clone(),
+            out_shape,
+            shift,
+            nbits,
+            profile,
+            nonlin,
+        );
+        phases.add(&ph2);
+        comm = comm + comm2;
         mpc_ms += tm.elapsed().as_secs_f64() * 1000.0;
         per_party_feat = feat2;
-        feat_shape = Chw { c: cl.out_c(), h: cl.out_h() / POOL, w: cl.out_w() / POOL };
+        feat_shape = Chw {
+            c: cl.out_c(),
+            h: cl.out_h() / POOL,
+            w: cl.out_w() / POOL,
+        };
     }
 
     // ── Switch pooled features → packed FHE dense input ──
     let t0 = Instant::now();
     let flat = feat_shape.c * feat_shape.h * feat_shape.w;
-    let (mut c_dense_in, _, ph) = pack_shares_to_fhe(s, &session.ek, &per_party_feat, t_mask, profile);
+    let (mut c_dense_in, _, ph) =
+        pack_shares_to_fhe(s, &session.ek, &per_party_feat, t_mask, profile);
     fhe_ph.add(&ph);
     let mut dense_in_dim = flat;
     fhe_ms += t0.elapsed().as_secs_f64() * 1000.0;
@@ -1354,8 +1599,18 @@ pub fn run_cnn_hybrid_in_session(
     //    switch again" invariant made concrete for arbitrary depth. ──
     for (hidden_w, hidden_b) in model.hidden.clone() {
         let th = Instant::now();
-        let (hidden_open, hidden_masks, ph) =
-            hybrid_matvec_open(s, &session.ek, &c_dense_in, &hidden_w, dense_in_dim, profile, &mut rng, &mut masks_src(&mut pool), &mut weights_src, &session.dk);
+        let (hidden_open, hidden_masks, ph) = hybrid_matvec_open(
+            s,
+            &session.ek,
+            &c_dense_in,
+            &hidden_w,
+            dense_in_dim,
+            profile,
+            &mut rng,
+            &mut masks_src(&mut pool),
+            &mut weights_src,
+            &session.dk,
+        );
         fhe_ph.add(&ph);
         fhe_ms += th.elapsed().as_secs_f64() * 1000.0;
 
@@ -1366,7 +1621,7 @@ pub fn run_cnn_hybrid_in_session(
             let hidden_masks = hidden_masks.clone();
             let hidden_b = hidden_b.clone();
             move |be: &mut TransportBackend<MpcTransport>| {
-                be.set_gc_nonlinearities(nonlin == Nonlin::Gc);
+                be.set_nonlin(nonlin.mode());
                 let t = Instant::now();
                 let raws = import_raw_batch(be, me, &hidden_open, &hidden_masks, h, nbits);
                 let vs: Vec<ShareRef> = raws
@@ -1381,22 +1636,28 @@ pub fn run_cnn_hybrid_in_session(
                 let t = Instant::now();
                 let act = fused_relu_rescale(be, &vs, shift, nbits, nonlin);
                 let relu_ms = ms(t);
-                let comps =
-                    act.iter().map(|p| be.my_additive_component(p)).collect::<Vec<Fr>>();
-                (comps, MpcPhases { import_ms, relu_ms, ..Default::default() })
+                let comps = act
+                    .iter()
+                    .map(|p| be.my_additive_component(p))
+                    .collect::<Vec<Fr>>();
+                (
+                    comps,
+                    MpcPhases {
+                        import_ms,
+                        relu_ms,
+                        ..Default::default()
+                    },
+                )
             }
         });
         phases.add(&per_party_hidden[0].1);
-        let per_party_hidden: Vec<Vec<Fr>> =
-            per_party_hidden.into_iter().map(|(c, _)| c).collect();
-        comm = CommStats {
-            messages: comm.messages + hidden_comm.messages,
-            bytes: comm.bytes + hidden_comm.bytes,
-        };
+        let per_party_hidden: Vec<Vec<Fr>> = per_party_hidden.into_iter().map(|(c, _)| c).collect();
+        comm = comm + hidden_comm;
         mpc_ms += t1.elapsed().as_secs_f64() * 1000.0;
 
         let t2 = Instant::now();
-        let (c_hidden, _, ph) = pack_shares_to_fhe(s, &session.ek, &per_party_hidden, t_mask, profile);
+        let (c_hidden, _, ph) =
+            pack_shares_to_fhe(s, &session.ek, &per_party_hidden, t_mask, profile);
         fhe_ph.add(&ph);
         c_dense_in = c_hidden;
         dense_in_dim = h;
@@ -1432,7 +1693,7 @@ pub fn run_cnn_hybrid_in_session(
             // `argmax` reduces over scalar `lt`, not `lt_batch`, so the GC flag
             // does not reach it — deliberately: it is `nclasses−1` comparisons
             // against a layer's thousands, and the phase breakdown shows it.
-            be.set_gc_nonlinearities(nonlin == Nonlin::Gc);
+            be.set_nonlin(nonlin.mode());
             let raws = import_raw_batch(be, me, &dense_open, &dense_masks, nclasses, nbits);
             let logits: Vec<ShareRef> = raws
                 .iter()
@@ -1447,12 +1708,15 @@ pub fn run_cnn_hybrid_in_session(
             let argmax_ms = ms(t);
             (
                 (be.reveal(&idx, None) as u64 & (t_mask)) as usize,
-                MpcPhases { argmax_ms, ..Default::default() },
+                MpcPhases {
+                    argmax_ms,
+                    ..Default::default()
+                },
             )
         }
     });
     phases.add(&classes[0].1);
-    comm = CommStats { messages: comm.messages + argmax_comm.messages, bytes: comm.bytes + argmax_comm.bytes };
+    comm = comm + argmax_comm;
     mpc_ms += t0.elapsed().as_secs_f64() * 1000.0;
     let class = classes[0].0;
 
@@ -1485,7 +1749,13 @@ pub fn run_cnn_hybrid_in_session(
         conv_mults: model.out_channels()
             + model.extra_conv.iter().map(|c| c.out_c()).sum::<usize>(),
         conv_mults_toeplitz: conv_pack::toeplitz_multiplications(
-            ConvShape { in_c: 1, h: model.d, w: model.d, kh: K, kw: K },
+            ConvShape {
+                in_c: 1,
+                h: model.d,
+                w: model.d,
+                kh: K,
+                kw: K,
+            },
             model.out_channels(),
             BfvParams::DEFAULT.n,
         ),
@@ -1581,23 +1851,41 @@ pub fn run_cli(args: &[String]) -> Result<(), String> {
             }
             "--json" => json = true,
             "--gc" => nonlin = Nonlin::Gc,
+            "--falcon" => nonlin = Nonlin::Falcon,
             "--both" => both = true,
             "--precompute" => precompute = true,
             "--img" => {
                 i += 1;
-                d = args.get(i).ok_or("--img needs a value")?.parse().map_err(|_| "bad img".to_string())?;
+                d = args
+                    .get(i)
+                    .ok_or("--img needs a value")?
+                    .parse()
+                    .map_err(|_| "bad img".to_string())?;
             }
             "--rtt-ms" => {
                 i += 1;
-                rtt_ms = args.get(i).ok_or("--rtt-ms needs a value")?.parse().map_err(|_| "bad rtt-ms".to_string())?;
+                rtt_ms = args
+                    .get(i)
+                    .ok_or("--rtt-ms needs a value")?
+                    .parse()
+                    .map_err(|_| "bad rtt-ms".to_string())?;
             }
             "--bandwidth-mbps" => {
                 i += 1;
-                bandwidth_mbps = Some(args.get(i).ok_or("--bandwidth-mbps needs a value")?.parse().map_err(|_| "bad bandwidth".to_string())?);
+                bandwidth_mbps = Some(
+                    args.get(i)
+                        .ok_or("--bandwidth-mbps needs a value")?
+                        .parse()
+                        .map_err(|_| "bad bandwidth".to_string())?,
+                );
             }
             "--seed" => {
                 i += 1;
-                seed = args.get(i).ok_or("--seed needs a value")?.parse().map_err(|_| "bad seed".to_string())?;
+                seed = args
+                    .get(i)
+                    .ok_or("--seed needs a value")?
+                    .parse()
+                    .map_err(|_| "bad seed".to_string())?;
             }
             other => return Err(format!("unknown option '{other}'\n{USAGE}")),
         }
@@ -1622,16 +1910,24 @@ pub fn run_cli(args: &[String]) -> Result<(), String> {
                 .iter()
                 .map(|(n, r)| cnn_point(d, *n, r))
                 .collect();
-            println!("{}", serde_json::to_string_pretty(&pts).map_err(|e| e.to_string())?);
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&pts).map_err(|e| e.to_string())?
+            );
             return Ok(());
         }
         println!("Private CNN classifier — nonlinearity protocol head-to-head");
         println!("architecture: 1×{d}×{d} → conv({OC},{K}×{K}) → ReLU → maxpool({POOL}×{POOL}) → dense(→{NCLASSES}) → argmax");
         println!(
             "network: rtt={rtt_ms}ms, bandwidth={}\n",
-            bandwidth_mbps.map(|b| format!("{b}Mbps")).unwrap_or_else(|| "unlimited".into())
+            bandwidth_mbps
+                .map(|b| format!("{b}Mbps"))
+                .unwrap_or_else(|| "unlimited".into())
         );
-        println!("  {:<34}  {:>10}  {:>10}  {:>12}  {:>10}", "nonlinearity", "total", "mpc", "wire bytes", "class");
+        println!(
+            "  {:<34}  {:>10}  {:>10}  {:>12}  {:>10}",
+            "nonlinearity", "total", "mpc", "wire bytes", "class"
+        );
         for (n, r) in [(Nonlin::A2b, &a), (Nonlin::Gc, &g)] {
             println!(
                 "  {:<34}  {:>8.0}ms  {:>8.0}ms  {:>12}  {:>10}",
@@ -1668,7 +1964,10 @@ pub fn run_cli(args: &[String]) -> Result<(), String> {
 
     if json {
         let p = cnn_point(d, nonlin, &r);
-        println!("{}", serde_json::to_string_pretty(&p).map_err(|e| e.to_string())?);
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&p).map_err(|e| e.to_string())?
+        );
         return Ok(());
     }
 
@@ -1680,9 +1979,19 @@ pub fn run_cli(args: &[String]) -> Result<(), String> {
     println!("image AND weights encrypted; only the class index is revealed");
     println!(
         "network: rtt={rtt_ms}ms, bandwidth={}\n",
-        bandwidth_mbps.map(|b| format!("{b}Mbps")).unwrap_or_else(|| "unlimited".into())
+        bandwidth_mbps
+            .map(|b| format!("{b}Mbps"))
+            .unwrap_or_else(|| "unlimited".into())
     );
-    println!("  predicted class : {}  ({})", r.class, if r.correct { "exact vs plaintext" } else { "WRONG" });
+    println!(
+        "  predicted class : {}  ({})",
+        r.class,
+        if r.correct {
+            "exact vs plaintext"
+        } else {
+            "WRONG"
+        }
+    );
     println!(
         "  FHE parameters  : BFV n={}, q=2^{}, t=2^{} (RLWE-secure, 128-bit)",
         r.ring_n, r.log2_q, r.log2_t
@@ -1695,7 +2004,10 @@ pub fn run_cli(args: &[String]) -> Result<(), String> {
         r.conv_mults_toeplitz as f64 / r.conv_mults as f64
     );
     println!("  nonlinearity    : {}", nonlin.label());
-    println!("  time            : total {:.0}ms  (fhe {:.0}ms, mpc {:.0}ms)", r.total_ms, r.fhe_ms, r.mpc_ms);
+    println!(
+        "  time            : total {:.0}ms  (fhe {:.0}ms, mpc {:.0}ms)",
+        r.total_ms, r.fhe_ms, r.mpc_ms
+    );
     println!(
         "  offline         : {:.0}ms  (query-independent, NOT in total)",
         r.offline_ms
@@ -1732,13 +2044,87 @@ pub fn run_cli(args: &[String]) -> Result<(), String> {
         "  mpc breakdown   : import {:.0}ms, relu {:.0}ms, pool {:.0}ms, argmax {:.0}ms",
         r.phases.import_ms, r.phases.relu_ms, r.phases.pool_ms, r.phases.argmax_ms
     );
-    println!("  MPC wire traffic: {} messages, {} bytes", r.comm.messages, r.comm.bytes);
+    println!(
+        "  MPC wire traffic: {} messages, {} bytes",
+        r.comm.messages, r.comm.bytes
+    );
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Why the nonlinearity is a garbled *comparator* plus an **arithmetic**
+    /// select, rather than one fused garbled max-of-4.
+    ///
+    /// Measured 2026-08-01 at N=5256 (the pool's comparison count for
+    /// pneumonia), solving the two-point cost model:
+    ///
+    /// | | |
+    /// |---|---|
+    /// | `lt_batch` (19 AND + 1-bit Y2A) | 43.1 ms |
+    /// | `mul_batch` (Beaver select) | 5.1 ms |
+    /// | `relu_gc` (31 AND + 12-bit Y2A) | 68.4 ms |
+    /// | ⇒ per AND-gate column | **2.28 ms** |
+    /// | ⇒ per Y2A output bit | **≈ 0** |
+    ///
+    /// So the cost is **proportional to AND-gate count**; the Y2A conversion is
+    /// free and the Beaver select is 11% of an `lt`+`mul` pair. That kills the
+    /// obvious fusion: a garbled max-of-4 would replace three cheap arithmetic
+    /// selects with three garbled muxes, taking a 2×2 window from 88 AND gates
+    /// to 148 — **1.68× more work** to remove 11%. The current split is right,
+    /// and this probe is what says so.
+    ///
+    /// It also says where a real win must come from: 158 144 AND gates per
+    /// inference is the whole nonlinearity budget, so beating it means not
+    /// garbling the comparison at all (Falcon's wrap-based DReLU), not
+    /// rearranging what is garbled.
+    #[test]
+    #[ignore] // profiling probe, real 3-party transport
+    fn profile_lt_versus_mul_under_gc() {
+        const N: usize = 5256; // the pool's comparison count for pneumonia
+        let (out, _) = run_parties(NetworkProfile::INSTANT, |me| {
+            move |be: &mut TransportBackend<MpcTransport>| {
+                be.set_gc_nonlinearities(true);
+                let a: Vec<ShareRef> = (0..N)
+                    .map(|i| be.share_secret(if me == 0 { i as u128 % 977 } else { 0 }, 20, 0))
+                    .collect();
+                let b: Vec<ShareRef> = (0..N)
+                    .map(|i| be.share_secret(if me == 0 { i as u128 % 613 } else { 0 }, 20, 0))
+                    .collect();
+                let pairs: Vec<(ShareRef, ShareRef)> =
+                    a.iter().cloned().zip(b.iter().cloned()).collect();
+
+                let t = Instant::now();
+                let conds = be.lt_batch(&pairs);
+                let lt_ms = ms(t);
+
+                let mul_pairs: Vec<(ShareRef, ShareRef)> = conds
+                    .iter()
+                    .zip(a.iter().zip(b.iter()))
+                    .map(|(c, (x, y))| (c.clone(), be.sub(y, x)))
+                    .collect();
+                let t = Instant::now();
+                let _ = be.mul_batch(&mul_pairs);
+                let mul_ms = ms(t);
+
+                let t = Instant::now();
+                let _ = be.relu_gc_batch(&a, 20, 8);
+                let relu_ms = ms(t);
+                (lt_ms, mul_ms, relu_ms)
+            }
+        });
+        let (lt, mul, relu) = out[0];
+        println!(
+            "\n  N={N}\n  lt_batch  (garbled comparator + Y2A) : {lt:.1} ms\n  \
+             mul_batch (Beaver select)            : {mul:.1} ms\n  \
+             relu_gc   (comparator+rescale + Y2A) : {relu:.1} ms\n  \
+             -> Beaver select is {:.0}% of an lt+mul pair, so fusing max-of-4 into\n     \
+             one garbled circuit trades 88 AND gates/window for 148 — a loss.\n",
+            mul / (lt + mul) * 100.0
+        );
+    }
 
     #[test]
     #[ignore] // uses the real 3-party transport
@@ -1753,7 +2139,11 @@ mod tests {
                 (be.reveal(&lt, None) as i64, be.reveal(&m, None) as i64)
             }
         });
-        assert_eq!(out[0], (0, 9), "lt(9,6) should be 0 and max2(9,6) should be 9");
+        assert_eq!(
+            out[0],
+            (0, 9),
+            "lt(9,6) should be 0 and max2(9,6) should be 9"
+        );
     }
 
     #[test]
@@ -1800,8 +2190,16 @@ mod tests {
             let (model, input) = CnnModel::random(d, seed);
             let a = run_cnn_hybrid_with(&model, &input, NetworkProfile::INSTANT, Nonlin::A2b);
             let g = run_cnn_hybrid_with(&model, &input, NetworkProfile::INSTANT, Nonlin::Gc);
-            assert!(a.correct, "d={d} seed={seed}: a2b class {} != plaintext {}", a.class, a.expected);
-            assert!(g.correct, "d={d} seed={seed}: gc class {} != plaintext {}", g.class, g.expected);
+            assert!(
+                a.correct,
+                "d={d} seed={seed}: a2b class {} != plaintext {}",
+                a.class, a.expected
+            );
+            assert!(
+                g.correct,
+                "d={d} seed={seed}: gc class {} != plaintext {}",
+                g.class, g.expected
+            );
             assert_eq!(a.class, g.class, "d={d} seed={seed}: protocols disagree");
             assert_eq!(g.bootstraps, 0, "the GC route must not change the FHE side");
         }
@@ -1820,11 +2218,22 @@ mod tests {
         for (d, seed) in [(8usize, 1u64), (10, 5)] {
             let (model, input) = CnnModel::random(d, seed);
             for nonlin in [Nonlin::A2b, Nonlin::Gc] {
-                let on = run_cnn_hybrid_full(&model, &input, NetworkProfile::INSTANT, nonlin, false);
-                let pre = run_cnn_hybrid_full(&model, &input, NetworkProfile::INSTANT, nonlin, true);
-                assert!(on.correct && pre.correct, "d={d} seed={seed}: must match plaintext");
-                assert_eq!(pre.class, on.class, "d={d} seed={seed}: precompute changed the class");
-                assert_eq!(pre.fhe_phases.n_mask_enc, 0, "online path still encrypted masks");
+                let on =
+                    run_cnn_hybrid_full(&model, &input, NetworkProfile::INSTANT, nonlin, false);
+                let pre =
+                    run_cnn_hybrid_full(&model, &input, NetworkProfile::INSTANT, nonlin, true);
+                assert!(
+                    on.correct && pre.correct,
+                    "d={d} seed={seed}: must match plaintext"
+                );
+                assert_eq!(
+                    pre.class, on.class,
+                    "d={d} seed={seed}: precompute changed the class"
+                );
+                assert_eq!(
+                    pre.fhe_phases.n_mask_enc, 0,
+                    "online path still encrypted masks"
+                );
                 assert_eq!(
                     pre.fhe_phases.n_weight_enc, 0,
                     "d={d} seed={seed}: online path still encrypted the model"
@@ -1833,9 +2242,18 @@ mod tests {
                     pre.fhe_phases.weights_ms == 0.0,
                     "d={d} seed={seed}: model encryption still charged to the online phase"
                 );
-                assert!(on.fhe_phases.n_weight_enc > 0, "the control must encrypt online");
-                assert!(pre.offline_ms > on.offline_ms, "the model's cost must move offline");
-                assert!(pre.offline_ms > 0.0, "offline work must be reported, not hidden");
+                assert!(
+                    on.fhe_phases.n_weight_enc > 0,
+                    "the control must encrypt online"
+                );
+                assert!(
+                    pre.offline_ms > on.offline_ms,
+                    "the model's cost must move offline"
+                );
+                assert!(
+                    pre.offline_ms > 0.0,
+                    "offline work must be reported, not hidden"
+                );
             }
         }
         // The two-conv model exercises the multi-layer size prediction for both
@@ -1843,8 +2261,14 @@ mod tests {
         // are where a count goes wrong.
         let (model, input, _) = two_conv_model();
         let pre = run_cnn_hybrid_full(&model, &input, NetworkProfile::INSTANT, Nonlin::Gc, true);
-        assert!(pre.correct, "two-conv: the precomputed preamble must still be exact");
-        assert_eq!(pre.fhe_phases.n_weight_enc, 0, "two-conv: model not fully precomputed");
+        assert!(
+            pre.correct,
+            "two-conv: the precomputed preamble must still be exact"
+        );
+        assert_eq!(
+            pre.fhe_phases.n_weight_enc, 0,
+            "two-conv: model not fully precomputed"
+        );
     }
 
     /// The encrypted model is **per-session**, so a second query in the same
@@ -1856,7 +2280,11 @@ mod tests {
     #[ignore]
     fn the_encrypted_model_is_reused_across_queries_in_a_session() {
         let (model, _) = CnnModel::random(8, 3);
-        let s = Bfv::new(BfvParams { n: 4096, log2_q: 100, log2_t: model.nbits as u32 });
+        let s = Bfv::new(BfvParams {
+            n: 4096,
+            log2_q: 100,
+            log2_t: model.nbits as u32,
+        });
         let (ck, _sk) = s.keygen();
         let polys = weight_polys(&s, &model);
         let ek = s.encrypt_key(&ck);
@@ -1937,7 +2365,10 @@ mod tests {
         let (m28, i28) = CnnModel::random(28, 1);
         let small = run_cnn_hybrid_with(&m8, &i8v, NetworkProfile::INSTANT, Nonlin::Gc);
         let big = run_cnn_hybrid_with(&m28, &i28, NetworkProfile::INSTANT, Nonlin::Gc);
-        assert!(small.correct && big.correct, "batching must not change the class");
+        assert!(
+            small.correct && big.correct,
+            "batching must not change the class"
+        );
         // 288 activations versus 5408, an 18.8× wider layer. Per-element
         // resharing would put the message counts in that ratio.
         assert!(
@@ -1974,7 +2405,13 @@ mod tests {
             .map(|_| (0..OC * K * K).map(|_| rng.gen_range(-2i64..=2)).collect())
             .collect();
         let cbias: Vec<i64> = (0..c2).map(|_| rng.gen_range(-4i64..=4)).collect();
-        model.extra_conv = vec![ConvLayer { kernels, cbias, in_c: OC, in_h: 7, in_w: 7 }];
+        model.extra_conv = vec![ConvLayer {
+            kernels,
+            cbias,
+            in_c: OC,
+            in_h: 7,
+            in_w: 7,
+        }];
         // dense now takes the two-conv flat = c2 * 2 * 2 = 16.
         let flat2 = c2 * 2 * 2;
         model.dense_w = (0..NCLASSES)
@@ -1992,7 +2429,11 @@ mod tests {
     fn two_conv_hybrid_matches_plaintext() {
         let (model, input, c2) = two_conv_model();
         let r = run_cnn_hybrid(&model, &input, NetworkProfile::INSTANT);
-        assert!(r.correct, "two-conv: encrypted class {} != plaintext {}", r.class, r.expected);
+        assert!(
+            r.correct,
+            "two-conv: encrypted class {} != plaintext {}",
+            r.class, r.expected
+        );
         assert_eq!(r.bootstraps, 0);
         assert_eq!(
             r.conv_mults,
@@ -2010,13 +2451,18 @@ mod tests {
     fn conv_packing_classifies_a_full_mnist_sized_image() {
         let (model, input) = CnnModel::random(28, 7);
         let r = run_cnn_hybrid(&model, &input, NetworkProfile::INSTANT);
-        assert!(r.correct, "encrypted class {} != plaintext {}", r.class, r.expected);
+        assert!(
+            r.correct,
+            "encrypted class {} != plaintext {}",
+            r.class, r.expected
+        );
         assert_eq!(r.bootstraps, 0);
         assert_eq!(r.conv_mults, OC, "one ct×ct multiply per output channel");
         assert!(
             r.conv_mults_toeplitz > 100 * r.conv_mults,
             "expected a large win over Toeplitz, got {} vs {}",
-            r.conv_mults_toeplitz, r.conv_mults
+            r.conv_mults_toeplitz,
+            r.conv_mults
         );
     }
 
@@ -2031,8 +2477,16 @@ mod tests {
         let (model, input) = CnnModel::random(8, 21);
         let r = run_cnn_hybrid(&model, &input, NetworkProfile::INSTANT);
         assert_eq!(r.ring_n, 4096, "ring dimension");
-        assert!(r.log2_q <= 109, "q=2^{} exceeds the 128-bit bound for n=4096", r.log2_q);
-        assert!(r.log2_t <= 30, "t=2^{} past the depth-1 noise budget", r.log2_t);
+        assert!(
+            r.log2_q <= 109,
+            "q=2^{} exceeds the 128-bit bound for n=4096",
+            r.log2_q
+        );
+        assert!(
+            r.log2_t <= 30,
+            "t=2^{} past the depth-1 noise budget",
+            r.log2_t
+        );
         assert!(r.correct && r.bootstraps == 0);
     }
 
@@ -2051,7 +2505,8 @@ mod tests {
         assert!(
             big.fhe_ms < 4.0 * small.fhe_ms,
             "FHE time should be near-flat in D: {:.0}ms at D=8 vs {:.0}ms at D=28",
-            small.fhe_ms, big.fhe_ms
+            small.fhe_ms,
+            big.fhe_ms
         );
     }
 }

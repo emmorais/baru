@@ -19,7 +19,7 @@
 //! |---|---|---|---|
 //! | schoolbook | this file | O(n²) 256-bit MACs | the original; the thing that was replaced |
 //! | multi-modular NTT | [`crate::fhe::ntt`] | O(n log n) word ops × 4 primes | hand-written, ~200 lines we maintain |
-//! | NTL + GMP | [`crate::fhe::ntl`] | NTL's own choice | mature C++; needs `--features ntl` |
+//! | NTL + GMP | `crate::fhe::ntl` | NTL's own choice | mature C++; needs `--features ntl` |
 //!
 //! Timings are **total wall clock per product**, marshalling included — the
 //! NTL column pays for converting `2n` limbs into GMP integers and `4n` limbs
@@ -56,7 +56,9 @@ use crate::fhe::ntt::{self, I256};
 fn sample(n: usize, bits: u32, seed: u64) -> Vec<i128> {
     let mut s = seed | 1;
     let mut next = || {
-        s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        s = s
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         s >> 1
     };
     (0..n)
@@ -64,7 +66,11 @@ fn sample(n: usize, bits: u32, seed: u64) -> Vec<i128> {
             let hi = next() as u128;
             let lo = next() as u128;
             let mag = (((hi << 64) | lo) % (1u128 << bits)) as i128;
-            if hi & 1 == 0 { mag } else { -mag }
+            if hi & 1 == 0 {
+                mag
+            } else {
+                -mag
+            }
         })
         .collect()
 }
@@ -87,7 +93,11 @@ fn schoolbook(a: &[i128], b: &[i128], n: usize) -> Vec<I256> {
         let lo = (p00 & 0xFFFF_FFFF_FFFF_FFFF) | (mid << 64);
         let hi = p11 + (p01 >> 64) + (p10 >> 64) + (mid >> 64);
         let m = I256::from_hi_lo(hi, lo);
-        if neg { m.wrapping_neg() } else { m }
+        if neg {
+            m.wrapping_neg()
+        } else {
+            m
+        }
     }
     let mut acc = vec![I256::ZERO; n];
     for (i, &ai) in a.iter().enumerate() {
@@ -149,7 +159,12 @@ pub struct Report {
 
 /// Time one ring dimension. Returns an error if the implementations disagree —
 /// a differential failure is a bug, not a slow result.
-pub fn run_one(n: usize, coeff_bits: u32, reps: usize, schoolbook_max: usize) -> Result<Point, String> {
+pub fn run_one(
+    n: usize,
+    coeff_bits: u32,
+    reps: usize,
+    schoolbook_max: usize,
+) -> Result<Point, String> {
     let a = sample(n, coeff_bits, 0xA11CE ^ n as u64);
     let b = sample(n, coeff_bits, 0xB0B ^ n as u64);
 
@@ -169,7 +184,10 @@ pub fn run_one(n: usize, coeff_bits: u32, reps: usize, schoolbook_max: usize) ->
 
     #[cfg(feature = "ntl")]
     let ntl_ms = {
-        let (t, out) = time(|| crate::fhe::ntl::exact_negacyclic_product(&a, &b, n), reps);
+        let (t, out) = time(
+            || crate::fhe::ntl::exact_negacyclic_product(&a, &b, n),
+            reps,
+        );
         agree &= out == ntt_out;
         Some(t)
     };
@@ -200,7 +218,12 @@ pub fn run_one(n: usize, coeff_bits: u32, reps: usize, schoolbook_max: usize) ->
     })
 }
 
-pub fn run(sizes: &[usize], coeff_bits: u32, reps: usize, schoolbook_max: usize) -> Result<Report, String> {
+pub fn run(
+    sizes: &[usize],
+    coeff_bits: u32,
+    reps: usize,
+    schoolbook_max: usize,
+) -> Result<Report, String> {
     let points = sizes
         .iter()
         .map(|&n| run_one(n, coeff_bits, reps, schoolbook_max))
@@ -211,7 +234,10 @@ pub fn run(sizes: &[usize], coeff_bits: u32, reps: usize, schoolbook_max: usize)
     #[cfg(not(feature = "ntl"))]
     let ntl_version: Option<String> = None;
 
-    Ok(Report { ntl_version, points })
+    Ok(Report {
+        ntl_version,
+        points,
+    })
 }
 
 // ─── CLI ─────────────────────────────────────────────────────────────────────
@@ -253,7 +279,11 @@ pub fn run_cli(args: &[String]) -> Result<(), String> {
                 let v = it.next().ok_or("--sizes needs a value")?;
                 sizes = v
                     .split(',')
-                    .map(|s| s.trim().parse::<usize>().map_err(|_| format!("bad size {s}")))
+                    .map(|s| {
+                        s.trim()
+                            .parse::<usize>()
+                            .map_err(|_| format!("bad size {s}"))
+                    })
                     .collect::<Result<_, _>>()?;
             }
             "--coeff-bits" => {
@@ -294,7 +324,10 @@ pub fn run_cli(args: &[String]) -> Result<(), String> {
     let r = run(&sizes, coeff_bits, reps, schoolbook_max)?;
 
     if json {
-        println!("{}", serde_json::to_string_pretty(&r).map_err(|e| e.to_string())?);
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&r).map_err(|e| e.to_string())?
+        );
         return Ok(());
     }
 
@@ -346,7 +379,10 @@ mod tests {
         for n in [8usize, 64] {
             let a = sample(n, 40, 3);
             let b = sample(n, 40, 9);
-            assert_eq!(schoolbook(&a, &b, n), ntt::exact_negacyclic_product(&a, &b, n));
+            assert_eq!(
+                schoolbook(&a, &b, n),
+                ntt::exact_negacyclic_product(&a, &b, n)
+            );
         }
     }
 

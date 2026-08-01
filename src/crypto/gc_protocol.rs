@@ -37,9 +37,24 @@
 //! For now the roles are fixed: garblers are parties 0 and 1, the evaluator is
 //! party 2. Rotating the evaluator (to balance load, or to garble the layers
 //! whose inputs a given party is missing) is a straightforward generalization
-//! left for later. This is a **semi-honest** protocol; the malicious upgrade
-//! (both garblers send + the evaluator/co-garbler cross-check, batched at the
-//! end) is sketched in `docs/malicious-hybrid.md` and not implemented here.
+//! left for later.
+//!
+//! # Security: still semi-honest, with one deviation point closed
+//!
+//! [`gc_lt_batch_table_checked`] adds the garbled-table cross-check, which
+//! catches a garbler that substitutes a circuit computing a different function
+//! — the strongest attack available here — for 32 bytes per batch.
+//!
+//! That is **not** sufficient for malicious security, and this module does not
+//! claim it. The OT-free construction that makes this leg fast is exactly what
+//! blocks the rest: because `x = s₀+s₁` is known to garbler 0 alone, no other
+//! party can recompute its input labels, so replication does not reach them.
+//! [`GC_MALICIOUS_GAPS`] states the three remaining deviations precisely and
+//! gives the three-input-adder design that closes them.
+//!
+//! Callers that need maliciously secure comparisons should use the `a2b` route
+//! in [`crate::crypto::aby3_verify::lt_batch_checked`], which is complete; the
+//! garbled leg is a latency optimisation, off by default.
 //!
 //! # Output (Y2A)
 //!
@@ -55,6 +70,7 @@ use crate::crypto::aby3_protocol::{
 };
 use crate::crypto::garbled::{eval_and, eval_xor, AndTable, Garbler, Label};
 use crate::crypto::net::{serialize_msg, Mailbox, MpcMsg, PartyId, Transport};
+use crate::crypto::security::{Abort, AbortReason, Checked};
 use crate::crypto::types::Fr;
 
 const LABEL_BYTES: usize = 16;
@@ -140,7 +156,11 @@ impl Shape {
     }
     /// Garble one item, returning `(input_zero_labels_x, input_zero_labels_y,
     /// tables, per-output-bit garbler mask)`.
-    fn garble(&self, g: &mut Garbler, nbits: usize) -> (Vec<Label>, Vec<Label>, Vec<AndTable>, Vec<bool>) {
+    fn garble(
+        &self,
+        g: &mut Garbler,
+        nbits: usize,
+    ) -> (Vec<Label>, Vec<Label>, Vec<AndTable>, Vec<bool>) {
         match self {
             Shape::Comparator => {
                 let c = g.garble_comparator(nbits);
@@ -158,7 +178,13 @@ impl Shape {
 /// two summands, evaluate one item and return the observed output bits
 /// (`out ⊕ mask`). Mirrors the gate order and deterministic tweaks of the
 /// garbler (`crypto::garbled`), so no tweaks travel on the wire.
-fn eval_item(shape: Shape, nbits: usize, tables: &[AndTable], xa: &[Label], ya: &[Label]) -> Vec<bool> {
+fn eval_item(
+    shape: Shape,
+    nbits: usize,
+    tables: &[AndTable],
+    xa: &[Label],
+    ya: &[Label],
+) -> Vec<bool> {
     // Ripple-carry adder over the two summands, shared by both shapes.
     // Produces the `nbits` sum labels (mod 2^nbits); ANDs consume tables 0..nbits-1.
     let mut s = vec![[0u8; LABEL_BYTES]; nbits];
@@ -179,7 +205,11 @@ fn eval_item(shape: Shape, nbits: usize, tables: &[AndTable], xa: &[Label], ya: 
             };
             let and = eval_and(&u, &v, &tables[ti], 2 * i as u64);
             ti += 1;
-            carry = if carry_const0 { and } else { eval_xor(&and, &carry) };
+            carry = if carry_const0 {
+                and
+            } else {
+                eval_xor(&and, &carry)
+            };
             carry_const0 = false;
         }
     }
@@ -213,12 +243,34 @@ struct GcOutput {
     masks: Vec<Vec<bool>>,
     /// Evaluator only: `observed[item][bit]`.
     observed: Vec<Vec<bool>>,
+    /// Evaluator only, checked path only: garbler 1's table digest disagreed
+    /// with what garbler 0 shipped.
+    table_mismatch: bool,
 }
 
 /// Run the garble/evaluate round for `n` items of the given `shape`. `xs`/`ys`
 /// are the per-item summand values (`x = s₀+s₁` on garbler 0, `y = s₂` on
 /// garbler 1); ignored on the other parties. `op_id` tags the two garbler
 /// messages.
+/// Digest of a garbler's tables for the whole batch, used by the checked path
+/// to detect a garbler that ships a circuit computing the wrong function.
+fn table_digest(all: &[Vec<AndTable>]) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(b"baru/gc/tables/v1");
+    for item in all {
+        for t in item {
+            h.update(t.tg);
+            h.update(t.te);
+        }
+    }
+    h.finalize().into()
+}
+
+// `(op_id, me, mbx)` is the protocol-call convention; the rest — shape, width,
+// both operand vectors, the verify flag — are independent inputs with nothing
+// to group them by.
+#[allow(clippy::too_many_arguments)]
 fn garble_evaluate<T: Transport>(
     shape: Shape,
     nbits: usize,
@@ -227,6 +279,7 @@ fn garble_evaluate<T: Transport>(
     op_id: u64,
     me: PartyId,
     mbx: &Mailbox<T>,
+    verify: bool,
 ) -> GcOutput {
     // Complete the pairwise-PRF ring handshake on *all three* parties before
     // the roles diverge. Otherwise, on a standalone GC call (the first protocol
@@ -238,7 +291,11 @@ fn garble_evaluate<T: Transport>(
 
     let n = xs.len().max(ys.len()).max(1);
     let n = if is_garbler(me) {
-        if me == 0 { xs.len() } else { ys.len() }
+        if me == 0 {
+            xs.len()
+        } else {
+            ys.len()
+        }
     } else {
         n
     };
@@ -247,10 +304,17 @@ fn garble_evaluate<T: Transport>(
         let k01 = garbler_shared_key(mbx, me);
         let mut payload = Vec::new();
         let mut masks = Vec::with_capacity(n);
+        // Garbler 1 derives a bit-identical circuit from k₀₁ but normally
+        // discards the tables, since garbler 0 is the one that ships them.
+        // Retaining them is what makes the cross-check free.
+        let mut all_tables: Vec<Vec<AndTable>> = Vec::new();
         for item in 0..n {
             let seed = item_seed(&k01, op_id, item);
             let mut g = Garbler::new(seed);
             let (x0, y0, tables, mask) = shape.garble(&mut g, nbits);
+            if verify && me == 1 {
+                all_tables.push(tables.clone());
+            }
             if me == 0 {
                 // Garbler 0 ships the tables + active labels for x = s₀+s₁.
                 for t in &tables {
@@ -258,35 +322,55 @@ fn garble_evaluate<T: Transport>(
                     push_label(&mut payload, &t.te);
                 }
                 let xv = xs[item];
-                for i in 0..nbits {
-                    push_label(&mut payload, &g.active(&x0[i], bit(xv, i)));
+                for (i, lbl) in x0.iter().enumerate().take(nbits) {
+                    push_label(&mut payload, &g.active(lbl, bit(xv, i)));
                 }
             } else {
                 // Garbler 1 ships active labels for y = s₂ only.
                 let yv = ys[item];
-                for i in 0..nbits {
-                    push_label(&mut payload, &g.active(&y0[i], bit(yv, i)));
+                for (i, lbl) in y0.iter().enumerate().take(nbits) {
+                    push_label(&mut payload, &g.active(lbl, bit(yv, i)));
                 }
             }
             masks.push(mask);
         }
+        if verify && me == 1 {
+            // One digest for the whole batch, appended after the labels.
+            payload.extend_from_slice(&table_digest(&all_tables));
+        }
         mbx.send(
             EVALUATOR,
-            serialize_msg(&MpcMsg::GcFromGarbler { op_id, garbler: me, payload }),
+            serialize_msg(&MpcMsg::GcFromGarbler {
+                op_id,
+                garbler: me,
+                payload,
+            }),
         );
-        GcOutput { masks, observed: Vec::new() }
+        GcOutput {
+            masks,
+            observed: Vec::new(),
+            table_mismatch: false,
+        }
     } else {
         // Evaluator: collect both garblers' payloads (any order).
         let mut p0: Option<Vec<u8>> = None;
         let mut p1: Option<Vec<u8>> = None;
         while p0.is_none() || p1.is_none() {
             let (_from, m) = mbx
-                .recv_matching(TIMEOUT_MS, |m| {
-                    matches!(m, MpcMsg::GcFromGarbler { op_id: o, .. } if *o == op_id)
-                })
+                .recv_matching(
+                    TIMEOUT_MS,
+                    |m| matches!(m, MpcMsg::GcFromGarbler { op_id: o, .. } if *o == op_id),
+                )
                 .unwrap_or_else(|| panic!("gc: evaluator timeout on op_id={op_id}"));
-            if let MpcMsg::GcFromGarbler { garbler, payload, .. } = m {
-                if garbler == 0 { p0 = Some(payload); } else { p1 = Some(payload); }
+            if let MpcMsg::GcFromGarbler {
+                garbler, payload, ..
+            } = m
+            {
+                if garbler == 0 {
+                    p0 = Some(payload);
+                } else {
+                    p1 = Some(payload);
+                }
             }
         }
         let p0 = p0.unwrap();
@@ -295,25 +379,52 @@ fn garble_evaluate<T: Transport>(
         let n_and = shape.n_and(nbits);
         let g0_per = n_and * TABLE_BYTES + nbits * LABEL_BYTES; // tables + x labels
         let g1_per = nbits * LABEL_BYTES; // y labels
-        let n = p1.len() / g1_per;
+        let digest_bytes = if verify { 32 } else { 0 };
+        let n = (p1.len() - digest_bytes) / g1_per;
         debug_assert_eq!(p0.len(), n * g0_per, "garbler-0 payload size");
-        debug_assert_eq!(p1.len(), n * g1_per, "garbler-1 payload size");
+        debug_assert_eq!(
+            p1.len(),
+            n * g1_per + digest_bytes,
+            "garbler-1 payload size"
+        );
 
         let mut observed = Vec::with_capacity(n);
+        let mut seen_tables: Vec<Vec<AndTable>> = Vec::new();
         for item in 0..n {
             let base0 = item * g0_per;
             let mut tables = Vec::with_capacity(n_and);
             for t in 0..n_and {
                 let o = base0 + t * TABLE_BYTES;
-                tables.push(AndTable { tg: read_label(&p0, o), te: read_label(&p0, o + LABEL_BYTES) });
+                tables.push(AndTable {
+                    tg: read_label(&p0, o),
+                    te: read_label(&p0, o + LABEL_BYTES),
+                });
             }
             let xbase = base0 + n_and * TABLE_BYTES;
-            let xa: Vec<Label> = (0..nbits).map(|i| read_label(&p0, xbase + i * LABEL_BYTES)).collect();
+            let xa: Vec<Label> = (0..nbits)
+                .map(|i| read_label(&p0, xbase + i * LABEL_BYTES))
+                .collect();
             let ybase = item * g1_per;
-            let ya: Vec<Label> = (0..nbits).map(|i| read_label(&p1, ybase + i * LABEL_BYTES)).collect();
+            let ya: Vec<Label> = (0..nbits)
+                .map(|i| read_label(&p1, ybase + i * LABEL_BYTES))
+                .collect();
             observed.push(eval_item(shape, nbits, &tables, &xa, &ya));
+            if verify {
+                seen_tables.push(tables);
+            }
         }
-        GcOutput { masks: Vec::new(), observed }
+        // Both garblers derive the same circuit from k₀₁, so garbler 1's digest
+        // pins what garbler 0 shipped. With at most one corruption, one of them
+        // is honest, so a substituted circuit cannot survive this.
+        let table_mismatch = verify && {
+            let claimed = &p1[n * g1_per..];
+            table_digest(&seen_tables) != claimed
+        };
+        GcOutput {
+            masks: Vec::new(),
+            observed,
+            table_mismatch,
+        }
     }
 }
 
@@ -336,7 +447,11 @@ fn y2a<T: Transport>(
     // Flatten to per-(item,bit) so we can batch the XOR multiply.
     let total = n * width;
     let mut next_id = id_base;
-    let take = |n: &mut u64| { let v = *n; *n += 1; v };
+    let take = |n: &mut u64| {
+        let v = *n;
+        *n += 1;
+        v
+    };
 
     // Re-share observed bits (owner = evaluator) and mask bits (owner = P0).
     //
@@ -352,7 +467,11 @@ fn y2a<T: Transport>(
     let obs_vals: Vec<Fr> = (0..n)
         .flat_map(|item| {
             (0..width).map(move |b| {
-                if me == EVALUATOR { out.observed[item][b] as Fr } else { 0 }
+                if me == EVALUATOR {
+                    out.observed[item][b] as Fr
+                } else {
+                    0
+                }
             })
         })
         .collect();
@@ -373,7 +492,12 @@ fn y2a<T: Transport>(
         .collect();
     let prods = mul_batch_party(&pairs, prod_base, me, mbx);
     let xor_bits: Vec<PartyShare> = (0..total)
-        .map(|k| sub_party(&add_party(&obs_sh[k], &mask_sh[k]), &scalar_mul_party(&prods[k], 2)))
+        .map(|k| {
+            sub_party(
+                &add_party(&obs_sh[k], &mask_sh[k]),
+                &scalar_mul_party(&prods[k], 2),
+            )
+        })
         .collect();
 
     // Recompose Σ 2ⁱ·bitᵢ per item (local).
@@ -424,13 +548,115 @@ pub fn gc_lt_batch<T: Transport>(
     if n == 0 {
         return Vec::new();
     }
-    let mask = if nbits >= 128 { Fr::MAX } else { (1u128 << nbits) - 1 };
+    let mask = if nbits >= 128 {
+        Fr::MAX
+    } else {
+        (1u128 << nbits) - 1
+    };
     // pre = a − b (local); x = s₀+s₁ (garbler 0), y = s₂ (garbler 1).
     let diffs: Vec<PartyShare> = (0..n).map(|i| sub_party(&a[i], &b[i])).collect();
     let (xs, ys) = summands(&diffs, mask, me);
-    let out = garble_evaluate(Shape::Comparator, nbits, &xs, &ys, op_id, me, mbx);
+    let out = garble_evaluate(Shape::Comparator, nbits, &xs, &ys, op_id, me, mbx, false);
     y2a(&out, n, 1, nbits, op_id + 1, me, mbx)
 }
+
+/// [`gc_lt_batch`] with the garbled-table cross-check enabled.
+///
+/// **This is not a maliciously secure comparison.** It closes exactly one of
+/// the protocol's deviation points — see [`GC_MALICIOUS_GAPS`] — and is exposed
+/// so the cost of that check can be measured and so the remaining gaps are
+/// stated in code rather than only in prose. Callers requiring malicious
+/// security must use the `a2b` route in
+/// [`crate::crypto::aby3_verify::lt_batch_checked`].
+pub fn gc_lt_batch_table_checked<T: Transport>(
+    a: &[PartyShare],
+    b: &[PartyShare],
+    nbits: usize,
+    op_id: u64,
+    me: PartyId,
+    mbx: &Mailbox<T>,
+) -> Checked<Vec<PartyShare>> {
+    assert_eq!(a.len(), b.len(), "gc_lt_batch: mismatched batch lengths");
+    let n = a.len();
+    if n == 0 {
+        return Ok(Vec::new());
+    }
+    let mask = if nbits >= 128 {
+        Fr::MAX
+    } else {
+        (1u128 << nbits) - 1
+    };
+    let diffs: Vec<PartyShare> = (0..n).map(|i| sub_party(&a[i], &b[i])).collect();
+    let (xs, ys) = summands(&diffs, mask, me);
+    let out = garble_evaluate(Shape::Comparator, nbits, &xs, &ys, op_id, me, mbx, true);
+    let mismatch = out.table_mismatch;
+    // Finish the protocol before reporting, for the same reason every other
+    // check in this crate is deferred: bailing out here would desynchronise the
+    // parties — the garblers would block forever in the Y2A resharing that the
+    // evaluator never joined — and would make the abort observable at a point
+    // that depends on which party detected it. The shares below are meaningless
+    // when `mismatch` is set; the caller must honour the `Err`.
+    let shares = y2a(&out, n, 1, nbits, op_id + 1, me, mbx);
+    if mismatch {
+        return Err(Abort::new(
+            AbortReason::GarbleMismatch,
+            "gc table cross-check",
+        ));
+    }
+    Ok(shares)
+}
+
+/// The deviations the garbled leg does **not** yet cover, and what would close
+/// them. Kept as a documented constant so the gap cannot quietly go stale.
+///
+/// # What the table cross-check does cover
+///
+/// Both garblers derive a bit-identical circuit from the pairwise key `k₀₁`, so
+/// garbler 1 can digest the tables garbler 0 must have shipped. With at most
+/// one corruption, one of the two is honest, so a garbler that substitutes a
+/// circuit computing a *different function* — the most powerful attack
+/// available here — is caught. Cost: 32 bytes per batch.
+///
+/// # What it does not cover
+///
+/// **1. Input labels for `x`.** The protocol is OT-free precisely because
+/// `x = s₀+s₁` is known to garbler 0 alone: garbler 1 holds `(s₁, s₂)` and the
+/// evaluator holds `(s₂, s₀)`, so neither can reconstruct `x`. Nobody can
+/// recompute garbler 0's active labels, so replication does not reach them, and
+/// a corrupt garbler 0 can evaluate the circuit at a value of its choosing.
+///
+/// **2. Input labels for `y`.** `y = s₂` is known to garbler 1 and the
+/// evaluator, but the evaluator lacks `k₀₁` and so cannot derive the zero
+/// labels needed to check what it was sent.
+///
+/// **3. A lying evaluator.** The garblers hold the output masks but not the
+/// output, so an evaluator that misreports `observed` is not contradicted by
+/// anything.
+///
+/// # What would close them
+///
+/// Garble a **three-input** adder over `(s₀, s₁, s₂)` instead of the two-input
+/// `x + y`. Each additive component is then known to exactly two parties, which
+/// restores replication on every input wire:
+///
+/// * `s₁` is known to both garblers — cross-checkable by digest, as the tables
+///   already are;
+/// * `s₀` is known to garbler 0 and the evaluator, so garbler 1 (which knows
+///   the zero labels but not the value) can send the evaluator the hash pair
+///   `(H(S⁰), H(S¹))` and let it verify the label it received against the bit
+///   it already holds;
+/// * `s₂` symmetrically, with the garblers' roles swapped.
+///
+/// Gap 3 is closed by standard output authenticity: the garblers commit to both
+/// output labels, and the evaluator must return the *label* rather than the
+/// bit — it only holds one of the two and cannot forge the other.
+///
+/// The cost is a wider adder (three summands rather than two) plus two hash
+/// pairs per input wire. This is a real design, not a sketch, but it means
+/// rewriting the garbled circuit shapes in [`crate::crypto::garbled`], which is
+/// why it is scoped separately rather than bolted on here.
+pub const GC_MALICIOUS_GAPS: &str =
+    "garbled leg: tables cross-checked; input labels and evaluator output are not";
 
 /// Garbled fused ReLU∘rescale for a batch: `outᵢ = (vᵢ>=0) ? (vᵢ>>shift) : 0`
 /// for signed `vᵢ` held in `vals`. Returns RSS arithmetic shares of the
@@ -448,10 +674,23 @@ pub fn gc_relu_batch<T: Transport>(
     if n == 0 {
         return Vec::new();
     }
-    let mask = if nbits >= 128 { Fr::MAX } else { (1u128 << nbits) - 1 };
+    let mask = if nbits >= 128 {
+        Fr::MAX
+    } else {
+        (1u128 << nbits) - 1
+    };
     let (xs, ys) = summands(vals, mask, me);
     let width = nbits - shift;
-    let out = garble_evaluate(Shape::Relu { shift }, nbits, &xs, &ys, op_id, me, mbx);
+    let out = garble_evaluate(
+        Shape::Relu { shift },
+        nbits,
+        &xs,
+        &ys,
+        op_id,
+        me,
+        mbx,
+        false,
+    );
     y2a(&out, n, width, nbits, op_id + 1, me, mbx)
 }
 
@@ -461,7 +700,10 @@ pub fn gc_relu_batch<T: Transport>(
 fn summands(shares: &[PartyShare], mask: Fr, me: PartyId) -> (Vec<Fr>, Vec<Fr>) {
     match me {
         0 => (
-            shares.iter().map(|s| s.left.wrapping_add(s.right) & mask).collect(),
+            shares
+                .iter()
+                .map(|s| s.left.wrapping_add(s.right) & mask)
+                .collect(),
             Vec::new(),
         ),
         1 => (Vec::new(), shares.iter().map(|s| s.right & mask).collect()),
@@ -567,7 +809,11 @@ mod tests {
                     let raw = reveal(s, rid + i as u64, None, me, mbx);
                     let m = (1i128 << nbits) - 1;
                     let x = raw as i128 & m;
-                    if x >= (1i128 << (nbits - 1)) { (x - (1i128 << nbits)) as i64 } else { x as i64 }
+                    if x >= (1i128 << (nbits - 1)) {
+                        (x - (1i128 << nbits)) as i64
+                    } else {
+                        x as i64
+                    }
                 })
                 .collect::<Vec<i64>>()
         });

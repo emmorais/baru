@@ -129,6 +129,33 @@ pub trait Backend: Send + Sync {
         (quotient, rem)
     }
 
+    /// A batch of dot products, `outᵢ = Σₖ aᵢₖ·bᵢₖ`.
+    ///
+    /// Exists as its own operation because the **resharing granularity** is a
+    /// protocol choice, not an implementation detail: summing products before
+    /// the resharing message costs one ring element per *output*, summing after
+    /// costs one per *product*. On a dense layer that is the `in_dim` factor —
+    /// 32× on the MedMNIST CNN.
+    ///
+    /// The default composes `mul_batch` with local addition, which is correct
+    /// everywhere and is what backends without a batched resharing already do.
+    /// `TransportBackend` overrides it.
+    fn dot_batch(&mut self, dots: &[Vec<(ShareRef, ShareRef)>], nbits: usize) -> Vec<ShareRef> {
+        let flat: Vec<(ShareRef, ShareRef)> = dots.iter().flatten().cloned().collect();
+        let prods = self.mul_batch(&flat);
+        let mut out = Vec::with_capacity(dots.len());
+        let mut i = 0;
+        for d in dots {
+            let mut acc = self.share_public(0, nbits);
+            for _ in d {
+                acc = self.add(&acc, &prods[i]);
+                i += 1;
+            }
+            out.push(acc);
+        }
+        out
+    }
+
     fn eq(&mut self, a: &ShareRef, b: &ShareRef) -> ShareRef;
     fn lt(&mut self, a: &ShareRef, b: &ShareRef) -> ShareRef;
     /// Batched `lt`: `aᵢ < bᵢ` for every pair, in the same number of rounds
@@ -190,7 +217,9 @@ pub trait Backend: Send + Sync {
     /// simulator this is simply the three `Share3` components.
     fn export_additive(&mut self, a: &ShareRef) -> Vec<Fr> {
         let _ = a;
-        panic!("export_additive: this MPC backend does not support share export (see crate::hybrid)")
+        panic!(
+            "export_additive: this MPC backend does not support share export (see crate::hybrid)"
+        )
     }
 
     /// Install raw additive components (wrapping sum ≡ secret mod `2^nbits`)
@@ -199,6 +228,8 @@ pub trait Backend: Send + Sync {
     /// the sum is what matters).
     fn import_additive(&mut self, components: &[Fr], nbits: usize) -> ShareRef {
         let _ = (components, nbits);
-        panic!("import_additive: this MPC backend does not support share import (see crate::hybrid)")
+        panic!(
+            "import_additive: this MPC backend does not support share import (see crate::hybrid)"
+        )
     }
 }

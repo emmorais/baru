@@ -61,17 +61,30 @@ const NUM_PRIMES_WIDE: usize = 7;
 /// not split the table in two.
 const NUM_PRIMES_MAX: usize = NUM_PRIMES_WIDE;
 
+// The narrow profile takes a *prefix* of the shared table, so it can never ask
+// for more primes than the table holds. Enforced at compile time: violating it
+// would index out of bounds far from here.
+const _: () = assert!(NUM_PRIMES <= NUM_PRIMES_WIDE);
+
 // ─── Modular arithmetic (primes < 2^62, so products fit u128) ────────────────
 
 #[inline]
 fn addmod(a: u64, b: u64, p: u64) -> u64 {
     let s = a + b;
-    if s >= p { s - p } else { s }
+    if s >= p {
+        s - p
+    } else {
+        s
+    }
 }
 
 #[inline]
 fn submod(a: u64, b: u64, p: u64) -> u64 {
-    if a >= b { a - b } else { a + p - b }
+    if a >= b {
+        a - b
+    } else {
+        a + p - b
+    }
 }
 
 #[inline]
@@ -207,7 +220,10 @@ impl Shoup {
     #[inline]
     fn new(w: u64, p: u64) -> Shoup {
         debug_assert!(w < p && p < (1u64 << 63));
-        Shoup { w, q: (((w as u128) << 64) / p as u128) as u64 }
+        Shoup {
+            w,
+            q: (((w as u128) << 64) / p as u128) as u64,
+        }
     }
 
     /// `w · x mod p`, for `x < p`.
@@ -258,7 +274,10 @@ fn build_twiddles(p: u64, root: u64, n: usize) -> Vec<Shoup> {
 impl Plan {
     fn new(p: u64, root_max: u64, n: usize) -> Plan {
         assert!(n.is_power_of_two() && n <= MAX_N);
-        assert!(p < (1u64 << 63), "Shoup multiplication needs p < 2^63, got {p}");
+        assert!(
+            p < (1u64 << 63),
+            "Shoup multiplication needs p < 2^63, got {p}"
+        );
         // ψ = root^(ROOT_ORDER / 2n) is a primitive 2n-th root of unity.
         let psi_g = powmod(root_max, ROOT_ORDER / (2 * n as u64), p);
         let psi_inv_g = invmod(psi_g, p);
@@ -358,8 +377,67 @@ fn plans_for(n: usize) -> &'static [Plan] {
     plans_for_count(n, NUM_PRIMES)
 }
 
+// ─── Per-prime parallelism ───────────────────────────────────────────────────
+//
+// The multi-modular decomposition is the one place in this crate where
+// parallelism is *free of argument*: each prime gets its own reduction, its own
+// pair of transforms and its own residue vector, sharing only `&'static [Plan]`
+// and the immutable inputs. There is no reduction across threads, no RNG, and
+// no ordering — the residues are written into fixed slots, so the result is
+// bit-identical to the serial path whatever the scheduler does. That is why
+// this, and not the evaluator's channel loop, is where threading belongs: the
+// channel loop draws masks from an RNG stream whose order is part of the
+// protocol.
+//
+// It buys at most `NUM_PRIMES` (4), not the core count, and it speeds up every
+// caller — encryption, the ct×ct multiply and decryption all bottom out here.
+
+/// Worker threads for the per-prime loops. `BARU_NTT_THREADS=1` forces the
+/// serial path.
+///
+/// Kept switchable on purpose. A wall-clock figure that silently depends on how
+/// many cores the machine had is not comparable against published work, so the
+/// docs quote both, and quoting both requires both to stay runnable.
+fn ntt_threads() -> usize {
+    static N: OnceLock<usize> = OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("BARU_NTT_THREADS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|&v| v >= 1)
+            .unwrap_or(NUM_PRIMES_WIDE)
+    })
+}
+
+/// Map `f` over the plans, one thread per prime when enabled.
+///
+/// Results land in per-index slots rather than being pushed, so the output
+/// order is the prime order regardless of completion order — CRT
+/// reconstruction indexes residues by prime and would otherwise silently
+/// reconstruct against the wrong modulus.
+fn map_plans<T: Send>(
+    plans: &'static [Plan],
+    f: impl Fn(usize, &'static Plan) -> T + Sync,
+) -> Vec<T> {
+    if ntt_threads() <= 1 || plans.len() < 2 {
+        return plans.iter().enumerate().map(|(k, p)| f(k, p)).collect();
+    }
+    let mut slots: Vec<Option<T>> = (0..plans.len()).map(|_| None).collect();
+    std::thread::scope(|sc| {
+        let f = &f;
+        for (slot, (k, plan)) in slots.iter_mut().zip(plans.iter().enumerate()) {
+            sc.spawn(move || *slot = Some(f(k, plan)));
+        }
+    });
+    slots
+        .into_iter()
+        .map(|s| s.expect("every prime slot is filled by its thread"))
+        .collect()
+}
+
 // ─── The CRT accumulator ─────────────────────────────────────────────────────
 
+use crate::fhe::bigint::IntN;
 /// Two's-complement 256-bit integer: enough for `|c[k]| ≤ 2^210` and for the
 /// CRT modulus `Π pᵢ ≈ 2^252`.
 ///
@@ -369,7 +447,6 @@ fn plans_for(n: usize) -> &'static [Plan] {
 /// `mod_u64` per limb per prime, so widening it would tax every scheme in the
 /// crate for the benefit of one.
 pub use crate::fhe::bigint::{I256, I512};
-use crate::fhe::bigint::IntN;
 
 // ─── The exact product ────────────────────────────────────────────────────────
 
@@ -399,9 +476,21 @@ fn build_crt_consts<const L: usize>(k: usize) -> CrtConst<L> {
     }
     let half = modulus.shr(1);
     let inv_prefix: Vec<u64> = (0..k)
-        .map(|i| if i == 0 { 1 } else { invmod(prefix[i].mod_u64(ps[i]), ps[i]) })
+        .map(|i| {
+            if i == 0 {
+                1
+            } else {
+                invmod(prefix[i].mod_u64(ps[i]), ps[i])
+            }
+        })
         .collect();
-    CrtConst { ps, prefix, inv_prefix, modulus, half }
+    CrtConst {
+        ps,
+        prefix,
+        inv_prefix,
+        modulus,
+        half,
+    }
 }
 
 fn crt_consts() -> &'static CrtConst<4> {
@@ -421,21 +510,40 @@ fn crt_reconstruct_with<const L: usize>(
     n: usize,
     c: &CrtConst<L>,
 ) -> Vec<IntN<L>> {
-    (0..n)
-        .map(|k| {
-            let mut x = IntN::<L>::from_hi_lo(0, residues[0][k] as u128);
-            for (i, res) in residues.iter().enumerate().skip(1) {
-                let p = c.ps[i];
-                let xi = x.mod_u64(p);
-                let t = mulmod(submod(res[k] % p, xi, p), c.inv_prefix[i], p);
-                x = x.wrapping_add(c.prefix[i].mul_u64(t));
-            }
-            if !x.ult(c.half) {
-                x = x.wrapping_sub(c.modulus);
-            }
-            x
-        })
-        .collect()
+    // Garner reconstruction is a pure map over coefficients — each `k` reads
+    // its own residues and nothing else — so it splits across threads by
+    // coefficient range with no interaction. Worth doing separately from the
+    // per-prime parallelism: once the transforms are threaded, this is what is
+    // left of decryption, and Amdahl makes it the ceiling.
+    let at = |k: usize| -> IntN<L> {
+        let mut x = IntN::<L>::from_hi_lo(0, residues[0][k] as u128);
+        for (i, res) in residues.iter().enumerate().skip(1) {
+            let p = c.ps[i];
+            let xi = x.mod_u64(p);
+            let t = mulmod(submod(res[k] % p, xi, p), c.inv_prefix[i], p);
+            x = x.wrapping_add(c.prefix[i].mul_u64(t));
+        }
+        if !x.ult(c.half) {
+            x = x.wrapping_sub(c.modulus);
+        }
+        x
+    };
+    let threads = ntt_threads();
+    // Below a few hundred coefficients the spawn cost outweighs the work; the
+    // test rings (n=64) live down there.
+    if threads <= 1 || n < 512 {
+        return (0..n).map(at).collect();
+    }
+    let chunk = n.div_ceil(threads);
+    let mut parts: Vec<Vec<IntN<L>>> = (0..n.div_ceil(chunk)).map(|_| Vec::new()).collect();
+    std::thread::scope(|sc| {
+        let at = &at;
+        for (i, slot) in parts.iter_mut().enumerate() {
+            let (lo, hi) = (i * chunk, ((i + 1) * chunk).min(n));
+            sc.spawn(move || *slot = (lo..hi).map(at).collect());
+        }
+    });
+    parts.concat()
 }
 
 fn crt_reconstruct(residues: &[Vec<u64>], n: usize) -> Vec<I256> {
@@ -451,14 +559,13 @@ fn reduce_mod(v: &[i128], p: u64) -> Vec<u64> {
 /// Exact negacyclic product of two centered-coefficient polynomials, in ℤ:
 /// `c[k] = Σ_{i+j=k} a[i]·b[j] − Σ_{i+j=k+n} a[i]·b[j]`.
 ///
-/// Computed modulo [`NUM_PRIMES`] NTT-friendly primes in O(n log n) each and
+/// Computed modulo `NUM_PRIMES` NTT-friendly primes in O(n log n) each and
 /// reconstructed exactly by CRT (Garner), then centered. Requires
 /// `|c[k]| < Π pᵢ / 2`.
 pub fn exact_negacyclic_product(a: &[i128], b: &[i128], n: usize) -> Vec<I256> {
     assert_eq!(a.len(), n);
     assert_eq!(b.len(), n);
-    let mut residues: Vec<Vec<u64>> = Vec::with_capacity(NUM_PRIMES);
-    for plan in plans_for(n) {
+    let residues = map_plans(plans_for(n), |_, plan| {
         let p = plan.p;
         let mut fa = reduce_mod(a, p);
         let mut fb = reduce_mod(b, p);
@@ -468,8 +575,8 @@ pub fn exact_negacyclic_product(a: &[i128], b: &[i128], n: usize) -> Vec<I256> {
             fa[i] = mulmod(fa[i], fb[i], p);
         }
         plan.inverse(&mut fa);
-        residues.push(fa);
-    }
+        fa
+    });
     crt_reconstruct(&residues, n)
 }
 
@@ -482,8 +589,7 @@ pub fn exact_negacyclic_product(a: &[i128], b: &[i128], n: usize) -> Vec<I256> {
 pub fn exact_negacyclic_product_pre(ta: &Transformed, b: &[i128], n: usize) -> Vec<I256> {
     assert_eq!(ta.n, n);
     assert_eq!(b.len(), n);
-    let mut residues: Vec<Vec<u64>> = Vec::with_capacity(NUM_PRIMES);
-    for (k, plan) in plans_for(n).iter().enumerate() {
+    let residues = map_plans(plans_for(n), |k, plan| {
         let p = plan.p;
         let fa = &ta.res[k];
         let mut fb = reduce_mod(b, p);
@@ -492,8 +598,8 @@ pub fn exact_negacyclic_product_pre(ta: &Transformed, b: &[i128], n: usize) -> V
             fb[i] = mulmod(fa[i], fb[i], p);
         }
         plan.inverse(&mut fb);
-        residues.push(fb);
-    }
+        fb
+    });
     crt_reconstruct(&residues, n)
 }
 
@@ -522,7 +628,7 @@ fn reduce_i256_mod(x: I256, p: u64) -> u64 {
 /// coefficients in, 512-bit exact accumulators out.
 ///
 /// Same construction as [`exact_negacyclic_product`] — the only differences are
-/// the operand width and that it uses all [`NUM_PRIMES_WIDE`] primes, giving a
+/// the operand width and that it uses all `NUM_PRIMES_WIDE` primes, giving a
 /// CRT modulus of ~2^441 instead of ~2^252.
 ///
 /// This exists for [`crate::mpcc::lowgear`], whose plaintext field must be wide
@@ -562,14 +668,11 @@ pub struct Transformed {
 
 /// Forward-transform centered coefficients once, for reuse.
 pub fn forward_transform(a: &[i128], n: usize) -> Transformed {
-    let res = plans_for(n)
-        .iter()
-        .map(|plan| {
-            let mut f = reduce_mod(a, plan.p);
-            plan.forward(&mut f);
-            f
-        })
-        .collect();
+    let res = map_plans(plans_for(n), |_, plan| {
+        let mut f = reduce_mod(a, plan.p);
+        plan.forward(&mut f);
+        f
+    });
     Transformed { n, res }
 }
 
@@ -606,8 +709,7 @@ pub fn exact_bfv_tensor_pre(
 ) -> (Vec<I256>, Vec<I256>, Vec<I256>) {
     assert_eq!(ta0.n, n);
     assert_eq!(ta1.n, n);
-    let (mut r0, mut r1, mut r2) = (Vec::new(), Vec::new(), Vec::new());
-    for (k, plan) in plans_for(n).iter().enumerate() {
+    let per = map_plans(plans_for(n), |k, plan| {
         let p = plan.p;
         let fa0 = &ta0.res[k];
         let fa1 = &ta1.res[k];
@@ -623,15 +725,9 @@ pub fn exact_bfv_tensor_pre(
         plan.inverse(&mut d0);
         plan.inverse(&mut d1);
         plan.inverse(&mut d2);
-        r0.push(d0);
-        r1.push(d1);
-        r2.push(d2);
-    }
-    (
-        crt_reconstruct(&r0, n),
-        crt_reconstruct(&r1, n),
-        crt_reconstruct(&r2, n),
-    )
+        (d0, d1, d2)
+    });
+    crt_three(per, n)
 }
 
 /// The RLWE tensor with **both** operands already forward-transformed.
@@ -652,8 +748,7 @@ pub fn exact_bfv_tensor_pre_pre(
     assert_eq!(ta1.n, n);
     assert_eq!(tb0.n, n);
     assert_eq!(tb1.n, n);
-    let (mut r0, mut r1, mut r2) = (Vec::new(), Vec::new(), Vec::new());
-    for (k, plan) in plans_for(n).iter().enumerate() {
+    let per = map_plans(plans_for(n), |k, plan| {
         let p = plan.p;
         let (fa0, fa1) = (&ta0.res[k], &ta1.res[k]);
         let (fb0, fb1) = (&tb0.res[k], &tb1.res[k]);
@@ -665,15 +760,49 @@ pub fn exact_bfv_tensor_pre_pre(
         plan.inverse(&mut d0);
         plan.inverse(&mut d1);
         plan.inverse(&mut d2);
+        (d0, d1, d2)
+    });
+    crt_three(per, n)
+}
+
+/// Transpose the per-prime tensor residues into the three components and
+/// reconstruct each.
+///
+/// The three reconstructions are independent, so they run concurrently too —
+/// on the `--precompute` path every forward transform has already been hoisted
+/// into the session preamble, which leaves the inverse transforms and *this*
+/// as the whole of the online multiply.
+#[allow(clippy::type_complexity)]
+fn crt_three(
+    per: Vec<(Vec<u64>, Vec<u64>, Vec<u64>)>,
+    n: usize,
+) -> (Vec<I256>, Vec<I256>, Vec<I256>) {
+    let (mut r0, mut r1, mut r2) = (
+        Vec::with_capacity(per.len()),
+        Vec::with_capacity(per.len()),
+        Vec::with_capacity(per.len()),
+    );
+    for (d0, d1, d2) in per {
         r0.push(d0);
         r1.push(d1);
         r2.push(d2);
     }
-    (
-        crt_reconstruct(&r0, n),
-        crt_reconstruct(&r1, n),
-        crt_reconstruct(&r2, n),
-    )
+    if ntt_threads() <= 1 {
+        return (
+            crt_reconstruct(&r0, n),
+            crt_reconstruct(&r1, n),
+            crt_reconstruct(&r2, n),
+        );
+    }
+    let (mut c0, mut c1, mut c2) = (Vec::new(), Vec::new(), Vec::new());
+    std::thread::scope(|sc| {
+        let h0 = sc.spawn(|| crt_reconstruct(&r0, n));
+        let h1 = sc.spawn(|| crt_reconstruct(&r1, n));
+        c2 = crt_reconstruct(&r2, n);
+        c0 = h0.join().expect("crt thread panicked");
+        c1 = h1.join().expect("crt thread panicked");
+    });
+    (c0, c1, c2)
 }
 
 #[cfg(test)]
@@ -696,7 +825,11 @@ mod tests {
             let lo = (p00 & 0xFFFF_FFFF_FFFF_FFFF) | (mid << 64);
             let hi = p11 + (p01 >> 64) + (p10 >> 64) + (mid >> 64);
             let m = I256::from_hi_lo(hi, lo);
-            if neg { m.wrapping_neg() } else { m }
+            if neg {
+                m.wrapping_neg()
+            } else {
+                m
+            }
         }
         let mut acc = vec![I256::ZERO; n];
         for (i, &ai) in a.iter().enumerate() {
@@ -721,9 +854,15 @@ mod tests {
         let mut s = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
         (0..n)
             .map(|_| {
-                s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                s = s
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
                 let mag = ((s >> 3) as u128) & ((1u128 << bits) - 1);
-                if s & 1 == 0 { mag as i128 } else { -(mag as i128) }
+                if s & 1 == 0 {
+                    mag as i128
+                } else {
+                    -(mag as i128)
+                }
             })
             .collect()
     }
@@ -733,10 +872,12 @@ mod tests {
         let pr = primes();
         // One table serves both profiles; the narrow one takes a prefix.
         assert_eq!(pr.p.len(), NUM_PRIMES_MAX);
-        assert!(NUM_PRIMES <= NUM_PRIMES_WIDE);
         for (&p, &r) in pr.p.iter().zip(&pr.root) {
             assert!(is_prime(p), "{p} must be prime");
-            assert!((p - 1).is_multiple_of(ROOT_ORDER), "{p} must be ≡ 1 mod {ROOT_ORDER}");
+            assert!(
+                (p - 1).is_multiple_of(ROOT_ORDER),
+                "{p} must be ≡ 1 mod {ROOT_ORDER}"
+            );
             // r must have order exactly ROOT_ORDER.
             assert_eq!(powmod(r, ROOT_ORDER, p), 1);
             assert_ne!(powmod(r, ROOT_ORDER / 2, p), 1);
@@ -754,14 +895,23 @@ mod tests {
         let narrow = crt_consts();
         assert_eq!(narrow.ps.len(), NUM_PRIMES);
         // half = Π p / 2 must exceed 2^249, i.e. bit 249 of `half` is set or above.
-        assert!(!narrow.half.shr(249).is_zero(), "narrow CRT modulus lost its headroom");
+        assert!(
+            !narrow.half.shr(249).is_zero(),
+            "narrow CRT modulus lost its headroom"
+        );
 
         // Wide: q=2^190 at n=8192 ⇒ |c| ≤ n·(q/2)² = 2^392.
         let wide = crt_consts_wide();
         assert_eq!(wide.ps.len(), NUM_PRIMES_WIDE);
-        assert!(!wide.half.shr(392).is_zero(), "wide CRT modulus too small for q=2^190 at n=8192");
+        assert!(
+            !wide.half.shr(392).is_zero(),
+            "wide CRT modulus too small for q=2^190 at n=8192"
+        );
         // …and it must still fit the accumulator (no wraparound at 512 bits).
-        assert!(!wide.modulus.is_negative(), "wide CRT modulus overflowed I512");
+        assert!(
+            !wide.modulus.is_negative(),
+            "wide CRT modulus overflowed I512"
+        );
     }
 
     /// [`Shoup::mul`] is only valid for `p < 2^63` (it needs `2p < 2^64` so the
@@ -771,8 +921,14 @@ mod tests {
     #[test]
     fn primes_admit_shoup() {
         for &p in &primes().p {
-            assert!(p < (1u64 << 63), "p = {p} is too large for Shoup multiplication");
-            assert!(p.checked_mul(2).is_some(), "2p must not overflow u64 (p = {p})");
+            assert!(
+                p < (1u64 << 63),
+                "p = {p} is too large for Shoup multiplication"
+            );
+            assert!(
+                p.checked_mul(2).is_some(),
+                "2p must not overflow u64 (p = {p})"
+            );
         }
     }
 
@@ -791,12 +947,20 @@ mod tests {
             };
             for _ in 0..2000 {
                 let (w, x) = (next(), next());
-                assert_eq!(Shoup::new(w, p).mul(x, p), mulmod(w, x, p), "p={p} w={w} x={x}");
+                assert_eq!(
+                    Shoup::new(w, p).mul(x, p),
+                    mulmod(w, x, p),
+                    "p={p} w={w} x={x}"
+                );
             }
             // Boundaries: 0, 1, p−1 in both positions.
             for &w in &[0u64, 1, p - 1] {
                 for &x in &[0u64, 1, p - 1] {
-                    assert_eq!(Shoup::new(w, p).mul(x, p), mulmod(w, x, p), "p={p} w={w} x={x}");
+                    assert_eq!(
+                        Shoup::new(w, p).mul(x, p),
+                        mulmod(w, x, p),
+                        "p={p} w={w} x={x}"
+                    );
                 }
             }
         }
@@ -821,7 +985,11 @@ mod tests {
                 }
                 // Mask to `bits`, then apply a sign.
                 let v = v.shr(256 - bits);
-                if next() & 1 == 0 { v } else { v.wrapping_neg() }
+                if next() & 1 == 0 {
+                    v
+                } else {
+                    v.wrapping_neg()
+                }
             })
             .collect()
     }
@@ -843,12 +1011,16 @@ mod tests {
                     acc = acc.wrapping_add(xw.mul_u64(limb).shl(64 * i as u32));
                 }
             }
-            if neg { acc.wrapping_neg() } else { acc }
+            if neg {
+                acc.wrapping_neg()
+            } else {
+                acc
+            }
         }
         let mut out = vec![I512::ZERO; n];
-        for i in 0..n {
-            for j in 0..n {
-                let p = mul(a[i], b[j]);
+        for (i, &ai) in a.iter().enumerate().take(n) {
+            for (j, &bj) in b.iter().enumerate().take(n) {
+                let p = mul(ai, bj);
                 let k = i + j;
                 if k < n {
                     out[k] = out[k].wrapping_add(p);
@@ -865,7 +1037,11 @@ mod tests {
         for n in [1usize, 2, 8, 32] {
             let a = sample_i256(n, 40, n as u64 * 3 + 1);
             let b = sample_i256(n, 40, n as u64 * 5 + 7);
-            assert_eq!(exact_negacyclic_product_wide(&a, &b, n), schoolbook_wide(&a, &b, n), "n={n}");
+            assert_eq!(
+                exact_negacyclic_product_wide(&a, &b, n),
+                schoolbook_wide(&a, &b, n),
+                "n={n}"
+            );
         }
     }
 
@@ -876,7 +1052,10 @@ mod tests {
         let n = 64;
         let a = sample_i256(n, 189, 0xC0FFEE);
         let b = sample_i256(n, 189, 0xBEEF);
-        assert_eq!(exact_negacyclic_product_wide(&a, &b, n), schoolbook_wide(&a, &b, n));
+        assert_eq!(
+            exact_negacyclic_product_wide(&a, &b, n),
+            schoolbook_wide(&a, &b, n)
+        );
     }
 
     /// The wide path must agree with the narrow one wherever both apply — the
@@ -925,7 +1104,11 @@ mod tests {
         for &n in &[8usize, 16, 64] {
             let a = pseudo(n, 1, 20);
             let b = pseudo(n, 2, 20);
-            assert_eq!(exact_negacyclic_product(&a, &b, n), schoolbook(&a, &b, n), "n={n}");
+            assert_eq!(
+                exact_negacyclic_product(&a, &b, n),
+                schoolbook(&a, &b, n),
+                "n={n}"
+            );
         }
     }
 
@@ -970,10 +1153,16 @@ mod tests {
         let n = 16;
         let zero = vec![0i128; n];
         let a = pseudo(n, 3, 60);
-        assert_eq!(exact_negacyclic_product(&zero, &a, n), schoolbook(&zero, &a, n));
+        assert_eq!(
+            exact_negacyclic_product(&zero, &a, n),
+            schoolbook(&zero, &a, n)
+        );
         let mut neg = vec![0i128; n];
         neg[0] = -(1i128 << 99);
         neg[1] = (1i128 << 99) - 1;
-        assert_eq!(exact_negacyclic_product(&neg, &a, n), schoolbook(&neg, &a, n));
+        assert_eq!(
+            exact_negacyclic_product(&neg, &a, n),
+            schoolbook(&neg, &a, n)
+        );
     }
 }

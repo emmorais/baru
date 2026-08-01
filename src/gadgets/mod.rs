@@ -104,11 +104,17 @@ pub fn relu(be: &mut dyn Backend, xs: &[ShareRef]) -> Vec<ShareRef> {
         return Vec::new();
     }
     let zeros: Vec<ShareRef> = xs.iter().map(|x| be.sub(x, x)).collect();
-    let pairs: Vec<(ShareRef, ShareRef)> =
-        zeros.iter().zip(xs).map(|(z, x)| (z.clone(), x.clone())).collect();
+    let pairs: Vec<(ShareRef, ShareRef)> = zeros
+        .iter()
+        .zip(xs)
+        .map(|(z, x)| (z.clone(), x.clone()))
+        .collect();
     let pos = be.lt_batch(&pairs); // 1 iff x > 0
-    let mul_pairs: Vec<(ShareRef, ShareRef)> =
-        xs.iter().zip(&pos).map(|(x, p)| (x.clone(), p.clone())).collect();
+    let mul_pairs: Vec<(ShareRef, ShareRef)> = xs
+        .iter()
+        .zip(&pos)
+        .map(|(x, p)| (x.clone(), p.clone()))
+        .collect();
     be.mul_batch(&mul_pairs)
 }
 
@@ -147,13 +153,15 @@ pub fn argmax(be: &mut dyn Backend, xs: &[ShareRef], nbits: usize) -> ShareRef {
         return be.share_public(0, nbits);
     }
     let mut vals: Vec<ShareRef> = xs.to_vec();
-    let mut idxs: Vec<ShareRef> =
-        (0..xs.len()).map(|i| be.share_public(i as u128, nbits)).collect();
+    let mut idxs: Vec<ShareRef> = (0..xs.len())
+        .map(|i| be.share_public(i as u128, nbits))
+        .collect();
 
     while vals.len() > 1 {
         let m = vals.len() / 2; // pairs this level; a trailing odd element carries
-        let pairs: Vec<(ShareRef, ShareRef)> =
-            (0..m).map(|k| (vals[2 * k].clone(), vals[2 * k + 1].clone())).collect();
+        let pairs: Vec<(ShareRef, ShareRef)> = (0..m)
+            .map(|k| (vals[2 * k].clone(), vals[2 * k + 1].clone()))
+            .collect();
         // adoptₖ = 1 iff left < right, i.e. the right element wins the pair.
         let adopt = be.lt_batch(&pairs);
 
@@ -182,7 +190,8 @@ pub fn argmax(be: &mut dyn Backend, xs: &[ShareRef], nbits: usize) -> ShareRef {
         vals = next_vals;
         idxs = next_idxs;
     }
-    idxs.pop().expect("argmax: tournament must leave one candidate")
+    idxs.pop()
+        .expect("argmax: tournament must leave one candidate")
 }
 
 pub fn argmax_ref(xs: &[i64]) -> usize {
@@ -208,7 +217,13 @@ pub fn arith_shr(be: &mut dyn Backend, x: &ShareRef, k: usize, nbits: usize) -> 
     let bits = be.a2b(x, nbits);
     let sign = bits[nbits - 1].clone();
     let out_bits: Vec<ShareRef> = (0..nbits)
-        .map(|j| if j + k < nbits { bits[j + k].clone() } else { sign.clone() })
+        .map(|j| {
+            if j + k < nbits {
+                bits[j + k].clone()
+            } else {
+                sign.clone()
+            }
+        })
         .collect();
     let mut r = be.b2a(&out_bits);
     // b2a inherits the bit-shares' width (1); restore the value's width so
@@ -238,7 +253,13 @@ pub fn arith_shr_batch(
         .map(|bits| {
             let sign = bits[nbits - 1].clone();
             let out_bits: Vec<ShareRef> = (0..nbits)
-                .map(|j| if j + k < nbits { bits[j + k].clone() } else { sign.clone() })
+                .map(|j| {
+                    if j + k < nbits {
+                        bits[j + k].clone()
+                    } else {
+                        sign.clone()
+                    }
+                })
                 .collect();
             let mut r = be.b2a(&out_bits);
             r.nbits = nbits;
@@ -271,30 +292,31 @@ pub fn dense(
         return Vec::new();
     }
     // Every product in the layer is independent of every other, so the whole
-    // weight matrix is **one** batched multiply; only the summation is
-    // sequential, and addition is local (free). The per-element form this
-    // replaced issued `out_dim x in_dim` dependent rounds — on an 8x64 layer,
-    // 14x the messages and 45x the wall-clock at RTT 20 ms for identical
-    // output (`baru bench-abstraction`).
-    let mut pairs = Vec::with_capacity(weights.len() * x.len());
-    for row in weights {
-        for (w, xi) in row.iter().zip(x) {
-            pairs.push((w.clone(), xi.clone()));
-        }
-    }
-    let prods = be.mul_batch(&pairs);
-    weights
+    // weight matrix is **one** batched round; only the summation is sequential,
+    // and addition is local (free). The per-element form this replaced issued
+    // `out_dim x in_dim` dependent rounds — on an 8x64 layer, 14x the messages
+    // and 45x the wall-clock at RTT 20 ms for identical output
+    // (`baru bench-abstraction`).
+    //
+    // `dot_batch`, not `mul_batch`: the round count is the same either way, but
+    // resharing once per **output** instead of once per **product** removes the
+    // `in_dim` factor from the bytes. That is what Falcon's `MatMul = k·x·z`
+    // means, and on the MedMNIST CNN it is 32x — 239 520 products against 7 474
+    // outputs.
+    let nbits = x.first().map(|s| s.nbits).unwrap_or(1);
+    let dots: Vec<Vec<(ShareRef, ShareRef)>> = weights
         .iter()
-        .zip(bias)
-        .enumerate()
-        .map(|(r, (row, b))| {
-            let mut acc = b.clone();
-            for c in 0..row.len().min(x.len()) {
-                acc = be.add(&acc, &prods[r * x.len() + c]);
-            }
-            acc
+        .map(|row| {
+            row.iter()
+                .zip(x)
+                .map(|(w, xi)| (w.clone(), xi.clone()))
+                .collect()
         })
-        .collect()
+        .collect();
+    let prods = be.dot_batch(&dots, nbits);
+    // `prods[r]` is already the whole dot product for row `r`, so only the
+    // bias is left to add — and that is local.
+    prods.iter().zip(bias).map(|(p, b)| be.add(p, b)).collect()
 }
 
 pub fn dense_ref(x: &[i64], weights: &[Vec<i64>], bias: &[i64]) -> Vec<i64> {
@@ -341,7 +363,11 @@ pub fn conv2d(
     let out_c = weights.len();
     let out_h = (in_shape.h - kh) / stride + 1;
     let out_w = (in_shape.w - kw) / stride + 1;
-    let out_shape = Chw { c: out_c, h: out_h, w: out_w };
+    let out_shape = Chw {
+        c: out_c,
+        h: out_h,
+        w: out_w,
+    };
     // Gather every (weight, input) product the layer needs, multiply them all
     // in **one** batched round, then accumulate locally. The per-element form
     // this replaced cost one communication round per multiply-accumulate,
@@ -360,10 +386,8 @@ pub fn conv2d(
                         for dx in 0..kw {
                             let iy = oy * stride + dy;
                             let ix = ox * stride + dx;
-                            pairs.push((
-                                kernel[k].clone(),
-                                input[in_shape.idx(ic, iy, ix)].clone(),
-                            ));
+                            pairs
+                                .push((kernel[k].clone(), input[in_shape.idx(ic, iy, ix)].clone()));
                             k += 1;
                         }
                     }
@@ -373,11 +397,14 @@ pub fn conv2d(
     }
     let prods = be.mul_batch(&pairs);
     let mut out = Vec::with_capacity(out_shape.len());
-    for oc in 0..out_c {
+    // `zip` would silently shorten the output if these ever disagreed, so the
+    // invariant is asserted rather than absorbed.
+    debug_assert_eq!(bias.len(), out_c, "one bias per output channel");
+    for (oc, b) in bias.iter().enumerate().take(out_c) {
         for oy in 0..out_h {
             for ox in 0..out_w {
                 let base = ((oc * out_h + oy) * out_w + ox) * per_out;
-                let mut acc = bias[oc].clone();
+                let mut acc = b.clone();
                 for j in 0..per_out {
                     acc = be.add(&acc, &prods[base + j]);
                 }
@@ -401,7 +428,11 @@ pub fn conv2d_ref(
     let out_c = weights.len();
     let out_h = (in_shape.h - kh) / stride + 1;
     let out_w = (in_shape.w - kw) / stride + 1;
-    let out_shape = Chw { c: out_c, h: out_h, w: out_w };
+    let out_shape = Chw {
+        c: out_c,
+        h: out_h,
+        w: out_w,
+    };
     let mut out = Vec::with_capacity(out_shape.len());
     for (oc, kernel) in weights.iter().enumerate() {
         for oy in 0..out_h {
@@ -435,7 +466,11 @@ pub fn maxpool2d(
 ) -> (Vec<ShareRef>, Chw) {
     let out_h = (in_shape.h - pool) / stride + 1;
     let out_w = (in_shape.w - pool) / stride + 1;
-    let out_shape = Chw { c: in_shape.c, h: out_h, w: out_w };
+    let out_shape = Chw {
+        c: in_shape.c,
+        h: out_h,
+        w: out_w,
+    };
 
     // Gather every window (all the same size), then reduce them in lockstep:
     // one fold step over *all* windows at once. Each step is a single
@@ -476,10 +511,13 @@ pub fn max2_batch(be: &mut dyn Backend, a: &[ShareRef], b: &[ShareRef]) -> Vec<S
     if a.is_empty() {
         return Vec::new();
     }
-    let pairs: Vec<(ShareRef, ShareRef)> =
-        a.iter().zip(b).map(|(x, y)| (x.clone(), y.clone())).collect();
+    let pairs: Vec<(ShareRef, ShareRef)> = a
+        .iter()
+        .zip(b)
+        .map(|(x, y)| (x.clone(), y.clone()))
+        .collect();
     let conds = be.lt_batch(&pairs); // condᵢ = 1 iff aᵢ < bᵢ
-    // muxᵢ(cond, b, a) = aᵢ + condᵢ·(bᵢ − aᵢ): one batched multiply.
+                                     // muxᵢ(cond, b, a) = aᵢ + condᵢ·(bᵢ − aᵢ): one batched multiply.
     let mul_pairs: Vec<(ShareRef, ShareRef)> = conds
         .iter()
         .zip(a.iter().zip(b))
@@ -492,7 +530,11 @@ pub fn max2_batch(be: &mut dyn Backend, a: &[ShareRef], b: &[ShareRef]) -> Vec<S
 pub fn maxpool2d_ref(input: &[i64], in_shape: Chw, pool: usize, stride: usize) -> (Vec<i64>, Chw) {
     let out_h = (in_shape.h - pool) / stride + 1;
     let out_w = (in_shape.w - pool) / stride + 1;
-    let out_shape = Chw { c: in_shape.c, h: out_h, w: out_w };
+    let out_shape = Chw {
+        c: in_shape.c,
+        h: out_h,
+        w: out_w,
+    };
     let mut out = Vec::with_capacity(out_shape.len());
     for c in 0..in_shape.c {
         for oy in 0..out_h {
@@ -522,7 +564,9 @@ mod tests {
         (v as u32) as i32 as i64
     }
     fn share_vec(be: &mut Aby3Simulator, xs: &[i64]) -> Vec<ShareRef> {
-        xs.iter().map(|&v| be.share_secret(residue(v), NBITS, 0)).collect()
+        xs.iter()
+            .map(|&v| be.share_secret(residue(v), NBITS, 0))
+            .collect()
     }
 
     #[test]
@@ -544,7 +588,11 @@ mod tests {
             let sa = be.share_secret(residue(a), NBITS, 0);
             let sb = be.share_secret(residue(b), NBITS, 0);
             let m = max2(&mut be, &sa, &sb);
-            assert_eq!(to_signed(be.reveal(&m, None)), max2_ref(a, b), "max2({a},{b})");
+            assert_eq!(
+                to_signed(be.reveal(&m, None)),
+                max2_ref(a, b),
+                "max2({a},{b})"
+            );
         }
     }
 
@@ -555,7 +603,11 @@ mod tests {
             let mut be = Aby3Simulator::new();
             let shares = share_vec(&mut be, xs);
             let m = max_reduce(&mut be, &shares);
-            assert_eq!(to_signed(be.reveal(&m, None)), max_reduce_ref(xs), "max_reduce {xs:?}");
+            assert_eq!(
+                to_signed(be.reveal(&m, None)),
+                max_reduce_ref(xs),
+                "max_reduce {xs:?}"
+            );
         }
     }
 
@@ -610,11 +662,11 @@ mod tests {
             &[3, 9, 2, 9, 1], // first max at index 1 (tie with 3 broken to 1)
             &[-5, -1, -9],
             &[10, 20, 30, 25],
-            &[7, 7, 7],       // all equal -> index 0
+            &[7, 7, 7], // all equal -> index 0
             &[1],
-            &[9, 1, 2, 3, 4, 5, 6, 7, 8],  // odd length, max first
-            &[1, 2, 3, 4, 5, 6, 7, 8, 9],  // odd length, max last
-            &[5, 1, 5, 1, 5],              // ties across sibling subtrees
+            &[9, 1, 2, 3, 4, 5, 6, 7, 8], // odd length, max first
+            &[1, 2, 3, 4, 5, 6, 7, 8, 9], // odd length, max last
+            &[5, 1, 5, 1, 5],             // ties across sibling subtrees
         ];
         for xs in cases {
             let mut be = Aby3Simulator::new();
@@ -627,11 +679,24 @@ mod tests {
 
     #[test]
     fn arith_shr_matches_reference_signed() {
-        for &(x, k) in &[(8i64, 1usize), (-8, 1), (7, 2), (-7, 2), (-1, 3), (100, 4), (-100, 4), (0, 5)] {
+        for &(x, k) in &[
+            (8i64, 1usize),
+            (-8, 1),
+            (7, 2),
+            (-7, 2),
+            (-1, 3),
+            (100, 4),
+            (-100, 4),
+            (0, 5),
+        ] {
             let mut be = Aby3Simulator::new();
             let s = be.share_secret(residue(x), NBITS, 0);
             let r = arith_shr(&mut be, &s, k, NBITS);
-            assert_eq!(to_signed(be.reveal(&r, None)), arith_shr_ref(x, k), "arith_shr({x},{k})");
+            assert_eq!(
+                to_signed(be.reveal(&r, None)),
+                arith_shr_ref(x, k),
+                "arith_shr({x},{k})"
+            );
         }
     }
 

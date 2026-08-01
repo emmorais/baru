@@ -1293,7 +1293,7 @@ enum PersistValue {
 
 impl Participant {
     /// A participant backed by the in-process
-    /// [`Aby3Simulator`](crate::interpreter::aby3_simulator::Aby3Simulator).
+    /// [`crate::interpreter::aby3_simulator::Aby3Simulator`].
     ///
     /// This is the right constructor for evaluating an expression on its own —
     /// a correctness baseline, a test, a plaintext-vs-MPC comparison — and it is
@@ -1530,8 +1530,7 @@ impl Participant {
                             .map(|row| Types::List(row.iter().map(|&w| Types::Fixed(w)).collect()))
                             .collect(),
                     );
-                    let bias =
-                        Types::List(layer.bias.iter().map(|&b| Types::Fixed(b)).collect());
+                    let bias = Types::List(layer.bias.iter().map(|&b| Types::Fixed(b)).collect());
                     let activation = Types::Str(
                         match layer.activation {
                             crate::ml::Activation::Relu => "relu",
@@ -1718,7 +1717,7 @@ impl Participant {
                 }
                 _ => panic!("zkp-compile: second arg must be a list of strings or a quoted list like '(\"x\")"),
             };
-            let backend = crate::zkp::binius64_backend::Binius64Backend::new();
+            let backend = crate::zkp::binius_real::Binius64Real::new();
             use crate::zkp::ZKPBackend;
             let circuit = backend
                 .compile_circuit(&expr, &private_vars)
@@ -1769,7 +1768,7 @@ impl Participant {
             let public_vals: std::collections::HashMap<String, i64> =
                 public_keys.into_iter().zip(public_nums).collect();
 
-            let backend = crate::zkp::binius64_backend::Binius64Backend::new();
+            let backend = crate::zkp::binius_real::Binius64Real::new();
             use crate::zkp::ZKPBackend;
             let proof = backend
                 .prove(&circuit, &private_vals, &public_vals)
@@ -1811,7 +1810,7 @@ impl Participant {
             let public_vals: std::collections::HashMap<String, i64> =
                 public_keys.into_iter().zip(public_nums).collect();
 
-            let backend = crate::zkp::binius64_backend::Binius64Backend::new();
+            let backend = crate::zkp::binius_real::Binius64Real::new();
             use crate::zkp::ZKPBackend;
             match backend.verify(&circuit, &proof, &public_vals) {
                 Ok(true) => Types::Num(1),

@@ -55,7 +55,11 @@ fn ms(d: std::time::Duration) -> f64 {
 fn problem(in_dim: usize, out_dim: usize) -> (Vec<i64>, Vec<Vec<i64>>, Vec<i64>) {
     let x: Vec<i64> = (0..in_dim).map(|i| ((i * 7) % 101) as i64 - 50).collect();
     let w: Vec<Vec<i64>> = (0..out_dim)
-        .map(|r| (0..in_dim).map(|i| (((r * 13 + i * 7) % 101) as i64) - 50).collect())
+        .map(|r| {
+            (0..in_dim)
+                .map(|i| (((r * 13 + i * 7) % 101) as i64) - 50)
+                .collect()
+        })
         .collect();
     let expected: Vec<i64> = w
         .iter()
@@ -204,11 +208,29 @@ pub fn run_cli(args: &[String]) -> Result<(), String> {
                 return Ok(());
             }
             "--json" => json = true,
-            "--in" => { i += 1; in_dim = args.get(i).ok_or("--in needs a value")?.parse().map_err(|_| "bad in".to_string())?; }
-            "--out" => { i += 1; out_dim = args.get(i).ok_or("--out needs a value")?.parse().map_err(|_| "bad out".to_string())?; }
+            "--in" => {
+                i += 1;
+                in_dim = args
+                    .get(i)
+                    .ok_or("--in needs a value")?
+                    .parse()
+                    .map_err(|_| "bad in".to_string())?;
+            }
+            "--out" => {
+                i += 1;
+                out_dim = args
+                    .get(i)
+                    .ok_or("--out needs a value")?
+                    .parse()
+                    .map_err(|_| "bad out".to_string())?;
+            }
             "--reps" => {
                 i += 1;
-                reps = args.get(i).ok_or("--reps needs a value")?.parse().map_err(|_| "bad reps".to_string())?;
+                reps = args
+                    .get(i)
+                    .ok_or("--reps needs a value")?
+                    .parse()
+                    .map_err(|_| "bad reps".to_string())?;
                 if reps == 0 {
                     return Err("--reps must be at least 1".into());
                 }
@@ -249,12 +271,17 @@ pub fn run_cli(args: &[String]) -> Result<(), String> {
             .iter()
             .map(|(b, r)| serde_json::json!({ "poly_backend": b.name(), "schemes": r }))
             .collect();
-        println!("{}", serde_json::to_string_pretty(&payload).map_err(|e| e.to_string())?);
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&payload).map_err(|e| e.to_string())?
+        );
         return Ok(());
     }
 
     println!("Minimal-FHE inner product — one ct×ct multiply, no relin/bootstrap/eval-keys");
-    println!("packed matvec({in_dim}x{out_dim}), both operands encrypted, decrypt under squared key\n");
+    println!(
+        "packed matvec({in_dim}x{out_dim}), both operands encrypted, decrypt under squared key\n"
+    );
     for (b, reports) in &runs {
         print_table(*b, reports, runs.len() > 1);
     }
@@ -299,7 +326,16 @@ fn print_table(b: Backend, reports: &[SchemeReport], label_backend: bool) {
     }
     println!(
         "{:<8} {:>6} {:>4} {:>6} {:>9} {:>9} {:>9} {:>9} {:>10} {:>4}",
-        "scheme", "secure", "eval", "n", "keygen", "encrypt", "multiply", "decrypt", "ct-bytes", "ok"
+        "scheme",
+        "secure",
+        "eval",
+        "n",
+        "keygen",
+        "encrypt",
+        "multiply",
+        "decrypt",
+        "ct-bytes",
+        "ok"
     );
     for r in reports {
         println!(

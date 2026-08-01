@@ -13,11 +13,11 @@
 //!
 //! # What is here
 //!
-//! * [`base`] — Chou–Orlandi "simplest OT" over Ristretto255. Two exponentiations
+//! * `base` — Chou–Orlandi "simplest OT" over Ristretto255. Two exponentiations
 //!   for the receiver, two for the sender, one round each way. Public-key
 //!   operations, so a few tens of microseconds per OT: fine for a handful,
 //!   hopeless for millions.
-//! * [`iknp`] — IKNP OT extension. Turns `κ = 128` base OTs into as many cheap
+//! * `iknp` — IKNP OT extension. Turns `κ = 128` base OTs into as many cheap
 //!   OTs as you like, at one hash and `κ` bits of communication each. This is
 //!   what makes OT usable as a preprocessing primitive.
 //!
@@ -191,6 +191,34 @@ impl BitColumns {
     pub(crate) fn len(&self) -> usize {
         self.m
     }
+}
+
+/// Multiply in `GF(2^128)` modulo `x^128 + x^7 + x^2 + x + 1`.
+///
+/// The KOS15 consistency check ([`iknp::ExtSender::kos_verify`]) is a random
+/// linear combination over this field: the receiver proves it used one
+/// consistent choice-bit vector across all `κ` columns, and soundness comes
+/// from the combination being taken over a *field* rather than bit by bit.
+///
+/// Bits are little-endian within the block, so bit `i` of the polynomial is bit
+/// `i` of the corresponding `u128`. The reduction constant `0x87` is the
+/// low-order form of `x^7 + x^2 + x + 1`, the same polynomial AES-GCM uses.
+pub(crate) fn gf128_mul(a: &Block, b: &Block) -> Block {
+    let x = u128::from_le_bytes(*a);
+    let y = u128::from_le_bytes(*b);
+    let mut acc: u128 = 0;
+    let mut cur = x;
+    for i in 0..128 {
+        if (y >> i) & 1 == 1 {
+            acc ^= cur;
+        }
+        let overflow = cur >> 127;
+        cur <<= 1;
+        if overflow == 1 {
+            cur ^= 0x87;
+        }
+    }
+    acc.to_le_bytes()
 }
 
 /// Pack `bits` little-endian into bytes.

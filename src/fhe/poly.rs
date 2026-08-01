@@ -5,9 +5,9 @@
 //! exact negacyclic product of centered coefficients in `ℤ[X]/(X^n + 1)`. Two
 //! implementations exist:
 //!
-//! - [`Backend::Ntt`] — [`crate::fhe::ntt`], the hand-written multi-modular
+//! - `Backend::Ntt` — [`crate::fhe::ntt`], the hand-written multi-modular
 //!   NTT. Always available, pure Rust, no toolchain.
-//! - [`Backend::Ntl`] — [`crate::fhe::ntl`], NTL over GMP. Requires
+//! - `Backend::Ntl` — `crate::fhe::ntl`, NTL over GMP. Requires
 //!   `--features ntl`; ~2.5× faster (`baru bench-polymul`).
 //!
 //! The choice is a **process-global runtime switch**, not a compile-time one,
@@ -35,7 +35,7 @@
 //! # Why the results are interchangeable
 //!
 //! Both compute the same exact integer. `ntl.rs`'s tests assert this at
-//! `n = 4096` with ±2⁹⁹ coefficients, and [`tests::backends_agree`] below
+//! `n = 4096` with ±2⁹⁹ coefficients, and `tests::backends_agree` below
 //! re-checks it through this dispatch layer. So switching backends is a pure
 //! performance decision — no scheme's correctness, noise budget or security
 //! depends on it.
@@ -66,7 +66,9 @@ impl Backend {
         match s {
             "ntt" => Ok(Backend::Ntt),
             "ntl" => Ok(Backend::Ntl),
-            other => Err(format!("unknown polynomial backend {other:?} (want \"ntt\" or \"ntl\")")),
+            other => Err(format!(
+                "unknown polynomial backend {other:?} (want \"ntt\" or \"ntl\")"
+            )),
         }
     }
 }
@@ -113,7 +115,13 @@ pub fn set_backend(b: Backend) -> Result<(), String> {
             b.name()
         ));
     }
-    BACKEND.store(match b { Backend::Ntl => NTL, Backend::Ntt => NTT }, Ordering::Relaxed);
+    BACKEND.store(
+        match b {
+            Backend::Ntl => NTL,
+            Backend::Ntt => NTT,
+        },
+        Ordering::Relaxed,
+    );
     Ok(())
 }
 
@@ -129,7 +137,7 @@ pub fn set_backend(b: Backend) -> Result<(), String> {
 ///
 /// The NTL backend is kept because it is a genuinely independent implementation
 /// and therefore a differential oracle for the one we rely on — see
-/// [`tests::backends_agree`] and `fhe::ntl`. It is no longer a performance
+/// `tests::backends_agree` and `fhe::ntl`. It is no longer a performance
 /// option.
 pub fn use_fastest() -> Backend {
     set_backend(Backend::Ntt).expect("the NTT backend is always available");
@@ -295,12 +303,20 @@ mod tests {
         let mut s = seed | 1;
         (0..n)
             .map(|_| {
-                s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                s = s
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
                 let hi = (s >> 1) as u128;
-                s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                s = s
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
                 let lo = (s >> 1) as u128;
                 let mag = (((hi << 64) | lo) % (1u128 << bits)) as i128;
-                if s & 1 == 0 { mag } else { -mag }
+                if s & 1 == 0 {
+                    mag
+                } else {
+                    -mag
+                }
             })
             .collect()
     }
@@ -317,7 +333,11 @@ mod tests {
     fn unavailable_backends_are_rejected_not_silently_downgraded() {
         if !is_available(Backend::Ntl) {
             assert!(set_backend(Backend::Ntl).is_err());
-            assert_eq!(backend(), Backend::Ntt, "a rejected set must not change the backend");
+            assert_eq!(
+                backend(),
+                Backend::Ntt,
+                "a rejected set must not change the backend"
+            );
         }
     }
 
@@ -349,8 +369,14 @@ mod tests {
             })
             .unwrap();
         }
-        assert!(products.windows(2).all(|w| w[0] == w[1]), "backends disagree on the product");
-        assert!(tensors.windows(2).all(|w| w[0] == w[1]), "backends disagree on the tensor");
+        assert!(
+            products.windows(2).all(|w| w[0] == w[1]),
+            "backends disagree on the product"
+        );
+        assert!(
+            tensors.windows(2).all(|w| w[0] == w[1]),
+            "backends disagree on the tensor"
+        );
     }
 
     #[test]

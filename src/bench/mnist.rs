@@ -50,6 +50,7 @@ use serde::Serialize;
 
 use crate::bench::cnn::{run_cnn_hybrid, CnnModel, ConvLayer};
 use crate::bench::comm::NetworkProfile;
+use crate::bench::metrics::ClassificationMetrics;
 
 #[path = "../../examples/data/mnist_cnn.rs"]
 #[allow(dead_code)] // generated file exports a few descriptive consts we don't read
@@ -67,17 +68,23 @@ fn load_model() -> (CnnModel, Vec<Vec<i64>>, Vec<u8>) {
     let images: Vec<Vec<i64>> = data::TEST_IMAGES.iter().map(|im| im.to_vec()).collect();
     let labels: Vec<u8> = data::TEST_LABELS.to_vec();
     let kernels: Vec<Vec<i64>> = data::KERNELS.iter().map(|k| k.to_vec()).collect();
-    let extra_conv = vec![ConvLayer {
-        kernels: data::CONV2_W.iter().map(|r| r.to_vec()).collect(),
-        cbias: data::CONV2_B.to_vec(),
-        in_c: data::CONV2_IN_C,
-        in_h: data::CONV2_IN_H,
-        in_w: data::CONV2_IN_W,
-    }];
+    // Read the conv stack through the generated accessor rather than naming
+    // individual layer constants: how many conv layers there are is the
+    // trainer's `--conv` choice, and the model is indifferent to it.
+    let extra_conv: Vec<ConvLayer> = data::extra_conv_layers()
+        .into_iter()
+        .map(|(kernels, cbias, in_c, in_h, in_w)| ConvLayer {
+            kernels,
+            cbias,
+            in_c,
+            in_h,
+            in_w,
+        })
+        .collect();
     let hidden: Vec<(Vec<Vec<i64>>, Vec<i64>)> = data::hidden_layers();
     let dense_w: Vec<Vec<i64>> = data::DENSE_W.iter().map(|r| r.to_vec()).collect();
     let model = CnnModel::from_trained(
-        28,
+        data::D,
         kernels,
         data::CBIAS.to_vec(),
         extra_conv,
@@ -92,8 +99,15 @@ fn load_model() -> (CnnModel, Vec<Vec<i64>>, Vec<u8>) {
 
 #[derive(Debug, Serialize)]
 pub struct MnistReport {
+    /// The layer stack, read off the trained weights rather than restated as a
+    /// literal here — depth is the trainer's choice, not this file's.
+    pub architecture: String,
     pub n_test: usize,
     pub plaintext_correct: usize,
+    /// Per-class recall, confusion, balanced accuracy, macro AUC and a Wilson
+    /// interval over the embedded subset — the same set `bench-medmnist`
+    /// reports, so the two benchmarks are read the same way.
+    pub metrics: ClassificationMetrics,
     pub plaintext_accuracy: f64,
     pub full_test_accuracy: f64,
     pub hybrid_evaluated: usize,
@@ -107,20 +121,21 @@ pub fn run(hybrid_n: usize, profile: NetworkProfile) -> MnistReport {
     let (model, images, labels) = load_model();
     let t0 = Instant::now();
 
-    // Plaintext-integer accuracy over every embedded test image.
-    let mut plaintext_correct = 0usize;
-    let preds: Vec<usize> = images
+    // Plaintext-integer scoring over every embedded test image. Logits rather
+    // than the argmax alone so the same metrics `bench-medmnist` reports are
+    // available here: MNIST is near-balanced, so accuracy is not actively
+    // misleading as it is on pneumonia, but a per-class collapse and an
+    // interval on a 300-image subset are worth seeing either way.
+    let logits: Vec<Vec<i64>> = images
         .iter()
-        .map(|img| {
-            let (class, _) = model.forward(img);
-            class
-        })
+        .map(|img| model.forward_logits(img).0)
         .collect();
-    for (p, &l) in preds.iter().zip(&labels) {
-        if *p == l as usize {
-            plaintext_correct += 1;
-        }
-    }
+    let preds: Vec<usize> = logits
+        .iter()
+        .map(|l| crate::gadgets::argmax_ref(l))
+        .collect();
+    let metrics = ClassificationMetrics::compute(&logits, &labels, model.nclasses());
+    let plaintext_correct = metrics.correct;
 
     // Encrypted accuracy on a subset: prove each hybrid prediction equals the
     // plaintext one (bit-exact) and count how many match the true label.
@@ -138,8 +153,10 @@ pub fn run(hybrid_n: usize, profile: NetworkProfile) -> MnistReport {
     }
 
     MnistReport {
+        architecture: model.architecture(),
         n_test: images.len(),
         plaintext_correct,
+        metrics,
         plaintext_accuracy: plaintext_correct as f64 / images.len() as f64,
         full_test_accuracy: FULL_TEST_ACCURACY,
         hybrid_evaluated: hybrid_n,
@@ -187,24 +204,32 @@ pub fn run_cli(args: &[String]) -> Result<(), String> {
 
     let r = run(hybrid_n, NetworkProfile::INSTANT);
     if json {
-        println!("{}", serde_json::to_string_pretty(&r).map_err(|e| e.to_string())?);
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&r).map_err(|e| e.to_string())?
+        );
         return Ok(());
     }
 
     println!("Private CNN on real MNIST — trained weights, real test digits, ZERO bootstraps");
-    println!(
-        "architecture: 1×28×28 → conv({}, 3×3) → ReLU → pool → conv({}, 3×3) → ReLU → pool → dense(→{}) → ReLU → dense(→10) → argmax",
-        data::OC,
-        data::CONV2_W.len(),
-        data::HN
-    );
+    println!("architecture: {}", r.architecture);
     println!();
+    let m = &r.metrics;
     println!(
-        "  plaintext-integer accuracy : {}/{} = {:.2}%  (this in-repo subset)",
+        "  plaintext-integer accuracy : {}/{} = {:.2}%  95% CI [{:.1}, {:.1}]  (in-repo subset)",
         r.plaintext_correct,
         r.n_test,
-        r.plaintext_accuracy * 100.0
+        r.plaintext_accuracy * 100.0,
+        m.accuracy_ci.0 * 100.0,
+        m.accuracy_ci.1 * 100.0
     );
+    println!(
+        "  balanced accuracy          : {:.2}%  (mean per-class recall, subset)",
+        m.balanced_accuracy * 100.0
+    );
+    if let Some(a) = m.auc {
+        println!("  AUC (macro one-vs-rest)    : {a:.4}  (subset)");
+    }
     println!(
         "  full MNIST test set (10 000): {:.2}%  (identical weights, measured offline)",
         r.full_test_accuracy * 100.0

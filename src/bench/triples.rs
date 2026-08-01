@@ -182,7 +182,10 @@ pub fn run_cli(args: &[String]) -> Result<(), String> {
 
     let r = run(batches)?;
     if json {
-        println!("{}", serde_json::to_string_pretty(&r).map_err(|e| e.to_string())?);
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&r).map_err(|e| e.to_string())?
+        );
         return Ok(());
     }
 

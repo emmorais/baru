@@ -80,19 +80,33 @@ post-quantum TLS transports.
 | Layer | Location | What it provides |
 |---|---|---|
 | **Interpreter** | `src/interpreter/` | Lisp parser, AST, trampolined evaluator, REPL, pluggable `Backend` |
-| **MPC** | `src/crypto/` | ABY3 replicated shares, **triple-free** multiplication, bit decomposition, batched primitives, in-process and TCP transports |
+| **MPC** | `src/crypto/` | ABY3 replicated shares, **triple-free** multiplication, bit decomposition, batched primitives, in-process and TCP transports. **Malicious security with abort** (`crypto::aby3_verify`, `interpreter::malicious_backend`) |
 | **FHE** | `src/fhe/` | BFV and BGV (secure, depth-1, no eval keys), TFHE-rs, SEAL CKKS (+ exact mock twins), multi-modular NTT, CRT slot packing |
-| **Hybrid** | `src/hybrid/` | MPC ↔ FHE scheme switching in both directions; re-encryption as a bootstrapping alternative |
-| **ZKP** | `src/zkp/` | Expression → circuit compiler, Binius64 SNARK prover/verifier, proof serialization |
+| **Hybrid** | `src/hybrid/` | MPC ↔ FHE scheme switching in both directions; re-encryption as a bootstrapping alternative; threshold-key switch with derandomized, checkable operations (`hybrid::threshold_switch`) |
+| **ZKP** | `src/zkp/` | Expression → circuit compiler, **real Binius64 prover/verifier** (`zkp::binius_real`; arithmetic, signed comparisons, `if`, `let`), proof serialization. The legacy `binius64_backend` is a retained placeholder that proves nothing — see the ZKP note below |
 | **Gadgets** | `src/gadgets/` | UC-composable MPC building blocks: `relu`, `maxpool2d`, `argmax`, `dense`, `conv2d` — each bit-exact against a plaintext reference |
 | **MPC compiler** | `src/mpcc/` | Backend-aware circuit IR, rewrite rules, cost models, protocol registry (dealer / Shamir / Semi2k / LowGear), executable VM |
-| **Primitives** | `src/ot/`, `src/psi/`, `src/pir/` | Chou–Orlandi + IKNP OT, DH-PSI, single-server BFV PIR — all measured, including where they lose |
+| **Primitives** | `src/ot/`, `src/psi/`, `src/pir/` | Chou–Orlandi + IKNP OT (with KOS check and Schnorr PoK), DH-PSI (with a batched DLEQ proof), single-server BFV PIR — all measured, including where they lose |
 | **ML plumbing** | `src/ml/`, `src/precompile/` | Model import + Q16.16 quantization with an accuracy report; champion-dispatched batched gadgets |
 | **Node** | `src/bin/tcp_party.rs` | Multi-party node: a distributed MPC evaluator over real sockets (plaintext TCP or optional PQ-TLS) |
 
 The interpreter's `Backend` trait bridges the layers: every arithmetic or
 comparison operation on a shared value dispatches through a backend that runs the
 appropriate protocol round.
+
+### Security posture
+
+Every engine **attests** what it actually implements
+(`crypto::attestations` — one table, readable in a sitting), and asking a
+session for more than an engine attests is an error rather than a silent
+downgrade. Today exactly one engine attests malicious security:
+`MaliciousBackend`, the ABY3 layer, secure **with abort** against one corrupt
+party in three. Everything else is semi-honest and says why, naming the specific
+gap.
+
+That gate is deliberate. The malicious upgrade landed in stages, and a
+half-finished stage must not be mistakable for a finished one — by a caller, a
+benchmark, or a paper table.
 
 ---
 
@@ -107,12 +121,14 @@ the corrections behind each row are in [`docs/experiments.md`](docs/experiments.
 | One private dense layer, secure hybrid | **79 ms** (BFV linear → ABY3 ReLU) vs 25 ms pure MPC — but **15 wire messages** vs 9276 | `bench-hybrid-nn` |
 | Private CNN, 28×28, image *and* weights encrypted | **260 ms**, 0 bootstraps, exact | `bench-cnn --img 28 --gc --precompute` |
 | Real MNIST accuracy, deployed integer model | **98.89%**; every encrypted prediction equals the plaintext one | `bench-mnist` |
-| Private *diagnosis* (MedMNIST chest X-ray) | **84.78%**, **488 ms** online per diagnosis, 0 bootstraps | `bench-medmnist` |
+| Private *diagnosis* (MedMNIST chest X-ray) | **84.78%**, **268 ms** online per diagnosis (435 ms single-core), 0 bootstraps, encrypted==plaintext on **300/300** | `bench-medmnist` |
 | Private *training* (SGD under MPC, backprop through ReLU) | trained model **bit-identical** to plaintext integer SGD, in **3 643** wire messages | `bench-train --hidden 8` |
 | Convolution packing | 1352 ct×ct multiplications → **8** | `bench-cnn --img 28` |
 | Our NTT vs NTL+GMP | **1.8× faster** at every size (after the Shoup butterfly rewrite) | `bench-polymul` |
 | Triples from SHE vs from OT | **192 B/triple** vs 3074, and ~28× faster | `bench-triples` |
 | Compiler vs expert hand-written network | **0.38×** the interactive calls, **0.49×** the messages | `bench-compiled-nn` |
+| **Cost of active security** (malicious ABY3, with abort) | comparisons: **2.63×** bytes but only **1.06×** rounds, **1.23×** wall clock on a WAN | `bench-malicious` |
+| **Proving** a Q16.16 quantized neuron (784 inputs) | **32 ms** prove, **4.8 ms** verify, 112 KB proof; constraints linear in width, proof size far sublinear | `bench-zkp-layer` |
 
 Honest negatives are first-class here and kept alongside the wins: PIR loses to
 downloading the database by 13×; hybrid-TFHE does not pay; faster ring arithmetic
@@ -122,6 +138,51 @@ MPC at any width. The hybrid's case is the *deployment shape* — the client
 sends ciphertexts and leaves, only the nonlinear segment needs live parties —
 not raw cost. See
 [Part VII](docs/experiments.md#part-vii--negative-superseded-and-withdrawn-results).
+
+---
+
+## A note on the ZKP backend
+
+`src/zkp/binius_real.rs` is a **real proof system**: it builds a Binius64
+constraint system with `binius_frontend`, proves with `binius_prover`, and
+verifies with `binius_verifier`. `tests/zkp_real.rs` checks the properties that
+matter — an honest proof verifies; proving without a witness fails; a witness
+that does not satisfy the statement is rejected; a proof does not transfer to a
+different statement; a tampered transcript is rejected.
+
+Scope is stated rather than implied. It compiles `+`, `−`, `×`, `/`, `mod`,
+the signed comparisons `<`, `>`, `<=`, `>=`, `==`, arithmetic shifts by a public
+constant, plus `if`, `let` and sequences, over 64-bit words — enough to prove a
+**ReLU neuron** and a **Q16.16 multiply-rescale**, which are the shapes private
+inference is built from. Lambdas and list operations are **refused with an
+error**; `bench-suite` reports anything it cannot compile as unsupported instead
+of skipping it.
+
+Three details in that circuit are easy to get silently wrong, so they are worth
+knowing about if you extend it.
+
+The comparison gates are **unsigned**, so signed comparison flips both sign bits
+first — without that, every negative value compares as larger than every
+positive one and `relu(-1)` returns `-1`, a circuit that is perfectly sound
+about the wrong function. Those gates also define only the *most significant
+bit* of their output, the rest being explicitly undefined, so the result is
+extracted with a logical shift rather than a mask.
+
+**Division is the sharp one.** A circuit cannot divide, so the prover supplies
+the quotient and remainder as witnesses and the circuit checks them — and the
+obvious check `a == b*q + r` with `|r| < |b|` is *unsound*, because circuit
+multiplication wraps mod 2⁶⁴. For `a = 1, b = 3` a cheating prover sets `r = 0`
+and `q = 3⁻¹ mod 2⁶⁴`; both checks pass and the quotient is nonsense. What
+closes it is requiring the 128-bit product's high word to be exactly the sign
+extension of the low word, so `b*q` cannot wrap. `tests/zkp_real.rs` drives that
+forgery through the real prover and asserts it is rejected.
+
+**The history is worth keeping.** Until 2026-07-31 this backend was
+`binius64_backend`, which concatenated hashes and whose `verify` never checked
+that a witness satisfied any constraint — anyone holding the public circuit
+could forge an accepting proof. It is retained, unused by the interpreter, so
+that `tests/zkp_soundness.rs` can keep demonstrating precisely what it failed to
+do. Any ZKP numbers published before that date should not be quoted.
 
 ---
 
@@ -275,7 +336,7 @@ src/
   gadgets/      relu, max2/max_reduce/maxpool2d, argmax, dense, conv2d
   mpcc/         circuit IR, rewrite rules (opt), cost + fhe_cost + ot_cost models,
                 protocol registry, semi2k, lowgear, mixed, scheduler, VM, exec
-  zkp/          CircuitCompiler (FlatIR), Binius64 backend, proof serialization
+  zkp/          CircuitCompiler (FlatIR), binius_real (real Binius64), serialization
   ot/ psi/ pir/ Chou-Orlandi + IKNP; DH-PSI; single-server BFV PIR
   ml/           NetworkSpec/QuantizedNetwork, `baru quantize`
   precompile/   Gadget/Registry/champion dispatch, batched matvec

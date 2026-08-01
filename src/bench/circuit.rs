@@ -130,9 +130,19 @@ fn max_fold_src(n: usize) -> String {
 #[allow(clippy::type_complexity)]
 fn compile_len(src: &str, cse: bool) -> Result<(usize, Program, Program), String> {
     let expr = parse(src).map_err(|e| format!("parse error: {e}"))?;
-    let mut cc = if cse { CircuitCompiler::new() } else { CircuitCompiler::new().without_cse() };
-    let circuit = cc.compile_fhe(&expr).map_err(|e| format!("compile error: {e}"))?;
-    let program = lower(&circuit.flat_ops, &circuit.output_wire, &LowerConfig::default())?;
+    let mut cc = if cse {
+        CircuitCompiler::new()
+    } else {
+        CircuitCompiler::new().without_cse()
+    };
+    let circuit = cc
+        .compile_fhe(&expr)
+        .map_err(|e| format!("compile error: {e}"))?;
+    let program = lower(
+        &circuit.flat_ops,
+        &circuit.output_wire,
+        &LowerConfig::default(),
+    )?;
     let rebalanced = reassociate_reductions(&circuit.flat_ops, &circuit.output_wire);
     let program_opt = lower(&rebalanced, &circuit.output_wire, &LowerConfig::default())?;
     Ok((circuit.flat_ops.len(), program, program_opt))
@@ -142,7 +152,11 @@ pub fn measure(name: &str, src: &str, n: usize) -> Result<CircuitPoint, String> 
     let (ops, program, program_opt) = compile_len(src, true)?;
     let (ops_no_cse, _, _) = compile_len(src, false)?;
     let sched = schedule(&program);
-    let interactive = program.code.iter().filter(|i| program.is_interactive(i)).count();
+    let interactive = program
+        .code
+        .iter()
+        .filter(|i| program.is_interactive(i))
+        .count();
     Ok(CircuitPoint {
         program: name.to_string(),
         n,
@@ -208,7 +222,10 @@ pub fn run_cli(args: &[String]) -> Result<(), String> {
     }
 
     if json {
-        println!("{}", serde_json::to_string_pretty(&pts).map_err(|e| e.to_string())?);
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&pts).map_err(|e| e.to_string())?
+        );
         return Ok(());
     }
 
@@ -219,7 +236,11 @@ pub fn run_cli(args: &[String]) -> Result<(), String> {
     );
     for p in &pts {
         let cse_note = if p.ops_no_cse > p.ops {
-            format!("{} ({:.0}x)", p.ops_no_cse, p.ops_no_cse as f64 / p.ops.max(1) as f64)
+            format!(
+                "{} ({:.0}x)",
+                p.ops_no_cse,
+                p.ops_no_cse as f64 / p.ops.max(1) as f64
+            )
         } else {
             p.ops_no_cse.to_string()
         };
@@ -252,7 +273,10 @@ pub fn run_cli(args: &[String]) -> Result<(), String> {
             first.1, first.0, last.0
         );
     }
-    let fold = pts.iter().filter(|p| p.program == "max-fold").collect::<Vec<_>>();
+    let fold = pts
+        .iter()
+        .filter(|p| p.program == "max-fold")
+        .collect::<Vec<_>>();
     if let (Some(a), Some(b)) = (fold.first(), fold.last()) {
         println!(
             "  max-fold:   as written, {} rounds at n={} and {} at n={} — LINEAR, because a\n  \
@@ -275,7 +299,11 @@ pub fn run_cli(args: &[String]) -> Result<(), String> {
 
 fn parse_list(s: &str) -> Result<Vec<usize>, String> {
     s.split(',')
-        .map(|t| t.trim().parse::<usize>().map_err(|_| format!("bad width list `{s}`")))
+        .map(|t| {
+            t.trim()
+                .parse::<usize>()
+                .map_err(|_| format!("bad width list `{s}`"))
+        })
         .collect()
 }
 
@@ -295,7 +323,10 @@ mod tests {
             "ReLU layer went from {} rounds at n=1 to {} at n=32",
             one.rounds, wide.rounds
         );
-        assert!(wide.interactive > one.interactive, "the wide layer must do more work");
+        assert!(
+            wide.interactive > one.interactive,
+            "the wide layer must do more work"
+        );
     }
 
     /// The reduction rule must turn a fold's *linear* depth into *logarithmic*
@@ -317,7 +348,12 @@ mod tests {
             b.rounds_reassociated
         );
         // ...while the unrebalanced chain doubles.
-        assert!(b.rounds > a.rounds + 2, "the chain should grow linearly: {} -> {}", a.rounds, b.rounds);
+        assert!(
+            b.rounds > a.rounds + 2,
+            "the chain should grow linearly: {} -> {}",
+            a.rounds,
+            b.rounds
+        );
     }
 
     /// CSE must be part of compilation, not an opt-in pass. A fold written the
@@ -333,6 +369,10 @@ mod tests {
             p.ops_no_cse,
             p.ops
         );
-        assert!(p.ops < 100, "compiled fold should be small, got {} ops", p.ops);
+        assert!(
+            p.ops < 100,
+            "compiled fold should be small, got {} ops",
+            p.ops
+        );
     }
 }

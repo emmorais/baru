@@ -1,7 +1,7 @@
 //! Executing a compiled circuit on a real MPC backend, level by level.
 //!
 //! This is the bridge that makes the *compiled* path comparable to
-//! hand-written code. [`crate::mpcc::schedule`] already proves, analytically,
+//! hand-written code. [`mod@crate::mpcc::schedule`] already proves, analytically,
 //! that ASAP levelling collapses a layer's independent operations into one
 //! round; this runs the resulting circuit against the same
 //! [`Backend`] the hand-written gadgets use, so the batching stops being a

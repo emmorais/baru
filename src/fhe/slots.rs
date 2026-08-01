@@ -7,7 +7,7 @@
 //! `m(X) = Σ xᵢ Xⁱ`. That is the right encoding for an inner product, because
 //! a polynomial product *is* a convolution and the reversed-weight trick lands
 //! each row's dot product on a known coefficient
-//! ([`crate::fhe::bfv::pack_weights`]).
+//! (`crate::fhe::bfv::pack_weights`).
 //!
 //! It is the wrong encoding for anything elementwise. `m(X)²` has coefficient
 //! `Σ_{i+j=k} xᵢxⱼ` — every output is polluted by cross terms, so `xᵢ²` is not
@@ -35,8 +35,8 @@
 //! componentwise multiplication**. Those `n` components are the "slots".
 //!
 //! That map is exactly the negacyclic NTT: twist by `ψ^j`, then a standard
-//! NTT. [`decode`] is the forward direction (coefficients → slots) and
-//! [`encode`] the inverse. Both are O(n log n) and run on *plaintexts* only,
+//! NTT. `decode` is the forward direction (coefficients → slots) and
+//! `encode` the inverse. Both are O(n log n) and run on *plaintexts* only,
 //! so they cost nothing against a ciphertext operation.
 //!
 //! # Relationship to `fhe::ntt`
@@ -59,12 +59,20 @@ use std::sync::{Mutex, OnceLock};
 #[inline]
 fn addmod(a: u64, b: u64, t: u64) -> u64 {
     let s = a + b;
-    if s >= t { s - t } else { s }
+    if s >= t {
+        s - t
+    } else {
+        s
+    }
 }
 
 #[inline]
 fn submod(a: u64, b: u64, t: u64) -> u64 {
-    if a >= b { a - b } else { a + t - b }
+    if a >= b {
+        a - b
+    } else {
+        a + t - b
+    }
 }
 
 #[inline]
@@ -162,7 +170,9 @@ impl Plan {
             return Err(format!("ring dimension {n} must be a power of two"));
         }
         if !is_prime(t) {
-            return Err(format!("plaintext modulus {t} must be prime for slot packing"));
+            return Err(format!(
+                "plaintext modulus {t} must be prime for slot packing"
+            ));
         }
         let order = 2 * n as u64;
         if !(t - 1).is_multiple_of(order) {
@@ -313,7 +323,9 @@ mod tests {
         let mut s = seed | 1;
         (0..n)
             .map(|_| {
-                s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                s = s
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
                 (s >> 33) % t
             })
             .collect()
@@ -323,9 +335,9 @@ mod tests {
     /// agree with.
     fn negacyclic_mul(a: &[u64], b: &[u64], n: usize, t: u64) -> Vec<u64> {
         let mut out = vec![0u64; n];
-        for i in 0..n {
-            for j in 0..n {
-                let p = mulmod(a[i], b[j], t);
+        for (i, &ai) in a.iter().enumerate().take(n) {
+            for (j, &bj) in b.iter().enumerate().take(n) {
+                let p = mulmod(ai, bj, t);
                 let k = i + j;
                 if k < n {
                     out[k] = addmod(out[k], p, t);
@@ -389,7 +401,10 @@ mod tests {
         let (x, y) = (sample(N, T, 5), sample(N, T, 6));
         let prod = negacyclic_mul(&x, &y, N, T);
         let componentwise: Vec<u64> = x.iter().zip(&y).map(|(a, b)| mulmod(*a, *b, T)).collect();
-        assert_ne!(prod, componentwise, "cross terms must pollute coefficient packing");
+        assert_ne!(
+            prod, componentwise,
+            "cross terms must pollute coefficient packing"
+        );
     }
 
     #[test]
@@ -409,6 +424,9 @@ mod tests {
         let t = largest_slot_prime(4096, 1 << 17).unwrap();
         assert!(supports_slots(4096, t));
         let slots = sample(4096, t, 11);
-        assert_eq!(decode(&encode(&slots, 4096, t).unwrap(), 4096, t).unwrap(), slots);
+        assert_eq!(
+            decode(&encode(&slots, 4096, t).unwrap(), 4096, t).unwrap(),
+            slots
+        );
     }
 }

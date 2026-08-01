@@ -57,34 +57,45 @@ pub struct BfvParams {
 impl BfvParams {
     /// Secure depth-1 default: n=4096, q=2^100 (≤ the 128-bit RLWE bound of
     /// ~109 for n=4096), t=2^20.
-    pub const DEFAULT: BfvParams = BfvParams { n: 4096, log2_q: 100, log2_t: 20 };
+    pub const DEFAULT: BfvParams = BfvParams {
+        n: 4096,
+        log2_q: 100,
+        log2_t: 20,
+    };
     /// Small ring for fast unit tests (NOT secure — testing only).
-    pub const TEST_SMALL: BfvParams = BfvParams { n: 64, log2_q: 100, log2_t: 20 };
+    pub const TEST_SMALL: BfvParams = BfvParams {
+        n: 64,
+        log2_q: 100,
+        log2_t: 20,
+    };
 
-    fn q_mask(&self) -> u128 {
+    pub(crate) fn q_mask(&self) -> u128 {
         (1u128 << self.log2_q) - 1
     }
     pub fn t(&self) -> u64 {
         1u64 << self.log2_t
     }
-    fn delta_shift(&self) -> u32 {
+    pub(crate) fn delta_shift(&self) -> u32 {
         self.log2_q - self.log2_t
     }
-    fn half_q(&self) -> u128 {
+    pub(crate) fn half_q(&self) -> u128 {
         1u128 << (self.log2_q - 1)
     }
 }
 
 // ─── Polynomial helpers (coeffs mod q, power-of-two q) ────────────────────────
 
-type Poly = Vec<u128>;
+pub(crate) type Poly = Vec<u128>;
 
 fn poly_add(a: &[u128], b: &[u128], mask: u128) -> Poly {
-    a.iter().zip(b).map(|(x, y)| x.wrapping_add(*y) & mask).collect()
+    a.iter()
+        .zip(b)
+        .map(|(x, y)| x.wrapping_add(*y) & mask)
+        .collect()
 }
 
 /// Negacyclic schoolbook product mod q (wrapping u128 is exact since q | 2^128).
-fn poly_mul_mod(a: &[u128], b: &[u128], p: &BfvParams) -> Poly {
+pub(crate) fn poly_mul_mod(a: &[u128], b: &[u128], p: &BfvParams) -> Poly {
     // Exact negacyclic product via the multi-modular NTT, then reduced mod
     // q. Centering the operands first is sound because a ≡ a_c (mod q), so
     // the product agrees mod q; the exact result's low bits are the answer.
@@ -97,7 +108,7 @@ fn poly_mul_mod(a: &[u128], b: &[u128], p: &BfvParams) -> Poly {
         .collect()
 }
 
-fn center(c: u128, p: &BfvParams) -> i128 {
+pub(crate) fn center(c: u128, p: &BfvParams) -> i128 {
     if c >= p.half_q() {
         c as i128 - (1i128 << p.log2_q)
     } else {
@@ -110,7 +121,9 @@ fn center(c: u128, p: &BfvParams) -> i128 {
 fn rescale(acc: Vec<I256>, p: &BfvParams) -> Poly {
     let mask = p.q_mask();
     let shift = p.delta_shift();
-    acc.into_iter().map(|c| c.shr_round(shift).low_u128() & mask).collect()
+    acc.into_iter()
+        .map(|c| c.shr_round(shift).low_u128() & mask)
+        .collect()
 }
 
 fn sample_ternary(n: usize) -> Poly {
@@ -141,6 +154,20 @@ struct KeyBundle {
     s: Vec<u128>,
     b: Vec<u128>,
     a: Vec<u128>,
+}
+
+/// The public key's two polynomials `(b, a)`, for callers that need to encrypt
+/// with explicitly supplied randomness — see [`crate::fhe::threshold`].
+pub fn public_parts(key_bytes: &[u8]) -> (Vec<u128>, Vec<u128>) {
+    let k: KeyBundle = bincode::deserialize(key_bytes).expect("BFV key bundle");
+    (k.b, k.a)
+}
+
+/// The secret polynomial `s` from a client key bundle, so it can be split into
+/// threshold shares by [`crate::fhe::threshold::deal_key_shares`].
+pub fn secret_part(client_key_bytes: &[u8]) -> Vec<u128> {
+    let k: KeyBundle = bincode::deserialize(client_key_bytes).expect("BFV key bundle");
+    k.s
 }
 
 /// A BFV ciphertext: a vector of ring elements (2 fresh, 3 after one
@@ -198,8 +225,18 @@ impl Bfv {
         let b: Poly = (0..p.n)
             .map(|i| 0u128.wrapping_sub(a_s[i]).wrapping_sub(e[i]) & mask)
             .collect();
-        let client = bincode::serialize(&KeyBundle { s: s.clone(), b: b.clone(), a: a.clone() }).unwrap();
-        let server = bincode::serialize(&KeyBundle { s: Vec::new(), b, a }).unwrap();
+        let client = bincode::serialize(&KeyBundle {
+            s: s.clone(),
+            b: b.clone(),
+            a: a.clone(),
+        })
+        .unwrap();
+        let server = bincode::serialize(&KeyBundle {
+            s: Vec::new(),
+            b,
+            a,
+        })
+        .unwrap();
         (client, server)
     }
 
@@ -299,7 +336,9 @@ impl Bfv {
         let s = self.bundle(ck_bytes).s;
         assert!(!s.is_empty(), "BFV decrypt needs the client key (with s)");
         let sc: Vec<i128> = s.iter().map(|&c| center(c, p)).collect();
-        DecryptKey { pre: poly::prepare_poly(&sc, p.n) }
+        DecryptKey {
+            pre: poly::prepare_poly(&sc, p.n),
+        }
     }
 
     /// [`Bfv::decrypt_poly`] against a prepared key.
@@ -429,7 +468,13 @@ impl Bfv {
         let n = a.c.len().max(b.c.len());
         let zero = vec![0u128; self.params.n];
         let c: Vec<Vec<u128>> = (0..n)
-            .map(|i| poly_add(a.c.get(i).unwrap_or(&zero), b.c.get(i).unwrap_or(&zero), mask))
+            .map(|i| {
+                poly_add(
+                    a.c.get(i).unwrap_or(&zero),
+                    b.c.get(i).unwrap_or(&zero),
+                    mask,
+                )
+            })
             .collect();
         BfvCt { c }
     }
@@ -603,7 +648,11 @@ mod tests {
             let cb = s.encrypt_scalar(&pk, b);
             let cm = s.mul(&ca, &cb);
             assert_eq!(cm.key_pow(), 2, "product must be degree-2 (no relin)");
-            assert_eq!(s.decrypt_scalar(&ck, &cm), (a * b) % (1 << 20), "{a}*{b} under s²");
+            assert_eq!(
+                s.decrypt_scalar(&ck, &cm),
+                (a * b) % (1 << 20),
+                "{a}*{b} under s²"
+            );
         }
     }
 
@@ -612,7 +661,11 @@ mod tests {
         let s = scheme();
         let (ck, pk) = s.keygen();
         let x = vec![3i64, -4, 5, -1];
-        let w = vec![vec![2i64, 3, -1, 4], vec![-5i64, 1, 0, 2], vec![7i64, -7, 2, 2]];
+        let w = vec![
+            vec![2i64, 3, -1, 4],
+            vec![-5i64, 1, 0, 2],
+            vec![7i64, -7, 2, 2],
+        ];
         let cx = s.encrypt_poly(&pk, &s.pack_input(&x));
         let cw = s.encrypt_poly(&pk, &s.pack_weights(&w));
         let prod = s.mul(&cx, &cw); // the WHOLE matvec: one ct×ct, no relin
@@ -649,7 +702,10 @@ mod tests {
             .iter()
             .map(|row| row.iter().zip(&x).map(|(a, b)| a * b).sum())
             .collect();
-        assert_eq!(got, expected, "prepared encryption must survive a ct×ct multiply");
+        assert_eq!(
+            got, expected,
+            "prepared encryption must survive a ct×ct multiply"
+        );
 
         // Mixing the two paths must also work — the pipeline does.
         let mixed = s.mul(&s.encrypt_poly(&pk, &s.pack_input(&x)), &cw);
@@ -657,7 +713,10 @@ mod tests {
         let got2: Vec<i64> = (0..w.len())
             .map(|r| s.to_signed(out[s.matvec_output_position(x.len(), r)]))
             .collect();
-        assert_eq!(got2, expected, "prepared and unprepared encryption must interoperate");
+        assert_eq!(
+            got2, expected,
+            "prepared and unprepared encryption must interoperate"
+        );
     }
 
     /// The prepared decryption path must agree with the unprepared one
@@ -752,18 +811,103 @@ mod tests {
         let out = s.decrypt_poly(&ck, &prod);
         for (r, row) in w.iter().enumerate() {
             let expected: i64 = x.iter().zip(row).map(|(a, b)| a * b).sum();
-            assert_eq!(s.to_signed(out[s.matvec_output_position(x.len(), r)]), expected, "row {r}");
+            assert_eq!(
+                s.to_signed(out[s.matvec_output_position(x.len(), r)]),
+                expected,
+                "row {r}"
+            );
         }
     }
 
     /// Measure the ACTUAL post-multiply noise budget of a depth-1 ct×ct
     /// product — the number that gates threshold decryption with smudging
     /// (`docs/malicious-hybrid.md` §6). Prints, does not assert a bound, since
+    /// The same measurement at **n=8192**, which is the parameter set
+    /// `fhe::boundary` recommends once the input-boundary proof's soundness
+    /// slack is charged against the smudging budget (§6b/§6c of
+    /// `docs/malicious-hybrid.md`).
+    ///
+    /// That recommendation previously rested on a *model* of how `|e_mult|`
+    /// grows with the ring dimension. This measures it, and then feeds the
+    /// measured value through the same budget calculation the model used — so
+    /// the parameter choice is backed by a number rather than an inference.
+    #[test]
+    fn measures_post_multiply_noise_at_n8192() {
+        use crate::fhe::boundary::achievable_lambda;
+        use crate::fhe::boundary_proof::{WellFormedProof, HONEST_BOUND, MIN_REPS};
+
+        let log2_t = 20u32;
+        let p = BfvParams {
+            n: 8192,
+            log2_q: 120,
+            log2_t,
+        };
+        let s = Bfv::new(p);
+        let (ck, pk) = s.keygen();
+        let t = p.t();
+        let mut rng = rand::thread_rng();
+        let m1: Vec<u64> = (0..p.n).map(|_| rng.gen::<u64>() % t).collect();
+        let m2: Vec<u64> = (0..p.n)
+            .map(|_| (rng.gen_range(-8i64..=8)).rem_euclid(t as i64) as u64)
+            .collect();
+        let c = s.mul(&s.encrypt_poly(&pk, &m1), &s.encrypt_poly(&pk, &m2));
+
+        let sk = s.bundle(&ck).s;
+        let mask = p.q_mask();
+        let mut acc = c.c.last().unwrap().clone();
+        for ci in c.c.iter().rev().skip(1) {
+            acc = poly_mul_mod(&acc, &sk, &p);
+            acc = poly_add(&acc, ci, mask);
+        }
+        let m_true = s.decrypt_poly(&ck, &c);
+        let delta = 1u128 << p.delta_shift();
+        let mut max_noise: i128 = 0;
+        for (&accv, &mv) in acc.iter().zip(&m_true) {
+            let dm = delta.wrapping_mul(mv as u128) & mask;
+            let noise = center(accv.wrapping_sub(dm) & mask, &p).unsigned_abs() as i128;
+            max_noise = max_noise.max(noise);
+        }
+        let noise_bits = (max_noise as f64).log2().ceil() as u32;
+
+        // The whole chain, with every term measured or enforced in code.
+        let slack = WellFormedProof::slack_bits(p.n, HONEST_BOUND, MIN_REPS);
+        let lambda = achievable_lambda(&p, noise_bits, slack);
+        println!(
+            "n=8192 q=2^120 t=2^20: |e_mult|≈2^{noise_bits}, boundary-proof slack {slack} bits, \
+             achievable lambda = {lambda}"
+        );
+
+        // Correctness at these parameters means the noise sits below q/2t, so
+        // the rounding recovers the plaintext. (Checking the *value* would need
+        // the negacyclic convolution of the two plaintexts — BFV multiply is a
+        // polynomial product, not elementwise; an earlier version of this test
+        // asserted the elementwise product and failed for that reason.)
+        let ceiling = crate::fhe::boundary::correctness_ceiling_bits(&p);
+        assert!(
+            noise_bits < ceiling,
+            "noise 2^{noise_bits} must stay under the correctness bound 2^{ceiling}"
+        );
+
+        // **The measured conclusion, which corrects an earlier inference.**
+        // `boundary::smallest_ring_for` previously proposed n=8192 with
+        // q=2^190. That modulus is not representable: this BFV stores q in a
+        // u128, so log2 q <= 127. At the largest modulus the implementation can
+        // actually hold, a realistic boundary proof leaves lambda = 30, not 40.
+        assert!(
+            (28..=32).contains(&lambda),
+            "expected lambda around 30 at the largest representable modulus, got {lambda}"
+        );
+    }
+
     /// the point is to read the measured value into the parameter analysis.
     #[test]
     fn measures_post_multiply_noise_budget() {
         for (log2_t, wmag) in [(20u32, 8i64), (24, 8), (20, 64)] {
-            let p = BfvParams { n: 4096, log2_q: 100, log2_t };
+            let p = BfvParams {
+                n: 4096,
+                log2_q: 100,
+                log2_t,
+            };
             let s = Bfv::new(p);
             let (ck, pk) = s.keygen();
             let t = p.t();
@@ -771,7 +915,9 @@ mod tests {
             // One operand full-range (packed activations near t), the other a
             // small weight window — the pipeline's worst case.
             let m1: Vec<u64> = (0..p.n).map(|_| rng.gen::<u64>() % t).collect();
-            let m2: Vec<u64> = (0..p.n).map(|_| (rng.gen_range(-wmag..=wmag)).rem_euclid(t as i64) as u64).collect();
+            let m2: Vec<u64> = (0..p.n)
+                .map(|_| (rng.gen_range(-wmag..=wmag)).rem_euclid(t as i64) as u64)
+                .collect();
             let c = s.mul(&s.encrypt_poly(&pk, &m1), &s.encrypt_poly(&pk, &m2));
 
             // acc = Σ cᵢ·sⁱ (the pre-round decrypt inner value).

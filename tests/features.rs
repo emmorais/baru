@@ -80,46 +80,6 @@ fn test_eval() {
     assert_eq!(eval_plain_string("(eval (quote (if #t 1 0)))"), "1");
 }
 
-#[test]
-#[ignore] // This test is ignored because it requires a more complex evaluation of quoted expressions
-fn test_quote_atom() {
-    assert_eq!(eval_plain_string("(car (+ 1 (+ 2 3)))"), "+");
-    /*assert_eq!(eval("(letrec ((count-additions
-              (lambda (expr)
-                  (if (atom expr)
-                      0
-                      (+ (if (= (car expr) '+) 1 0)
-                          (+
-                              (count-additions (car expr))
-                              (count-additions (cdr expr))
-                          )
-                      )
-                  )
-              )
-          ))
-          (count-additions (quote (+ 1 (+ 2 3))))
-    )"), 2);*/
-}
-
-#[test]
-#[ignore] // This test is ignored because it requires a more complex evaluation of quoted expressions
-fn test_quote_atom2() {
-    assert_eq!(
-        eval(
-            "((letrec ((count-additions
-                                    (lambda (expr)
-                                        (if (atom expr)
-                                            0
-                                            (+ (if (= (car expr) '+) 1 0)
-                                                (count-additions (car expr))
-                                                (count-additions (cdr expr)))))))
-                                        count-additions
-                            (quote (+ 1 (+ 2 3)))))"
-        ),
-        2
-    );
-}
-
 // ---------------------------------------------------------------------------
 // Comparisons
 // ---------------------------------------------------------------------------

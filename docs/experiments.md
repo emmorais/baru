@@ -1064,28 +1064,92 @@ baru bench-medmnist --dataset all --hybrid 3 --both
 | float accuracy of the same net | 84.78% | 81.03% |
 | majority-class baseline | 62.50% | 18.48% |
 | published ResNet-18 (28×28) | 0.854 | 0.935 |
-| encrypted == plaintext diagnosis | 3/3 | 3/3 |
+| 95% CI on the full-test figure | [81.7, 87.4] | [80.6, 81.8] |
+| **AUC, full test set** | **0.9314** | **0.9590** (macro OvR) |
+| published ResNet-18 AUC | 0.944 | 0.997 |
+| **balanced accuracy, full test set** | **80.64%** | **80.49%** |
+| sensitivity / specificity | 97.18% / **64.10%** | — |
+| encrypted == plaintext diagnosis | **300/300** | **300/300** |
 | FHE bootstraps | 0 | 0 |
-| latency/diagnosis, `a2b` | 5.71 s | 5.95 s |
-| + `--gc` | 4.94 s | 5.05 s |
-| + `--precompute` (**online**) | **2.90 s** | **3.00 s** |
-| offline, per query | 2.03 s | 2.04 s |
-| online at WAN (`--rtt-ms 20 --bandwidth-mbps 1000`) | 5.00 s | 5.30 s |
+
+The AUC and balanced-accuracy rows were measured against the real MedMNIST test
+splits from these exact committed weights, not from a regeneration — and
+recomputing accuracy the same way reproduced 84.78% / 81.18% to six decimals,
+which is what ties them to these weights.
+
+**Read the sensitivity/specificity row before quoting the accuracy.** Pneumonia's
+test set is ~60% positive, and the model earns its 84.78% largely by
+over-calling disease: it catches 97.18% of pneumonia but clears only 64.10% of
+healthy scans. Balanced accuracy is 80.64%, not 84.78%. Organa's weakest classes
+are kidney-left and spleen at 64% recall each. None of this is a cryptographic
+result — it is what the 53 k-parameter model does — but reporting accuracy alone
+would overstate it.
+
+Latencies **re-measured 2026-08-01, Apple M1 Pro (8 cores), 20 images/config**.
+The previous revision of this table carried 5.71 / 4.94 / 2.90 s, which had gone
+stale: the session-key hoists of 2026-07-30 (`3cd9fe4`) refreshed `README.md`
+and [private-inference-performance.md](private-inference-performance.md) to
+488 ms but never reached this table. The check that this is a code change and
+not a faster machine: HEAD-before-optimisation measures **488 ms** here, exactly
+the figure that commit recorded.
+
+| | pneumonia | organa |
+|---|---|---|
+| latency/diagnosis, `a2b` | 1.63 s | 1.74 s |
+| + `--gc` | 0.88 s | 0.90 s |
+| + `--precompute`, **single core** | 0.435 s | 0.460 s |
+| + **4 NTT threads** (**online**) | **0.268 s** | **0.291 s** |
+| offline, **per query** (mask pool, cannot be amortised) | 0.14 s/image | 0.14 s/image |
+| online at WAN (`--rtt-ms 20 --bandwidth-mbps 1000`) | 2.65 s | 2.81 s |
+| party-to-party traffic (`--gc`) | 61 msgs, 10.1 MB | 76 msgs, 11.3 MB |
+
+Both a single-core and a threaded figure are quoted deliberately: the threading
+is in the multi-modular NTT (independent primes, plus a pure-map CRT), is
+bit-identical to the serial path, and is disabled by `BARU_NTT_THREADS=1`. A
+wall-clock number that silently depends on core count cannot be compared against
+published work, so the comparable one stays measurable.
+
+Quote the online figure *with* the per-query offline one: 0.32 s/image of mask
+generation must happen for every query and only moves off the critical path, so
+"0.41 s per diagnosis" is the latency, not the work.
 
 Three readings. **Quantisation and encryption are both free**: the integer net
 tracks its float parent to within 0.2 points (agreeing on 99.7% / 98.7% of test
 predictions), and the encrypted pipeline reproduces the plaintext diagnosis
 bit-exactly — privacy costs wall-clock, not accuracy. **The model, not the
-crypto, is the ceiling**: this 2-conv classifier is sized to fit the depth-1
-noise budget, enough to match published ResNet-18 on pneumonia and 12 points
-short of it on the 11-class organ task. And **the cost centre is FHE**: of the
-2.90 s chest-X-ray diagnosis, **2.13 s (73%) is FHE arithmetic** and 0.76 s is
-the whole MPC segment (import 0.02 s, ReLU 0.51 s, pool 0.21 s, argmax 0.01 s).
-A diagnosis used to take ~33 s: the batched scheme-switch import took it to
-5.71 s, garbled nonlinearities (`--gc`) to 4.94 s, and preprocessed masks
-(`--precompute`) to **2.90 s online** — an 11× reduction with the construction
-unchanged. Anyone optimising further should go to `fhe::bfv`, not the MPC layer.
-On a wide-area link a diagnosis is 5.00 s — the pipeline is not round-bound, and
+crypto, is the ceiling**: this 2-conv classifier is sized to the envelope the
+pipeline allows, which is three constraints and not one. Spatially, 3×3 valid
+convolution and floor-pooling take 28 → 13 → 5 → 1, so a 28×28 input admits at
+most three convs. By *packing*, the Cheetah layout needs `2·in_c·H·W ≲ n`, so
+at the second conv's 13×13 input the first conv may emit at most **12**
+channels before the product degree passes `n = 4096` (16 would need 5266) —
+this is what stops the model getting wider, and it is a packing question, not a
+limit of the no-bootstrap construction: it relaxes at `n = 8192` or by
+splitting channels across ciphertexts. Only then does the depth-1 noise budget
+bind, on the activation magnitude. The result is enough to match published
+ResNet-18 on pneumonia and 12 points short of it on the 11-class organ task.
+
+And **the cost centre is the MPC nonlinearities again**: of the 268 ms
+chest-X-ray diagnosis, 99 ms is FHE (mul 44, decrypt 45, re-encrypt 10) and
+**168 ms (63%) is the MPC segment** (import 22, ReLU 38, pool 69, argmax 8).
+That is the fourth time the answer has flipped, which is the point: *which side
+dominates* has a half-life of about one optimisation, so no plan should rest on
+it. A diagnosis used to take ~33 s: the batched scheme-switch import took it to
+5.71 s, garbled nonlinearities (`--gc`) to 4.94 s, preprocessed masks
+(`--precompute`) to 2.90 s, the fixed-key AES gate hash and the three
+session-key hoists to 488 ms, **commuting the ReLU past the max-pool to 435 ms**,
+and **threading the multi-modular NTT to 268 ms on four cores** — 123× in total,
+with the construction unchanged and every step exact.
+
+That last step is worth stating as an identity rather than a tuning result:
+`relu∘rescale` is monotonic non-decreasing, so it commutes with `max`, and
+pooling *first* shrinks the ReLU layer by `POOL²` = 4× at no cost to the pool
+itself. It is exact, not approximate — the bit-exactness tests are unchanged.
+It buys 1.17× here and 1.38× on the `a2b` path, where the nonlinearity is the
+dominant cost rather than a sixth of it.
+
+Anyone optimising further should go to `fhe::bfv`, not the MPC layer. On a
+wide-area link a diagnosis is 2.65 s — the pipeline is not round-bound, and
 garbling is worth 2.0× on the MPC segment there.
 
 The same swap applies to the linear-discriminator demo:
@@ -1597,6 +1661,121 @@ entire case for FHE here is the cost of preprocessing"* — turns out to be
 exactly right, and to cut the other way once MPC gets the better preprocessing.
 **The crossover belongs to the baseline's preprocessing, not to either
 cryptosystem.**
+
+---
+
+## Part VIII — The cost of active security
+
+*Command:* `baru bench-malicious --n 64 --bits 32`. Both legs run the same
+workload through the **identical** transport stack (`LatencyTransport` +
+`CountingTransport`), so the only difference is the protocol.
+`docs/malicious-hybrid.md` describes the constructions.
+
+### The headline
+
+| Workload | bytes | interactive calls | wall clock (WAN, 25 ms one-way) |
+|---|---|---|---|
+| Comparisons, n=32, 32-bit | **2.63×** | **1.06×** | **1.23×** |
+| Dot product, n=64, 32-bit | 2.44× | 2.00× | 2.87× |
+
+The comparison row is the one that matters for private inference: every ReLU,
+max-pool and argmax reduces to a comparison, so it is the entire nonlinear
+surface. Active security there costs **2.6× the bytes and 1.06× the rounds**.
+
+That is the predicted shape, and the prediction was worth making explicit
+because it is the repository's recurring lesson applied to a new protocol: the
+MAC doubles what is *sent* but batches into the *same* round, so on a link where
+latency dominates the upgrade is nearly free. Bit decomposition's two extra
+rounds — the random-pair pool and the MAC-attaching opening — are per *batch*,
+not per value, so they amortise: 1.06× at n=32.
+
+The dot-product row is a small-workload artifact and is reported rather than
+hidden. The semi-honest leg needs only 4 interactive calls in total, so the
+fixed cost of generating a pair pool is not amortised against anything. It is
+2.00× calls because the base is 4, not because multiplication doubles rounds.
+
+### The ring sacrifice is free at these widths
+
+The malicious multiplication check needs statistical slack in the ring, which
+the literature charges as a widening to `Z_2^{k+s}`. Baru already shares over
+`Z_2^128` while values are 32-bit, so the slack is already paid for:
+
+```
+values occupy 70 bits of the 128-bit ring
+  → 58 bits of statistical security at no widening cost
+```
+
+70 bits is a 32-bit product (64) plus the accumulation depth of a 64-term dot
+product (6). Reported by the benchmark from the widths actually in use, not
+asserted — `aby3_verify::headroom_bits` computes it, and it returns 0 rather
+than a comfortable number when the width leaves no room.
+
+### Method note — an unbatched loop, again
+
+The first run of this benchmark reported **39×–52× wall clock** on the dot
+product against only 2× interactive calls. The cause was in the benchmark, not
+the protocol: it shared inputs with scalar `share_secret` in a loop, and each
+call costs one extra synchronisation in the malicious backend (the MAC-attaching
+opening). `Mailbox::recv_matching` polls on a 2 ms sleep, so 128 extra
+synchronisations are ~256 ms of pure waiting.
+
+Switching to `share_secret_batch` — which both backends have, and which every
+real workload in this repository already uses — took the dot product from 39× to
+2.18×. This is the fourth time in this record that a segment-level measurement
+said "the protocol is slow" and a per-phase breakdown said "one unbatched loop
+inside it is slow." It is recorded here because the earlier number was wrong in
+a way that would have been quotable.
+
+---
+
+## Part IX — Proving a quantized layer (ZKP)
+
+*Command:* `baru bench-zkp-layer --widths 1,4,16,64,256,784`. Real Binius64
+prover and verifier (`zkp::binius_real`); weights public, inputs private.
+
+Baru's comparison table carried an empty ZKP column for anything resembling
+inference. The reason was not that it had not been measured — it was that
+before 2026-07-31 the ZKP backend proved nothing at all (Part VII), and the
+real one that replaced it could not compile a ReLU until the circuit fragment
+gained comparisons, `if`, shifts and division.
+
+### A Q16.16 quantized neuron: `relu((Σ wᵢ·xᵢ) >> 16 + b)`
+
+| width | gates | constraints | prove | verify | proof bytes |
+|---|---|---|---|---|---|
+| 1 | 11 | 14 | 6.3 ms | 1.0 ms | 18 544 |
+| 4 | 23 | 42 | 4.6 ms | 0.8 ms | 21 120 |
+| 16 | 71 | 151 | 5.2 ms | 1.0 ms | 31 456 |
+| 64 | 263 | 589 | 8.0 ms | 1.3 ms | 47 808 |
+| 256 | 1 031 | 2 341 | 14.6 ms | 2.3 ms | 71 968 |
+| **784** | **3 143** | **7 159** | **32.3 ms** | **4.8 ms** | **111 712** |
+
+784 is the MNIST input width, so the last row is one full first-layer neuron of
+the network the rest of this record benchmarks.
+
+Two things are worth reading off the sweep rather than the last row alone.
+**Constraints grow linearly** in width (≈9 per input — a multiply, an add, and
+the shared rescale/ReLU tail amortising away). **Proof size does not**: a 286×
+larger circuit produces a 6× larger proof, which is the succinctness that makes
+a SNARK worth using. Verification stays in single-digit milliseconds throughout.
+
+The small-width rows are dominated by fixed setup, which is why width 4 proves
+marginally *faster* than width 1 — not noise worth explaining away, just the
+floor.
+
+### What this does not say
+
+This is **integrity, not confidentiality**, and the two are easy to conflate
+when the numbers sit in adjacent columns:
+
+* MPC and FHE keep data secret **from the parties computing on it**.
+* A SNARK proves the computation was done correctly while hiding the witness
+  **from a verifier**. The prover holds everything in the clear.
+
+So "ZKP proves a 784-wide neuron in 32 ms" must not be set against "MPC
+evaluates a layer in *N* ms" as if they were alternatives. They answer different
+questions, and a deployment that needs both pays for both. The benchmark prints
+this caveat with its results so the numbers cannot travel without it.
 
 ---
 

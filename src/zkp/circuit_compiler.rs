@@ -126,50 +126,94 @@ impl FlatOp {
     pub fn remap(&self, f: &dyn Fn(&str) -> String) -> FlatOp {
         let w = |s: &Wire| f(s);
         match self {
-            FlatOp::Const { dst, value } => FlatOp::Const { dst: w(dst), value: *value },
-            FlatOp::ConstF { dst, value } => FlatOp::ConstF { dst: w(dst), value: *value },
-            FlatOp::IAdd32 { dst, lhs, rhs } => {
-                FlatOp::IAdd32 { dst: w(dst), lhs: w(lhs), rhs: w(rhs) }
-            }
-            FlatOp::ISub32 { dst, lhs, rhs } => {
-                FlatOp::ISub32 { dst: w(dst), lhs: w(lhs), rhs: w(rhs) }
-            }
-            FlatOp::IMul { dst, lhs, rhs } => {
-                FlatOp::IMul { dst: w(dst), lhs: w(lhs), rhs: w(rhs) }
-            }
-            FlatOp::ICmpEq { dst, lhs, rhs } => {
-                FlatOp::ICmpEq { dst: w(dst), lhs: w(lhs), rhs: w(rhs) }
-            }
-            FlatOp::ICmpUlt { dst, lhs, rhs } => {
-                FlatOp::ICmpUlt { dst: w(dst), lhs: w(lhs), rhs: w(rhs) }
-            }
-            FlatOp::ICmpSlt { dst, lhs, rhs } => {
-                FlatOp::ICmpSlt { dst: w(dst), lhs: w(lhs), rhs: w(rhs) }
-            }
-            FlatOp::BAnd { dst, lhs, rhs } => {
-                FlatOp::BAnd { dst: w(dst), lhs: w(lhs), rhs: w(rhs) }
-            }
-            FlatOp::BOr { dst, lhs, rhs } => {
-                FlatOp::BOr { dst: w(dst), lhs: w(lhs), rhs: w(rhs) }
-            }
-            FlatOp::BXor { dst, lhs, rhs } => {
-                FlatOp::BXor { dst: w(dst), lhs: w(lhs), rhs: w(rhs) }
-            }
-            FlatOp::BNot { dst, src } => FlatOp::BNot { dst: w(dst), src: w(src) },
-            FlatOp::Shl { dst, src, amount } => {
-                FlatOp::Shl { dst: w(dst), src: w(src), amount: *amount }
-            }
-            FlatOp::Shr { dst, src, amount } => {
-                FlatOp::Shr { dst: w(dst), src: w(src), amount: *amount }
-            }
-            FlatOp::Mux { dst, cond, t_val, e_val } => FlatOp::Mux {
+            FlatOp::Const { dst, value } => FlatOp::Const {
+                dst: w(dst),
+                value: *value,
+            },
+            FlatOp::ConstF { dst, value } => FlatOp::ConstF {
+                dst: w(dst),
+                value: *value,
+            },
+            FlatOp::IAdd32 { dst, lhs, rhs } => FlatOp::IAdd32 {
+                dst: w(dst),
+                lhs: w(lhs),
+                rhs: w(rhs),
+            },
+            FlatOp::ISub32 { dst, lhs, rhs } => FlatOp::ISub32 {
+                dst: w(dst),
+                lhs: w(lhs),
+                rhs: w(rhs),
+            },
+            FlatOp::IMul { dst, lhs, rhs } => FlatOp::IMul {
+                dst: w(dst),
+                lhs: w(lhs),
+                rhs: w(rhs),
+            },
+            FlatOp::ICmpEq { dst, lhs, rhs } => FlatOp::ICmpEq {
+                dst: w(dst),
+                lhs: w(lhs),
+                rhs: w(rhs),
+            },
+            FlatOp::ICmpUlt { dst, lhs, rhs } => FlatOp::ICmpUlt {
+                dst: w(dst),
+                lhs: w(lhs),
+                rhs: w(rhs),
+            },
+            FlatOp::ICmpSlt { dst, lhs, rhs } => FlatOp::ICmpSlt {
+                dst: w(dst),
+                lhs: w(lhs),
+                rhs: w(rhs),
+            },
+            FlatOp::BAnd { dst, lhs, rhs } => FlatOp::BAnd {
+                dst: w(dst),
+                lhs: w(lhs),
+                rhs: w(rhs),
+            },
+            FlatOp::BOr { dst, lhs, rhs } => FlatOp::BOr {
+                dst: w(dst),
+                lhs: w(lhs),
+                rhs: w(rhs),
+            },
+            FlatOp::BXor { dst, lhs, rhs } => FlatOp::BXor {
+                dst: w(dst),
+                lhs: w(lhs),
+                rhs: w(rhs),
+            },
+            FlatOp::BNot { dst, src } => FlatOp::BNot {
+                dst: w(dst),
+                src: w(src),
+            },
+            FlatOp::Shl { dst, src, amount } => FlatOp::Shl {
+                dst: w(dst),
+                src: w(src),
+                amount: *amount,
+            },
+            FlatOp::Shr { dst, src, amount } => FlatOp::Shr {
+                dst: w(dst),
+                src: w(src),
+                amount: *amount,
+            },
+            FlatOp::Mux {
+                dst,
+                cond,
+                t_val,
+                e_val,
+            } => FlatOp::Mux {
                 dst: w(dst),
                 cond: w(cond),
                 t_val: w(t_val),
                 e_val: w(e_val),
             },
-            FlatOp::PopCount { dst, src } => FlatOp::PopCount { dst: w(dst), src: w(src) },
-            FlatOp::IDiv { dst_q, dst_r, lhs, rhs } => FlatOp::IDiv {
+            FlatOp::PopCount { dst, src } => FlatOp::PopCount {
+                dst: w(dst),
+                src: w(src),
+            },
+            FlatOp::IDiv {
+                dst_q,
+                dst_r,
+                lhs,
+                rhs,
+            } => FlatOp::IDiv {
                 dst_q: w(dst_q),
                 dst_r: w(dst_r),
                 lhs: w(lhs),
@@ -373,7 +417,7 @@ impl CircuitCompiler {
     }
 
     /// Disable common-subexpression elimination. For A/B measurement only —
-    /// see [`Self::cse_enabled`].
+    /// see `Self::cse_enabled`.
     pub fn without_cse(mut self) -> Self {
         self.cse_enabled = false;
         self
@@ -640,7 +684,11 @@ impl CircuitCompiler {
         let flat = Self::fold_constants(flat);
         // CSE before DCE: collapsing duplicates is what *creates* the dead
         // wires DCE then removes.
-        let flat = if self.cse_enabled { cse(&flat, &result_wire) } else { flat };
+        let flat = if self.cse_enabled {
+            cse(&flat, &result_wire)
+        } else {
+            flat
+        };
         let flat =
             Self::eliminate_dead_wires(flat, &result_wire, &self.witnesses, &self.public_inputs);
 
@@ -687,7 +735,11 @@ impl CircuitCompiler {
         )?;
 
         let flat = Self::fold_constants(flat);
-        let flat = if self.cse_enabled { cse(&flat, &result_wire) } else { flat };
+        let flat = if self.cse_enabled {
+            cse(&flat, &result_wire)
+        } else {
+            flat
+        };
         let flat = Self::eliminate_dead_wires(
             flat,
             &result_wire,
@@ -1750,7 +1802,6 @@ impl CircuitCompiler {
 
 // ─── Tests ───────────────────────────────────────────────────
 
-
 // ─── Shared FlatOp passes (used by the compile pipeline and `mpcc::opt`) ──────
 
 /// Common subexpression elimination over the `FlatOp` SSA.
@@ -1759,7 +1810,7 @@ impl CircuitCompiler {
 /// collide. The output wire's definition is never eliminated — the caller's
 /// circuit signature depends on it.
 ///
-/// This lives here, beside [`CircuitCompiler::fold_constants`], rather than in
+/// This lives here, beside `CircuitCompiler::fold_constants`, rather than in
 /// `mpcc::opt` where it started, because **every** backend needs it: `mpcc` was
 /// the only consumer for a while, so a circuit handed to FHE or ZKP kept every
 /// redundant gate the source expression happened to contain. A fold written the

@@ -1,11 +1,35 @@
-// Binius64 ZKP Backend implementation for Baru
-// Integrates with the actual binius64 library for Reed-Solomon SNARK proofs
-//
-// Architecture:
-// 1. Compile Baru expressions to Binius64 arithmetic circuits
-// 2. Generate proofs using the Binius64 prover (FRI-based SNARK)
-// 3. Verify proofs using the Binius64 verifier
-// 4. Serialize/deserialize proofs as binary data
+//! # ⚠ This is a placeholder, not a proof system
+//!
+//! This module's header previously claimed it "integrates with the actual
+//! binius64 library for Reed-Solomon SNARK proofs". It does not, and the
+//! difference matters enough to state first.
+//!
+//! * [`Binius64Backend::prove`] concatenates the circuit, a hash of it, a hash
+//!   of the witness, a hash of the public values, and five rounds of what its
+//!   own comment calls a "simulated" FRI layer — each round hashing the
+//!   proof-so-far.
+//! * [`Binius64Backend::verify`] checks a magic header, that the circuit hash
+//!   matches one it recomputes from the **public** circuit, that the public
+//!   values echo those supplied, and that the proof is long enough.
+//! * Nothing anywhere checks that a witness **satisfies the constraints**, and
+//!   nothing binds a satisfying assignment to the commitment.
+//!
+//! The consequence is not a weak soundness bound; it is the absence of
+//! soundness. Anyone holding the circuit — which is public — can produce an
+//! accepting proof for any public statement without knowing a witness.
+//! `tests/zkp_soundness.rs` demonstrates this rather than asserting it, and
+//! doubles as a tripwire: wiring in a real prover should make those tests fail.
+//!
+//! The `binius-field` and `binius-core` crates are declared in `Cargo.toml` but
+//! are not imported anywhere under `src/`. [`super::circuit_compiler`] is
+//! genuine — it is shared with the FHE backend — and is the part of `src/zkp/`
+//! worth building on.
+//!
+//! Intended architecture, for whoever finishes it:
+//! 1. Compile Baru expressions to Binius64 arithmetic circuits (done)
+//! 2. Generate proofs using the Binius64 prover (FRI-based SNARK) — **missing**
+//! 3. Verify proofs using the Binius64 verifier — **missing**
+//! 4. Serialize/deserialize proofs as binary data (done)
 
 use super::circuit_compiler::{CircuitCompiler, Constraint};
 use super::{Circuit, CircuitMetadata, PublicValues, ZKPBackend, ZKProof};

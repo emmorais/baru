@@ -126,7 +126,10 @@ pub fn run_cli(args: &[String]) -> Result<(), String> {
              Pass --validate <samples.json> to check accuracy before trusting this model."
         );
     } else {
-        println!("quantization error over {} sample(s):", report.samples_checked);
+        println!(
+            "quantization error over {} sample(s):",
+            report.samples_checked
+        );
         println!("  max abs error:  {:.6}", report.max_abs_error);
         println!("  mean abs error: {:.6}", report.mean_abs_error);
         match report.max_rel_error {
@@ -261,11 +264,7 @@ impl NetworkSpec {
                 .iter()
                 .map(|row| row.iter().map(|&w| (w * scale).round() as i64).collect())
                 .collect(),
-            bias: l
-                .bias
-                .iter()
-                .map(|&b| (b * scale).round() as i64)
-                .collect(),
+            bias: l.bias.iter().map(|&b| (b * scale).round() as i64).collect(),
             activation: l.activation,
         };
         let quantized = QuantizedNetwork {
@@ -432,8 +431,15 @@ mod tests {
         let net = toy_net();
         let (q, report) = net.quantize(16, &[vec![0.3, -0.6]]);
         let scale = (1i64 << 16) as f64;
-        let x_fixed: Vec<i64> = [0.3, -0.6].iter().map(|&v| (v * scale).round() as i64).collect();
-        let got: Vec<f64> = q.forward(&x_fixed).iter().map(|&v| v as f64 / scale).collect();
+        let x_fixed: Vec<i64> = [0.3, -0.6]
+            .iter()
+            .map(|&v| (v * scale).round() as i64)
+            .collect();
+        let got: Vec<f64> = q
+            .forward(&x_fixed)
+            .iter()
+            .map(|&v| v as f64 / scale)
+            .collect();
         let expected = net.forward(&[0.3, -0.6]);
         for (g, e) in got.iter().zip(&expected) {
             assert!((g - e).abs() <= report.max_abs_error + 1e-9);
@@ -466,6 +472,9 @@ mod tests {
         q.save_json(&path).unwrap();
         let loaded = QuantizedNetwork::load_json(&path).unwrap();
         let _ = std::fs::remove_file(&path);
-        assert_eq!(loaded.forward(&[10_000, -5_000]), q.forward(&[10_000, -5_000]));
+        assert_eq!(
+            loaded.forward(&[10_000, -5_000]),
+            q.forward(&[10_000, -5_000])
+        );
     }
 }

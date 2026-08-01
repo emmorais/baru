@@ -380,7 +380,13 @@ pub fn evaluate(
                 .fhe
                 .ok_or("an operation was assigned to FHE but no FHE scheme was given")?;
             if secret {
-                let (ns, mul_depth) = fhe_op_cost(&instr.op, spec, bit_width, dep.parties, (elem_bytes * 8.0) as u32)?;
+                let (ns, mul_depth) = fhe_op_cost(
+                    &instr.op,
+                    spec,
+                    bit_width,
+                    dep.parties,
+                    (elem_bytes * 8.0) as u32,
+                )?;
                 // Packing: independent operations of the same kind at the same
                 // dependence level share a ciphertext, so they are tallied and
                 // charged `ceil(count / slots)` operations below — not one each.

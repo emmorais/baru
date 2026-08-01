@@ -65,7 +65,7 @@ pub const US_PER_OT: f64 = 4.67;
 pub const MEASURED_AT_BATCH: usize = 8192;
 
 /// How many correlated OTs Gilboa's OLE needs per multiplied bit, per cross
-/// term. A Beaver triple needs both cross terms, hence the 2 in [`triple_ots`].
+/// term. A Beaver triple needs both cross terms, hence the 2 in [`OtTriples::triple_ots`].
 pub const OTS_PER_BIT_PER_CROSS_TERM: f64 = 1.0;
 
 /// OT-based triple generation for one protocol.

@@ -59,9 +59,9 @@ use serde::Serialize;
 
 use crate::bench::comm::{CommStats, NetworkProfile};
 use crate::bench::hybrid_nn::{run_parties, sleep_link, MpcTransport};
-use crate::fhe::ckks_compare::CkksCompareBackend;
 use crate::crypto::types::Fr;
 use crate::fhe::bfv::{Bfv, BfvAdapter, BfvCt, BfvParams};
+use crate::fhe::ckks_compare::CkksCompareBackend;
 use crate::hybrid::FheAdapter;
 use crate::interpreter::backend::{Backend, ShareRef};
 use crate::interpreter::transport_backend::TransportBackend;
@@ -227,8 +227,11 @@ fn mpc_relu_rescale_layer(
                 .collect();
             let mut raws: Option<Vec<ShareRef>> = None;
             for owner in 0..3 {
-                let vals: Vec<Fr> =
-                    if me == owner { my_comps.clone() } else { vec![0; width] };
+                let vals: Vec<Fr> = if me == owner {
+                    my_comps.clone()
+                } else {
+                    vec![0; width]
+                };
                 let shs = be.share_secret_batch(&vals, nbits, owner);
                 raws = Some(match raws {
                     None => shs,
@@ -236,7 +239,13 @@ fn mpc_relu_rescale_layer(
                 });
             }
             let bvals: Vec<Fr> = (0..width)
-                .map(|j| if me == 0 { residue(bias[j] << shift, nbits) } else { 0 })
+                .map(|j| {
+                    if me == 0 {
+                        residue(bias[j] << shift, nbits)
+                    } else {
+                        0
+                    }
+                })
                 .collect();
             let bshares = be.share_secret_batch(&bvals, nbits, 0);
             let vs: Vec<ShareRef> = raws
@@ -373,10 +382,7 @@ pub fn run_deep_hybrid(mlp: &DeepMlp, input: &[i64], profile: NetworkProfile) ->
         let t0 = Instant::now();
         let (per_party, layer_comm) =
             mpc_relu_rescale_layer(&opened, &masks, &layer.bias, mlp.shift, nbits, profile);
-        comm = CommStats {
-            messages: comm.messages + layer_comm.messages,
-            bytes: comm.bytes + layer_comm.bytes,
-        };
+        comm = comm + layer_comm;
         mpc_ms += t0.elapsed().as_secs_f64() * 1000.0;
 
         // [SWITCH → FHE] re-encrypt the activation components as the next
@@ -499,35 +505,64 @@ pub fn run_cli(args: &[String]) -> Result<(), String> {
                     .get(i)
                     .ok_or("--depths needs a value")?
                     .split(',')
-                    .map(|s| s.trim().parse::<usize>().map_err(|_| "bad depth".to_string()))
+                    .map(|s| {
+                        s.trim()
+                            .parse::<usize>()
+                            .map_err(|_| "bad depth".to_string())
+                    })
                     .collect::<Result<Vec<_>, _>>()?;
             }
             "--width" => {
                 i += 1;
-                width = args.get(i).ok_or("--width needs a value")?.parse().map_err(|_| "bad width".to_string())?;
+                width = args
+                    .get(i)
+                    .ok_or("--width needs a value")?
+                    .parse()
+                    .map_err(|_| "bad width".to_string())?;
             }
             "--relu-iters" => {
                 i += 1;
-                relu_iters = args.get(i).ok_or("--relu-iters needs a value")?.parse().map_err(|_| "bad relu-iters".to_string())?;
+                relu_iters = args
+                    .get(i)
+                    .ok_or("--relu-iters needs a value")?
+                    .parse()
+                    .map_err(|_| "bad relu-iters".to_string())?;
             }
             "--boot-budget" => {
                 i += 1;
-                boot_budget = args.get(i).ok_or("--boot-budget needs a value")?.parse().map_err(|_| "bad boot-budget".to_string())?;
+                boot_budget = args
+                    .get(i)
+                    .ok_or("--boot-budget needs a value")?
+                    .parse()
+                    .map_err(|_| "bad boot-budget".to_string())?;
                 if boot_budget == 0 {
                     return Err("--boot-budget must be >= 1".into());
                 }
             }
             "--rtt-ms" => {
                 i += 1;
-                rtt_ms = args.get(i).ok_or("--rtt-ms needs a value")?.parse().map_err(|_| "bad rtt-ms".to_string())?;
+                rtt_ms = args
+                    .get(i)
+                    .ok_or("--rtt-ms needs a value")?
+                    .parse()
+                    .map_err(|_| "bad rtt-ms".to_string())?;
             }
             "--bandwidth-mbps" => {
                 i += 1;
-                bandwidth_mbps = Some(args.get(i).ok_or("--bandwidth-mbps needs a value")?.parse().map_err(|_| "bad bandwidth".to_string())?);
+                bandwidth_mbps = Some(
+                    args.get(i)
+                        .ok_or("--bandwidth-mbps needs a value")?
+                        .parse()
+                        .map_err(|_| "bad bandwidth".to_string())?,
+                );
             }
             "--seed" => {
                 i += 1;
-                seed = args.get(i).ok_or("--seed needs a value")?.parse().map_err(|_| "bad seed".to_string())?;
+                seed = args
+                    .get(i)
+                    .ok_or("--seed needs a value")?
+                    .parse()
+                    .map_err(|_| "bad seed".to_string())?;
             }
             other => return Err(format!("unknown option '{other}'\n{USAGE}")),
         }
@@ -543,7 +578,9 @@ pub fn run_cli(args: &[String]) -> Result<(), String> {
         println!("Deep private inference — hybrid BFV × ABY3, ZERO FHE bootstraps");
         println!(
             "width={width}, rtt={rtt_ms}ms, bandwidth={}",
-            bandwidth_mbps.map(|b| format!("{b}Mbps")).unwrap_or_else(|| "unlimited".into())
+            bandwidth_mbps
+                .map(|b| format!("{b}Mbps"))
+                .unwrap_or_else(|| "unlimited".into())
         );
         println!(
             "competitor model: CKKS, {} levels/layer (1 linear + {} ReLU@{relu_iters} iters), \
@@ -594,7 +631,10 @@ pub fn run_cli(args: &[String]) -> Result<(), String> {
     }
 
     if json {
-        println!("{}", serde_json::to_string_pretty(&points).map_err(|e| e.to_string())?);
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&points).map_err(|e| e.to_string())?
+        );
     } else {
         println!();
         println!("Every depth: exact match to plaintext, 0 FHE bootstraps.");
@@ -613,7 +653,10 @@ mod tests {
         let out = mlp.forward(&input);
         assert_eq!(out.len(), 16);
         let bound = mlp.max_abs_intermediate(&input);
-        assert!((bound as i128) < (1i128 << (mlp.nbits - 1)), "config overflows");
+        assert!(
+            (bound as i128) < (1i128 << (mlp.nbits - 1)),
+            "config overflows"
+        );
         // Determinism.
         let (mlp2, input2) = DeepMlp::random(8, 16, 1);
         assert_eq!(input, input2);
@@ -626,7 +669,10 @@ mod tests {
         let (b16, _) = competitor_bootstraps(16, 2, 20);
         let (b50, _) = competitor_bootstraps(50, 2, 20);
         assert!(per >= 10);
-        assert!(b2 < b16 && b16 < b50, "bootstraps must grow with depth: {b2},{b16},{b50}");
+        assert!(
+            b2 < b16 && b16 < b50,
+            "bootstraps must grow with depth: {b2},{b16},{b50}"
+        );
     }
 
     #[test]

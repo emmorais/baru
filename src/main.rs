@@ -69,6 +69,9 @@ fn main() -> Result<(), Box<dyn Error>> {
     if args.first().map(String::as_str) == Some("bench-medmnist") {
         return baru::bench::medmnist::run_cli(&args[1..]).map_err(|e| e.into());
     }
+    if args.first().map(String::as_str) == Some("bench-falcon") {
+        return baru::bench::falcon::run_cli(&args[1..]).map_err(|e| e.into());
+    }
     if args.first().map(String::as_str) == Some("bench-abstraction") {
         return baru::bench::abstraction::run_cli(&args[1..]).map_err(|e| e.into());
     }
@@ -83,6 +86,14 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
     if args.first().map(String::as_str) == Some("bench-mixed-layer") {
         return baru::bench::mixed_layer::run_cli(&args[1..]).map_err(|e| e.into());
+    }
+    if args.first().map(String::as_str) == Some("bench-zkp-layer") {
+        baru::bench::zkp_layer::main(&args[1..]);
+        return Ok(());
+    }
+    if args.first().map(String::as_str) == Some("bench-malicious") {
+        baru::bench::malicious::main(&args[1..]);
+        return Ok(());
     }
     if args.first().map(String::as_str) == Some("bench-gc-compare") {
         return baru::bench::gc_compare::run_cli(&args[1..]).map_err(|e| e.into());

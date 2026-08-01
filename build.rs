@@ -93,8 +93,14 @@ fn main() {
         .warnings(false) // NTL's headers are not warning-clean under -Wall
         .compile("baru_ntl_polymul");
 
-    println!("cargo:rustc-link-search=native={}", ntl.join("lib").display());
-    println!("cargo:rustc-link-search=native={}", gmp.join("lib").display());
+    println!(
+        "cargo:rustc-link-search=native={}",
+        ntl.join("lib").display()
+    );
+    println!(
+        "cargo:rustc-link-search=native={}",
+        gmp.join("lib").display()
+    );
     println!("cargo:rustc-link-lib=ntl");
     println!("cargo:rustc-link-lib=gmp");
 }

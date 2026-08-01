@@ -113,7 +113,10 @@ pub struct Placement {
 
 impl Placement {
     pub fn by_kind(map: HashMap<String, Side>) -> Self {
-        Placement { by_kind: map, by_wire: HashMap::new() }
+        Placement {
+            by_kind: map,
+            by_wire: HashMap::new(),
+        }
     }
 
     fn side_of(&self, op: &FlatOp) -> Side {
@@ -207,6 +210,10 @@ pub struct MixedStats {
 
 /// Evaluate `flat` with operations routed by `assignment` (keyed by operation
 /// kind, e.g. `"mul"`), converting representations at every crossing.
+// Eight independent inputs: two backends, a key, the program, its inputs, its
+// output wire, the ring width and the routing. No subset forms a cohesive
+// struct, so grouping would only add a layer to see through.
+#[allow(clippy::too_many_arguments)]
 pub fn run_mixed<A: FheArith>(
     be: &mut dyn Backend,
     fhe: &A,
@@ -247,10 +254,10 @@ pub fn run_mixed<A: FheArith>(
         let out = match side {
             Side::Fhe => {
                 st.fhe_ops += 1;
-                let mut get_ct = |w: &String,
-                                  env: &mut HashMap<String, Val<A::Ct>>,
-                                  st: &mut MixedStats,
-                                  be: &mut dyn Backend|
+                let get_ct = |w: &String,
+                              env: &mut HashMap<String, Val<A::Ct>>,
+                              st: &mut MixedStats,
+                              be: &mut dyn Backend|
                  -> Result<A::Ct, String> {
                     match env.get(w) {
                         Some(Val::Fhe(c)) => Ok(c.clone()),
@@ -432,7 +439,7 @@ pub fn packed_dot(
     }
     let mut ct_b: Option<crate::fhe::bfv::BfvCt> = None;
     for cv in &b_comps {
-        let ct = s.encrypt_poly(client_key, &s.pack_weights(&[cv.clone()]));
+        let ct = s.encrypt_poly(client_key, &s.pack_weights(std::slice::from_ref(cv)));
         ct_b = Some(match ct_b {
             None => ct,
             Some(acc) => s.add(&acc, &ct),
@@ -564,8 +571,17 @@ mod tests {
         asg.insert("add".to_string(), Side::Fhe);
         let mut be2 = Aby3Simulator::new();
         let env2 = bind(&mut be2);
-        let (r_mix, st_mix) =
-            run_mixed(&mut be2, &fhe, &ck, &flat, &env2, &out, NBITS, &Placement::by_kind(asg)).unwrap();
+        let (r_mix, st_mix) = run_mixed(
+            &mut be2,
+            &fhe,
+            &ck,
+            &flat,
+            &env2,
+            &out,
+            NBITS,
+            &Placement::by_kind(asg),
+        )
+        .unwrap();
         let got_mix = to_signed(be2.reveal(&r_mix, None));
 
         assert_eq!(got_mpc, want, "all-MPC route must match plaintext");
@@ -705,15 +721,17 @@ mod tests {
         let mut be2 = Aby3Simulator::new();
         let env2 = setup(&mut be2);
         let p_sunk = Placement::by_kind(kinds).sink_to_fhe(&flat);
-        let (r2, st2) =
-            run_mixed(&mut be2, &fhe, &ck, &flat, &env2, &out, NBITS, &p_sunk).unwrap();
+        let (r2, st2) = run_mixed(&mut be2, &fhe, &ck, &flat, &env2, &out, NBITS, &p_sunk).unwrap();
 
         assert_eq!(
             to_signed(be1.reveal(&r1, None)),
             to_signed(be2.reveal(&r2, None)),
             "moving the boundary must not change the value"
         );
-        assert!(p_sunk.refinements() > 0, "the rule should have moved something");
+        assert!(
+            p_sunk.refinements() > 0,
+            "the rule should have moved something"
+        );
         assert!(
             st2.to_mpc < st1.to_mpc,
             "sinking the addition should save a crossing back: {} -> {}",
@@ -740,8 +758,17 @@ mod tests {
         for (i, n) in ["a0", "b0", "a1", "b1"].iter().enumerate() {
             env.insert(n.to_string(), be.share_secret(vals[i] as Fr, NBITS, 0));
         }
-        let (r, st) =
-            run_mixed(&mut be, &fhe, &ck, &flat, &env, &out, NBITS, &Placement::by_kind(asg)).unwrap();
+        let (r, st) = run_mixed(
+            &mut be,
+            &fhe,
+            &ck,
+            &flat,
+            &env,
+            &out,
+            NBITS,
+            &Placement::by_kind(asg),
+        )
+        .unwrap();
         assert_eq!(to_signed(be.reveal(&r, None)), (3 * 2) * (4 * 5));
         assert_eq!(
             st.demoted_muls, 1,
