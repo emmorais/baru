@@ -31,10 +31,35 @@
 
 use crate::crypto::types::Fr;
 
-/// Falcon's private-compare modulus (Algorithm 1). Any prime exceeding the bit
-/// length being compared works; 67 is what the paper uses and is small enough
-/// that the whole field can be tested exhaustively.
+/// The private-compare modulus (Algorithm 1).
+///
+/// # Choosing it
+///
+/// `Π_PC` forms `c[i] = u[i] + 1 + Σ_{k>i} w[k]` with `u[i] ∈ {−1,0,1}` and at
+/// most `ℓ` unit terms in the sum, so the terms live in roughly `[0, ℓ+2]`. The
+/// zero test is only meaningful if none of them wraps, which fixes the
+/// requirement: **`p > ℓ + 2`**.
+///
+/// So the modulus is a function of the *ring* width being compared, not a
+/// universal constant. **Falcon uses `p = 37` with `ℓ = 32`** (§3.1: "we use
+/// ℓ = 2^5, p = 37", with 13 bits of fixed-point precision); `p = 67` is
+/// SecureNN's choice, sized for `ℓ = 64`.
+///
+/// `67` is kept here because it satisfies the bound for every `ℓ ≤ 64` and so
+/// covers both parameter sets, and because it is small enough to test the whole
+/// field exhaustively. **The faithful-reproduction benchmark must use Falcon's
+/// own `ℓ = 32`**, since their communication advantage over prior work comes
+/// largely from the smaller ring — see
+/// [falcon-reproduction.md](../../docs/falcon-reproduction.md).
 pub const P: u64 = 67;
+
+/// Falcon's own private-compare modulus, for the faithful parameter set.
+pub const P_FALCON: u64 = 37;
+
+/// The largest ring width `p` can safely serve: `p > ℓ + 2`.
+pub const fn max_ring_bits(p: u64) -> u64 {
+    p - 3
+}
 
 /// An element of `Z_p`, always held reduced.
 ///
@@ -543,12 +568,21 @@ mod tests {
         }
     }
 
-    /// `P` must exceed the bit length being compared, or `Π_PC`'s terms wrap and
-    /// the zero test stops meaning what it should. Falcon compares 32- and
-    /// 64-bit values; 67 covers both with room.
+    /// The modulus bound is `p > ℓ + 2`, and it is what ties `p` to the ring
+    /// width rather than making it a universal constant.
+    ///
+    /// Both parameter sets are checked: Falcon's own `p = 37` must serve its
+    /// `ℓ = 32`, and the `p = 67` used here must serve every `ℓ ≤ 64`. Getting
+    /// this wrong is silent — the terms wrap and the zero test starts answering
+    /// a different question.
     #[test]
-    fn the_modulus_is_prime_and_large_enough_for_64_bit_compares() {
-        assert!((2..P).all(|d| P % d != 0), "P must be prime");
-        assert!(P > 64 + 2, "P must exceed the compared bit length");
+    fn the_modulus_bound_holds_for_both_parameter_sets() {
+        let is_prime = |p: u64| (2..p).all(|d| p % d != 0);
+        assert!(is_prime(P), "P must be prime");
+        assert!(is_prime(P_FALCON), "Falcon's p must be prime");
+        assert!(P_FALCON > 32 + 2, "p = 37 must serve Falcon's ℓ = 32");
+        assert!(P > 64 + 2, "p = 67 must serve ℓ = 64");
+        assert_eq!(max_ring_bits(P_FALCON), 34, "p = 37 covers ℓ up to 34");
+        assert_eq!(max_ring_bits(P), 64, "p = 67 covers ℓ up to 64");
     }
 }

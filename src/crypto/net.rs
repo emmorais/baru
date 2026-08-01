@@ -124,6 +124,21 @@ pub enum MpcMsg {
         values: Vec<u128>,
     },
 
+    /// Resharing values for a batch of multiplications over the small prime
+    /// field `Z_p` (`crate::crypto::fp_protocol`). Same one-directed-message
+    /// pattern as [`MpcMsg::TaggedZBatch`], but **one byte per element** rather
+    /// than sixteen: Falcon's `p` is 37 and this crate's is 67, so a field
+    /// element is a byte.
+    ///
+    /// That width is not a micro-optimisation — Falcon's headline advantage over
+    /// prior work is communication volume, so carrying its field traffic in
+    /// `u128` slots would overstate its cost by 16× and make any comparison
+    /// against it meaningless.
+    TaggedFpBatch {
+        base_op_id: u64,
+        values: Vec<u8>,
+    },
+
     /// One garbler's contribution in the 3-party (two-garbler) garbled-circuit
     /// protocol (`crate::crypto::gc_protocol`). Both garblers derive an
     /// identical circuit from their shared PRF key; garbler 0 ships the garbled
@@ -156,6 +171,28 @@ impl PrfKeys {
         prf(&self.mine, ctr).wrapping_sub(prf(&self.prev, ctr))
     }
 
+    /// The same zero-sum correlated randomness, but in `Z_p` — what a
+    /// replicated multiplication over a *prime field* needs
+    /// (`crate::crypto::fp_protocol`, for Falcon's private compare).
+    ///
+    /// [`Self::alpha`] cannot be reused by reduction: three values summing to
+    /// zero mod `2^128` do **not** sum to zero mod `p`. What carries over is the
+    /// *construction* — the telescoping difference `F(kᵢ) − F(kᵢ₋₁)` sums to
+    /// zero in any group, so the subtraction is simply done in the field.
+    ///
+    /// The reduction of a uniform `u128` mod `p` is biased by about `2^-121`,
+    /// which is negligible and is the same bias the rest of the crate accepts
+    /// when deriving small values from a PRF.
+    pub fn alpha_mod(&self, ctr: u64, p: u64) -> u64 {
+        let a = (prf(&self.mine, ctr) % p as u128) as u64;
+        let b = (prf(&self.prev, ctr) % p as u128) as u64;
+        if a >= b {
+            a - b
+        } else {
+            a + p - b
+        }
+    }
+
     /// A replicated sharing of a **fresh uniform value nobody knows**, for
     /// counter `ctr`, with *no communication*.
     ///
@@ -182,6 +219,20 @@ impl PrfKeys {
     /// `aby3_verify::VERIFY_CTR_BASE`).
     pub fn random_share(&self, ctr: u64) -> (u128, u128) {
         (prf(&self.prev, ctr), prf(&self.mine, ctr))
+    }
+
+    /// [`Self::random_share`] in `Z_p`.
+    ///
+    /// Note the contrast with [`Self::alpha_mod`], which is easy to conflate:
+    /// that one is a *difference* of the two PRFs, because it must sum to zero
+    /// across parties; this one is the two PRFs themselves, because it must
+    /// reconstruct to a uniform value nobody knows. Using the zero-sum form here
+    /// would produce a sharing of zero.
+    pub fn random_share_mod(&self, ctr: u64, p: u64) -> (u64, u64) {
+        (
+            (prf(&self.prev, ctr) % p as u128) as u64,
+            (prf(&self.mine, ctr) % p as u128) as u64,
+        )
     }
 }
 
