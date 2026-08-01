@@ -45,16 +45,33 @@ use crate::crypto::types::Fr;
 /// ℓ = 2^5, p = 37", with 13 bits of fixed-point precision); `p = 67` is
 /// SecureNN's choice, sized for `ℓ = 64`.
 ///
-/// `67` is kept here because it satisfies the bound for every `ℓ ≤ 64` and so
-/// covers both parameter sets, and because it is small enough to test the whole
-/// field exhaustively. **The faithful-reproduction benchmark must use Falcon's
-/// own `ℓ = 32`**, since their communication advantage over prior work comes
-/// largely from the smaller ring — see
-/// [falcon-reproduction.md](../../docs/falcon-reproduction.md).
-pub const P: u64 = 67;
+/// **This is Falcon's own choice**, and the reproduction uses it. An earlier
+/// revision used `p = 67` — SecureNN's value, sized for `ℓ = 64` — which is
+/// valid but costs `7` bits per element against Falcon's `6`. Since LeNet's
+/// communication is essentially all `Z_p` traffic, that alone would have
+/// inflated the baseline by `7/6` and understated Falcon by the same factor.
+/// See [falcon-reproduction.md](../../docs/falcon-reproduction.md).
+///
+/// The bound `p > ℓ + 2` caps the ring at [`max_ring_bits`] = 34, comfortably
+/// above Falcon's `ℓ = 32`. Anything wider needs a larger modulus.
+pub const P: u64 = 37;
 
-/// Falcon's own private-compare modulus, for the faithful parameter set.
-pub const P_FALCON: u64 = 37;
+/// SecureNN's modulus, for `ℓ = 64`. Kept named so the distinction stays
+/// visible rather than becoming folk knowledge.
+pub const P_SECURENN: u64 = 67;
+
+/// Bits needed to carry one field element on the wire, `⌈log₂ p⌉`.
+///
+/// 6 at `p = 37`. Elements are bit-packed at this width rather than byte-padded:
+/// a byte per element would be `8/6` of Falcon's traffic, which for a network
+/// whose cost is dominated by field elements is a third of the total.
+pub const ELEM_BITS: u32 = {
+    let mut b = 0;
+    while (1u64 << b) < P {
+        b += 1;
+    }
+    b
+};
 
 /// The largest ring width `p` can safely serve: `p > ℓ + 2`.
 pub const fn max_ring_bits(p: u64) -> u64 {
@@ -579,10 +596,12 @@ mod tests {
     fn the_modulus_bound_holds_for_both_parameter_sets() {
         let is_prime = |p: u64| (2..p).all(|d| p % d != 0);
         assert!(is_prime(P), "P must be prime");
-        assert!(is_prime(P_FALCON), "Falcon's p must be prime");
-        assert!(P_FALCON > 32 + 2, "p = 37 must serve Falcon's ℓ = 32");
-        assert!(P > 64 + 2, "p = 67 must serve ℓ = 64");
-        assert_eq!(max_ring_bits(P_FALCON), 34, "p = 37 covers ℓ up to 34");
-        assert_eq!(max_ring_bits(P), 64, "p = 67 covers ℓ up to 64");
+        assert!(is_prime(P_SECURENN), "SecureNN's p must be prime");
+        assert!(P > 32 + 2, "p = 37 must serve Falcon's ℓ = 32");
+        assert!(P_SECURENN > 64 + 2, "p = 67 must serve ℓ = 64");
+        assert_eq!(max_ring_bits(P), 34, "p = 37 covers ℓ up to 34");
+        assert_eq!(max_ring_bits(P_SECURENN), 64, "p = 67 covers ℓ up to 64");
+        // The wire width is what the communication comparison turns on.
+        assert_eq!(ELEM_BITS, 6, "a p = 37 element is 6 bits, as Falcon counts it");
     }
 }

@@ -964,6 +964,7 @@ pub mod ckks_compare;
 pub mod cohort;
 pub mod cohort_eval;
 pub mod cnn;
+pub mod falcon;
 pub mod gc_compare;
 pub mod malicious;
 pub mod zkp_layer;

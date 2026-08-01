@@ -333,23 +333,215 @@ would understate them.
    | this reproduction, all parties | **1.57 MB** |
    | Falcon, reported | **0.74 MB** (LeNet, semi-honest LAN) |
 
-   **Read this as encouraging but not yet validating.** Same order of magnitude,
-   within ~2×, which is what you would hope for from an independent
-   reimplementation — a reproduction that was structurally wrong would be out by
-   10× or more. But the residual gap is unexplained, and there are at least four
-   candidates, which must be settled before any of these numbers is quoted:
+   *(Superseded by the validation below — this extrapolation counted only
+   `Π_PC`, not the full DReLU, and so understated by ~2×.)*
 
-   - **`p = 37` vs `p = 67`.** Falcon's field is 6 bits; ours is 7, and we send a
-     whole byte. Packing at Falcon's width is worth up to 1.33×.
-   - **Online/offline split.** Falcon's preprocessing figure generates the `Π_PC`
-     masks *and* the wrap3 mask bits offline (bit injection into `Z_p`). Some of
-     what is counted here as online may be offline there.
-   - **Is 0.74 MB per party or across all three?** If per party, this
-     reproduction is *below* Falcon rather than above, and the comparison flips.
-   - **DReLU count.** Our 3-comparisons-per-window assumption for max-pool may
-     not match theirs.
+## Validated against Falcon's published complexity (2026-08-01)
 
-10. **`bench-falcon`**: the same LeNet-shaped network three ways — Falcon
+The paper states per-protocol complexities, so the reproduction can be checked
+against something far sharper than a whole-network megabyte figure. Semi-honest,
+`n` the input width, `k` the bits of a `Z_p` element:
+
+| protocol | rounds | comm |
+|---|---|---|
+| Private Compare | `2 + log₂ ℓ` | `2kn` |
+| wrap3 | `3 + log₂ ℓ` | `3kn` |
+| ReLU / DReLU | `5 + log₂ ℓ` | `4kn` |
+
+At ℓ = 32 that is **7 rounds and `2ℓ = 64` field elements** for `Π_PC`. This
+implementation measures **8 rounds and 65 elements** — one more of each, and the
+*same* one: the final opening. Falcon's table counts the interactive
+multiplication rounds of a protocol whose output is shares; ours additionally
+reveals `d`, one round carrying one element. Net of that, the two agree
+**exactly**: `32 (u) + 31 (tree) + 1 (mask) = 64` elements over
+`1 + log₂ ℓ + 1 = 7` rounds. Asserted for ℓ ∈ {8,16,32,64} by
+`the_cost_matches_falcons_published_complexity`, so it cannot drift.
+
+### This also settles the accounting question
+
+Taking `ReLU/DReLU = 4kn` at Falcon's `k = 6` bits (`p = 37`) gives 96 B/party
+per DReLU, and LeNet's 8 044 DReLUs give **0.77 MB per party** — against the
+**0.74 MB** the paper reports. So:
+
+- **0.74 MB is per party**, not summed over the three.
+- **LeNet's communication is essentially all DReLU traffic**; the linear layers
+  are negligible beside it.
+- This reproduction, at 8 bits per element, costs **1.03 MB/party — 1.33×
+  Falcon**, and that factor is *exactly* `8/6`, the element packing. There is no
+  unexplained residue.
+
+The earlier "within ~2×, four candidate explanations" reading is superseded: of
+those four, the packing was the whole story, the per-party question is answered,
+and the online/offline and DReLU-count concerns turn out not to bite.
+
+### Fidelity fixed, and the reproduction now lands on Falcon's number
+
+**Done 2026-08-01.** Two changes, both required rather than optional:
+
+- **`P` is now 37, Falcon's own modulus** (was 67, SecureNN's, sized for
+  `ℓ = 64`). `P_SECURENN` is kept named so the distinction does not become folk
+  knowledge. The bound `p > ℓ+2` caps the ring at 34, above Falcon's 32.
+- **Field elements are bit-packed at `ELEM_BITS = 6`**, not one per byte.
+
+Measured after both, per party at ℓ = 32:
+
+| | |
+|---|---|
+| marginal bytes / comparison | **48.8** (measured) |
+| Falcon's `2kn` | **48.0** |
+| difference | 1 element — our revealed `d` |
+
+and the LeNet extrapolation, using Falcon's own `DReLU = 4kn`:
+
+| | |
+|---|---|
+| this reproduction | **0.77 MB/party** |
+| Falcon, reported | **0.74 MB/party** |
+
+**4% apart, with the residue accounted for.** The reproduction is faithful.
+
+Three traps were passed on the way here, each of which would have silently
+flattered our side by understating the baseline: the `Π_PC` batching (8× in
+rounds), the max-pool one-hot (2× in selects), and the element packing (1.33× in
+bytes). Any benchmark built on top of this must keep all three.
+
+### ⚠️ And a fourth, pointing the other way: Baru's own byte counts are encoding-limited
+
+Making the Falcon path wire-exact exposed an asymmetry that would now bias the
+comparison **against Baru**.
+
+`aby3_protocol` reshares through `MpcMsg::TaggedZBatch { values: Vec<u128> }`,
+and bincode encodes `u128` as a fixed 16 bytes regardless of `nbits`. Measured
+directly (`ring_traffic_is_dominated_by_the_u128_encoding`, n = 4096,
+nbits = 20):
+
+| | |
+|---|---|
+| bytes per ring element | **16.01** |
+| meaningful content | 2.50 (20 bits) |
+| **encoding overhead** | **6.4×** |
+
+So every ring-share byte this repo reports is ~6.4× its information content,
+while the `Z_p` path is now packed to the bit. **Benchmarking the two against
+each other as they stand would handicap Baru by that factor** — precisely the
+mirror image of the three traps above, and worth as much care.
+
+#### The split, measured
+
+`CommStats` now separates traffic by bincode variant tag, so every benchmark
+reports it. For one pneumonia diagnosis:
+
+| config | total | ring (ABY3) | garbled | other |
+|---|---|---|---|---|
+| `--gc --precompute` | 10.1 MB | **0.5 MB (5%)** | 7.3 MB | 2.3 MB |
+| `a2b` | 29.9 MB | **29.5 MB (99%)** | 0.0 MB | 0.5 MB |
+
+So the worry was right in principle and **mostly wrong about the headline
+config**:
+
+- **`--gc --precompute` — the configuration every headline number uses — is
+  garbled-dominated, and garbled material is already packed bytes.** Ring shares
+  are 5% of it, so the `u128` padding costs ~0.4 MB of 10.1. The figure stands,
+  and a communication comparison against Falcon on this path is **not**
+  materially biased.
+- **The `a2b` figure is inflated, and substantially.** At 99% ring and 84%
+  padding, its true information content is ≈ 29.5 × 20/128 + 0.5 ≈ **5.1 MB, not
+  29.9 MB** — a 5.9× overstatement of a number the docs quote.
+
+Two consequences:
+
+1. **`a2b`'s 29.9 MB should be reported as encoding-limited** wherever it
+   appears, or the encoding fixed. It makes Baru's least favourable
+   configuration look ~6× worse than it is.
+2. **Stage 10 does not need a width-aware ring encoding after all**, because it
+   will compare on the `--gc` path where ring traffic is 5%. Worth fixing on its
+   own merits; not a blocker.
+
+The measurement was worth making precisely because the conclusion flipped: the
+effect is real, and it lands almost entirely on a configuration the headline
+does not use.
+
+10. **Batched ring reveal.** ✅ **Done 2026-08-01**
+    (`aby3_protocol::reveal_batch_party`). `Π_WA` opens one masked value per
+    DReLU, and the only reveal the semi-honest path had was per-share — `N−1`
+    messages *per value*, so a convolution layer would have spent tens of
+    thousands of round trips on what is structurally one exchange, and the wrap
+    protocol's measured cost would have been an artefact of the API rather than
+    of the protocol. Now one directed message per party per batch, asserted.
+
+    (`aby3_verify::reveal_batch_checked` already existed but broadcasts and
+    cross-checks, which is the malicious variant's job.)
+
+11. **`Π_WA` and `Π_DReLU` on the transport.** ✅ **Done 2026-08-01**
+    (`falcon_mpc::wrap3_batch`, `drelu_batch`). Correctness carried over from the
+    local simulation — every value in the ring at ℓ = 8, over real messages —
+    and now measured rather than derived:
+
+    | per party, ℓ = 32, batched | |
+    |---|---|
+    | messages | **10** (1 ring reveal + 8 `Π_PC` + 1) |
+    | marginal bytes / DReLU | **52.8** |
+    | Falcon `wrap3 = 3kn` | 72.0 → 0.73× |
+    | Falcon `ReLU = 4kn` | 96.0 |
+
+    (64.8 B before the ring reveal was packed at ℓ rather than padded to `u128`;
+    `reveal_components_packed_party` fixes that, and it was our own number the
+    padding was inflating.)
+
+    **Compare against the `3kn` line, not `4kn`.** Falcon's table puts "ReLU
+    **and** Derivative of ReLU" on one row at `4kn`, while `wrap3` is `3kn`. A
+    DReLU is wrap3 plus a local XOR, so `3kn` is the like-for-like figure; the
+    extra `kn` is `Π_SS`, the select that turns the bit into a ReLU, and **that
+    is not built here yet**. The first version of this measurement compared
+    against `4kn` and reported a flattering 0.67× — crediting us for work not
+    done.
+
+    ### ⚠️ How much weight the byte ratios can carry
+
+    **The round comparison is solid; the byte comparison is not, and the reason
+    is `k`.**
+
+    Rounds match Falcon's `2 + log₂ ℓ` *exactly*, checked for ℓ ∈ {8,16,32,64}.
+    That is unambiguous and is the strongest evidence the construction is theirs.
+
+    The byte rows are a different matter. Reading `k` as the `Z_p` element width
+    (6 bits) makes `Π_PC = 2kn = 48 B` agree with our measured 48.8 to within one
+    element — convincing. But the same reading makes `wrap3 = 3kn` charge `kn`
+    = 24 B more than `Π_PC`, where our wrap3 adds only the one opened ring value
+    (4 B packed). Reading `k` as the ring width instead makes `Π_PC = 8 B`, which
+    is impossible for a protocol performing 32 field multiplications. **Neither
+    reading is consistent across both rows**, so `k` either changes meaning
+    between them or absorbs costs the table does not itemise — plausibly the
+    preprocessing (`Π_PC` masks and wrap3's bit-injected mask bits) that their
+    Figure 6 generates offline.
+
+    So: **do not quote 0.73× as though it meant we are 27% leaner than Falcon.**
+    It means our wrap3 sends 52.8 B/party where their table's wrap3 row implies
+    72, under an interpretation of `k` that does not survive contact with the
+    other rows. The defensible statements are that the round structure is
+    identical and that end-to-end LeNet lands at the right order of magnitude.
+    Settling it needs their source (`snwagh/falcon-public`), not more arithmetic
+    from the paper.
+
+    Also needed on the way: `reveal_components_batch_party`. `Π_WA` step 3
+    computes `α = wrap3(r₁,r₂,r₃)` in the clear, a function of the individual
+    summands that cannot be recovered from `r = Σrⱼ`, so the reveal has to return
+    components. Same single message — every party already holds all three after
+    the exchange.
+
+12. **`Π_SS` and `Π_ReLU` on the transport.** ✅ **Done 2026-08-01**
+    (`falcon_mpc::select_batch`, `relu_batch`). **Falcon's whole inference
+    nonlinearity now runs on real messages**, verified against `max(0, a)` for
+    every value in the ring at ℓ = 8.
+
+    `Π_SS`'s trick is worth naming: `b` lives in `Z_2` but the select needs it as
+    a ring value to multiply by. Preprocessing supplies one random bit `c` shared
+    in **both** rings; opening `b ⊕ c` reveals nothing, yet lets every party pick
+    locally between `⟦c⟧_L` and `⟦1−c⟧_L` — which *is* `⟦b⟧_L`. That avoids a
+    share-conversion protocol, and it costs one bit opening plus one ring
+    multiplication.
+
+13. **`bench-falcon`**: the same LeNet-shaped network three ways — Falcon
    hand-written, Baru gadgets, Baru compiled — over the same transport, with
    message and byte counts, exactly as `bench-compiled-nn` does. All three
    checked against one plaintext reference; a cost comparison between routes

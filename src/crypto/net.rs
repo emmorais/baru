@@ -139,6 +139,21 @@ pub enum MpcMsg {
         values: Vec<u8>,
     },
 
+    /// A batched reveal whose payload is packed at the share's **actual** width
+    /// rather than padded to `u128`.
+    ///
+    /// [`MpcMsg::RevealShareBatch`] carries `Vec<u128>` — 16 bytes per element
+    /// whatever `nbits` is, so at `nbits = 20` it is 84% padding and at `ℓ = 32`
+    /// still 75%. That is invisible in a protocol whose traffic is dominated by
+    /// something else, and badly misleading in one whose traffic *is* the
+    /// reveals. Falcon's wrap3 opens one ring value per DReLU, so the width has
+    /// to be honest for the comparison to mean anything.
+    RevealPackedBatch {
+        base_id: u64,
+        bits: u32,
+        data: Vec<u8>,
+    },
+
     /// One garbler's contribution in the 3-party (two-garbler) garbled-circuit
     /// protocol (`crate::crypto::gc_protocol`). Both garblers derive an
     /// identical circuit from their shared PRF key; garbler 0 ships the garbled

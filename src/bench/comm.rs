@@ -34,6 +34,32 @@ pub struct CommStats {
     /// Total payload bytes across those messages (post-serialization, i.e.
     /// the actual bytes handed to the transport).
     pub bytes: u64,
+    /// Of `bytes`, those carried by `MpcMsg::TaggedZBatch` — the ABY3 ring
+    /// resharing. **These are encoded as `Vec<u128>`, a fixed 16 bytes per
+    /// element whatever `nbits` is**, so at the CNN benchmarks' `nbits = 20`
+    /// they carry 20 bits of content per 128 bits on the wire.
+    ///
+    /// Broken out because "how much of our traffic is padding" is otherwise
+    /// invisible, and it decides whether a communication comparison against a
+    /// bit-packed system means anything.
+    pub ring_bytes: u64,
+    /// Of `bytes`, those carried by `MpcMsg::GcFromGarbler` — garbled tables
+    /// and labels, already `Vec<u8>` and so compact.
+    pub gc_bytes: u64,
+}
+
+impl std::ops::Add for CommStats {
+    type Output = CommStats;
+    /// Componentwise, so the traffic breakdown accumulates with the totals
+    /// rather than being silently dropped when segments are summed.
+    fn add(self, o: CommStats) -> CommStats {
+        CommStats {
+            messages: self.messages + o.messages,
+            bytes: self.bytes + o.bytes,
+            ring_bytes: self.ring_bytes + o.ring_bytes,
+            gc_bytes: self.gc_bytes + o.gc_bytes,
+        }
+    }
 }
 
 impl CommStats {
@@ -41,8 +67,44 @@ impl CommStats {
         CommStats {
             messages: self.messages.saturating_sub(other.messages),
             bytes: self.bytes.saturating_sub(other.bytes),
+            ring_bytes: self.ring_bytes.saturating_sub(other.ring_bytes),
+            gc_bytes: self.gc_bytes.saturating_sub(other.gc_bytes),
         }
     }
+}
+
+/// The bincode discriminants of the message variants the breakdown tracks.
+///
+/// **Derived, not hardcoded.** An earlier version wrote the tags in as literals
+/// and they were silently invalidated the moment a new variant was inserted
+/// ahead of `GcFromGarbler` — the breakdown then attributed garbled traffic to
+/// nothing and a reveal to "garbled", while every total stayed correct and no
+/// test failed. Reading the discriminant back out of a serialized sample costs
+/// one encode per process and cannot drift.
+struct VariantTags {
+    ring: u32,
+    gc: u32,
+}
+
+fn variant_tags() -> &'static VariantTags {
+    static TAGS: std::sync::OnceLock<VariantTags> = std::sync::OnceLock::new();
+    TAGS.get_or_init(|| {
+        let tag_of = |m: &crate::crypto::net::MpcMsg| -> u32 {
+            let b = crate::crypto::net::serialize_msg(m);
+            u32::from_le_bytes([b[0], b[1], b[2], b[3]])
+        };
+        VariantTags {
+            ring: tag_of(&crate::crypto::net::MpcMsg::TaggedZBatch {
+                base_op_id: 0,
+                values: Vec::new(),
+            }),
+            gc: tag_of(&crate::crypto::net::MpcMsg::GcFromGarbler {
+                op_id: 0,
+                garbler: 0,
+                payload: Vec::new(),
+            }),
+        }
+    })
 }
 
 /// Wraps a `Transport`, counting every message sent (and its size) without
@@ -53,6 +115,8 @@ pub struct CountingTransport<T: Transport> {
     nparties: usize,
     messages: Arc<AtomicU64>,
     bytes: Arc<AtomicU64>,
+    ring_bytes: Arc<AtomicU64>,
+    gc_bytes: Arc<AtomicU64>,
 }
 
 impl<T: Transport> CountingTransport<T> {
@@ -61,6 +125,8 @@ impl<T: Transport> CountingTransport<T> {
             inner,
             nparties,
             messages: Arc::new(AtomicU64::new(0)),
+            ring_bytes: Arc::new(AtomicU64::new(0)),
+            gc_bytes: Arc::new(AtomicU64::new(0)),
             bytes: Arc::new(AtomicU64::new(0)),
         }
     }
@@ -70,6 +136,28 @@ impl<T: Transport> CountingTransport<T> {
         CommStats {
             messages: self.messages.load(Ordering::Relaxed),
             bytes: self.bytes.load(Ordering::Relaxed),
+            ring_bytes: self.ring_bytes.load(Ordering::Relaxed),
+            gc_bytes: self.gc_bytes.load(Ordering::Relaxed),
+        }
+    }
+
+    /// Attribute a message to a traffic class by its bincode variant tag — the
+    /// leading little-endian `u32` of the encoding.
+    ///
+    /// Reading the tag rather than deserialising keeps this cheap enough to
+    /// leave on in every benchmark, which matters: a breakdown that has to be
+    /// switched on is a breakdown nobody looks at.
+    fn classify(&self, msg: &Message, times: u64) {
+        if msg.len() < 4 {
+            return;
+        }
+        let tags = variant_tags();
+        let tag = u32::from_le_bytes([msg[0], msg[1], msg[2], msg[3]]);
+        let n = msg.len() as u64 * times;
+        if tag == tags.ring {
+            self.ring_bytes.fetch_add(n, Ordering::Relaxed);
+        } else if tag == tags.gc {
+            self.gc_bytes.fetch_add(n, Ordering::Relaxed);
         }
     }
 
@@ -81,6 +169,8 @@ impl<T: Transport> CountingTransport<T> {
         CommHandle {
             messages: self.messages.clone(),
             bytes: self.bytes.clone(),
+            ring_bytes: self.ring_bytes.clone(),
+            gc_bytes: self.gc_bytes.clone(),
         }
     }
 }
@@ -91,6 +181,8 @@ impl<T: Transport> CountingTransport<T> {
 pub struct CommHandle {
     messages: Arc<AtomicU64>,
     bytes: Arc<AtomicU64>,
+    ring_bytes: Arc<AtomicU64>,
+    gc_bytes: Arc<AtomicU64>,
 }
 
 impl CommHandle {
@@ -98,6 +190,8 @@ impl CommHandle {
         CommStats {
             messages: self.messages.load(Ordering::Relaxed),
             bytes: self.bytes.load(Ordering::Relaxed),
+            ring_bytes: self.ring_bytes.load(Ordering::Relaxed),
+            gc_bytes: self.gc_bytes.load(Ordering::Relaxed),
         }
     }
 }
@@ -110,6 +204,7 @@ impl<T: Transport> Transport for CountingTransport<T> {
     fn send(&self, to: PartyId, msg: Message) {
         self.messages.fetch_add(1, Ordering::Relaxed);
         self.bytes.fetch_add(msg.len() as u64, Ordering::Relaxed);
+        self.classify(&msg, 1);
         self.inner.send(to, msg);
     }
 
@@ -118,6 +213,7 @@ impl<T: Transport> Transport for CountingTransport<T> {
         self.messages.fetch_add(fanout, Ordering::Relaxed);
         self.bytes
             .fetch_add(msg.len() as u64 * fanout, Ordering::Relaxed);
+        self.classify(&msg, fanout);
         self.inner.broadcast(msg);
     }
 
@@ -309,7 +405,8 @@ mod tests {
             counted.stats(),
             CommStats {
                 messages: 1,
-                bytes: 10
+                bytes: 10,
+                ..Default::default()
             }
         );
 
@@ -319,7 +416,8 @@ mod tests {
             counted.stats(),
             CommStats {
                 messages: 3,
-                bytes: 20
+                bytes: 20,
+                ..Default::default()
             }
         );
     }
@@ -409,7 +507,8 @@ mod tests {
             h.stats(),
             CommStats {
                 messages: 1,
-                bytes: 7
+                bytes: 7,
+                ..Default::default()
             }
         );
     }

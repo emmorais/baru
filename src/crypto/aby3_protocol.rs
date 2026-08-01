@@ -296,6 +296,181 @@ pub fn reveal<T: Transport>(
 /// elements per multiplication and then opened 2 more. Triples are not
 /// merely moved offline here, they are eliminated: there is nothing left to
 /// precompute or distribute.
+/// Open a whole batch of ring shares to every party in **one** directed message
+/// each — the semi-honest counterpart of
+/// [`crate::crypto::aby3_verify::reveal_batch_checked`], which broadcasts and
+/// cross-checks instead.
+///
+/// Party `i` holds `(sᵢ, sᵢ₊₁)` and is missing `sᵢ₊₂`, which party `i+2` holds
+/// as its `left`. So every party sends its `left` to party `i+1` and receives
+/// the one summand it lacks. One round, one message per party, whatever the
+/// batch size.
+///
+/// The batching is the point: [`reveal`] costs `N−1` messages *per value*, so
+/// opening a convolution layer element by element would spend tens of thousands
+/// of round trips on what is structurally a single exchange. `Π_WA` opens one
+/// masked value per DReLU, so without this the wrap protocol's cost would be
+/// dominated by an artefact of the API rather than by the protocol.
+pub fn reveal_batch_party<T: Transport>(
+    shares: &[PartyShare],
+    base_id: u64,
+    me: PartyId,
+    mbx: &Mailbox<T>,
+) -> Vec<Fr> {
+    if shares.is_empty() {
+        return Vec::new();
+    }
+    let mine: Vec<Fr> = shares.iter().map(|s| s.left).collect();
+    mbx.send(
+        (me + 1) % N,
+        serialize_msg(&MpcMsg::RevealShareBatch { base_id, values: mine }),
+    );
+    let (_, msg) = mbx
+        .recv_matching(TIMEOUT_MS, |m| {
+            matches!(m, MpcMsg::RevealShareBatch { base_id: b, .. } if *b == base_id)
+        })
+        .unwrap_or_else(|| panic!("reveal_batch_party: timeout for base_id={base_id}"));
+    let missing = match msg {
+        MpcMsg::RevealShareBatch { values, .. } => values,
+        _ => unreachable!("predicate guarantees RevealShareBatch"),
+    };
+    assert_eq!(missing.len(), shares.len(), "reveal batch length mismatch");
+    shares
+        .iter()
+        .zip(missing)
+        .map(|(s, m)| s.left.wrapping_add(s.right).wrapping_add(m))
+        .collect()
+}
+
+/// Open a batch of ring shares and return the three **additive components** of
+/// each, in canonical party order, rather than only their sum.
+///
+/// Same single directed message as [`reveal_batch_party`] — after the exchange
+/// every party already holds all three summands (`left`, `right`, and the one
+/// received), so the components cost nothing extra. What differs is only what is
+/// returned.
+///
+/// `Π_WA` needs exactly this: its step 3 computes `α = wrap3(r₁, r₂, r₃, L)` "in
+/// the clear", which is a function of the individual summands and *not*
+/// recoverable from `r = Σrⱼ`. A reveal that returns only the value would make
+/// the wrap protocol unimplementable without a second exchange.
+/// Pack ring values at `bits` each, little-endian within the stream.
+fn pack_ring(values: &[Fr], bits: u32) -> Vec<u8> {
+    let mut out = vec![0u8; (values.len() * bits as usize).div_ceil(8)];
+    for (i, v) in values.iter().enumerate() {
+        let base = i * bits as usize;
+        for b in 0..bits as usize {
+            if (v >> b) & 1 == 1 {
+                out[(base + b) / 8] |= 1 << ((base + b) % 8);
+            }
+        }
+    }
+    out
+}
+
+fn unpack_ring(data: &[u8], n: usize, bits: u32) -> Vec<Fr> {
+    (0..n)
+        .map(|i| {
+            let base = i * bits as usize;
+            let mut v: Fr = 0;
+            for b in 0..bits as usize {
+                let idx = base + b;
+                if data[idx / 8] >> (idx % 8) & 1 == 1 {
+                    v |= 1 << b;
+                }
+            }
+            v
+        })
+        .collect()
+}
+
+/// [`reveal_components_batch_party`] with the payload packed at `bits`.
+///
+/// Same protocol, honest width. Use this wherever the reveal traffic is a
+/// material share of the total; `RevealShareBatch`'s `u128` payload is 75–84%
+/// padding at the widths this crate actually uses.
+pub fn reveal_components_packed_party<T: Transport>(
+    shares: &[PartyShare],
+    bits: u32,
+    base_id: u64,
+    me: PartyId,
+    mbx: &Mailbox<T>,
+) -> Vec<[Fr; 3]> {
+    if shares.is_empty() {
+        return Vec::new();
+    }
+    let mine: Vec<Fr> = shares.iter().map(|s| s.left).collect();
+    mbx.send(
+        (me + 1) % N,
+        serialize_msg(&MpcMsg::RevealPackedBatch {
+            base_id,
+            bits,
+            data: pack_ring(&mine, bits),
+        }),
+    );
+    let (_, msg) = mbx
+        .recv_matching(TIMEOUT_MS, |m| {
+            matches!(m, MpcMsg::RevealPackedBatch { base_id: b, .. } if *b == base_id)
+        })
+        .unwrap_or_else(|| panic!("reveal_components_packed_party: timeout id={base_id}"));
+    let received = match msg {
+        MpcMsg::RevealPackedBatch { data, .. } => unpack_ring(&data, shares.len(), bits),
+        _ => unreachable!("predicate guarantees RevealPackedBatch"),
+    };
+    shares
+        .iter()
+        .zip(received)
+        .map(|(s, got)| {
+            let mut c = [0 as Fr; 3];
+            c[me % N] = s.left;
+            c[(me + 1) % N] = s.right;
+            c[(me + 2) % N] = got;
+            c
+        })
+        .collect()
+}
+
+pub fn reveal_components_batch_party<T: Transport>(
+    shares: &[PartyShare],
+    base_id: u64,
+    me: PartyId,
+    mbx: &Mailbox<T>,
+) -> Vec<[Fr; 3]> {
+    if shares.is_empty() {
+        return Vec::new();
+    }
+    let mine: Vec<Fr> = shares.iter().map(|s| s.left).collect();
+    mbx.send(
+        (me + 1) % N,
+        serialize_msg(&MpcMsg::RevealShareBatch { base_id, values: mine }),
+    );
+    let (_, msg) = mbx
+        .recv_matching(TIMEOUT_MS, |m| {
+            matches!(m, MpcMsg::RevealShareBatch { base_id: b, .. } if *b == base_id)
+        })
+        .unwrap_or_else(|| panic!("reveal_components_batch_party: timeout id={base_id}"));
+    let received = match msg {
+        MpcMsg::RevealShareBatch { values, .. } => values,
+        _ => unreachable!("predicate guarantees RevealShareBatch"),
+    };
+    assert_eq!(received.len(), shares.len(), "reveal batch length mismatch");
+    shares
+        .iter()
+        .zip(received)
+        .map(|(s, got)| {
+            // This party's `left` is component `me`, its `right` component
+            // `me+1`; the value it just received is component `me+2`. Placing
+            // them by index makes every party agree on the ordering, which is
+            // what lets `wrap3` be computed identically everywhere.
+            let mut c = [0 as Fr; 3];
+            c[me % N] = s.left;
+            c[(me + 1) % N] = s.right;
+            c[(me + 2) % N] = got;
+            c
+        })
+        .collect()
+}
+
 pub fn mul_party<T: Transport>(
     a: &PartyShare,
     b: &PartyShare,
@@ -778,6 +953,50 @@ fn party_pairs(s: &crate::crypto::types::Share3) -> Vec<PartyShare> {
 mod tests {
     use super::*;
     use crate::crypto::net::InprocHandle;
+
+    /// The batched reveal must open the same values as the per-share [`reveal`],
+    /// and must do it in **one** message per party rather than `N−1` per value.
+    ///
+    /// The message count is half the point: `Π_WA` opens one masked value per
+    /// DReLU, so an unbatched reveal would make the wrap protocol's cost an
+    /// artefact of the API.
+    #[test]
+    #[ignore] // real 3-party transport
+    fn batched_reveal_matches_the_scalar_one_in_a_single_round() {
+        use crate::bench::comm::CountingTransport;
+        const N_VALS: usize = 512;
+        let secrets: Vec<Fr> = (0..N_VALS as u128).map(|i| i.wrapping_mul(0x9E37_79B9)).collect();
+        let expected = secrets.clone();
+
+        let handles = InprocHandle::create(3);
+        let mut comm = None;
+        let mut joins = Vec::new();
+        for h in handles {
+            let counted = CountingTransport::new(h, 3);
+            if comm.is_none() {
+                comm = Some(counted.handle());
+            }
+            let secrets = secrets.clone();
+            joins.push(std::thread::spawn(move || {
+                let mbx = Mailbox::new(counted);
+                let me = mbx.id();
+                // Owner 0 supplies each value; sharing a held value is free.
+                let shares: Vec<PartyShare> =
+                    secrets.iter().map(|&v| share_component(v, 0, me)).collect();
+                reveal_batch_party(&shares, 7, me, &mbx)
+            }));
+        }
+        let outs: Vec<Vec<Fr>> = joins.into_iter().map(|j| j.join().expect("panic")).collect();
+        for o in &outs {
+            assert_eq!(o, &expected, "every party must open the same values");
+        }
+        let stats = comm.unwrap().stats();
+        assert_eq!(
+            stats.messages, 1,
+            "a batched reveal is one directed message per party, got {}",
+            stats.messages
+        );
+    }
 
     /// Component sharings must be constructible with no communication and
     /// must reconstruct the original additive components. This is what makes

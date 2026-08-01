@@ -1360,7 +1360,7 @@ pub fn run_cnn_hybrid_in_session(
         nonlin,
     );
     phases.add(&ph);
-    comm = CommStats { messages: comm.messages + conv_comm.messages, bytes: comm.bytes + conv_comm.bytes };
+    comm = comm + conv_comm;
     mpc_ms += t0.elapsed().as_secs_f64() * 1000.0;
     let mut feat_shape = model.pool_shape;
 
@@ -1382,10 +1382,7 @@ pub fn run_cnn_hybrid_in_session(
         let (feat2, comm2, ph2) =
             mpc_conv_relu_pool(co, cm, cl.cbias.clone(), out_shape, shift, nbits, profile, nonlin);
         phases.add(&ph2);
-        comm = CommStats {
-            messages: comm.messages + comm2.messages,
-            bytes: comm.bytes + comm2.bytes,
-        };
+        comm = comm + comm2;
         mpc_ms += tm.elapsed().as_secs_f64() * 1000.0;
         per_party_feat = feat2;
         feat_shape = Chw { c: cl.out_c(), h: cl.out_h() / POOL, w: cl.out_w() / POOL };
@@ -1440,10 +1437,7 @@ pub fn run_cnn_hybrid_in_session(
         phases.add(&per_party_hidden[0].1);
         let per_party_hidden: Vec<Vec<Fr>> =
             per_party_hidden.into_iter().map(|(c, _)| c).collect();
-        comm = CommStats {
-            messages: comm.messages + hidden_comm.messages,
-            bytes: comm.bytes + hidden_comm.bytes,
-        };
+        comm = comm + hidden_comm;
         mpc_ms += t1.elapsed().as_secs_f64() * 1000.0;
 
         let t2 = Instant::now();
@@ -1503,7 +1497,7 @@ pub fn run_cnn_hybrid_in_session(
         }
     });
     phases.add(&classes[0].1);
-    comm = CommStats { messages: comm.messages + argmax_comm.messages, bytes: comm.bytes + argmax_comm.bytes };
+    comm = comm + argmax_comm;
     mpc_ms += t0.elapsed().as_secs_f64() * 1000.0;
     let class = classes[0].0;
 

@@ -373,10 +373,7 @@ pub fn run_deep_hybrid(mlp: &DeepMlp, input: &[i64], profile: NetworkProfile) ->
         let t0 = Instant::now();
         let (per_party, layer_comm) =
             mpc_relu_rescale_layer(&opened, &masks, &layer.bias, mlp.shift, nbits, profile);
-        comm = CommStats {
-            messages: comm.messages + layer_comm.messages,
-            bytes: comm.bytes + layer_comm.bytes,
-        };
+        comm = comm + layer_comm;
         mpc_ms += t0.elapsed().as_secs_f64() * 1000.0;
 
         // [SWITCH → FHE] re-encrypt the activation components as the next

@@ -13,18 +13,59 @@
 //! - **Zero-sum randomness.** `PrfKeys::alpha` sums to zero mod `2^128`, which
 //!   says nothing mod `p`. [`PrfKeys::alpha_mod`](crate::crypto::net::PrfKeys::alpha_mod)
 //!   applies the same telescoping construction in the field instead.
-//! - **Wire width.** A field element is one byte, not sixteen. Falcon's claim
-//!   over prior work is communication volume, so this has to be right or the
-//!   comparison is worthless.
+//! - **Wire width.** A field element is **6 bits**, bit-packed — not a byte and
+//!   certainly not sixteen. Falcon counts `k = 6` bits per `Z_p` element, and
+//!   this network's traffic is essentially all field elements, so byte-padding
+//!   would inflate the reproduction by `8/6` and byte-16 padding by 16×. The
+//!   comparison is the point, so the encoding has to match.
 //!
 //! Everything else — the local cross terms, the single directed resharing
 //! message, the α counter discipline — is the ring protocol unchanged.
 
-use crate::crypto::field::{Fp, FpShare, P};
+use crate::crypto::field::{Fp, FpShare, ELEM_BITS, P};
 use crate::crypto::net::{serialize_msg, Mailbox, MpcMsg, PartyId, Transport};
 
 const N: usize = 3;
 const TIMEOUT_MS: u64 = 5_000;
+
+/// Bit-pack field elements at [`ELEM_BITS`] each.
+///
+/// Not a micro-optimisation. Falcon's published communication counts `k` bits
+/// per `Z_p` element with `k = 6`; a byte per element would be `8/6` of that,
+/// and since this network's traffic is essentially all field elements, padding
+/// would inflate the reproduction by a third and make it look worse than the
+/// system it is reproducing. The comparison is the point, so the encoding has to
+/// match.
+pub fn pack(values: &[Fp]) -> Vec<u8> {
+    let mut out = vec![0u8; (values.len() * ELEM_BITS as usize).div_ceil(8)];
+    for (i, v) in values.iter().enumerate() {
+        let bit = i * ELEM_BITS as usize;
+        let val = v.value();
+        for b in 0..ELEM_BITS as usize {
+            if (val >> b) & 1 == 1 {
+                out[(bit + b) / 8] |= 1 << ((bit + b) % 8);
+            }
+        }
+    }
+    out
+}
+
+/// Inverse of [`pack`]; `n` is how many elements to read back.
+pub fn unpack(bytes: &[u8], n: usize) -> Vec<Fp> {
+    (0..n)
+        .map(|i| {
+            let bit = i * ELEM_BITS as usize;
+            let mut val = 0u64;
+            for b in 0..ELEM_BITS as usize {
+                let idx = bit + b;
+                if bytes[idx / 8] >> (idx % 8) & 1 == 1 {
+                    val |= 1 << b;
+                }
+            }
+            Fp::new(val)
+        })
+        .collect()
+}
 
 /// Distinct α counter per product, matching `aby3_protocol`'s discipline: each
 /// `op_id` owns a disjoint `2^40` slot, so no two multiplications anywhere
@@ -77,19 +118,18 @@ pub fn mul_batch<T: Transport>(
         return Vec::new();
     }
     let keys = mbx.prf_keys(me);
-    let z_mine: Vec<u8> = pairs
+    let z_mine: Vec<Fp> = pairs
         .iter()
         .enumerate()
         .map(|(i, (a, b))| {
-            let t = a.left * b.left + a.left * b.right + a.right * b.left
-                + Fp::new(keys.alpha_mod(alpha_ctr(base_op_id, i), P));
-            t.value() as u8
+            a.left * b.left + a.left * b.right + a.right * b.left
+                + Fp::new(keys.alpha_mod(alpha_ctr(base_op_id, i), P))
         })
         .collect();
 
     mbx.send(
         (me + N - 1) % N,
-        serialize_msg(&MpcMsg::TaggedFpBatch { base_op_id, values: z_mine.clone() }),
+        serialize_msg(&MpcMsg::TaggedFpBatch { base_op_id, values: pack(&z_mine) }),
     );
     let (_, msg) = mbx
         .recv_matching(TIMEOUT_MS, |m| {
@@ -97,15 +137,14 @@ pub fn mul_batch<T: Transport>(
         })
         .unwrap_or_else(|| panic!("fp mul_batch: timeout on z for op_id={base_op_id}"));
     let z_next = match msg {
-        MpcMsg::TaggedFpBatch { values, .. } => values,
+        MpcMsg::TaggedFpBatch { values, .. } => unpack(&values, z_mine.len()),
         _ => unreachable!("predicate guarantees TaggedFpBatch"),
     };
-    assert_eq!(z_next.len(), z_mine.len(), "fp batch length mismatch in resharing");
 
     z_mine
         .into_iter()
         .zip(z_next)
-        .map(|(l, r)| FpShare { left: Fp::new(l as u64), right: Fp::new(r as u64) })
+        .map(|(left, right)| FpShare { left, right })
         .collect()
 }
 
@@ -122,10 +161,10 @@ pub fn reveal_batch<T: Transport>(
     if shares.is_empty() {
         return Vec::new();
     }
-    let mine: Vec<u8> = shares.iter().map(|s| s.left.value() as u8).collect();
+    let mine: Vec<Fp> = shares.iter().map(|s| s.left).collect();
     mbx.send(
         (me + 1) % N,
-        serialize_msg(&MpcMsg::TaggedFpBatch { base_op_id, values: mine.clone() }),
+        serialize_msg(&MpcMsg::TaggedFpBatch { base_op_id, values: pack(&mine) }),
     );
     let (_, msg) = mbx
         .recv_matching(TIMEOUT_MS, |m| {
@@ -133,14 +172,10 @@ pub fn reveal_batch<T: Transport>(
         })
         .unwrap_or_else(|| panic!("fp reveal_batch: timeout for op_id={base_op_id}"));
     let missing = match msg {
-        MpcMsg::TaggedFpBatch { values, .. } => values,
+        MpcMsg::TaggedFpBatch { values, .. } => unpack(&values, shares.len()),
         _ => unreachable!("predicate guarantees TaggedFpBatch"),
     };
-    shares
-        .iter()
-        .zip(missing)
-        .map(|(s, m)| s.left + s.right + Fp::new(m as u64))
-        .collect()
+    shares.iter().zip(missing).map(|(s, m)| s.left + s.right + m).collect()
 }
 
 #[cfg(test)]
@@ -169,6 +204,67 @@ mod tests {
             })
             .collect();
         joins.into_iter().map(|j| j.join().expect("party panicked")).collect()
+    }
+
+    /// How many bytes a ring multiplication actually puts on the wire, per
+    /// meaningful bit — the comparison that says whether Baru's own reported
+    /// traffic is encoding-limited.
+    ///
+    /// `aby3_protocol` reshares through `MpcMsg::TaggedZBatch { values: Vec<u128> }`
+    /// and bincode encodes `u128` as a fixed 16 bytes, whatever `nbits` is. At
+    /// the CNN benchmarks' `nbits = 20` that is 128 wire bits for 20 meaningful
+    /// ones. This test measures the ratio rather than asserting it is fine.
+    #[test]
+    #[ignore] // real 3-party transport
+    fn ring_traffic_is_dominated_by_the_u128_encoding() {
+        use crate::bench::comm::CountingTransport;
+        use crate::crypto::aby3_protocol::{mul_batch_party, share_component as ring_component, PartyShare};
+        const N: usize = 4096;
+        const NBITS: u32 = 20;
+
+        let handles = InprocHandle::create(3);
+        let mut comm = None;
+        let mut joins = Vec::new();
+        for h in handles {
+            let counted = CountingTransport::new(h, 3);
+            if comm.is_none() {
+                comm = Some(counted.handle());
+            }
+            joins.push(thread::spawn(move || {
+                let mbx = Mailbox::new(counted);
+                let me = mbx.id();
+                let pairs: Vec<(PartyShare, PartyShare)> = (0..N)
+                    .map(|i| {
+                        (
+                            ring_component(i as u128 % (1 << NBITS), 0, me),
+                            ring_component((i as u128 * 7) % (1 << NBITS), 0, me),
+                        )
+                    })
+                    .collect();
+                let _ = mul_batch_party(&pairs, 1, me, &mbx);
+            }));
+        }
+        for j in joins {
+            j.join().expect("panic");
+        }
+        let s = comm.unwrap().stats();
+        let bytes_per_elem = s.bytes as f64 / N as f64;
+        let useful = NBITS as f64 / 8.0;
+
+        println!(
+            "\n  ABY3 ring mul_batch, n={N}, nbits={NBITS} — per party\n    \
+             bytes on the wire : {}\n    per element       : {bytes_per_elem:.2} B\n    \
+             meaningful        : {useful:.2} B ({NBITS} bits)\n    \
+             encoding overhead : {:.1}x\n    \
+             (for contrast, the Z_p path packs at {} bits/element)\n",
+            s.bytes,
+            bytes_per_elem / useful,
+            crate::crypto::field::ELEM_BITS
+        );
+        assert!(
+            bytes_per_elem > 8.0,
+            "expected the u128 encoding to dominate; got {bytes_per_elem:.2} B/element"
+        );
     }
 
     /// A free random sharing must actually be a *consistent* replicated sharing

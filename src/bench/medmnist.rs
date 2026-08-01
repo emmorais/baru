@@ -303,6 +303,11 @@ pub struct MedMnistReport {
     /// Party-to-party messages and bytes for one encrypted diagnosis.
     pub per_image_messages: f64,
     pub per_image_bytes: f64,
+    /// Of `per_image_bytes`, the ABY3 ring resharing — encoded `Vec<u128>`, so
+    /// 16 B per element whatever `nbits` is. See `CommStats::ring_bytes`.
+    pub per_image_ring_bytes: f64,
+    /// Of `per_image_bytes`, the garbled tables and labels — already compact.
+    pub per_image_gc_bytes: f64,
     /// Query-independent work per image, excluded from `per_image_ms`. The
     /// sum of the two fields below.
     pub per_image_offline_ms: f64,
@@ -408,6 +413,8 @@ pub fn run(
         per_image_argmax_ms: per.argmax_ms,
         per_image_messages: per.messages,
         per_image_bytes: per.bytes,
+        per_image_ring_bytes: per.ring_bytes,
+        per_image_gc_bytes: per.gc_bytes,
         per_image_offline_ms: session.offline_ms() / hybrid_n as f64 + per.offline_query_ms,
         per_image_offline_session_ms: session.offline_ms() / hybrid_n as f64,
         per_image_offline_query_ms: per.offline_query_ms,
@@ -433,6 +440,8 @@ struct CnnTotals {
     argmax_ms: f64,
     messages: f64,
     bytes: f64,
+    ring_bytes: f64,
+    gc_bytes: f64,
     offline_query_ms: f64,
     weights_ms: f64,
     mul_ms: f64,
@@ -451,6 +460,8 @@ impl CnnTotals {
         self.pool_ms += r.phases.pool_ms;
         self.argmax_ms += r.phases.argmax_ms;
         self.messages += r.comm.messages as f64;
+        self.ring_bytes += r.comm.ring_bytes as f64;
+        self.gc_bytes += r.comm.gc_bytes as f64;
         self.bytes += r.comm.bytes as f64;
         self.offline_query_ms += r.offline_query_ms;
         self.weights_ms += r.fhe_phases.weights_ms;
@@ -475,6 +486,8 @@ impl CnnTotals {
             argmax_ms: self.argmax_ms / d,
             messages: self.messages / d,
             bytes: self.bytes / d,
+            ring_bytes: self.ring_bytes / d,
+            gc_bytes: self.gc_bytes / d,
             offline_query_ms: self.offline_query_ms / d,
             weights_ms: self.weights_ms / d,
             mul_ms: self.mul_ms / d,
@@ -674,6 +687,18 @@ fn print_report(r: &MedMnistReport) {
         "    traffic  : {:.0} messages, {:.1} MB party-to-party",
         r.per_image_messages,
         r.per_image_bytes / 1e6
+    );
+    // The split matters because the two halves are encoded very differently:
+    // ring shares go out as `Vec<u128>` (16 B per element regardless of
+    // `nbits`), garbled material as packed bytes. A traffic figure that does not
+    // separate them cannot be compared against a bit-packed system.
+    println!(
+        "      of which : ring(ABY3) {:.1} MB [16 B/elem, ~{:.0}% padding], \
+         garbled {:.1} MB, other {:.1} MB",
+        r.per_image_ring_bytes / 1e6,
+        100.0 * (1.0 - r.log2_t as f64 / 128.0),
+        r.per_image_gc_bytes / 1e6,
+        (r.per_image_bytes - r.per_image_ring_bytes - r.per_image_gc_bytes) / 1e6
     );
     println!(
         "  wall clock incl. plaintext scoring pass: {:.0} ms\n",
