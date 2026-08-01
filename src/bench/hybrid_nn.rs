@@ -65,8 +65,8 @@ use crate::bench::comm::{CommStats, CountingTransport, LatencyTransport, Network
 use crate::bench::Phase;
 use crate::crypto::net::InprocHandle;
 use crate::crypto::types::Fr;
-use crate::fhe::ckks_compare::{relu_approx_plain, CkksCompareBackend};
 use crate::fhe::bfv::{Bfv, BfvAdapter, BfvCt, BfvParams};
+use crate::fhe::ckks_compare::{relu_approx_plain, CkksCompareBackend};
 // `Backend` is already taken by the MPC interpreter's trait, below.
 use crate::fhe::poly::{self, Backend as PolyBackend};
 use crate::fhe::{CkksBackend, FheBackend, MockFheBackend, RealFheBackend, TfheBackend};
@@ -251,7 +251,11 @@ fn import_batched(
     let count = my_comps.len();
     let mut acc: Option<Vec<ShareRef>> = None;
     for owner in 0..3 {
-        let vals: Vec<Fr> = if me == owner { my_comps.to_vec() } else { vec![0; count] };
+        let vals: Vec<Fr> = if me == owner {
+            my_comps.to_vec()
+        } else {
+            vec![0; count]
+        };
         let shs = be.share_secret_batch(&vals, nbits, owner);
         acc = Some(match acc {
             // Folding the three owners is local addition — free.
@@ -579,14 +583,7 @@ fn run_ckks_only(data: &LayerData, iterations: u32, profile: NetworkProfile) -> 
     // Activation-range calibration: a real deployment measures this on
     // sample data (what `ml::QuantizationReport` exists for); here the
     // plaintext reference plays that role.
-    let bound = data
-        .pre
-        .iter()
-        .map(|v| v.abs())
-        .max()
-        .unwrap_or(1)
-        .max(1) as f64
-        * 1.25;
+    let bound = data.pre.iter().map(|v| v.abs()).max().unwrap_or(1).max(1) as f64 * 1.25;
 
     let relu = t.phase("relu", || {
         pre.iter()
@@ -703,7 +700,11 @@ fn run_hybrid_bfv(data: &LayerData, profile: NetworkProfile) -> StrategyReport {
         log2_t <= 30,
         "activation range needs t=2^{log2_t}, beyond BFV's depth-1 noise budget at q=2^100"
     );
-    let s = Bfv::new(BfvParams { n: 4096, log2_q: 100, log2_t });
+    let s = Bfv::new(BfvParams {
+        n: 4096,
+        log2_q: 100,
+        log2_t,
+    });
     let nbits = s.params.log2_t as usize;
     let t_mask = s.params.t() - 1;
     // Chunking lifts the single-ciphertext ceiling: the packing bound
@@ -716,7 +717,10 @@ fn run_hybrid_bfv(data: &LayerData, profile: NetworkProfile) -> StrategyReport {
     // throughput but needs rotations + Galois keys — which would forfeit
     // this construction's no-evaluation-keys property. Our layout is the
     // rotation-free, Cheetah-style one.)
-    assert!(2 * in_dim <= s.params.n, "in_dim exceeds the ring dimension");
+    assert!(
+        2 * in_dim <= s.params.n,
+        "in_dim exceeds the ring dimension"
+    );
     let rows_per_chunk = (s.params.n / in_dim).saturating_sub(1).min(out_dim.max(1));
     let chunks: Vec<&[Vec<i64>]> = data.w.chunks(rows_per_chunk).collect();
     let adapter = BfvAdapter(&s);
@@ -734,8 +738,7 @@ fn run_hybrid_bfv(data: &LayerData, profile: NetworkProfile) -> StrategyReport {
     });
     let cx = t.phase("enc-input", || s.encrypt_poly(&ck, &s.pack_input(&data.x)));
     t.phase("link-io", || {
-        let bytes =
-            adapter.ct_bytes(&cx) + cws.iter().map(|c| adapter.ct_bytes(c)).sum::<usize>();
+        let bytes = adapter.ct_bytes(&cx) + cws.iter().map(|c| adapter.ct_bytes(c)).sum::<usize>();
         sleep_link(&profile, bytes, 2);
     });
 
@@ -781,9 +784,7 @@ fn run_hybrid_bfv(data: &LayerData, profile: NetworkProfile) -> StrategyReport {
     let (enc_masks, enc_rho) = t.phase("offline-prep", || {
         let em: Vec<Vec<BfvCt>> = masks
             .iter()
-            .map(|chunk_masks| {
-                chunk_masks.iter().map(|m| s.encrypt_poly(&ck, m)).collect()
-            })
+            .map(|chunk_masks| chunk_masks.iter().map(|m| s.encrypt_poly(&ck, m)).collect())
             .collect();
         let er: Vec<BfvCt> = rho.iter().map(|r| s.encrypt_poly(&ck, r)).collect();
         (em, er)
@@ -803,7 +804,11 @@ fn run_hybrid_bfv(data: &LayerData, profile: NetworkProfile) -> StrategyReport {
                 s.decrypt_poly(&ck, &masked)
             })
             .collect();
-        sleep_link(&profile, conv_bytes + y.iter().map(|v| v.len() * 8).sum::<usize>(), 2);
+        sleep_link(
+            &profile,
+            conv_bytes + y.iter().map(|v| v.len() * 8).sum::<usize>(),
+            2,
+        );
         y
     });
     // Flatten (chunk, local row) -> per-output opened value and its chunk's
@@ -882,7 +887,9 @@ fn run_hybrid_bfv(data: &LayerData, profile: NetworkProfile) -> StrategyReport {
 
     let output = t.phase("decrypt", || {
         let coeffs = s.decrypt_poly(&ck, &back);
-        (0..out_dim).map(|j| s.to_signed(coeffs[j] & t_mask)).collect::<Vec<i64>>()
+        (0..out_dim)
+            .map(|j| s.to_signed(coeffs[j] & t_mask))
+            .collect::<Vec<i64>>()
     });
 
     let total_ms = t.total_ms();
@@ -1162,8 +1169,7 @@ pub fn run_cli(args: &[String]) -> Result<(), String> {
         i += 1;
     }
 
-    let mut profile =
-        NetworkProfile::fixed_latency(std::time::Duration::from_micros(rtt_ms * 500));
+    let mut profile = NetworkProfile::fixed_latency(std::time::Duration::from_micros(rtt_ms * 500));
     if let Some(mbps) = bandwidth_mbps {
         profile = profile.with_bandwidth(mbps * 1e6 / 8.0);
     }
@@ -1196,43 +1202,43 @@ pub fn run_cli(args: &[String]) -> Result<(), String> {
     let mut reports = Vec::new();
     let sweeping = poly_sweep.len() > 1;
     for &pb in &poly_sweep {
-    if !json && sweeping {
-        println!("── polynomial backend: {} ──\n", pb.name());
-    }
-    for &s in &strategies {
-        let r = poly::with_backend(pb, || run_strategy(s, &data, relu_iterations, profile))?;
-        if !json {
-            let phases: Vec<String> = r
-                .phases
-                .iter()
-                .map(|p| format!("{}={}", p.name, fmt_ms(p.micros)))
-                .collect();
-            let comm = r
-                .comm
-                .map(|c| format!("  comm[msgs={} bytes={}]", c.messages, c.bytes))
-                .unwrap_or_default();
-            println!(
-                "{:<12} total={:<10} {}{}  {}",
-                r.strategy,
-                fmt_ms((r.total_ms * 1000.0) as u128),
-                if r.ok { "✓" } else { "✗" },
-                comm,
-                phases.join(" ")
-            );
-            println!("             output: {:?}", r.output);
-            if r.max_abs_error_vs_exact != 0 {
-                println!(
-                    "             max |err| vs exact ReLU: {}",
-                    r.max_abs_error_vs_exact
-                );
-            }
-            for n in &r.notes {
-                println!("             note: {n}");
-            }
-            println!();
+        if !json && sweeping {
+            println!("── polynomial backend: {} ──\n", pb.name());
         }
-        reports.push((pb, r));
-    }
+        for &s in &strategies {
+            let r = poly::with_backend(pb, || run_strategy(s, &data, relu_iterations, profile))?;
+            if !json {
+                let phases: Vec<String> = r
+                    .phases
+                    .iter()
+                    .map(|p| format!("{}={}", p.name, fmt_ms(p.micros)))
+                    .collect();
+                let comm = r
+                    .comm
+                    .map(|c| format!("  comm[msgs={} bytes={}]", c.messages, c.bytes))
+                    .unwrap_or_default();
+                println!(
+                    "{:<12} total={:<10} {}{}  {}",
+                    r.strategy,
+                    fmt_ms((r.total_ms * 1000.0) as u128),
+                    if r.ok { "✓" } else { "✗" },
+                    comm,
+                    phases.join(" ")
+                );
+                println!("             output: {:?}", r.output);
+                if r.max_abs_error_vs_exact != 0 {
+                    println!(
+                        "             max |err| vs exact ReLU: {}",
+                        r.max_abs_error_vs_exact
+                    );
+                }
+                for n in &r.notes {
+                    println!("             note: {n}");
+                }
+                println!();
+            }
+            reports.push((pb, r));
+        }
     }
 
     if json {
@@ -1262,7 +1268,9 @@ pub fn run_cli(args: &[String]) -> Result<(), String> {
                             .map(|(_, r)| r.total_ms)
                     };
                     match (f(base), f(pb)) {
-                        (Some(a), Some(c)) if c > 0.0 => Some(format!("{}={:.2}x", s.name(), a / c)),
+                        (Some(a), Some(c)) if c > 0.0 => {
+                            Some(format!("{}={:.2}x", s.name(), a / c))
+                        }
                         _ => None,
                     }
                 })
@@ -1338,7 +1346,11 @@ mod tests {
         // (it would have hit the old single-chunk assertion).
         let data = make_layer(256, 32);
         let r = run_hybrid_bfv(&data, NetworkProfile::INSTANT);
-        assert!(r.ok, "chunked hybrid-bfv output {:?} != {:?}", r.output, data.expected);
+        assert!(
+            r.ok,
+            "chunked hybrid-bfv output {:?} != {:?}",
+            r.output, data.expected
+        );
         assert_eq!(r.max_abs_error_vs_exact, 0);
     }
 

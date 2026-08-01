@@ -232,8 +232,8 @@ impl CkksCompareBackend {
         let ctx = Context::new(&params, true, SecurityLevel::TC128)
             .expect("CkksCompareBackend: context (requested chain likely exceeds the security budget for this degree)");
         let evaluator = CKKSEvaluator::new(&ctx).expect("CkksCompareBackend: evaluator");
-        let encoder =
-            CKKSEncoder::new(&ctx, 2.0f64.powi(COMPARE_SCALE_BITS)).expect("CkksCompareBackend: encoder");
+        let encoder = CKKSEncoder::new(&ctx, 2.0f64.powi(COMPARE_SCALE_BITS))
+            .expect("CkksCompareBackend: encoder");
         CkksCompareBackend {
             ctx,
             evaluator,
@@ -324,7 +324,9 @@ impl CkksCompareBackend {
         let keys = self.client_keys(client_key_bytes);
         let secret = SecretKey::from_bytes(&self.ctx, &keys.secret).expect("secret key");
         let decryptor = Decryptor::new(&self.ctx, &secret).expect("decryptor");
-        let pt = decryptor.decrypt(&ct.ct).expect("CkksCompareBackend: decrypt");
+        let pt = decryptor
+            .decrypt(&ct.ct)
+            .expect("CkksCompareBackend: decrypt");
         self.encoder
             .decode_f64(&pt)
             .expect("CkksCompareBackend: decode")[0]
@@ -369,7 +371,12 @@ impl CkksCompareBackend {
         }
     }
 
-    fn mod_switch_plaintext_to(&self, pt: &Plaintext, from_level: u32, target_level: u32) -> Plaintext {
+    fn mod_switch_plaintext_to(
+        &self,
+        pt: &Plaintext,
+        from_level: u32,
+        target_level: u32,
+    ) -> Plaintext {
         assert!(from_level <= target_level);
         let mut cur = pt.clone();
         for _ in from_level..target_level {
@@ -668,7 +675,13 @@ mod tests {
     #[test]
     fn cmpgt_approx_matches_plain_comparison_within_tolerance() {
         let bound = 5.0;
-        for &(a, b) in &[(3.0, 1.0), (1.0, 3.0), (0.0, 0.0), (-2.0, -4.0), (-4.0, -2.0)] {
+        for &(a, b) in &[
+            (3.0, 1.0),
+            (1.0, 3.0),
+            (0.0, 0.0),
+            (-2.0, -4.0),
+            (-4.0, -2.0),
+        ] {
             let got = cmpgt_approx_plain(a, b, bound, 16);
             let expected = if a > b { 1.0 } else { 0.0 };
             assert!(

@@ -79,8 +79,13 @@ fn falcon_wrap_preproc(
     let x = ((xs[0] as u128 + xs[1] as u128 + xs[2] as u128) & m) as u64;
     let beta = seed & 1;
     WrapPreproc {
-        x: PartyShare { left: xs[me % 3] as u128, right: xs[(me + 1) % 3] as u128 },
-        bits: (0..l_bits).map(|k| fp_component(Fp::new((x >> k) & 1), 0, me)).collect(),
+        x: PartyShare {
+            left: xs[me % 3] as u128,
+            right: xs[(me + 1) % 3] as u128,
+        },
+        bits: (0..l_bits)
+            .map(|k| fp_component(Fp::new((x >> k) & 1), 0, me))
+            .collect(),
         delta: {
             let d = crate::crypto::falcon::wrap3(xs[0], xs[1], xs[2], l_bits);
             [u64::from(me == 0) * d, u64::from(me == 2) * d]
@@ -100,7 +105,10 @@ fn falcon_sel_preproc(base: u64, i: u64, me: PartyId) -> crate::crypto::falcon_m
     let cr = [cbit as u128, 0u128, 0u128];
     crate::crypto::falcon_mpc::SelectPreproc {
         c_bit: [c[me % 3], c[(me + 1) % 3]],
-        c_ring: PartyShare { left: cr[me % 3], right: cr[(me + 1) % 3] },
+        c_ring: PartyShare {
+            left: cr[me % 3],
+            right: cr[(me + 1) % 3],
+        },
     }
 }
 
@@ -166,7 +174,8 @@ impl<T: Transport> TransportBackend<T> {
 
     /// Batched interactive protocol invocations so far — see the field docs.
     pub fn interactive_calls(&self) -> usize {
-        self.interactive_calls.load(std::sync::atomic::Ordering::Relaxed)
+        self.interactive_calls
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     fn note_interactive(&self) {
@@ -222,8 +231,16 @@ impl<T: Transport> TransportBackend<T> {
     /// caveat the repo already carries for dealer-based BFV key generation.
     fn lt_falcon_batch(&mut self, pairs: &[(ShareRef, ShareRef)]) -> Vec<ShareRef> {
         use crate::crypto::falcon_mpc::{drelu_batch, select_batch};
-        let nbits = pairs.iter().map(|(a, b)| a.nbits.max(b.nbits)).max().unwrap() as u32;
-        let mask: Fr = if nbits >= 128 { Fr::MAX } else { (1u128 << nbits) - 1 };
+        let nbits = pairs
+            .iter()
+            .map(|(a, b)| a.nbits.max(b.nbits))
+            .max()
+            .unwrap() as u32;
+        let mask: Fr = if nbits >= 128 {
+            Fr::MAX
+        } else {
+            (1u128 << nbits) - 1
+        };
         let n = pairs.len();
 
         let diffs: Vec<PartyShare> = pairs
@@ -238,9 +255,12 @@ impl<T: Transport> TransportBackend<T> {
             .collect();
 
         let base = self.alloc_block(FALCON_ID_BLOCK);
-        let wp: Vec<_> =
-            (0..n).map(|i| falcon_wrap_preproc(base, i as u64, nbits, self.me)).collect();
-        let sp: Vec<_> = (0..n).map(|i| falcon_sel_preproc(base, i as u64, self.me)).collect();
+        let wp: Vec<_> = (0..n)
+            .map(|i| falcon_wrap_preproc(base, i as u64, nbits, self.me))
+            .collect();
+        let sp: Vec<_> = (0..n)
+            .map(|i| falcon_sel_preproc(base, i as u64, self.me))
+            .collect();
         let bits = drelu_batch(&diffs, &wp, nbits, base, self.me, &self.mailbox);
 
         // Lift `Z_2 → Z_L` so the result composes like an `a2b` output.
@@ -398,13 +418,18 @@ impl<T: Transport> TransportBackend<T> {
         if pairs.is_empty() {
             return Vec::new();
         }
-        let nbits = pairs.iter().map(|(a, b)| a.nbits.max(b.nbits)).max().unwrap();
+        let nbits = pairs
+            .iter()
+            .map(|(a, b)| a.nbits.max(b.nbits))
+            .max()
+            .unwrap();
         let n = pairs.len();
         let a: Vec<PartyShare> = pairs.iter().map(|(a, _)| self.get_cloned(a)).collect();
         let b: Vec<PartyShare> = pairs.iter().map(|(_, b)| self.get_cloned(b)).collect();
         // Reserve op_id (garble messages) + the Y2A id block, in lockstep.
         let op_id = self.alloc_block(1 + crate::crypto::gc_protocol::gc_id_block(n, 1));
-        let out = crate::crypto::gc_protocol::gc_lt_batch(&a, &b, nbits, op_id, self.me, &self.mailbox);
+        let out =
+            crate::crypto::gc_protocol::gc_lt_batch(&a, &b, nbits, op_id, self.me, &self.mailbox);
         out.into_iter()
             .map(|ps| {
                 let id = self.alloc_id();
@@ -417,7 +442,12 @@ impl<T: Transport> TransportBackend<T> {
     /// garble round: `outᵢ = (vᵢ>=0) ? (vᵢ>>shift) : 0`. Same Yao-leg protocol
     /// and roles as [`Self::lt_gc_batch`]; returns RSS arithmetic shares of the
     /// activations (`nbits−shift`-bit results carried in `nbits`).
-    pub fn relu_gc_batch(&mut self, vals: &[ShareRef], nbits: usize, shift: usize) -> Vec<ShareRef> {
+    pub fn relu_gc_batch(
+        &mut self,
+        vals: &[ShareRef],
+        nbits: usize,
+        shift: usize,
+    ) -> Vec<ShareRef> {
         if vals.is_empty() {
             return Vec::new();
         }
@@ -425,7 +455,14 @@ impl<T: Transport> TransportBackend<T> {
         let width = nbits - shift;
         let vs: Vec<PartyShare> = vals.iter().map(|v| self.get_cloned(v)).collect();
         let op_id = self.alloc_block(1 + crate::crypto::gc_protocol::gc_id_block(n, width));
-        let out = crate::crypto::gc_protocol::gc_relu_batch(&vs, nbits, shift, op_id, self.me, &self.mailbox);
+        let out = crate::crypto::gc_protocol::gc_relu_batch(
+            &vs,
+            nbits,
+            shift,
+            op_id,
+            self.me,
+            &self.mailbox,
+        );
         out.into_iter()
             .map(|ps| {
                 let id = self.alloc_id();
@@ -482,11 +519,19 @@ impl<T: Transport + 'static> Backend for TransportBackend<T> {
         let base_op_id = self.alloc_id();
         let owned: Vec<Vec<(PartyShare, PartyShare)>> = dots
             .iter()
-            .map(|d| d.iter().map(|(a, b)| (self.get_cloned(a), self.get_cloned(b))).collect())
+            .map(|d| {
+                d.iter()
+                    .map(|(a, b)| (self.get_cloned(a), self.get_cloned(b)))
+                    .collect()
+            })
             .collect();
         let refs: Vec<&[(PartyShare, PartyShare)]> = owned.iter().map(|v| v.as_slice()).collect();
-        let results =
-            crate::crypto::aby3_protocol::dot_batch_party(&refs, base_op_id, self.me, &self.mailbox);
+        let results = crate::crypto::aby3_protocol::dot_batch_party(
+            &refs,
+            base_op_id,
+            self.me,
+            &self.mailbox,
+        );
         results
             .into_iter()
             .map(|ps| {
@@ -607,7 +652,11 @@ impl<T: Transport + 'static> Backend for TransportBackend<T> {
         }
         // Each comparison is the MSB of `a − b`; batch all the decompositions
         // into one `a2b_batch` so the whole set costs ~9 rounds, not `9·len`.
-        let nbits = pairs.iter().map(|(a, b)| a.nbits.max(b.nbits)).max().unwrap();
+        let nbits = pairs
+            .iter()
+            .map(|(a, b)| a.nbits.max(b.nbits))
+            .max()
+            .unwrap();
         let diffs: Vec<ShareRef> = pairs.iter().map(|(a, b)| self.sub(a, b)).collect();
         self.a2b_batch(&diffs, nbits)
             .into_iter()
@@ -683,7 +732,12 @@ impl<T: Transport + 'static> Backend for TransportBackend<T> {
                     .map(|ps| {
                         let id = self.alloc_id();
                         self.shares.insert(id, ps);
-                        ShareRef { id, nbits: 1, owner: v.owner, fixed: false }
+                        ShareRef {
+                            id,
+                            nbits: 1,
+                            owner: v.owner,
+                            fixed: false,
+                        }
                     })
                     .collect()
             })

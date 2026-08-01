@@ -337,7 +337,10 @@ mod tests {
     fn the_harness_measures_constants_and_both_sweeps() {
         let r = run(1).unwrap();
         assert!(r.rtt_secs > 0.0, "RTT probe produced nothing");
-        assert!(r.bandwidth_bytes_per_sec > 0.0, "bandwidth probe produced nothing");
+        assert!(
+            r.bandwidth_bytes_per_sec > 0.0,
+            "bandwidth probe produced nothing"
+        );
         assert_eq!(r.latency_sweep.len(), 3);
         assert_eq!(r.bandwidth_sweep.len(), 3);
     }

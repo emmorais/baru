@@ -164,8 +164,7 @@ fn prove_and_verify(expr: &str, private: &[(&str, i64)]) -> (bool, i64) {
     let ckt = be
         .compile_circuit(&parsed, &names)
         .unwrap_or_else(|e| panic!("compile {expr}: {e}"));
-    let priv_map: HashMap<String, i64> =
-        private.iter().map(|(k, v)| (k.to_string(), *v)).collect();
+    let priv_map: HashMap<String, i64> = private.iter().map(|(k, v)| (k.to_string(), *v)).collect();
     let mut pubs = HashMap::new();
     let claimed = be
         .evaluate(&ckt, &priv_map, &pubs)
@@ -182,7 +181,15 @@ fn prove_and_verify(expr: &str, private: &[(&str, i64)]) -> (bool, i64) {
 /// negative value compares as larger than every positive one.
 #[test]
 fn signed_comparisons_are_correct_including_negatives() {
-    for (a, b) in [(3i64, 9i64), (9, 3), (-1, 1), (1, -1), (-5, -2), (0, 0), (-7, -7)] {
+    for (a, b) in [
+        (3i64, 9i64),
+        (9, 3),
+        (-1, 1),
+        (1, -1),
+        (-5, -2),
+        (0, 0),
+        (-7, -7),
+    ] {
         let (ok, lt) = prove_and_verify("(< x y)", &[("x", a), ("y", b)]);
         assert!(ok, "verify (< {a} {b})");
         assert_eq!(lt, (a < b) as i64, "signed {a} < {b}");
@@ -268,8 +275,6 @@ fn a_false_relu_claim_is_still_unprovable() {
     );
 }
 
-
-
 /// Fixed-point rescaling: Q16.16 multiplication needs a `>> 16` that preserves
 /// sign. A *logical* shift here would turn every negative activation into a
 /// huge positive one, so this sweeps negatives deliberately.
@@ -317,8 +322,15 @@ fn shift_left_works_and_secret_shift_amounts_are_refused() {
 #[test]
 fn division_matches_rust_semantics() {
     for (a, b) in [
-        (7i64, 2i64), (-7, 2), (7, -2), (-7, -2),
-        (100, 10), (0, 5), (1, 3), (-1, 3), (i64::MAX, 3),
+        (7i64, 2i64),
+        (-7, 2),
+        (7, -2),
+        (-7, -2),
+        (100, 10),
+        (0, 5),
+        (1, 3),
+        (-1, 3),
+        (i64::MAX, 3),
     ] {
         let (ok, q) = prove_and_verify("(/ x y)", &[("x", a), ("y", b)]);
         assert!(ok, "verify ({a} / {b})");

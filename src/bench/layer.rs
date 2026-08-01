@@ -523,8 +523,20 @@ pub fn run_cli(args: &[String]) -> Result<(), String> {
     );
     println!();
     println!("The hybrid undercuts every deployable MPC protocol:");
-    println!("  · {}", describe(r.crossover, "OT-preprocessed MPC  (the figure paper-outline E25 quotes)"));
-    println!("  · {}", describe(r.crossover_vs_she, "SHE-preprocessed MPC (`lowgear`, MEASURED)"));
+    println!(
+        "  · {}",
+        describe(
+            r.crossover,
+            "OT-preprocessed MPC  (the figure paper-outline E25 quotes)"
+        )
+    );
+    println!(
+        "  · {}",
+        describe(
+            r.crossover_vs_she,
+            "SHE-preprocessed MPC (`lowgear`, MEASURED)"
+        )
+    );
     if r.crossover != r.crossover_vs_she {
         println!(
             "\n  ** The two disagree. E25 concludes \"the entire case for FHE here is the cost\n\
@@ -623,11 +635,18 @@ mod tests {
         // And it is a real run, not a synthesised row — that was the point of
         // widening LowGear's field.
         assert_eq!(
-            r.mpc.iter().find(|p| p.protocol == "lowgear").unwrap().provenance,
+            r.mpc
+                .iter()
+                .find(|p| p.protocol == "lowgear")
+                .unwrap()
+                .provenance,
             "measured"
         );
         assert!(
-            r.mpc.iter().filter(|p| p.protocol == "lowgear").all(|p| p.correct),
+            r.mpc
+                .iter()
+                .filter(|p| p.protocol == "lowgear")
+                .all(|p| p.correct),
             "lowgear must compute the layer correctly, ReLU included"
         );
     }

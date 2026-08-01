@@ -146,10 +146,7 @@ impl Spdz2kEngine {
     }
 
     fn alpha_value(&self) -> u128 {
-        self.alpha
-            .iter()
-            .fold(0u128, |a, x| a.wrapping_add(*x))
-            & self.wmask()
+        self.alpha.iter().fold(0u128, |a, x| a.wrapping_add(*x)) & self.wmask()
     }
 
     /// Share a value with its MAC. Used for inputs and for dealt triples.
@@ -242,15 +239,15 @@ impl Spdz2kEngine {
         }
         let w = self.wmask();
         let mut rng = rand::thread_rng();
-        let chi: Vec<u128> = (0..self.opened.len()).map(|_| rng.gen::<u128>() & w).collect();
+        let chi: Vec<u128> = (0..self.opened.len())
+            .map(|_| rng.gen::<u128>() & w)
+            .collect();
 
         let mut total = 0u128;
         for i in 0..self.parties {
             let mut sigma = 0u128;
             for (j, op) in self.opened.iter().enumerate() {
-                let term = op.mac[i]
-                    .wrapping_sub(self.alpha[i].wrapping_mul(op.public))
-                    & w;
+                let term = op.mac[i].wrapping_sub(self.alpha[i].wrapping_mul(op.public)) & w;
                 sigma = sigma.wrapping_add(chi[j].wrapping_mul(term)) & w;
             }
             total = total.wrapping_add(sigma) & w;
@@ -312,16 +309,36 @@ impl ShareEngine for Spdz2kEngine {
     fn add(&mut self, a: &AuthShare, b: &AuthShare) -> AuthShare {
         let w = self.wmask();
         AuthShare {
-            value: a.value.iter().zip(&b.value).map(|(x, y)| x.wrapping_add(*y) & w).collect(),
-            mac: a.mac.iter().zip(&b.mac).map(|(x, y)| x.wrapping_add(*y) & w).collect(),
+            value: a
+                .value
+                .iter()
+                .zip(&b.value)
+                .map(|(x, y)| x.wrapping_add(*y) & w)
+                .collect(),
+            mac: a
+                .mac
+                .iter()
+                .zip(&b.mac)
+                .map(|(x, y)| x.wrapping_add(*y) & w)
+                .collect(),
         }
     }
 
     fn sub(&mut self, a: &AuthShare, b: &AuthShare) -> AuthShare {
         let w = self.wmask();
         AuthShare {
-            value: a.value.iter().zip(&b.value).map(|(x, y)| x.wrapping_sub(*y) & w).collect(),
-            mac: a.mac.iter().zip(&b.mac).map(|(x, y)| x.wrapping_sub(*y) & w).collect(),
+            value: a
+                .value
+                .iter()
+                .zip(&b.value)
+                .map(|(x, y)| x.wrapping_sub(*y) & w)
+                .collect(),
+            mac: a
+                .mac
+                .iter()
+                .zip(&b.mac)
+                .map(|(x, y)| x.wrapping_sub(*y) & w)
+                .collect(),
         }
     }
 
@@ -420,9 +437,18 @@ mod tests {
 
     #[test]
     fn refuses_parameters_that_would_only_look_secure() {
-        assert!(Spdz2kEngine::new(2, 32, 8).is_err(), "s = 8 is not security");
-        assert!(Spdz2kEngine::new(2, 100, 64).is_err(), "k + s must fit the ring");
-        assert!(Spdz2kEngine::new(1, 32, 32).is_err(), "needs at least two parties");
+        assert!(
+            Spdz2kEngine::new(2, 32, 8).is_err(),
+            "s = 8 is not security"
+        );
+        assert!(
+            Spdz2kEngine::new(2, 100, 64).is_err(),
+            "k + s must fit the ring"
+        );
+        assert!(
+            Spdz2kEngine::new(1, 32, 32).is_err(),
+            "needs at least two parties"
+        );
     }
 
     #[test]
@@ -447,7 +473,10 @@ mod tests {
         let z = e.mul_batch(&[(x, y)]).pop().expect("one product");
         let got = e.open_batch(&[z]);
         assert_eq!(got[0], 11 * 13);
-        assert!(e.mac_check().is_ok(), "an honest run must pass the MAC check");
+        assert!(
+            e.mac_check().is_ok(),
+            "an honest run must pass the MAC check"
+        );
     }
 
     /// The point of the whole engine: a value opened as something other than

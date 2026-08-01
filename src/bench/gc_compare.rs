@@ -34,7 +34,9 @@ use serde::Serialize;
 
 use crate::bench::comm::{CountingTransport, LatencyTransport, NetworkProfile};
 use crate::bench::hybrid_nn::run_parties;
-use crate::crypto::garbled::{comparator_stats, eval_and, eval_comparator, eval_xor, Garbler, Label};
+use crate::crypto::garbled::{
+    comparator_stats, eval_and, eval_comparator, eval_xor, Garbler, Label,
+};
 use crate::crypto::net::{recv_blocking, InprocHandle, Transport};
 use crate::interpreter::backend::Backend;
 
@@ -67,8 +69,12 @@ fn measure_a2b(n: usize, b: usize) -> (f64, usize, bool) {
     let mask = (1i64 << b) - 1;
     // Signed values in [-2^(b-1), 2^(b-1)); lt is MSB of the two's-complement
     // difference, i.e. signed a < b.
-    let av: Vec<i64> = (0..n).map(|_| rng.gen_range(-(1 << (b - 2))..(1 << (b - 2)))).collect();
-    let bv: Vec<i64> = (0..n).map(|_| rng.gen_range(-(1 << (b - 2))..(1 << (b - 2)))).collect();
+    let av: Vec<i64> = (0..n)
+        .map(|_| rng.gen_range(-(1 << (b - 2))..(1 << (b - 2))))
+        .collect();
+    let bv: Vec<i64> = (0..n)
+        .map(|_| rng.gen_range(-(1 << (b - 2))..(1 << (b - 2))))
+        .collect();
     let want: Vec<u128> = (0..n).map(|i| (av[i] < bv[i]) as u128).collect();
 
     let av2 = av.clone();
@@ -80,12 +86,20 @@ fn measure_a2b(n: usize, b: usize) -> (f64, usize, bool) {
             let pairs: Vec<_> = (0..n)
                 .map(|i| {
                     let a = be.share_secret(
-                        if me == 0 { (av[i] as i128).rem_euclid(1i128 << b) as u128 } else { 0 },
+                        if me == 0 {
+                            (av[i] as i128).rem_euclid(1i128 << b) as u128
+                        } else {
+                            0
+                        },
                         b,
                         0,
                     );
                     let bb = be.share_secret(
-                        if me == 0 { (bv[i] as i128).rem_euclid(1i128 << b) as u128 } else { 0 },
+                        if me == 0 {
+                            (bv[i] as i128).rem_euclid(1i128 << b) as u128
+                        } else {
+                            0
+                        },
                         b,
                         0,
                     );
@@ -139,7 +153,10 @@ fn measure_gc(n: usize, b: usize) -> (f64, usize, bool) {
     }
     let elapsed = t0.elapsed().as_secs_f64() * 1000.0;
     let stats = comparator_stats(n, b);
-    debug_assert_eq!(serialized_bytes, stats.wire_bytes, "byte accounting mismatch");
+    debug_assert_eq!(
+        serialized_bytes, stats.wire_bytes,
+        "byte accounting mismatch"
+    );
     (elapsed, stats.wire_bytes, correct)
 }
 
@@ -232,8 +249,17 @@ fn measure_gc_transport(n: usize, b: usize, profile: NetworkProfile) -> (f64, us
                     (eval_xor(&xa[i], &carry), eval_xor(&ya[i], &carry))
                 };
                 let (tg, te) = tables[i];
-                let and = eval_and(&u, &v, &crate::crypto::garbled::AndTable { tg, te }, 2 * i as u64);
-                carry = if carry_const0 { and } else { eval_xor(&and, &carry) };
+                let and = eval_and(
+                    &u,
+                    &v,
+                    &crate::crypto::garbled::AndTable { tg, te },
+                    2 * i as u64,
+                );
+                carry = if carry_const0 {
+                    and
+                } else {
+                    eval_xor(&and, &carry)
+                };
                 carry_const0 = false;
             }
             let msb = eval_xor(&eval_xor(&xa[b - 1], &ya[b - 1]), &carry);
@@ -261,11 +287,18 @@ fn measure_gc_transport(n: usize, b: usize, profile: NetworkProfile) -> (f64, us
 /// *whole* nonlinearity the pipeline runs, not just the comparison. Returns
 /// (wall-time ms, bytes, correct). The output is boolean-shared; a downstream
 /// B2A (accounted separately in the CLI) returns it to arithmetic.
-fn measure_gc_relu_transport(n: usize, b: usize, shift: usize, profile: NetworkProfile) -> (f64, usize, bool) {
+fn measure_gc_relu_transport(
+    n: usize,
+    b: usize,
+    shift: usize,
+    profile: NetworkProfile,
+) -> (f64, usize, bool) {
     use crate::crypto::garbled::relu_stats;
     let mut rng = rand::thread_rng();
     let mask = (1u128 << b) - 1;
-    let inputs: Vec<(u128, u128)> = (0..n).map(|_| (rng.gen::<u128>() & mask, rng.gen::<u128>() & mask)).collect();
+    let inputs: Vec<(u128, u128)> = (0..n)
+        .map(|_| (rng.gen::<u128>() & mask, rng.gen::<u128>() & mask))
+        .collect();
     let seeds: Vec<u64> = (0..n).map(|_| rng.gen()).collect();
 
     let handles = InprocHandle::create(2);
@@ -318,7 +351,10 @@ fn measure_gc_relu_transport(n: usize, b: usize, shift: usize, profile: NetworkP
             let mut tables = Vec::with_capacity(n_and);
             for i in 0..n_and {
                 let o = base + i * 32;
-                tables.push(crate::crypto::garbled::AndTable { tg: read(&buf, o), te: read(&buf, o + 16) });
+                tables.push(crate::crypto::garbled::AndTable {
+                    tg: read(&buf, o),
+                    te: read(&buf, o + 16),
+                });
             }
             let lbase = base + n_and * 32;
             let mut xa = Vec::with_capacity(b);
@@ -333,9 +369,17 @@ fn measure_gc_relu_transport(n: usize, b: usize, shift: usize, profile: NetworkP
             let mut cc0 = true;
             let mut ti = 0usize;
             for i in 0..b {
-                sa[i] = if cc0 { eval_xor(&xa[i], &ya[i]) } else { eval_xor(&eval_xor(&xa[i], &ya[i]), &carry) };
+                sa[i] = if cc0 {
+                    eval_xor(&xa[i], &ya[i])
+                } else {
+                    eval_xor(&eval_xor(&xa[i], &ya[i]), &carry)
+                };
                 if i < b - 1 {
-                    let (u, v) = if cc0 { (xa[i], ya[i]) } else { (eval_xor(&xa[i], &carry), eval_xor(&ya[i], &carry)) };
+                    let (u, v) = if cc0 {
+                        (xa[i], ya[i])
+                    } else {
+                        (eval_xor(&xa[i], &carry), eval_xor(&ya[i], &carry))
+                    };
                     let and = eval_and(&u, &v, &tables[ti], 2 * i as u64);
                     ti += 1;
                     carry = if cc0 { and } else { eval_xor(&and, &carry) };
@@ -358,7 +402,13 @@ fn measure_gc_relu_transport(n: usize, b: usize, shift: usize, profile: NetworkP
     let elapsed = start.elapsed().as_secs_f64() * 1000.0;
 
     let mut correct = true;
-    let signed = |v: u128| -> i128 { if v >> (b - 1) & 1 == 1 { v as i128 - (1i128 << b) } else { v as i128 } };
+    let signed = |v: u128| -> i128 {
+        if v >> (b - 1) & 1 == 1 {
+            v as i128 - (1i128 << b)
+        } else {
+            v as i128
+        }
+    };
     for k in 0..n {
         let s = (inputs_used[k].0 + inputs_used[k].1) & mask;
         let v = signed(s);
@@ -376,16 +426,35 @@ fn measure_gc_relu_transport(n: usize, b: usize, shift: usize, profile: NetworkP
 /// Run the `a2b`-based fused ReLU∘rescale through the transport: one
 /// `a2b_batch` (all bits) then one `mul_batch` (the sign gate) — matching
 /// `bench::cnn::fused_relu_rescale_batch`. Returns (wall-time ms, bytes, ok).
-fn measure_a2b_relu_profile(n: usize, b: usize, shift: usize, profile: NetworkProfile) -> (f64, usize, bool) {
+fn measure_a2b_relu_profile(
+    n: usize,
+    b: usize,
+    shift: usize,
+    profile: NetworkProfile,
+) -> (f64, usize, bool) {
     let mut rng = rand::thread_rng();
-    let vals: Vec<i64> = (0..n).map(|_| rng.gen_range(-(1 << (b - 2))..(1 << (b - 2)))).collect();
-    let want: Vec<i64> = vals.iter().map(|&v| if v >= 0 { v >> shift } else { 0 }).collect();
+    let vals: Vec<i64> = (0..n)
+        .map(|_| rng.gen_range(-(1 << (b - 2))..(1 << (b - 2))))
+        .collect();
+    let want: Vec<i64> = vals
+        .iter()
+        .map(|&v| if v >= 0 { v >> shift } else { 0 })
+        .collect();
     let (results, comm) = run_parties(profile, move |me| {
         let vals = vals.clone();
         move |be: &mut crate::interpreter::transport_backend::TransportBackend<_>| {
             let vs: Vec<_> = (0..n)
-                .map(|i| be.share_secret(
-                    if me == 0 { (vals[i] as i128).rem_euclid(1i128 << b) as u128 } else { 0 }, b, 0))
+                .map(|i| {
+                    be.share_secret(
+                        if me == 0 {
+                            (vals[i] as i128).rem_euclid(1i128 << b) as u128
+                        } else {
+                            0
+                        },
+                        b,
+                        0,
+                    )
+                })
                 .collect();
             let t0 = Instant::now();
             let bit_sets = be.a2b_batch(&vs, b);
@@ -399,12 +468,19 @@ fn measure_a2b_relu_profile(n: usize, b: usize, shift: usize, profile: NetworkPr
             }
             let acts = be.mul_batch(&pairs);
             let elapsed = t0.elapsed().as_secs_f64() * 1000.0;
-            let out: Vec<i64> = acts.iter().map(|a| {
-                let r = be.reveal(a, None);
-                let m = (1i128 << b) - 1;
-                let v = (r as i128) & m;
-                if v >= (1i128 << (b - 1)) { (v - (1i128 << b)) as i64 } else { v as i64 }
-            }).collect();
+            let out: Vec<i64> = acts
+                .iter()
+                .map(|a| {
+                    let r = be.reveal(a, None);
+                    let m = (1i128 << b) - 1;
+                    let v = (r as i128) & m;
+                    if v >= (1i128 << (b - 1)) {
+                        (v - (1i128 << b)) as i64
+                    } else {
+                        v as i64
+                    }
+                })
+                .collect();
             (elapsed, out)
         }
     });
@@ -416,8 +492,12 @@ fn measure_a2b_relu_profile(n: usize, b: usize, shift: usize, profile: NetworkPr
 /// the profile-by-profile head-to-head. Returns (wall-time ms, bytes, ok).
 fn measure_a2b_profile(n: usize, b: usize, profile: NetworkProfile) -> (f64, usize, bool) {
     let mut rng = rand::thread_rng();
-    let av: Vec<i64> = (0..n).map(|_| rng.gen_range(-(1 << (b - 2))..(1 << (b - 2)))).collect();
-    let bv: Vec<i64> = (0..n).map(|_| rng.gen_range(-(1 << (b - 2))..(1 << (b - 2)))).collect();
+    let av: Vec<i64> = (0..n)
+        .map(|_| rng.gen_range(-(1 << (b - 2))..(1 << (b - 2))))
+        .collect();
+    let bv: Vec<i64> = (0..n)
+        .map(|_| rng.gen_range(-(1 << (b - 2))..(1 << (b - 2))))
+        .collect();
     let want: Vec<u128> = (0..n).map(|i| (av[i] < bv[i]) as u128).collect();
     let (results, comm) = run_parties(profile, move |me| {
         let av = av.clone();
@@ -426,12 +506,20 @@ fn measure_a2b_profile(n: usize, b: usize, profile: NetworkProfile) -> (f64, usi
             let pairs: Vec<_> = (0..n)
                 .map(|i| {
                     let a = be.share_secret(
-                        if me == 0 { (av[i] as i128).rem_euclid(1i128 << b) as u128 } else { 0 },
+                        if me == 0 {
+                            (av[i] as i128).rem_euclid(1i128 << b) as u128
+                        } else {
+                            0
+                        },
                         b,
                         0,
                     );
                     let bb = be.share_secret(
-                        if me == 0 { (bv[i] as i128).rem_euclid(1i128 << b) as u128 } else { 0 },
+                        if me == 0 {
+                            (bv[i] as i128).rem_euclid(1i128 << b) as u128
+                        } else {
+                            0
+                        },
                         b,
                         0,
                     );
@@ -459,8 +547,12 @@ fn measure_a2b_profile(n: usize, b: usize, profile: NetworkProfile) -> (f64, usi
 /// cost against `a2b` (which also lands in arithmetic). Returns (ms, bytes, ok).
 fn measure_gc_real_lt(n: usize, b: usize, profile: NetworkProfile) -> (f64, usize, bool) {
     let mut rng = rand::thread_rng();
-    let av: Vec<i64> = (0..n).map(|_| rng.gen_range(-(1 << (b - 2))..(1 << (b - 2)))).collect();
-    let bv: Vec<i64> = (0..n).map(|_| rng.gen_range(-(1 << (b - 2))..(1 << (b - 2)))).collect();
+    let av: Vec<i64> = (0..n)
+        .map(|_| rng.gen_range(-(1 << (b - 2))..(1 << (b - 2))))
+        .collect();
+    let bv: Vec<i64> = (0..n)
+        .map(|_| rng.gen_range(-(1 << (b - 2))..(1 << (b - 2))))
+        .collect();
     let want: Vec<u128> = (0..n).map(|i| (av[i] < bv[i]) as u128).collect();
     let (results, comm) = run_parties(profile, move |me| {
         let av = av.clone();
@@ -469,9 +561,23 @@ fn measure_gc_real_lt(n: usize, b: usize, profile: NetworkProfile) -> (f64, usiz
             let pairs: Vec<_> = (0..n)
                 .map(|i| {
                     let a = be.share_secret(
-                        if me == 0 { (av[i] as i128).rem_euclid(1i128 << b) as u128 } else { 0 }, b, 0);
+                        if me == 0 {
+                            (av[i] as i128).rem_euclid(1i128 << b) as u128
+                        } else {
+                            0
+                        },
+                        b,
+                        0,
+                    );
                     let bb = be.share_secret(
-                        if me == 0 { (bv[i] as i128).rem_euclid(1i128 << b) as u128 } else { 0 }, b, 0);
+                        if me == 0 {
+                            (bv[i] as i128).rem_euclid(1i128 << b) as u128
+                        } else {
+                            0
+                        },
+                        b,
+                        0,
+                    );
                     (a, bb)
                 })
                 .collect();
@@ -489,26 +595,52 @@ fn measure_gc_real_lt(n: usize, b: usize, profile: NetworkProfile) -> (f64, usiz
 /// The real 3-party garbled *fused ReLU∘rescale* — `TransportBackend::
 /// relu_gc_batch`: the whole nonlinearity in one garble round + Y2A, through
 /// the transport. Returns (ms, bytes, ok).
-fn measure_gc_real_relu(n: usize, b: usize, shift: usize, profile: NetworkProfile) -> (f64, usize, bool) {
+fn measure_gc_real_relu(
+    n: usize,
+    b: usize,
+    shift: usize,
+    profile: NetworkProfile,
+) -> (f64, usize, bool) {
     let mut rng = rand::thread_rng();
-    let vals: Vec<i64> = (0..n).map(|_| rng.gen_range(-(1 << (b - 2))..(1 << (b - 2)))).collect();
-    let want: Vec<i64> = vals.iter().map(|&v| if v >= 0 { v >> shift } else { 0 }).collect();
+    let vals: Vec<i64> = (0..n)
+        .map(|_| rng.gen_range(-(1 << (b - 2))..(1 << (b - 2))))
+        .collect();
+    let want: Vec<i64> = vals
+        .iter()
+        .map(|&v| if v >= 0 { v >> shift } else { 0 })
+        .collect();
     let (results, comm) = run_parties(profile, move |me| {
         let vals = vals.clone();
         move |be: &mut crate::interpreter::transport_backend::TransportBackend<_>| {
             let vs: Vec<_> = (0..n)
-                .map(|i| be.share_secret(
-                    if me == 0 { (vals[i] as i128).rem_euclid(1i128 << b) as u128 } else { 0 }, b, 0))
+                .map(|i| {
+                    be.share_secret(
+                        if me == 0 {
+                            (vals[i] as i128).rem_euclid(1i128 << b) as u128
+                        } else {
+                            0
+                        },
+                        b,
+                        0,
+                    )
+                })
                 .collect();
             let t0 = Instant::now();
             let acts = be.relu_gc_batch(&vs, b, shift);
             let elapsed = t0.elapsed().as_secs_f64() * 1000.0;
-            let out: Vec<i64> = acts.iter().map(|a| {
-                let r = be.reveal(a, None);
-                let m = (1i128 << b) - 1;
-                let v = (r as i128) & m;
-                if v >= (1i128 << (b - 1)) { (v - (1i128 << b)) as i64 } else { v as i64 }
-            }).collect();
+            let out: Vec<i64> = acts
+                .iter()
+                .map(|a| {
+                    let r = be.reveal(a, None);
+                    let m = (1i128 << b) - 1;
+                    let v = (r as i128) & m;
+                    if v >= (1i128 << (b - 1)) {
+                        (v - (1i128 << b)) as i64
+                    } else {
+                        v as i64
+                    }
+                })
+                .collect();
             (elapsed, out)
         }
     });
@@ -560,8 +692,20 @@ pub fn run_cli(args: &[String]) -> Result<(), String> {
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
-            "--n" => n = it.next().ok_or("--n needs a value")?.parse().map_err(|_| "bad --n")?,
-            "--nbits" => b = it.next().ok_or("--nbits needs a value")?.parse().map_err(|_| "bad --nbits")?,
+            "--n" => {
+                n = it
+                    .next()
+                    .ok_or("--n needs a value")?
+                    .parse()
+                    .map_err(|_| "bad --n")?
+            }
+            "--nbits" => {
+                b = it
+                    .next()
+                    .ok_or("--nbits needs a value")?
+                    .parse()
+                    .map_err(|_| "bad --nbits")?
+            }
             "--json" => json = true,
             "-h" | "--help" => {
                 println!("{USAGE}");
@@ -573,7 +717,10 @@ pub fn run_cli(args: &[String]) -> Result<(), String> {
 
     let r = run(n, b);
     if json {
-        println!("{}", serde_json::to_string_pretty(&r).map_err(|e| e.to_string())?);
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&r).map_err(|e| e.to_string())?
+        );
         return Ok(());
     }
 
@@ -610,15 +757,28 @@ pub fn run_cli(args: &[String]) -> Result<(), String> {
         let (la, _, aok) = measure_a2b_profile(n, b, profile);
         let (lg, _, gok) = measure_gc_transport(n, b, profile);
         assert!(aok && gok, "correctness must hold at every profile");
-        let (winner, factor) = if la < lg { ("a2b", lg / la) } else { ("GC", la / lg) };
-        println!("  {:32}  {:8.1} ms  {:8.1} ms  {} {:.1}x", name, la, lg, winner, factor);
+        let (winner, factor) = if la < lg {
+            ("a2b", lg / la)
+        } else {
+            ("GC", la / lg)
+        };
+        println!(
+            "  {:32}  {:8.1} ms  {:8.1} ms  {} {:.1}x",
+            name, la, lg, winner, factor
+        );
     }
     // The pipeline's actual operation is the *fused ReLU∘rescale*, not a bare
     // comparison. Garbled circuits do the whole thing in one round; the a2b
     // path is a2b (9 rounds) + one sign-gate multiply (1 round).
     let shift = 8usize;
-    println!("\n  fused ReLU∘rescale layer ({} ops, {}-bit, shift {}) through the transport:", n, b, shift);
-    println!("  {:32}  {:>11}  {:>11}  {:>10}", "network", "a2b relu", "GC relu", "winner");
+    println!(
+        "\n  fused ReLU∘rescale layer ({} ops, {}-bit, shift {}) through the transport:",
+        n, b, shift
+    );
+    println!(
+        "  {:32}  {:>11}  {:>11}  {:>10}",
+        "network", "a2b relu", "GC relu", "winner"
+    );
     for (name, rtt, bw) in profiles {
         let one_way = std::time::Duration::from_secs_f64(rtt / 2.0 / 1000.0);
         let mut profile = NetworkProfile::fixed_latency(one_way);
@@ -632,8 +792,15 @@ pub fn run_cli(args: &[String]) -> Result<(), String> {
         // in arithmetic). Modeled as one extra one-way hop.
         lg += rtt / 2.0;
         assert!(aok && gok, "relu correctness must hold at every profile");
-        let (winner, factor) = if la < lg { ("a2b", lg / la) } else { ("GC", la / lg) };
-        println!("  {:32}  {:8.1} ms  {:8.1} ms  {} {:.1}x", name, la, lg, winner, factor);
+        let (winner, factor) = if la < lg {
+            ("a2b", lg / la)
+        } else {
+            ("GC", la / lg)
+        };
+        println!(
+            "  {:32}  {:8.1} ms  {:8.1} ms  {} {:.1}x",
+            name, la, lg, winner, factor
+        );
     }
 
     // The REAL 3-party garbled protocol (crate::crypto::gc_protocol): garble +
@@ -641,7 +808,10 @@ pub fn run_cli(args: &[String]) -> Result<(), String> {
     // transport as a2b. Unlike the pure-GC proxy above, this includes the Y2A
     // cost — the honest end-to-end comparison (a2b also lands in arithmetic).
     println!("\n  REAL 3-party GC protocol (garble+eval+Y2A) through the transport:");
-    println!("  {:32}  {:>11}  {:>13}  {:>10}", "network", "a2b lt", "GC lt (3pc)", "winner");
+    println!(
+        "  {:32}  {:>11}  {:>13}  {:>10}",
+        "network", "a2b lt", "GC lt (3pc)", "winner"
+    );
     for (name, rtt, bw) in profiles {
         let one_way = std::time::Duration::from_secs_f64(rtt / 2.0 / 1000.0);
         let mut profile = NetworkProfile::fixed_latency(one_way);
@@ -650,12 +820,27 @@ pub fn run_cli(args: &[String]) -> Result<(), String> {
         }
         let (la, _, aok) = measure_a2b_profile(n, b, profile);
         let (lg, _, gok) = measure_gc_real_lt(n, b, profile);
-        assert!(aok && gok, "real-GC lt correctness must hold at every profile");
-        let (winner, factor) = if la < lg { ("a2b", lg / la) } else { ("GC", la / lg) };
-        println!("  {:32}  {:8.1} ms  {:10.1} ms  {} {:.1}x", name, la, lg, winner, factor);
+        assert!(
+            aok && gok,
+            "real-GC lt correctness must hold at every profile"
+        );
+        let (winner, factor) = if la < lg {
+            ("a2b", lg / la)
+        } else {
+            ("GC", la / lg)
+        };
+        println!(
+            "  {:32}  {:8.1} ms  {:10.1} ms  {} {:.1}x",
+            name, la, lg, winner, factor
+        );
     }
-    println!("\n  REAL 3-party GC fused ReLU∘rescale ({n} ops, shift {shift}) through the transport:");
-    println!("  {:32}  {:>11}  {:>13}  {:>10}", "network", "a2b relu", "GC relu (3pc)", "winner");
+    println!(
+        "\n  REAL 3-party GC fused ReLU∘rescale ({n} ops, shift {shift}) through the transport:"
+    );
+    println!(
+        "  {:32}  {:>11}  {:>13}  {:>10}",
+        "network", "a2b relu", "GC relu (3pc)", "winner"
+    );
     for (name, rtt, bw) in profiles {
         let one_way = std::time::Duration::from_secs_f64(rtt / 2.0 / 1000.0);
         let mut profile = NetworkProfile::fixed_latency(one_way);
@@ -664,9 +849,19 @@ pub fn run_cli(args: &[String]) -> Result<(), String> {
         }
         let (la, _, aok) = measure_a2b_relu_profile(n, b, shift, profile);
         let (lg, _, gok) = measure_gc_real_relu(n, b, shift, profile);
-        assert!(aok && gok, "real-GC relu correctness must hold at every profile");
-        let (winner, factor) = if la < lg { ("a2b", lg / la) } else { ("GC", la / lg) };
-        println!("  {:32}  {:8.1} ms  {:10.1} ms  {} {:.1}x", name, la, lg, winner, factor);
+        assert!(
+            aok && gok,
+            "real-GC relu correctness must hold at every profile"
+        );
+        let (winner, factor) = if la < lg {
+            ("a2b", lg / la)
+        } else {
+            ("GC", la / lg)
+        };
+        println!(
+            "  {:32}  {:8.1} ms  {:10.1} ms  {} {:.1}x",
+            name, la, lg, winner, factor
+        );
     }
 
     println!(

@@ -125,8 +125,16 @@ pub fn share_input_batch<T: Transport>(
         let mut rng = rand::thread_rng();
         // Per-peer buffers: peer `i` receives its own component and the
         // component of `i+1`, exactly as in the unbatched protocol.
-        let mut lefts = [Vec::with_capacity(n), Vec::with_capacity(n), Vec::with_capacity(n)];
-        let mut rights = [Vec::with_capacity(n), Vec::with_capacity(n), Vec::with_capacity(n)];
+        let mut lefts = [
+            Vec::with_capacity(n),
+            Vec::with_capacity(n),
+            Vec::with_capacity(n),
+        ];
+        let mut rights = [
+            Vec::with_capacity(n),
+            Vec::with_capacity(n),
+            Vec::with_capacity(n),
+        ];
         let mut mine = Vec::with_capacity(n);
         for &value in values {
             let s0: Fr = rng.gen();
@@ -137,7 +145,10 @@ pub fn share_input_batch<T: Transport>(
                 lefts[i].push(s[i]);
                 rights[i].push(s[(i + 1) % N]);
             }
-            mine.push(PartyShare { left: s[me], right: s[(me + 1) % N] });
+            mine.push(PartyShare {
+                left: s[me],
+                right: s[(me + 1) % N],
+            });
         }
         for i in 0..N {
             if i != me {
@@ -164,8 +175,16 @@ pub fn share_input_batch<T: Transport>(
         let MpcMsg::InputShareBatch { lefts, rights, .. } = m else {
             unreachable!("predicate guarantees InputShareBatch")
         };
-        assert_eq!(lefts.len(), n, "share_input_batch: owner sent a batch of the wrong length");
-        assert_eq!(rights.len(), n, "share_input_batch: owner sent a batch of the wrong length");
+        assert_eq!(
+            lefts.len(),
+            n,
+            "share_input_batch: owner sent a batch of the wrong length"
+        );
+        assert_eq!(
+            rights.len(),
+            n,
+            "share_input_batch: owner sent a batch of the wrong length"
+        );
         lefts
             .into_iter()
             .zip(rights)
@@ -323,12 +342,16 @@ pub fn reveal_batch_party<T: Transport>(
     let mine: Vec<Fr> = shares.iter().map(|s| s.left).collect();
     mbx.send(
         (me + 1) % N,
-        serialize_msg(&MpcMsg::RevealShareBatch { base_id, values: mine }),
+        serialize_msg(&MpcMsg::RevealShareBatch {
+            base_id,
+            values: mine,
+        }),
     );
     let (_, msg) = mbx
-        .recv_matching(TIMEOUT_MS, |m| {
-            matches!(m, MpcMsg::RevealShareBatch { base_id: b, .. } if *b == base_id)
-        })
+        .recv_matching(
+            TIMEOUT_MS,
+            |m| matches!(m, MpcMsg::RevealShareBatch { base_id: b, .. } if *b == base_id),
+        )
         .unwrap_or_else(|| panic!("reveal_batch_party: timeout for base_id={base_id}"));
     let missing = match msg {
         MpcMsg::RevealShareBatch { values, .. } => values,
@@ -412,9 +435,10 @@ pub fn reveal_components_packed_party<T: Transport>(
         }),
     );
     let (_, msg) = mbx
-        .recv_matching(TIMEOUT_MS, |m| {
-            matches!(m, MpcMsg::RevealPackedBatch { base_id: b, .. } if *b == base_id)
-        })
+        .recv_matching(
+            TIMEOUT_MS,
+            |m| matches!(m, MpcMsg::RevealPackedBatch { base_id: b, .. } if *b == base_id),
+        )
         .unwrap_or_else(|| panic!("reveal_components_packed_party: timeout id={base_id}"));
     let received = match msg {
         MpcMsg::RevealPackedBatch { data, .. } => unpack_ring(&data, shares.len(), bits),
@@ -445,12 +469,16 @@ pub fn reveal_components_batch_party<T: Transport>(
     let mine: Vec<Fr> = shares.iter().map(|s| s.left).collect();
     mbx.send(
         (me + 1) % N,
-        serialize_msg(&MpcMsg::RevealShareBatch { base_id, values: mine }),
+        serialize_msg(&MpcMsg::RevealShareBatch {
+            base_id,
+            values: mine,
+        }),
     );
     let (_, msg) = mbx
-        .recv_matching(TIMEOUT_MS, |m| {
-            matches!(m, MpcMsg::RevealShareBatch { base_id: b, .. } if *b == base_id)
-        })
+        .recv_matching(
+            TIMEOUT_MS,
+            |m| matches!(m, MpcMsg::RevealShareBatch { base_id: b, .. } if *b == base_id),
+        )
         .unwrap_or_else(|| panic!("reveal_components_batch_party: timeout id={base_id}"));
     let received = match msg {
         MpcMsg::RevealShareBatch { values, .. } => values,
@@ -560,7 +588,11 @@ pub fn dot_batch_party_at<T: Transport>(
     if dots.is_empty() {
         return Vec::new();
     }
-    let wmask: Fr = if bits >= 128 { Fr::MAX } else { (1u128 << bits) - 1 };
+    let wmask: Fr = if bits >= 128 {
+        Fr::MAX
+    } else {
+        (1u128 << bits) - 1
+    };
     let keys = mbx.prf_keys(me);
     let z_mine: Vec<u128> = dots
         .iter()
@@ -584,9 +616,10 @@ pub fn dot_batch_party_at<T: Transport>(
         }),
     );
     let (_, msg) = mbx
-        .recv_matching(TIMEOUT_MS, |m| {
-            matches!(m, MpcMsg::TaggedZBatch { base_op_id: b, .. } if *b == base_op_id)
-        })
+        .recv_matching(
+            TIMEOUT_MS,
+            |m| matches!(m, MpcMsg::TaggedZBatch { base_op_id: b, .. } if *b == base_op_id),
+        )
         .unwrap_or_else(|| panic!("dot_batch_party: timeout on z for op_id={base_op_id}"));
     let z_next = match msg {
         MpcMsg::TaggedZBatch { data, bits, .. } => unpack_ring(&data, z_mine.len(), bits),
@@ -655,9 +688,16 @@ pub fn mul_batch_party_at<T: Transport>(
     if pairs.is_empty() {
         return Vec::new();
     }
-    assert!(pairs.len() <= MAX_BATCH, "multiplication batch too large for α counters");
+    assert!(
+        pairs.len() <= MAX_BATCH,
+        "multiplication batch too large for α counters"
+    );
     let keys = mbx.prf_keys(me);
-    let wmask: Fr = if bits >= 128 { Fr::MAX } else { (1u128 << bits) - 1 };
+    let wmask: Fr = if bits >= 128 {
+        Fr::MAX
+    } else {
+        (1u128 << bits) - 1
+    };
     // Local: three of the nine cross terms, re-randomised by a zero-sum α, then
     // reduced to the width actually in use.
     let z_mine: Vec<u128> = pairs
@@ -685,15 +725,20 @@ pub fn mul_batch_party_at<T: Transport>(
         }),
     );
     let (_, msg) = mbx
-        .recv_matching(TIMEOUT_MS, |m| {
-            matches!(m, MpcMsg::TaggedZBatch { base_op_id: b, .. } if *b == base_op_id)
-        })
+        .recv_matching(
+            TIMEOUT_MS,
+            |m| matches!(m, MpcMsg::TaggedZBatch { base_op_id: b, .. } if *b == base_op_id),
+        )
         .unwrap_or_else(|| panic!("mul_batch_party: timeout on z for op_id={base_op_id}"));
     let z_next = match msg {
         MpcMsg::TaggedZBatch { data, bits: b, .. } => unpack_ring(&data, z_mine.len(), b),
         _ => unreachable!("predicate guarantees TaggedZBatch"),
     };
-    assert_eq!(z_next.len(), z_mine.len(), "batch length mismatch in resharing");
+    assert_eq!(
+        z_next.len(),
+        z_mine.len(),
+        "batch length mismatch in resharing"
+    );
 
     z_mine
         .into_iter()
@@ -747,8 +792,9 @@ fn ppa_add<T: Transport>(
     let base = take_id(next_id);
     let uv = mul_batch_party(&pairs, base, me, mbx);
     let mut g = uv.clone();
-    let mut p: Vec<PartyShare> =
-        (0..nbits).map(|k| xor_from_product(&u[k], &v[k], &uv[k])).collect();
+    let mut p: Vec<PartyShare> = (0..nbits)
+        .map(|k| xor_from_product(&u[k], &v[k], &uv[k]))
+        .collect();
     let p_leaf = p.clone();
 
     let mut d = 1usize;
@@ -777,7 +823,9 @@ fn ppa_add<T: Transport>(
     if nbits == 1 {
         return vec![p_leaf[0].clone()];
     }
-    let pairs: Vec<_> = (1..nbits).map(|k| (p_leaf[k].clone(), g[k - 1].clone())).collect();
+    let pairs: Vec<_> = (1..nbits)
+        .map(|k| (p_leaf[k].clone(), g[k - 1].clone()))
+        .collect();
     let base = take_id(next_id);
     let prod = mul_batch_party(&pairs, base, me, mbx);
     let mut out = Vec::with_capacity(nbits);
@@ -833,7 +881,9 @@ pub fn a2b_party<T: Transport>(
             } else {
                 0
             };
-            (0..nbits).map(|k| share_component((known >> k) & 1, j, me)).collect()
+            (0..nbits)
+                .map(|k| share_component((known >> k) & 1, j, me))
+                .collect()
         })
         .collect();
     let (x, y, z) = (&comp[0], &comp[1], &comp[2]);
@@ -851,7 +901,11 @@ pub fn a2b_party<T: Transport>(
     }
     let base = take_id(&mut next_id);
     let pw = mul_batch_party(&pairs, base, me, mbx);
-    let (xy, xz, yz) = (&pw[0..nbits], &pw[nbits..2 * nbits], &pw[2 * nbits..3 * nbits]);
+    let (xy, xz, yz) = (
+        &pw[0..nbits],
+        &pw[nbits..2 * nbits],
+        &pw[2 * nbits..3 * nbits],
+    );
 
     let triple: Vec<_> = (0..nbits).map(|k| (xy[k].clone(), z[k].clone())).collect();
     let base = take_id(&mut next_id);
@@ -926,7 +980,10 @@ pub fn a2b_batch_party_at<T: Transport>(
     me: PartyId,
     mbx: &Mailbox<T>,
 ) -> Vec<Vec<PartyShare>> {
-    assert!(wire_bits >= 2, "the XOR encoding needs at least two bits of room");
+    assert!(
+        wire_bits >= 2,
+        "the XOR encoding needs at least two bits of room"
+    );
     let count = values.len();
     if count == 0 {
         return Vec::new();
@@ -952,7 +1009,9 @@ pub fn a2b_batch_party_at<T: Transport>(
                     } else {
                         0
                     };
-                    (0..nbits).map(|k| share_component((known >> k) & 1, j, me)).collect()
+                    (0..nbits)
+                        .map(|k| share_component((known >> k) & 1, j, me))
+                        .collect()
                 })
                 .collect();
             let mut it = per_owner.into_iter();
@@ -993,7 +1052,11 @@ pub fn a2b_batch_party_at<T: Transport>(
     let mut shifts = Vec::with_capacity(count);
     for (lane, (x, y, z)) in comp.iter().enumerate() {
         let b = lane * 3 * nbits;
-        let (xy, xz, yz) = (&pw[b..b + nbits], &pw[b + nbits..b + 2 * nbits], &pw[b + 2 * nbits..b + 3 * nbits]);
+        let (xy, xz, yz) = (
+            &pw[b..b + nbits],
+            &pw[b + nbits..b + 2 * nbits],
+            &pw[b + 2 * nbits..b + 3 * nbits],
+        );
         let xyz = &xyz_all[lane * nbits..lane * nbits + nbits];
         let mut sum = Vec::with_capacity(nbits);
         let mut carry = Vec::with_capacity(nbits);
@@ -1045,10 +1108,15 @@ fn ppa_add_batch<T: Transport>(
     }
     let base = take_id(next_id);
     let uv = mul_batch_party_at(&pairs, wire_bits, base, me, mbx);
-    let mut g: Vec<Vec<PartyShare>> =
-        (0..count).map(|l| uv[l * nbits..l * nbits + nbits].to_vec()).collect();
+    let mut g: Vec<Vec<PartyShare>> = (0..count)
+        .map(|l| uv[l * nbits..l * nbits + nbits].to_vec())
+        .collect();
     let mut p: Vec<Vec<PartyShare>> = (0..count)
-        .map(|l| (0..nbits).map(|k| xor_from_product(&u[l][k], &v[l][k], &uv[l * nbits + k])).collect())
+        .map(|l| {
+            (0..nbits)
+                .map(|k| xor_from_product(&u[l][k], &v[l][k], &uv[l * nbits + k]))
+                .collect()
+        })
         .collect();
     let p_leaf = p.clone();
 
@@ -1094,7 +1162,11 @@ fn ppa_add_batch<T: Transport>(
             let mut bits = Vec::with_capacity(nbits);
             bits.push(p_leaf[lane][0].clone());
             for (i, k) in (1..nbits).enumerate() {
-                bits.push(xor_from_product(&p_leaf[lane][k], &g[lane][k - 1], &prod[lane * width + i]));
+                bits.push(xor_from_product(
+                    &p_leaf[lane][k],
+                    &g[lane][k - 1],
+                    &prod[lane * width + i],
+                ));
             }
             bits
         })
@@ -1146,7 +1218,9 @@ mod tests {
     fn batched_reveal_matches_the_scalar_one_in_a_single_round() {
         use crate::bench::comm::CountingTransport;
         const N_VALS: usize = 512;
-        let secrets: Vec<Fr> = (0..N_VALS as u128).map(|i| i.wrapping_mul(0x9E37_79B9)).collect();
+        let secrets: Vec<Fr> = (0..N_VALS as u128)
+            .map(|i| i.wrapping_mul(0x9E37_79B9))
+            .collect();
         let expected = secrets.clone();
 
         let handles = InprocHandle::create(3);
@@ -1167,7 +1241,10 @@ mod tests {
                 reveal_batch_party(&shares, 7, me, &mbx)
             }));
         }
-        let outs: Vec<Vec<Fr>> = joins.into_iter().map(|j| j.join().expect("panic")).collect();
+        let outs: Vec<Vec<Fr>> = joins
+            .into_iter()
+            .map(|j| j.join().expect("panic"))
+            .collect();
         for o in &outs {
             assert_eq!(o, &expected, "every party must open the same values");
         }
@@ -1245,8 +1322,11 @@ mod tests {
         for owner in 0..N {
             let ss = secrets.clone();
             let batched = run_parties(move |me, mbx| {
-                let vals: Vec<Fr> =
-                    if me == owner { ss.clone() } else { vec![0; ss.len()] };
+                let vals: Vec<Fr> = if me == owner {
+                    ss.clone()
+                } else {
+                    vec![0; ss.len()]
+                };
                 let shares = share_input_batch(&vals, 0, owner, me, &mbx);
                 (0..shares.len())
                     .map(|k| reveal(&shares[k], 1000 + k as u64, None, me, &mbx))
@@ -1262,7 +1342,10 @@ mod tests {
                     })
                     .collect::<Vec<Fr>>()
             });
-            assert_eq!(batched[0], secrets, "batched sharing must reconstruct the inputs");
+            assert_eq!(
+                batched[0], secrets,
+                "batched sharing must reconstruct the inputs"
+            );
             assert_eq!(
                 batched[0], scalar[0],
                 "batched and scalar input sharing must agree (owner {owner})"
@@ -1296,7 +1379,10 @@ mod tests {
         // were a public function of op_id (the old bug's shape), it would be
         // identical regardless of the secret; the α mask must make it differ.
         use crate::crypto::net::PrfKeys;
-        let keys = PrfKeys { mine: [1u8; 32], prev: [2u8; 32] };
+        let keys = PrfKeys {
+            mine: [1u8; 32],
+            prev: [2u8; 32],
+        };
         let z1 = |xr: u128| {
             // party 1 holds (x1,x2),(y1,y2); vary its x-share.
             let a = PartyShare { left: xr, right: 3 };
@@ -1307,13 +1393,28 @@ mod tests {
                 .wrapping_add(a.right.wrapping_mul(b.left))
                 .wrapping_add(keys.alpha(100))
         };
-        assert_ne!(z1(11), z1(12), "reshared component must depend on the secret share");
+        assert_ne!(
+            z1(11),
+            z1(12),
+            "reshared component must depend on the secret share"
+        );
         // And the α that masks it is genuinely zero-sum across a key ring.
-        let k0 = PrfKeys { mine: [1u8; 32], prev: [3u8; 32] };
-        let k1 = PrfKeys { mine: [2u8; 32], prev: [1u8; 32] };
-        let k2 = PrfKeys { mine: [3u8; 32], prev: [2u8; 32] };
+        let k0 = PrfKeys {
+            mine: [1u8; 32],
+            prev: [3u8; 32],
+        };
+        let k1 = PrfKeys {
+            mine: [2u8; 32],
+            prev: [1u8; 32],
+        };
+        let k2 = PrfKeys {
+            mine: [3u8; 32],
+            prev: [2u8; 32],
+        };
         assert_eq!(
-            k0.alpha(100).wrapping_add(k1.alpha(100)).wrapping_add(k2.alpha(100)),
+            k0.alpha(100)
+                .wrapping_add(k1.alpha(100))
+                .wrapping_add(k2.alpha(100)),
             0,
             "the three parties' α must cancel"
         );
@@ -1327,14 +1428,20 @@ mod tests {
     fn a2b_batch_matches_plaintext() {
         let nbits = 16;
         let vals: Vec<i64> = vec![0, 3, 255, -1, 1024, -300, 4095, -2048];
-        let expected: Vec<u128> =
-            vals.iter().map(|&v| (v as i128).rem_euclid(1i128 << nbits) as u128).collect();
+        let expected: Vec<u128> = vals
+            .iter()
+            .map(|&v| (v as i128).rem_euclid(1i128 << nbits) as u128)
+            .collect();
         let got = run_parties(move |me, mbx| {
             let shares: Vec<PartyShare> = vals
                 .iter()
                 .enumerate()
                 .map(|(i, &v)| {
-                    let fr: Fr = if me == 0 { (v as i128).rem_euclid(1i128 << nbits) as u128 } else { 0 };
+                    let fr: Fr = if me == 0 {
+                        (v as i128).rem_euclid(1i128 << nbits) as u128
+                    } else {
+                        0
+                    };
                     share_input(fr, i as u64, 0, me, &mbx)
                 })
                 .collect();
@@ -1344,7 +1451,8 @@ mod tests {
                 .enumerate()
                 .map(|(i, bits)| {
                     bits.iter().enumerate().fold(0u128, |acc, (k, b)| {
-                        acc | ((reveal(b, 20_000 + (i * nbits + k) as u64, None, me, &mbx) & 1) << k)
+                        acc | ((reveal(b, 20_000 + (i * nbits + k) as u64, None, me, &mbx) & 1)
+                            << k)
                     })
                 })
                 .collect::<Vec<u128>>()
@@ -1361,7 +1469,11 @@ mod tests {
         let cases: Vec<i64> = vec![0, 1, 2, 5, 255, 1024, 4095, -1, -2, -7, -2048];
         for &v in &cases {
             let out = run_parties(move |me, mbx| {
-                let fr: Fr = if me == 0 { (v as i128).rem_euclid(1i128 << nbits) as u128 } else { 0 };
+                let fr: Fr = if me == 0 {
+                    (v as i128).rem_euclid(1i128 << nbits) as u128
+                } else {
+                    0
+                };
                 let sh = share_input(fr, 0, me, 0, &mbx);
                 let bits = a2b_party(&sh, nbits, 1_000, me, &mbx);
                 bits.iter()

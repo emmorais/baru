@@ -101,13 +101,18 @@ pub fn pack_input(img: &[i64], shape: ConvShape, n: usize, t_mask: u64) -> Vec<u
 /// Pack one output channel's kernel (`[in_c][kh][kw]`, row-major),
 /// **reversed in channel, row and column**, at the input's strides.
 pub fn pack_kernel(kernel: &[i64], shape: ConvShape, n: usize, t_mask: u64) -> Vec<u64> {
-    assert_eq!(kernel.len(), shape.in_c * shape.kh * shape.kw, "kernel length mismatch");
+    assert_eq!(
+        kernel.len(),
+        shape.in_c * shape.kh * shape.kw,
+        "kernel length mismatch"
+    );
     let mut m = vec![0u64; n];
     for c in 0..shape.in_c {
         for a in 0..shape.kh {
             for b in 0..shape.kw {
                 // reversed on every axis
-                let kv = kernel[(c * shape.kh + (shape.kh - 1 - a)) * shape.kw + (shape.kw - 1 - b)];
+                let kv =
+                    kernel[(c * shape.kh + (shape.kh - 1 - a)) * shape.kw + (shape.kw - 1 - b)];
                 let idx = (shape.in_c - 1 - c) * shape.hw() + a * shape.w + b;
                 m[idx] = (kv as u64) & t_mask;
             }
@@ -166,9 +171,27 @@ mod tests {
     fn packed_layout_computes_the_convolution() {
         let n = 512;
         for shape in [
-            ConvShape { in_c: 1, h: 8, w: 8, kh: 3, kw: 3 },
-            ConvShape { in_c: 2, h: 6, w: 7, kh: 3, kw: 2 },
-            ConvShape { in_c: 3, h: 5, w: 5, kh: 2, kw: 2 },
+            ConvShape {
+                in_c: 1,
+                h: 8,
+                w: 8,
+                kh: 3,
+                kw: 3,
+            },
+            ConvShape {
+                in_c: 2,
+                h: 6,
+                w: 7,
+                kh: 3,
+                kw: 2,
+            },
+            ConvShape {
+                in_c: 3,
+                h: 5,
+                w: 5,
+                kh: 2,
+                kw: 2,
+            },
         ] {
             let img = pseudo(shape.input_len(), 1);
             let kernel = pseudo(shape.in_c * shape.kh * shape.kw, 2);
@@ -179,12 +202,20 @@ mod tests {
             // plain negacyclic product over i128
             let mut prod = vec![0i128; n];
             for (i, &xi) in x.iter().enumerate() {
-                if xi == 0 { continue; }
+                if xi == 0 {
+                    continue;
+                }
                 for (j, &kj) in k.iter().enumerate() {
-                    if kj == 0 { continue; }
+                    if kj == 0 {
+                        continue;
+                    }
                     let p = (xi as i64 as i128) * (kj as i64 as i128);
                     let idx = i + j;
-                    if idx < n { prod[idx] += p } else { prod[idx - n] -= p }
+                    if idx < n {
+                        prod[idx] += p
+                    } else {
+                        prod[idx - n] -= p
+                    }
                 }
             }
             let want = conv2d_ref(&img, &kernel, shape);
@@ -207,7 +238,13 @@ mod tests {
         let s = Bfv::new(BfvParams::TEST_SMALL); // n = 64
         let n = s.params.n;
         let t_mask = s.params.t() - 1;
-        let shape = ConvShape { in_c: 1, h: 5, w: 5, kh: 3, kw: 3 };
+        let shape = ConvShape {
+            in_c: 1,
+            h: 5,
+            w: 5,
+            kh: 3,
+            kw: 3,
+        };
         assert!(shape.required_degree() < n);
         let img = pseudo(shape.input_len(), 3);
         let kernel = pseudo(shape.kh * shape.kw, 4);
@@ -230,7 +267,13 @@ mod tests {
     #[test]
     fn beats_the_toeplitz_formulation_at_realistic_sizes() {
         // MNIST-shaped: 28×28, 3×3 kernel, 8 output channels, n = 4096.
-        let shape = ConvShape { in_c: 1, h: 28, w: 28, kh: 3, kw: 3 };
+        let shape = ConvShape {
+            in_c: 1,
+            h: 28,
+            w: 28,
+            kh: 3,
+            kw: 3,
+        };
         let n = 4096;
         assert!(shape.required_degree() < n);
         let toeplitz = toeplitz_multiplications(shape, 8, n);

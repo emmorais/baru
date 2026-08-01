@@ -55,7 +55,7 @@
 
 use sha2::{Digest, Sha256};
 
-use super::bfv::{center, poly_mul_mod, BfvParams, BfvCt, Poly};
+use super::bfv::{center, poly_mul_mod, BfvCt, BfvParams, Poly};
 use super::boundary::WitnessBound;
 
 /// Honest encryption randomness is ternary, so every witness coefficient is in
@@ -146,7 +146,9 @@ impl WellFormedProof {
 pub enum ProofError {
     /// A response exceeded the norm bound — the proof does not establish a
     /// bounded-noise opening.
-    ResponseOutOfRange { repetition: usize },
+    ResponseOutOfRange {
+        repetition: usize,
+    },
     /// The recomputed commitments do not hash to the challenges, so the
     /// transcript was not produced by this statement.
     ChallengeMismatch,
@@ -420,10 +422,7 @@ pub fn verify(
         if z.iter().take(3).any(|v| v.len() != n) || z[3].len() != n {
             return Err(ProofError::Malformed("response length"));
         }
-        if z.iter()
-            .take(3)
-            .any(|v| v.iter().any(|c| c.abs() > accept))
-        {
+        if z.iter().take(3).any(|v| v.iter().any(|c| c.abs() > accept)) {
             return Err(ProofError::ResponseOutOfRange { repetition: j });
         }
     }
@@ -460,7 +459,11 @@ mod tests {
     fn params() -> BfvParams {
         // Small ring keeps the tests fast; the construction does not depend on
         // the dimension beyond the mask width.
-        BfvParams { n: 256, log2_q: 100, log2_t: 20 }
+        BfvParams {
+            n: 256,
+            log2_q: 100,
+            log2_t: 20,
+        }
     }
 
     /// Encrypt while retaining the randomness, so the test holds a real
@@ -496,9 +499,7 @@ mod tests {
                 ub[i].wrapping_add(e1[i]).wrapping_add(mi << shift) & mask
             })
             .collect();
-        let c1: Poly = (0..p.n)
-            .map(|i| ua[i].wrapping_add(e2[i]) & mask)
-            .collect();
+        let c1: Poly = (0..p.n).map(|i| ua[i].wrapping_add(e2[i]) & mask).collect();
         (
             BfvCt { c: vec![c0, c1] },
             Opening {
@@ -575,10 +576,7 @@ mod tests {
         let c0: Poly = (0..p.n)
             .map(|i| {
                 let mi = (m[i] as u128) & t_mask;
-                ub[i]
-                    .wrapping_add(opening.e1[i])
-                    .wrapping_add(mi << shift)
-                    & mask
+                ub[i].wrapping_add(opening.e1[i]).wrapping_add(mi << shift) & mask
             })
             .collect();
         let c1: Poly = (0..p.n)

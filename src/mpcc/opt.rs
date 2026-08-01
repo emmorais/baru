@@ -281,8 +281,6 @@ fn algebraic(flat: &[FlatOp], output_wire: &str) -> Vec<FlatOp> {
     out
 }
 
-
-
 /// `(x << a) << b → x << (a+b)`, when the intermediate has no other use.
 /// Fusing a *right* shift chain is equally valid (both are logical shifts on
 /// every backend — see the `Shr` note in `mpcc::lower`), but mixing the two
@@ -707,7 +705,6 @@ fn reassociate(flat: &[FlatOp], output_wire: &str, only: Option<&str>) -> Vec<Fl
     out
 }
 
-
 // ─── Reassociating a *compound* reduction ─────────────────────────────────────
 
 /// Largest number of `FlatOp`s a single reduction step may contain.
@@ -834,7 +831,10 @@ fn steps_at(
         if boundary.len() != 2 || !boundary.contains(&stop) {
             continue;
         }
-        let elem = boundary.into_iter().find(|b| *b != stop).expect("two boundaries");
+        let elem = boundary
+            .into_iter()
+            .find(|b| *b != stop)
+            .expect("two boundaries");
         inside.sort_unstable();
         out.push(Step {
             ops: inside,
@@ -856,7 +856,13 @@ fn step_template(flat: &[FlatOp], s: &Step) -> (String, Vec<FlatOp>) {
     let mut n = 0usize;
     for &j in &s.ops {
         let d = flat[j].dst().to_string();
-        let name = if d == s.dst { "$out".to_string() } else { let x = format!("$t{n}"); n += 1; x };
+        let name = if d == s.dst {
+            "$out".to_string()
+        } else {
+            let x = format!("$t{n}");
+            n += 1;
+            x
+        };
         map.insert(d, name);
     }
     let tmpl: Vec<FlatOp> = s
@@ -984,7 +990,9 @@ fn reduction_chain(
             {
                 break;
             }
-            let Some(&p) = producer.get(&cur.acc) else { break };
+            let Some(&p) = producer.get(&cur.acc) else {
+                break;
+            };
             let Some(next) = steps_at(flat, p, counts, producer, output_wire)
                 .into_iter()
                 .find(|s| step_template(flat, s).0 == key)
@@ -1051,7 +1059,8 @@ pub fn reassociate_reductions(flat: &[FlatOp], output_wire: &str) -> Vec<FlatOp>
     const PASSES: usize = 8;
     let mut cur = flat.to_vec();
     for _ in 0..PASSES {
-        let next = dead_code_eliminate(&reassociate_reduction(&cur, output_wire, None), output_wire);
+        let next =
+            dead_code_eliminate(&reassociate_reduction(&cur, output_wire, None), output_wire);
         if next == cur {
             break;
         }
@@ -1155,7 +1164,13 @@ fn reassociate_reduction(flat: &[FlatOp], output_wire: &str, only: Option<&str>)
                 let mut k = 0;
                 while k + 1 < level.len() {
                     let into = if last { dst.clone() } else { fresh() };
-                    out.extend(instantiate(&tmpl, &level[k], &level[k + 1], &into, &mut fresh));
+                    out.extend(instantiate(
+                        &tmpl,
+                        &level[k],
+                        &level[k + 1],
+                        &into,
+                        &mut fresh,
+                    ));
                     next.push(into);
                     k += 2;
                 }
@@ -1923,7 +1938,10 @@ mod tests {
             );
             // One product, not two: the duplicate really is gone, rather than
             // both copies having survived into a circuit CSE cannot improve.
-            let muls = flat.iter().filter(|o| matches!(o, FlatOp::IMul { .. })).count();
+            let muls = flat
+                .iter()
+                .filter(|o| matches!(o, FlatOp::IMul { .. }))
+                .count();
             assert_eq!(muls, 1, "{src}: expected a single product, got {muls}");
             equivalent(&flat, &again, &out, 24).unwrap();
         }

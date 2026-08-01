@@ -34,23 +34,23 @@
 //! baru mpcc optimize  --case dot4-builtin        # backend-aware rewriting
 //! ```
 
-pub mod exec;
-pub mod mixed;
 pub mod assign;
 pub mod cost;
+pub mod exec;
 pub mod fhe_cost;
 pub mod ir;
 pub mod lower;
 /// LowGear — Beaver triples from SHE, the measured counterpart to
 /// [`semi2k`]'s OT-based preprocessing.
 pub mod lowgear;
+pub mod mixed;
 pub mod opt;
 pub mod ot_cost;
 pub mod protocols;
 pub mod schedule;
 pub mod semi2k;
-pub mod spdz2k;
 pub mod sim;
+pub mod spdz2k;
 pub mod vm;
 
 use std::collections::HashMap;
@@ -206,7 +206,10 @@ pub fn run_protocol(
             let field_bits = params.field_bits();
             // The domain a program must be lowered for is the registry's
             // *wire* width (byte-aligned), not the modulus width.
-            let wire_bits = find("lowgear").expect("lowgear is in the registry").cost.field_bits;
+            let wire_bits = find("lowgear")
+                .expect("lowgear is in the registry")
+                .cost
+                .field_bits;
             match prog.domain {
                 Domain::Field { bits } if bits == wire_bits => {}
                 Domain::Field { bits } => {

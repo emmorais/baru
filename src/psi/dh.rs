@@ -244,7 +244,9 @@ impl Sender {
     /// once, alongside the first flight; [`verify_exponent`] checks the
     /// response against it.
     pub fn exponent_commitment(&self) -> [u8; POINT_BYTES] {
-        (RISTRETTO_BASEPOINT_TABLE * &self.alpha).compress().to_bytes()
+        (RISTRETTO_BASEPOINT_TABLE * &self.alpha)
+            .compress()
+            .to_bytes()
     }
 
     /// [`Sender::respond`] plus a proof that every item used the same `α`.

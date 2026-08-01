@@ -71,9 +71,14 @@ pub struct WrapRandomness {
 
 impl WrapRandomness {
     /// Build a consistent randomness bundle for mask summands `x_summands`.
-    pub fn new(x_summands: [u64; 3], l_bits: u32, share_bit: &mut impl FnMut(u64) -> [FpShare; 3]) -> Self {
+    pub fn new(
+        x_summands: [u64; 3],
+        l_bits: u32,
+        share_bit: &mut impl FnMut(u64) -> [FpShare; 3],
+    ) -> Self {
         let mask = (1u128 << l_bits) - 1;
-        let x = ((x_summands[0] as u128 + x_summands[1] as u128 + x_summands[2] as u128) & mask) as u64;
+        let x =
+            ((x_summands[0] as u128 + x_summands[1] as u128 + x_summands[2] as u128) & mask) as u64;
         let bits = (0..l_bits).map(|i| share_bit((x >> i) & 1)).collect();
         WrapRandomness {
             x_summands,
@@ -142,8 +147,7 @@ pub fn wrap3_protocol(
     let eta = if r == l_minus_1 {
         0
     } else {
-        u64::from(field::private_compare(&rnd.bits, r + 1, beta, m, zeros))
-            ^ reconstruct_bit(beta)
+        u64::from(field::private_compare(&rnd.bits, r + 1, beta, m, zeros)) ^ reconstruct_bit(beta)
     };
 
     // 5. θ = β₁ + β₂ + β₃ + α − η − δ (mod 2)
@@ -375,7 +379,10 @@ pub struct TruncPair {
 impl TruncPair {
     /// `r'` is the **exact** shift of `r`, which is what makes the pair usable.
     pub fn new(r: u64, d: u32) -> Self {
-        TruncPair { r, r_shifted: r >> d }
+        TruncPair {
+            r,
+            r_shifted: r >> d,
+        }
     }
 }
 
@@ -444,7 +451,10 @@ mod tests {
     struct Rng(u64);
     impl Rng {
         fn next_u64(&mut self) -> u64 {
-            self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            self.0 = self
+                .0
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             self.0 >> 33
         }
         fn fp(&mut self) -> Fp {
@@ -497,7 +507,7 @@ mod tests {
     }
 
     fn value_of(a: [u64; 3], l_bits: u32) -> u64 {
-        (((a[0] as u128 + a[1] as u128 + a[2] as u128)) & ((1u128 << l_bits) - 1)) as u64
+        ((a[0] as u128 + a[1] as u128 + a[2] as u128) & ((1u128 << l_bits) - 1)) as u64
     }
 
     /// `Π_WA` returns exactly `wrap3(a₁,a₂,a₃,L)` on every input except the one
@@ -720,8 +730,11 @@ mod tests {
                         let enc_vals: Vec<u64> = plain.iter().map(|&v| enc(v)).collect();
                         let mut mk = || {
                             let l_u = 1u64 << LB;
-                            let xs =
-                                [rng.next_u64() % l_u, rng.next_u64() % l_u, rng.next_u64() % l_u];
+                            let xs = [
+                                rng.next_u64() % l_u,
+                                rng.next_u64() % l_u,
+                                rng.next_u64() % l_u,
+                            ];
                             let wr = WrapRandomness::new(xs, LB, &mut |bit| rng.share_of(bit));
                             let z = rng.zeros(2 * LB as usize + 4);
                             let bit = rng.next_u64() & 1;
@@ -731,7 +744,12 @@ mod tests {
                                 mv = Fp::ONE;
                             }
                             let m = field::share(mv, rng.fp(), rng.fp());
-                            DreluRandomness { wrap: wr, zeros: z, beta, mask: m }
+                            DreluRandomness {
+                                wrap: wr,
+                                zeros: z,
+                                beta,
+                                mask: m,
+                            }
                         };
                         let mut split = |v: u64| -> [u64; 3] {
                             let l_u = 1u64 << LB;
@@ -742,11 +760,7 @@ mod tests {
                         let (got, ind) = maxpool_protocol(&enc_vals, LB, &mut mk, &mut split);
 
                         let want = *plain.iter().max().unwrap();
-                        assert_eq!(
-                            signed(got, LB),
-                            want,
-                            "max of {plain:?} should be {want}"
-                        );
+                        assert_eq!(signed(got, LB), want, "max of {plain:?} should be {want}");
                         assert_eq!(ind.iter().sum::<u64>(), 1, "indicator must be one-hot");
                         let k = ind.iter().position(|&e| e == 1).unwrap();
                         assert_eq!(plain[k], want, "one-hot must point at a maximal element");
@@ -766,11 +780,17 @@ mod tests {
         let enc = |v: i128| ((v + l) % l) as u64;
         let mut rng = Rng(4711);
         for trial in 0..400i128 {
-            let plain: Vec<i128> = (0..4).map(|k| ((trial * 7 + k * 13) % (l / 2)) - l / 4).collect();
+            let plain: Vec<i128> = (0..4)
+                .map(|k| ((trial * 7 + k * 13) % (l / 2)) - l / 4)
+                .collect();
             let enc_vals: Vec<u64> = plain.iter().map(|&v| enc(v)).collect();
             let mut mk = || {
                 let l_u = 1u64 << LB;
-                let xs = [rng.next_u64() % l_u, rng.next_u64() % l_u, rng.next_u64() % l_u];
+                let xs = [
+                    rng.next_u64() % l_u,
+                    rng.next_u64() % l_u,
+                    rng.next_u64() % l_u,
+                ];
                 let wr = WrapRandomness::new(xs, LB, &mut |bit| rng.share_of(bit));
                 let z = rng.zeros(2 * LB as usize + 4);
                 let bit = rng.next_u64() & 1;
@@ -780,7 +800,12 @@ mod tests {
                     mv = Fp::ONE;
                 }
                 let m = field::share(mv, rng.fp(), rng.fp());
-                DreluRandomness { wrap: wr, zeros: z, beta, mask: m }
+                DreluRandomness {
+                    wrap: wr,
+                    zeros: z,
+                    beta,
+                    mask: m,
+                }
             };
             let mut split = |v: u64| -> [u64; 3] {
                 let l_u = 1u64 << LB;
@@ -854,7 +879,10 @@ mod tests {
             (0.3..0.7).contains(&rate),
             "expected ≈½ of inputs to be off; got {rate:.3} ({wrong}/{total})"
         );
-        assert_eq!(worst, 1, "the error should be exactly one unit in the last place");
+        assert_eq!(
+            worst, 1,
+            "the error should be exactly one unit in the last place"
+        );
     }
 
     /// The precondition argument, pinned.

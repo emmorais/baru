@@ -148,7 +148,11 @@ impl std::ops::Add for Fp {
 impl std::ops::Sub for Fp {
     type Output = Fp;
     fn sub(self, o: Fp) -> Fp {
-        Fp(if self.0 >= o.0 { self.0 - o.0 } else { self.0 + P - o.0 })
+        Fp(if self.0 >= o.0 {
+            self.0 - o.0
+        } else {
+            self.0 + P - o.0
+        })
     }
 }
 
@@ -184,7 +188,10 @@ impl FpShare {
 
     /// Multiplication by a public constant — local, as in the ring case.
     pub fn scalar_mul(self, k: Fp) -> FpShare {
-        FpShare { left: self.left * k, right: self.right * k }
+        FpShare {
+            left: self.left * k,
+            right: self.right * k,
+        }
     }
 }
 
@@ -192,21 +199,30 @@ impl FpShare {
 impl std::ops::Add for FpShare {
     type Output = FpShare;
     fn add(self, o: FpShare) -> FpShare {
-        FpShare { left: self.left + o.left, right: self.right + o.right }
+        FpShare {
+            left: self.left + o.left,
+            right: self.right + o.right,
+        }
     }
 }
 
 impl std::ops::Sub for FpShare {
     type Output = FpShare;
     fn sub(self, o: FpShare) -> FpShare {
-        FpShare { left: self.left - o.left, right: self.right - o.right }
+        FpShare {
+            left: self.left - o.left,
+            right: self.right - o.right,
+        }
     }
 }
 
 impl std::ops::Neg for FpShare {
     type Output = FpShare;
     fn neg(self) -> FpShare {
-        FpShare { left: -self.left, right: -self.right }
+        FpShare {
+            left: -self.left,
+            right: -self.right,
+        }
     }
 }
 
@@ -247,11 +263,13 @@ pub fn reconstruct(shares: &[FpShare; 3]) -> Fp {
 /// independent of the inputs. Passing a non-zero-sum triple silently corrupts
 /// the result, so it is checked in debug builds.
 pub fn mul_shares(a: &[FpShare; 3], b: &[FpShare; 3], zero: [Fp; 3]) -> [FpShare; 3] {
-    debug_assert_eq!(zero[0] + zero[1] + zero[2], Fp::ZERO, "zero-sharing must sum to 0");
+    debug_assert_eq!(
+        zero[0] + zero[1] + zero[2],
+        Fp::ZERO,
+        "zero-sharing must sum to 0"
+    );
     let t: Vec<Fp> = (0..3)
-        .map(|i| {
-            a[i].left * b[i].left + a[i].left * b[i].right + a[i].right * b[i].left + zero[i]
-        })
+        .map(|i| a[i].left * b[i].left + a[i].left * b[i].right + a[i].right * b[i].left + zero[i])
         .collect();
     [
         FpShare::new(t[0], t[1]),
@@ -316,7 +334,10 @@ pub fn private_compare(
     zeros: &[[Fp; 3]],
 ) -> bool {
     let l = bits.len();
-    assert!(zeros.len() >= 2 * l, "private_compare needs 2·ℓ zero-sharings");
+    assert!(
+        zeros.len() >= 2 * l,
+        "private_compare needs 2·ℓ zero-sharings"
+    );
     let rbit = |i: usize| (r >> i) & 1;
     let mut z = 0usize;
 
@@ -472,11 +493,7 @@ mod tests {
                 let (fa, fb) = (Fp::new(a), Fp::new(b));
                 let sa = share(fa, Fp::new(a * 3 + 1), Fp::new(b * 5 + 2));
                 let sb = share(fb, Fp::new(b * 7 + 4), Fp::new(a * 11 + 6));
-                let sum = [
-                    sa[0] + sb[0],
-                    sa[1] + sb[1],
-                    sa[2] + sb[2],
-                ];
+                let sum = [sa[0] + sb[0], sa[1] + sb[1], sa[2] + sb[2]];
                 assert_eq!(reconstruct(&sum), fa + fb);
                 let diff = [sa[0] - sb[0], sa[1] - sb[1], sa[2] - sb[2]];
                 assert_eq!(reconstruct(&diff), fa - fb);
@@ -495,7 +512,10 @@ mod tests {
     struct Rng(u64);
     impl Rng {
         fn next(&mut self) -> Fp {
-            self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            self.0 = self
+                .0
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             Fp::new(self.0 >> 33)
         }
         fn zeros(&mut self, n: usize) -> Vec<[Fp; 3]> {
@@ -531,8 +551,9 @@ mod tests {
 
     /// Run `Π_PC` once and return `β' ⊕ β`, the protocol's stated output.
     fn pc_once(x: u64, r: u64, beta: u64, l: usize, rng: &mut Rng) -> u64 {
-        let bits: Vec<[FpShare; 3]> =
-            (0..l).map(|i| rng.share_of(Fp::new((x >> i) & 1))).collect();
+        let bits: Vec<[FpShare; 3]> = (0..l)
+            .map(|i| rng.share_of(Fp::new((x >> i) & 1)))
+            .collect();
         let sbeta = rng.share_of(Fp::new(beta));
         let mut mv = rng.next();
         if mv.is_zero() {
@@ -602,6 +623,9 @@ mod tests {
         assert_eq!(max_ring_bits(P), 34, "p = 37 covers ℓ up to 34");
         assert_eq!(max_ring_bits(P_SECURENN), 64, "p = 67 covers ℓ up to 64");
         // The wire width is what the communication comparison turns on.
-        assert_eq!(ELEM_BITS, 6, "a p = 37 element is 6 bits, as Falcon counts it");
+        assert_eq!(
+            ELEM_BITS, 6,
+            "a p = 37 element is 6 bits, as Falcon counts it"
+        );
     }
 }

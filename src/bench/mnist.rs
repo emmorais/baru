@@ -126,7 +126,10 @@ pub fn run(hybrid_n: usize, profile: NetworkProfile) -> MnistReport {
     // available here: MNIST is near-balanced, so accuracy is not actively
     // misleading as it is on pneumonia, but a per-class collapse and an
     // interval on a 300-image subset are worth seeing either way.
-    let logits: Vec<Vec<i64>> = images.iter().map(|img| model.forward_logits(img).0).collect();
+    let logits: Vec<Vec<i64>> = images
+        .iter()
+        .map(|img| model.forward_logits(img).0)
+        .collect();
     let preds: Vec<usize> = logits
         .iter()
         .map(|l| crate::gadgets::argmax_ref(l))
@@ -201,7 +204,10 @@ pub fn run_cli(args: &[String]) -> Result<(), String> {
 
     let r = run(hybrid_n, NetworkProfile::INSTANT);
     if json {
-        println!("{}", serde_json::to_string_pretty(&r).map_err(|e| e.to_string())?);
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&r).map_err(|e| e.to_string())?
+        );
         return Ok(());
     }
 

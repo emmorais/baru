@@ -190,7 +190,11 @@ fn dot_product(profile: NetworkProfile, n: usize, nbits: usize) -> Comparison {
     });
     let mal_ms = t1.elapsed().as_secs_f64() * 1e3;
 
-    let mask = if nbits >= 128 { u128::MAX } else { (1u128 << nbits) - 1 };
+    let mask = if nbits >= 128 {
+        u128::MAX
+    } else {
+        (1u128 << nbits) - 1
+    };
     Comparison {
         workload: format!("dot product, n={n}, {nbits}-bit"),
         semi_honest: Leg {
@@ -208,7 +212,9 @@ fn dot_product(profile: NetworkProfile, n: usize, nbits: usize) -> Comparison {
             wire_bytes: mal_comm.bytes,
             messages: mal_comm.messages,
             interactive_calls: mal_out[0].0 .1,
-            correct: mal_out.iter().all(|((v, _), _)| v & mask == expected & mask),
+            correct: mal_out
+                .iter()
+                .all(|((v, _), _)| v & mask == expected & mask),
             verified: Some(mal_out.iter().all(|(_, ok)| *ok)),
         },
     }
@@ -294,7 +300,10 @@ pub fn main(args: &[String]) {
                 i += 2;
             }
             "--bits" => {
-                nbits = args.get(i + 1).and_then(|v| v.parse().ok()).unwrap_or(nbits);
+                nbits = args
+                    .get(i + 1)
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(nbits);
                 i += 2;
             }
             _ => i += 1,
@@ -305,7 +314,10 @@ pub fn main(args: &[String]) {
         ("LAN (instant)", NetworkProfile::INSTANT),
         // 25 ms one-way — a representative inter-region WAN hop, which is
         // where round structure rather than bytes decides the cost.
-        ("WAN (25ms one-way)", NetworkProfile::fixed_latency(std::time::Duration::from_millis(25))),
+        (
+            "WAN (25ms one-way)",
+            NetworkProfile::fixed_latency(std::time::Duration::from_millis(25)),
+        ),
     ] {
         let r = run(profile, name, n, nbits);
         println!("\n=== the cost of active security — {} ===", r.profile);

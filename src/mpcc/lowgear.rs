@@ -178,7 +178,12 @@ impl LowGearParams {
 
     /// Small parameters for fast tests. **Not secure** — the ring is tiny.
     pub fn test_small() -> LowGearParams {
-        LowGearParams { n: 64, log2_q: 190, t: 3329, sec: 20 }
+        LowGearParams {
+            n: 64,
+            log2_q: 190,
+            t: 3329,
+            sec: 20,
+        }
     }
 
     /// Bits per field element on the wire — **exactly**
@@ -191,7 +196,11 @@ impl LowGearParams {
     }
 
     fn bgv(&self) -> WideParams {
-        WideParams { n: self.n, log2_q: self.log2_q, t: self.t }
+        WideParams {
+            n: self.n,
+            log2_q: self.log2_q,
+            t: self.t,
+        }
     }
 
     /// log2 of the flooding bound: `σ` bits above the input-dependent noise
@@ -319,7 +328,11 @@ impl LowGear {
         let bgv = BgvWide::new(params.bgv())?;
         let k0 = bgv.keygen();
         let k1 = bgv.keygen();
-        Ok(LowGear { params, bgv, keys: [k0, k1] })
+        Ok(LowGear {
+            params,
+            bgv,
+            keys: [k0, k1],
+        })
     }
 
     /// One **oblivious linear evaluation** over `n` slots.
@@ -331,7 +344,12 @@ impl LowGear {
     /// The responder's steps are all depth-free: a plaintext multiply, a
     /// plaintext addition, and a noise addition. Nothing here raises the
     /// ciphertext degree.
-    pub fn ole(&self, requester: usize, x: &[u64], y: &[u64]) -> Result<(Vec<u64>, Vec<u64>, OleStats), String> {
+    pub fn ole(
+        &self,
+        requester: usize,
+        x: &[u64],
+        y: &[u64],
+    ) -> Result<(Vec<u64>, Vec<u64>, OleStats), String> {
         let p = &self.params;
         let (n, t) = (p.n, p.t);
         if x.len() != n || y.len() != n {
@@ -347,7 +365,9 @@ impl LowGear {
         let r = random_vec(n, t);
         let neg_r: Vec<u64> = r.iter().map(|v| (t - v) % t).collect();
         let prod = self.bgv.mul_plain_poly(&ct, &slots::encode(y, n, t)?);
-        let masked = self.bgv.add_plain_poly(&prod, &slots::encode(&neg_r, n, t)?);
+        let masked = self
+            .bgv
+            .add_plain_poly(&prod, &slots::encode(&neg_r, n, t)?);
         let flooded = self.bgv.add_flooding_noise(&masked, p.log2_flood_bound());
 
         // Requester: decrypt to its share.
@@ -394,16 +414,32 @@ impl LowGear {
             triples: n,
         };
         Ok((
-            TripleShares { a: a0, b: b0, c: c0 },
-            TripleShares { a: a1, b: b1, c: c1 },
+            TripleShares {
+                a: a0,
+                b: b0,
+                c: c0,
+            },
+            TripleShares {
+                a: a1,
+                b: b1,
+                c: c1,
+            },
             stats,
         ))
     }
 
     /// Generate at least `count` triples, batching `n` at a time.
     pub fn generate(&self, count: usize) -> Result<(TripleShares, TripleShares, OleStats), String> {
-        let mut p0 = TripleShares { a: Vec::new(), b: Vec::new(), c: Vec::new() };
-        let mut p1 = TripleShares { a: Vec::new(), b: Vec::new(), c: Vec::new() };
+        let mut p0 = TripleShares {
+            a: Vec::new(),
+            b: Vec::new(),
+            c: Vec::new(),
+        };
+        let mut p1 = TripleShares {
+            a: Vec::new(),
+            b: Vec::new(),
+            c: Vec::new(),
+        };
         let mut total = OleStats::default();
         while p0.a.len() < count {
             let (s0, s1, st) = self.generate_batch()?;
@@ -439,7 +475,11 @@ impl LowGear {
 /// The flooding budget caps a single plaintext modulus at ~17 bits here, so a
 /// 64-bit field needs `⌈64/log₂t⌉` independent instances. This is the standard
 /// construction and the only honest way to compare against Semi2k's `Z_2^64`.
-pub fn wider_field_cost(params: &LowGearParams, field_bits: u32, one_limb_bytes: f64) -> (u32, f64) {
+pub fn wider_field_cost(
+    params: &LowGearParams,
+    field_bits: u32,
+    one_limb_bytes: f64,
+) -> (u32, f64) {
     let limb_bits = (params.t as f64).log2().floor() as u32;
     let limbs = field_bits.div_ceil(limb_bits.max(1));
     (limbs, one_limb_bytes * limbs as f64)
@@ -534,7 +574,8 @@ impl LowGearEngine {
 
     fn triple(&mut self) -> (Additive, Additive, Additive) {
         if self.pool.is_empty() {
-            self.refill().expect("lowgear: SHE triple generation failed");
+            self.refill()
+                .expect("lowgear: SHE triple generation failed");
         }
         self.counters.triples += 1;
         self.pool.pop().expect("pool refilled")
@@ -670,10 +711,20 @@ mod tests {
     #[test]
     fn parameters_that_break_decryption_are_rejected() {
         // A plaintext modulus far above the flooding budget must not validate.
-        let bad = LowGearParams { n: 4096, log2_q: 100, t: 1 + 8192 * 100_000, sec: 40 };
+        let bad = LowGearParams {
+            n: 4096,
+            log2_q: 100,
+            t: 1 + 8192 * 100_000,
+            sec: 40,
+        };
         assert!(bad.validate().is_err());
         // A non-slot prime must not validate either.
-        let no_slots = LowGearParams { n: 4096, log2_q: 100, t: 3329, sec: 40 };
+        let no_slots = LowGearParams {
+            n: 4096,
+            log2_q: 100,
+            t: 3329,
+            sec: 40,
+        };
         assert!(no_slots.validate().is_err());
     }
 
@@ -715,7 +766,10 @@ mod tests {
         let lg = small();
         let (p0, p1, stats) = lg.generate_batch().unwrap();
         assert_eq!(stats.triples, lg.params.n);
-        assert!(lg.triples_are_valid(&p0, &p1), "a·b must equal c in every slot");
+        assert!(
+            lg.triples_are_valid(&p0, &p1),
+            "a·b must equal c in every slot"
+        );
     }
 
     /// Shares must individually look random — a share equal to the value it
@@ -770,7 +824,8 @@ mod tests {
         let predicted_bytes = spec.cost.field_bits as u64 / 8;
         let charged_bytes = Modulus::Prime(p.t).element_bytes();
         assert_eq!(
-            predicted_bytes, charged_bytes,
+            predicted_bytes,
+            charged_bytes,
             "registry field_bits={} predicts {predicted_bytes} B/element, but the VM \
              charges {charged_bytes} B for t={} ({} bits)",
             spec.cost.field_bits,
@@ -778,7 +833,11 @@ mod tests {
             p.field_bits()
         );
         // The wire width must be byte-aligned and actually hold the modulus.
-        assert_eq!(spec.cost.field_bits % 8, 0, "wire width must be byte-aligned");
+        assert_eq!(
+            spec.cost.field_bits % 8,
+            0,
+            "wire width must be byte-aligned"
+        );
         assert!(spec.cost.field_bits >= p.field_bits());
     }
 
@@ -794,7 +853,10 @@ mod tests {
             let sz = e.mul_batch(&[(sx, sy)]);
             assert_eq!(e.open_batch(&sz)[0], (x * y) % t, "{x}*{y} mod {t}");
         }
-        assert!(e.counters().offline_bytes > 0, "SHE preprocessing must be charged");
+        assert!(
+            e.counters().offline_bytes > 0,
+            "SHE preprocessing must be charged"
+        );
         assert!(e.counters().triples_generated >= e.counters().triples);
     }
 
@@ -808,7 +870,11 @@ mod tests {
         let d = e.sub(&a, &b);
         let m = e.mul_const(&a, 3);
         let k = e.add_const(&a, 5);
-        assert_eq!(e.counters().online_bytes, before, "local ops must not charge");
+        assert_eq!(
+            e.counters().online_bytes,
+            before,
+            "local ops must not charge"
+        );
         assert_eq!(e.open_batch(&[s, d, m, k]), vec![14, 6, 30, 15]);
     }
 
@@ -825,7 +891,10 @@ mod tests {
         let bits = e.random_bits(64);
         assert_eq!(bits.len(), 64);
         let opened = e.open_batch(&bits);
-        assert!(opened.iter().all(|&b| b == 0 || b == 1), "every share must open to a bit");
+        assert!(
+            opened.iter().all(|&b| b == 0 || b == 1),
+            "every share must open to a bit"
+        );
         assert_eq!(e.counters().random_bits, 64);
     }
 
@@ -848,7 +917,10 @@ mod tests {
         let p = LowGearParams::default_params();
         let (limbs, bytes) = wider_field_cost(&p, 64, 100.0);
         // A ~61-bit prime needs 2 limbs to cover 64 bits (it used to need 4).
-        assert_eq!(limbs, 2, "expected 2 CRT limbs for a 64-bit field, got {limbs}");
+        assert_eq!(
+            limbs, 2,
+            "expected 2 CRT limbs for a 64-bit field, got {limbs}"
+        );
         assert!((bytes - 100.0 * limbs as f64).abs() < 1e-9);
         // The layer's own values are 32-bit, which one limb already covers.
         assert_eq!(wider_field_cost(&p, 32, 100.0).0, 1);
@@ -864,7 +936,10 @@ mod tests {
     fn deployed_parameters_produce_valid_triples() {
         let lg = LowGear::new(LowGearParams::default_params()).unwrap();
         let (p0, p1, stats) = lg.generate_batch().unwrap();
-        assert!(lg.triples_are_valid(&p0, &p1), "SHE triples must reconstruct at the real budget");
+        assert!(
+            lg.triples_are_valid(&p0, &p1),
+            "SHE triples must reconstruct at the real budget"
+        );
         assert_eq!(stats.triples, lg.params.n);
         // The claim this module exists to check: far under the OT route's
         // measured 3104 B/triple.

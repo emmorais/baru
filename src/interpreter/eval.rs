@@ -1530,8 +1530,7 @@ impl Participant {
                             .map(|row| Types::List(row.iter().map(|&w| Types::Fixed(w)).collect()))
                             .collect(),
                     );
-                    let bias =
-                        Types::List(layer.bias.iter().map(|&b| Types::Fixed(b)).collect());
+                    let bias = Types::List(layer.bias.iter().map(|&b| Types::Fixed(b)).collect());
                     let activation = Types::Str(
                         match layer.activation {
                             crate::ml::Activation::Relu => "relu",

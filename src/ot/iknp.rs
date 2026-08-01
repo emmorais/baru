@@ -432,7 +432,10 @@ mod kos_tests {
         assert_eq!(out.sender.len(), choices.len());
         for (i, &c) in choices.iter().enumerate() {
             let expected = if c { out.sender[i].1 } else { out.sender[i].0 };
-            assert_eq!(out.receiver[i], expected, "OT {i} delivered the wrong string");
+            assert_eq!(
+                out.receiver[i], expected,
+                "OT {i} delivered the wrong string"
+            );
         }
     }
 
@@ -523,7 +526,10 @@ mod kos_tests {
         let mut seed = [0u8; KAPPA_BYTES];
         rng.fill(&mut seed);
         let resp = ext_receiver.kos_response(&seed);
-        assert!(ext_sender.kos_verify(&seed, &resp), "honest run must verify");
+        assert!(
+            ext_sender.kos_verify(&seed, &resp),
+            "honest run must verify"
+        );
     }
 }
 

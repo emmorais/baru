@@ -155,9 +155,9 @@ pub fn run_cli(args: &[String]) -> Result<(), String> {
                 iterations = list
                     .split(',')
                     .map(|s| {
-                        s.trim()
-                            .parse::<u32>()
-                            .map_err(|_| format!("--iterations: '{s}' is not a non-negative integer"))
+                        s.trim().parse::<u32>().map_err(|_| {
+                            format!("--iterations: '{s}' is not a non-negative integer")
+                        })
                     })
                     .collect::<Result<Vec<_>, _>>()?;
             }

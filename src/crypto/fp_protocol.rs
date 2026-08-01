@@ -81,7 +81,11 @@ fn alpha_ctr(op_id: u64, i: usize) -> u64 {
 pub fn share_component(value: Fp, owner: usize, me: PartyId) -> FpShare {
     FpShare {
         left: if me == owner { value } else { Fp::ZERO },
-        right: if me == (owner + N - 1) % N { value } else { Fp::ZERO },
+        right: if me == (owner + N - 1) % N {
+            value
+        } else {
+            Fp::ZERO
+        },
     }
 }
 
@@ -99,7 +103,10 @@ pub fn random_share<T: Transport>(ctr: u64, me: PartyId, mbx: &Mailbox<T>) -> Fp
     // (this party's `left`); `mine` is shared with me+1 and names component
     // `me+1` (this party's `right`). Same assignment as the ring version.
     let (left, right) = keys.random_share_mod(ctr, P);
-    FpShare { left: Fp::new(left), right: Fp::new(right) }
+    FpShare {
+        left: Fp::new(left),
+        right: Fp::new(right),
+    }
 }
 
 /// Batched multiplication over `Z_p`: one directed message per party for the
@@ -122,19 +129,25 @@ pub fn mul_batch<T: Transport>(
         .iter()
         .enumerate()
         .map(|(i, (a, b))| {
-            a.left * b.left + a.left * b.right + a.right * b.left
+            a.left * b.left
+                + a.left * b.right
+                + a.right * b.left
                 + Fp::new(keys.alpha_mod(alpha_ctr(base_op_id, i), P))
         })
         .collect();
 
     mbx.send(
         (me + N - 1) % N,
-        serialize_msg(&MpcMsg::TaggedFpBatch { base_op_id, values: pack(&z_mine) }),
+        serialize_msg(&MpcMsg::TaggedFpBatch {
+            base_op_id,
+            values: pack(&z_mine),
+        }),
     );
     let (_, msg) = mbx
-        .recv_matching(TIMEOUT_MS, |m| {
-            matches!(m, MpcMsg::TaggedFpBatch { base_op_id: b, .. } if *b == base_op_id)
-        })
+        .recv_matching(
+            TIMEOUT_MS,
+            |m| matches!(m, MpcMsg::TaggedFpBatch { base_op_id: b, .. } if *b == base_op_id),
+        )
         .unwrap_or_else(|| panic!("fp mul_batch: timeout on z for op_id={base_op_id}"));
     let z_next = match msg {
         MpcMsg::TaggedFpBatch { values, .. } => unpack(&values, z_mine.len()),
@@ -164,18 +177,26 @@ pub fn reveal_batch<T: Transport>(
     let mine: Vec<Fp> = shares.iter().map(|s| s.left).collect();
     mbx.send(
         (me + 1) % N,
-        serialize_msg(&MpcMsg::TaggedFpBatch { base_op_id, values: pack(&mine) }),
+        serialize_msg(&MpcMsg::TaggedFpBatch {
+            base_op_id,
+            values: pack(&mine),
+        }),
     );
     let (_, msg) = mbx
-        .recv_matching(TIMEOUT_MS, |m| {
-            matches!(m, MpcMsg::TaggedFpBatch { base_op_id: b, .. } if *b == base_op_id)
-        })
+        .recv_matching(
+            TIMEOUT_MS,
+            |m| matches!(m, MpcMsg::TaggedFpBatch { base_op_id: b, .. } if *b == base_op_id),
+        )
         .unwrap_or_else(|| panic!("fp reveal_batch: timeout for op_id={base_op_id}"));
     let missing = match msg {
         MpcMsg::TaggedFpBatch { values, .. } => unpack(&values, shares.len()),
         _ => unreachable!("predicate guarantees TaggedFpBatch"),
     };
-    shares.iter().zip(missing).map(|(s, m)| s.left + s.right + m).collect()
+    shares
+        .iter()
+        .zip(missing)
+        .map(|(s, m)| s.left + s.right + m)
+        .collect()
 }
 
 #[cfg(test)]
@@ -203,7 +224,10 @@ mod tests {
                 })
             })
             .collect();
-        joins.into_iter().map(|j| j.join().expect("party panicked")).collect()
+        joins
+            .into_iter()
+            .map(|j| j.join().expect("party panicked"))
+            .collect()
     }
 
     /// How many bytes a ring multiplication actually puts on the wire, per
@@ -218,7 +242,9 @@ mod tests {
     #[ignore] // real 3-party transport
     fn ring_traffic_is_dominated_by_the_u128_encoding() {
         use crate::bench::comm::CountingTransport;
-        use crate::crypto::aby3_protocol::{mul_batch_party, share_component as ring_component, PartyShare};
+        use crate::crypto::aby3_protocol::{
+            mul_batch_party, share_component as ring_component, PartyShare,
+        };
         const N: usize = 4096;
         const NBITS: u32 = 20;
 
@@ -279,13 +305,16 @@ mod tests {
     #[ignore] // real 3-party transport
     fn random_shares_are_consistent_and_uniform() {
         let out = run3(|me, mbx| {
-            (0..64u64).map(|c| random_share(c, me, mbx)).collect::<Vec<_>>()
+            (0..64u64)
+                .map(|c| random_share(c, me, mbx))
+                .collect::<Vec<_>>()
         });
         let mut nonzero = 0;
         for i in 0..64usize {
             for p in 0..3usize {
                 assert_eq!(
-                    out[p][i].right, out[(p + 1) % 3][i].left,
+                    out[p][i].right,
+                    out[(p + 1) % 3][i].left,
                     "party {p}'s right must be party {}'s left",
                     (p + 1) % 3
                 );
@@ -295,7 +324,10 @@ mod tests {
                 nonzero += 1;
             }
         }
-        assert!(nonzero > 55, "shared values must not be a sharing of zero ({nonzero}/64 non-zero)");
+        assert!(
+            nonzero > 55,
+            "shared values must not be a sharing of zero ({nonzero}/64 non-zero)"
+        );
     }
 
     /// The transport multiplication must agree with the field arithmetic — the
@@ -304,7 +336,10 @@ mod tests {
     #[ignore] // real 3-party transport
     fn transport_multiplication_matches_the_field() {
         let cases: Vec<(u64, u64)> = (0..P).flat_map(|a| (0..P).map(move |b| (a, b))).collect();
-        let expected: Vec<Fp> = cases.iter().map(|&(a, b)| Fp::new(a) * Fp::new(b)).collect();
+        let expected: Vec<Fp> = cases
+            .iter()
+            .map(|&(a, b)| Fp::new(a) * Fp::new(b))
+            .collect();
         let out = run3(move |me, mbx| {
             // Party 0 owns both inputs; sharing a held value is free.
             let pairs: Vec<(FpShare, FpShare)> = cases

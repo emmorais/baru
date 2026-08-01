@@ -160,7 +160,11 @@ mod tests {
     /// that from the model, so the two cannot drift apart unnoticed.
     #[test]
     fn the_model_reproduces_the_measured_headroom() {
-        let p = BfvParams { n: 4096, log2_q: 100, log2_t: 20 };
+        let p = BfvParams {
+            n: 4096,
+            log2_q: 100,
+            log2_t: 20,
+        };
         assert_eq!(correctness_ceiling_bits(&p), 79);
         // Measured 2^38.6, rounded up to 39.
         let lambda = smudging_lambda(&p, 39);
@@ -170,7 +174,11 @@ mod tests {
         );
 
         // t = 2^24 is about 4 bits worse on the ceiling and ~4 on the noise.
-        let p24 = BfvParams { n: 4096, log2_q: 100, log2_t: 24 };
+        let p24 = BfvParams {
+            n: 4096,
+            log2_q: 100,
+            log2_t: 24,
+        };
         assert_eq!(correctness_ceiling_bits(&p24), 75);
     }
 
@@ -178,7 +186,11 @@ mod tests {
     /// budget bit for bit — the two analyses cannot be done independently.
     #[test]
     fn soundness_slack_costs_statistical_security_one_for_one() {
-        let p = BfvParams { n: 4096, log2_q: 100, log2_t: 20 };
+        let p = BfvParams {
+            n: 4096,
+            log2_q: 100,
+            log2_t: 20,
+        };
         let honest = smudging_lambda(&p, 39);
         for slack in [0u32, 1, 5, 10, 20] {
             let got = achievable_lambda(&p, 39, slack);
@@ -195,7 +207,11 @@ mod tests {
     /// not have shown.
     #[test]
     fn a_realistic_proof_does_not_fit_at_n_4096() {
-        let p = BfvParams { n: 4096, log2_q: 100, log2_t: 20 };
+        let p = BfvParams {
+            n: 4096,
+            log2_q: 100,
+            log2_t: 20,
+        };
         // Typical relaxed-Σ slack from challenge difference + rejection
         // sampling is well above 2^10.
         assert!(
@@ -234,7 +250,11 @@ mod tests {
     /// The design constraint, stated in the unit a proof designer needs.
     #[test]
     fn the_tolerable_slack_is_a_usable_number() {
-        let p = BfvParams { n: 4096, log2_q: 100, log2_t: 20 };
+        let p = BfvParams {
+            n: 4096,
+            log2_q: 100,
+            log2_t: 20,
+        };
         let budget = max_tolerable_slack_bits(&p, 39, 30);
         assert!(
             (5..=10).contains(&budget),
@@ -248,7 +268,11 @@ mod tests {
     /// security, not as a small comfortable number.
     #[test]
     fn an_exhausted_budget_reports_zero() {
-        let p = BfvParams { n: 4096, log2_q: 100, log2_t: 20 };
+        let p = BfvParams {
+            n: 4096,
+            log2_q: 100,
+            log2_t: 20,
+        };
         assert_eq!(achievable_lambda(&p, 39, 100), 0);
     }
 }

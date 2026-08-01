@@ -127,4 +127,3 @@ pub fn eq_simulate(a: &Share3, b: &Share3) -> Share3 {
     let vb = reconstruct(b);
     share_secret((va == vb) as Fr)
 }
-

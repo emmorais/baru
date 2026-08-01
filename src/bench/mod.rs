@@ -779,12 +779,7 @@ pub fn run_cli(args: &[String]) -> Result<(), String> {
 /// Failed backends are recorded too, with the error in `notes`: "TFHE ran out
 /// of memory on this shape" is a result worth keeping, and silently dropping it
 /// would make the store's coverage look better than it is.
-fn persist(
-    reports: &[CaseReport],
-    spec: &str,
-    tags: &[String],
-    iters: u32,
-) -> Result<(), String> {
+fn persist(reports: &[CaseReport], spec: &str, tags: &[String], iters: u32) -> Result<(), String> {
     use crate::db::{Metric, Run};
 
     let mut store = crate::db::open(spec)?;
@@ -805,7 +800,8 @@ fn persist(
             run.config.insert("expr".into(), report.expr.clone());
             run.config.insert("iters".into(), iters.to_string());
             for (name, value) in &report.inputs {
-                run.config.insert(format!("input.{}", name), value.to_string());
+                run.config
+                    .insert(format!("input.{}", name), value.to_string());
             }
             if let Some(r) = b.result {
                 run.config.insert("result".into(), r.to_string());
@@ -959,29 +955,29 @@ mod tests {
 pub mod abstraction;
 pub mod backend_aware;
 pub mod circuit;
-pub mod compiled_nn;
 pub mod ckks_compare;
+pub mod cnn;
 pub mod cohort;
 pub mod cohort_eval;
-pub mod cnn;
-pub mod falcon;
-pub mod gc_compare;
-pub mod malicious;
-pub mod zkp_layer;
+pub mod comm;
+pub mod compiled_nn;
 pub mod deep_nn;
+pub mod falcon;
+pub mod fhe_innerprod;
+pub mod gc_compare;
+pub mod hybrid_nn;
 pub mod layer;
+pub mod malicious;
 pub mod medmnist;
 pub mod metrics;
 pub mod mixed_layer;
+pub mod mnist;
 pub mod net;
+pub mod nn;
 pub mod ot;
 pub mod pir;
 pub mod polymul;
 pub mod psi;
-pub mod mnist;
-pub mod fhe_innerprod;
-pub mod comm;
-pub mod hybrid_nn;
-pub mod nn;
 pub mod train;
 pub mod triples;
+pub mod zkp_layer;

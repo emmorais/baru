@@ -516,10 +516,7 @@ pub fn reveal_checked<T: Transport>(
     // could not check for itself.
     v.absorb_prev("rev", share_id, next, share.right);
 
-    share
-        .left
-        .wrapping_add(from_next)
-        .wrapping_add(from_prev)
+    share.left.wrapping_add(from_next).wrapping_add(from_prev)
 }
 
 /// Batched malicious multiplication.
@@ -725,7 +722,10 @@ pub fn a2b_batch_checked<T: Transport>(
         for k in 0..nbits {
             let sym = add(&add(&xy[k], &xz[k]), &yz[k]);
             let lin = add(&add(&x[k], &y[k]), &z[k]);
-            sum.push(add(&sub(&lin, &scalar_mul(&sym, 2)), &scalar_mul(&xyz[k], 4)));
+            sum.push(add(
+                &sub(&lin, &scalar_mul(&sym, 2)),
+                &scalar_mul(&xyz[k], 4),
+            ));
             carry.push(sub(&sym, &scalar_mul(&xyz[k], 2)));
         }
         let mut shifted = Vec::with_capacity(nbits);
@@ -885,7 +885,8 @@ fn coin_flip<T: Transport>(me: PartyId, mbx: &Mailbox<T>) -> Checked<[u8; 32]> {
     let mut acc = Sha256::new();
     for i in 0..N {
         let s = seeds[i].ok_or_else(|| Abort::new(AbortReason::CommitmentMismatch, "coin_flip"))?;
-        let c = commits[i].ok_or_else(|| Abort::new(AbortReason::CommitmentMismatch, "coin_flip"))?;
+        let c =
+            commits[i].ok_or_else(|| Abort::new(AbortReason::CommitmentMismatch, "coin_flip"))?;
         let recomputed: [u8; 32] = Sha256::digest(s).into();
         if recomputed != c {
             return Err(Abort::new(AbortReason::CommitmentMismatch, "coin_flip"));
@@ -946,10 +947,7 @@ pub fn check<T: Transport>(
         let mut w = PartyShare { left: 0, right: 0 };
         let mut u = PartyShare { left: 0, right: 0 };
         for (c, (z, z_mac)) in chi.iter().zip(&products) {
-            w = super::aby3_protocol::add_party(
-                &w,
-                &super::aby3_protocol::scalar_mul_party(z, *c),
-            );
+            w = super::aby3_protocol::add_party(&w, &super::aby3_protocol::scalar_mul_party(z, *c));
             u = super::aby3_protocol::add_party(
                 &u,
                 &super::aby3_protocol::scalar_mul_party(z_mac, *c),
@@ -991,11 +989,23 @@ pub fn check<T: Transport>(
         match mbx.recv_matching(TIMEOUT_MS, |m| matches!(m, MpcMsg::ViewHash { .. })) {
             // My predecessor's "toward next" transcript is the one it keeps
             // with me; it must equal my "toward prev".
-            Some((_, MpcMsg::ViewHash { toward_next: true, digest })) => {
+            Some((
+                _,
+                MpcMsg::ViewHash {
+                    toward_next: true,
+                    digest,
+                },
+            )) => {
                 views_ok &= digest == mine_prev;
             }
             // My successor's "toward prev" transcript must equal my "toward next".
-            Some((_, MpcMsg::ViewHash { toward_next: false, digest })) => {
+            Some((
+                _,
+                MpcMsg::ViewHash {
+                    toward_next: false,
+                    digest,
+                },
+            )) => {
                 views_ok &= digest == mine_next;
             }
             _ => panic!("check: timeout waiting for view hashes"),
@@ -1010,7 +1020,10 @@ pub fn check<T: Transport>(
         return Err(Abort::new(AbortReason::ViewMismatch, "deferred check"));
     }
     if !sacrifice_ok {
-        return Err(Abort::new(AbortReason::MultiplicationCheck, "deferred check"));
+        return Err(Abort::new(
+            AbortReason::MultiplicationCheck,
+            "deferred check",
+        ));
     }
     Ok(())
 }
@@ -1060,6 +1073,8 @@ mod tests {
         // are handed out one per operation.
         assert_eq!(VERIFY_CTR_BASE, 1u64 << 63);
         let highest_realistic_op_id: u64 = 1 << 22;
-        assert!((highest_realistic_op_id << 40) < VERIFY_CTR_BASE || highest_realistic_op_id > 1 << 23);
+        assert!(
+            (highest_realistic_op_id << 40) < VERIFY_CTR_BASE || highest_realistic_op_id > 1 << 23
+        );
     }
 }

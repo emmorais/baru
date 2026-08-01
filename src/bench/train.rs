@@ -47,7 +47,7 @@ use serde::Serialize;
 use crate::bench::comm::{CommStats, NetworkProfile};
 use crate::bench::hybrid_nn::{run_parties, MpcTransport};
 use crate::crypto::types::Fr;
-use crate::gadgets::{arith_shr_batch, argmax, dense};
+use crate::gadgets::{argmax, arith_shr_batch, dense};
 use crate::interpreter::backend::{Backend, ShareRef};
 use crate::interpreter::transport_backend::TransportBackend;
 
@@ -107,7 +107,13 @@ pub fn make_dataset(n: usize, n_features: usize, n_classes: usize, seed: u64) ->
         x.push(xi);
         label.push(lab);
     }
-    Dataset { x, label, n_features, n_classes, w_true }
+    Dataset {
+        x,
+        label,
+        n_features,
+        n_classes,
+        w_true,
+    }
 }
 
 impl Dataset {
@@ -123,26 +129,27 @@ impl Dataset {
         use rand::rngs::StdRng;
         use rand::{Rng, SeedableRng};
         let mut rng = StdRng::seed_from_u64(seed);
-        let x: Vec<i64> = (0..self.n_features).map(|_| rng.gen_range(0i64..2)).collect();
+        let x: Vec<i64> = (0..self.n_features)
+            .map(|_| rng.gen_range(0i64..2))
+            .collect();
         let scores: Vec<i64> = self
             .w_true
             .iter()
             .map(|row| row.iter().zip(&x).map(|(&w, &v)| w * v).sum())
             .collect();
-        let lab = scores.iter().enumerate().max_by_key(|(_, &s)| s).map(|(i, _)| i).unwrap();
+        let lab = scores
+            .iter()
+            .enumerate()
+            .max_by_key(|(_, &s)| s)
+            .map(|(i, _)| i)
+            .unwrap();
         (x, lab)
     }
 }
 
 /// Plaintext integer-SGD reference — the exact ground truth the encrypted
 /// run must match. `w`/`b` are updated in place; returns nothing.
-fn plain_step(
-    w: &mut [Vec<i64>],
-    b: &mut [i64],
-    x: &[i64],
-    y: &[i64],
-    lr_shift: usize,
-) {
+fn plain_step(w: &mut [Vec<i64>], b: &mut [i64], x: &[i64], y: &[i64], lr_shift: usize) {
     let n_classes = w.len();
     let z: Vec<i64> = (0..n_classes)
         .map(|c| w[c].iter().zip(x).map(|(&wi, &xi)| wi * xi).sum::<i64>() + b[c])
@@ -160,7 +167,11 @@ fn plain_predict(w: &[Vec<i64>], b: &[i64], x: &[i64]) -> usize {
     let z: Vec<i64> = (0..w.len())
         .map(|c| w[c].iter().zip(x).map(|(&wi, &xi)| wi * xi).sum::<i64>() + b[c])
         .collect();
-    z.iter().enumerate().max_by(|a, bb| a.1.cmp(bb.1)).map(|(i, _)| i).unwrap()
+    z.iter()
+        .enumerate()
+        .max_by(|a, bb| a.1.cmp(bb.1))
+        .map(|(i, _)| i)
+        .unwrap()
 }
 
 fn loss(w: &[Vec<i64>], b: &[i64], ds: &Dataset) -> i64 {
@@ -168,7 +179,12 @@ fn loss(w: &[Vec<i64>], b: &[i64], ds: &Dataset) -> i64 {
     for s in 0..ds.x.len() {
         let y = ds.onehot(s);
         for c in 0..ds.n_classes {
-            let z: i64 = w[c].iter().zip(&ds.x[s]).map(|(&wi, &xi)| wi * xi).sum::<i64>() + b[c];
+            let z: i64 = w[c]
+                .iter()
+                .zip(&ds.x[s])
+                .map(|(&wi, &xi)| wi * xi)
+                .sum::<i64>()
+                + b[c];
             let d = z - y[c];
             total += d * d;
         }
@@ -207,9 +223,13 @@ impl Mlp {
         use rand::{Rng, SeedableRng};
         let mut rng = StdRng::seed_from_u64(seed ^ 0x5EED);
         Mlp {
-            w1: (0..h).map(|_| (0..d).map(|_| rng.gen_range(-3i64..=3)).collect()).collect(),
+            w1: (0..h)
+                .map(|_| (0..d).map(|_| rng.gen_range(-3i64..=3)).collect())
+                .collect(),
             b1: vec![0; h],
-            w2: (0..c).map(|_| (0..h).map(|_| rng.gen_range(-2i64..=2)).collect()).collect(),
+            w2: (0..c)
+                .map(|_| (0..h).map(|_| rng.gen_range(-2i64..=2)).collect())
+                .collect(),
             b2: vec![0; c],
         }
     }
@@ -264,7 +284,11 @@ impl Mlp {
 
     fn predict(&self, x: &[i64]) -> usize {
         let (_, _, z2) = self.forward(x);
-        z2.iter().enumerate().max_by(|a, b| a.1.cmp(b.1)).map(|(i, _)| i).unwrap()
+        z2.iter()
+            .enumerate()
+            .max_by(|a, b| a.1.cmp(b.1))
+            .map(|(i, _)| i)
+            .unwrap()
     }
 
     fn loss(&self, ds: &Dataset) -> i64 {
@@ -281,7 +305,9 @@ impl Mlp {
     }
 
     fn accuracy(&self, ds: &Dataset) -> f64 {
-        let correct = (0..ds.x.len()).filter(|&s| self.predict(&ds.x[s]) == ds.label[s]).count();
+        let correct = (0..ds.x.len())
+            .filter(|&s| self.predict(&ds.x[s]) == ds.label[s])
+            .count();
         correct as f64 / ds.x.len() as f64
     }
 }
@@ -338,8 +364,7 @@ fn private_train(
                     // δ = z − y (local), then the whole outer product δ⊗x in
                     // ONE batched multiply, and every gradient shifted in one
                     // decomposition round.
-                    let delta: Vec<ShareRef> =
-                        (0..c).map(|cc| be.sub(&z[cc], &y[cc])).collect();
+                    let delta: Vec<ShareRef> = (0..c).map(|cc| be.sub(&z[cc], &y[cc])).collect();
                     let mut pairs = Vec::with_capacity(c * d);
                     for dl in delta.iter() {
                         for xi in x.iter() {
@@ -350,8 +375,7 @@ fn private_train(
                     // Bias gradients ride along in the same shift batch.
                     let mut to_shift = grads;
                     to_shift.extend(delta.iter().cloned());
-                    let shifted =
-                        arith_shr_batch(be, &to_shift, lr_shift, NBITS);
+                    let shifted = arith_shr_batch(be, &to_shift, lr_shift, NBITS);
                     for cc in 0..c {
                         for i in 0..d {
                             w[cc][i] = be.sub(&w[cc][i], &shifted[cc * d + i]);
@@ -403,13 +427,28 @@ fn private_train_mlp(
     let (mut per_party, comm) = run_parties(profile, move |me| {
         let x_data = x_data.clone();
         let onehots = onehots.clone();
-        let init = Mlp { w1: init.w1.clone(), b1: init.b1.clone(), w2: init.w2.clone(), b2: init.b2.clone() };
+        let init = Mlp {
+            w1: init.w1.clone(),
+            b1: init.b1.clone(),
+            w2: init.w2.clone(),
+            b2: init.b2.clone(),
+        };
         move |be: &mut TransportBackend<MpcTransport>| {
-            let pubv = |be: &mut TransportBackend<MpcTransport>, v: i64| be.share_public(residue(v, NBITS), NBITS);
+            let pubv = |be: &mut TransportBackend<MpcTransport>, v: i64| {
+                be.share_public(residue(v, NBITS), NBITS)
+            };
             // Public random init.
-            let mut w1: Vec<Vec<ShareRef>> = init.w1.iter().map(|r| r.iter().map(|&v| pubv(be, v)).collect()).collect();
+            let mut w1: Vec<Vec<ShareRef>> = init
+                .w1
+                .iter()
+                .map(|r| r.iter().map(|&v| pubv(be, v)).collect())
+                .collect();
             let mut b1: Vec<ShareRef> = init.b1.iter().map(|&v| pubv(be, v)).collect();
-            let mut w2: Vec<Vec<ShareRef>> = init.w2.iter().map(|r| r.iter().map(|&v| pubv(be, v)).collect()).collect();
+            let mut w2: Vec<Vec<ShareRef>> = init
+                .w2
+                .iter()
+                .map(|r| r.iter().map(|&v| pubv(be, v)).collect())
+                .collect();
             let mut b2: Vec<ShareRef> = init.b2.iter().map(|&v| pubv(be, v)).collect();
 
             for _ in 0..epochs {
@@ -432,11 +471,17 @@ fn private_train_mlp(
                     // so it is computed once and reused rather than redone.
                     let z1 = dense(be, &x, &w1, &b1);
                     let zeros: Vec<ShareRef> = z1.iter().map(|v| be.sub(v, v)).collect();
-                    let lt_pairs: Vec<(ShareRef, ShareRef)> =
-                        zeros.iter().zip(&z1).map(|(z, v)| (z.clone(), v.clone())).collect();
+                    let lt_pairs: Vec<(ShareRef, ShareRef)> = zeros
+                        .iter()
+                        .zip(&z1)
+                        .map(|(z, v)| (z.clone(), v.clone()))
+                        .collect();
                     let mask = be.lt_batch(&lt_pairs);
-                    let a1_pairs: Vec<(ShareRef, ShareRef)> =
-                        z1.iter().zip(&mask).map(|(v, m)| (v.clone(), m.clone())).collect();
+                    let a1_pairs: Vec<(ShareRef, ShareRef)> = z1
+                        .iter()
+                        .zip(&mask)
+                        .map(|(v, m)| (v.clone(), m.clone()))
+                        .collect();
                     let a1 = be.mul_batch(&a1_pairs);
 
                     let z2 = dense(be, &a1, &w2, &b2);
@@ -466,8 +511,11 @@ fn private_train_mlp(
                             acc.expect("at least one class")
                         })
                         .collect();
-                    let step_pairs: Vec<(ShareRef, ShareRef)> =
-                        da1.iter().zip(&mask).map(|(v, m)| (v.clone(), m.clone())).collect();
+                    let step_pairs: Vec<(ShareRef, ShareRef)> = da1
+                        .iter()
+                        .zip(&mask)
+                        .map(|(v, m)| (v.clone(), m.clone()))
+                        .collect();
                     let delta1 = be.mul_batch(&step_pairs); // ⊙ step(z1)
 
                     // Both gradient outer products in ONE batched multiply, and
@@ -508,11 +556,19 @@ fn private_train_mlp(
                     }
                 }
             }
-            let rev2 = |be: &mut TransportBackend<MpcTransport>, s: &ShareRef| to_signed(be.reveal(s, None));
+            let rev2 = |be: &mut TransportBackend<MpcTransport>, s: &ShareRef| {
+                to_signed(be.reveal(s, None))
+            };
             Mlp {
-                w1: w1.iter().map(|r| r.iter().map(|s| rev2(be, s)).collect()).collect(),
+                w1: w1
+                    .iter()
+                    .map(|r| r.iter().map(|s| rev2(be, s)).collect())
+                    .collect(),
                 b1: b1.iter().map(|s| rev2(be, s)).collect(),
-                w2: w2.iter().map(|r| r.iter().map(|s| rev2(be, s)).collect()).collect(),
+                w2: w2
+                    .iter()
+                    .map(|r| r.iter().map(|s| rev2(be, s)).collect())
+                    .collect(),
                 b2: b2.iter().map(|s| rev2(be, s)).collect(),
             }
         }
@@ -608,15 +664,78 @@ pub fn run_cli(args: &[String]) -> Result<(), String> {
                 return Ok(());
             }
             "--json" => json = true,
-            "--samples" => { i += 1; n = args.get(i).ok_or("--samples needs a value")?.parse().map_err(|_| "bad samples".to_string())?; }
-            "--features" => { i += 1; d = args.get(i).ok_or("--features needs a value")?.parse().map_err(|_| "bad features".to_string())?; }
-            "--classes" => { i += 1; c = args.get(i).ok_or("--classes needs a value")?.parse().map_err(|_| "bad classes".to_string())?; }
-            "--epochs" => { i += 1; epochs = args.get(i).ok_or("--epochs needs a value")?.parse().map_err(|_| "bad epochs".to_string())?; }
-            "--lr-shift" => { i += 1; lr_shift = args.get(i).ok_or("--lr-shift needs a value")?.parse().map_err(|_| "bad lr-shift".to_string())?; }
-            "--hidden" => { i += 1; hidden = args.get(i).ok_or("--hidden needs a value")?.parse().map_err(|_| "bad hidden".to_string())?; }
-            "--lr2-shift" => { i += 1; lr2_shift = args.get(i).ok_or("--lr2-shift needs a value")?.parse().map_err(|_| "bad lr2-shift".to_string())?; }
-            "--rtt-ms" => { i += 1; rtt_ms = args.get(i).ok_or("--rtt-ms needs a value")?.parse().map_err(|_| "bad rtt-ms".to_string())?; }
-            "--seed" => { i += 1; seed = args.get(i).ok_or("--seed needs a value")?.parse().map_err(|_| "bad seed".to_string())?; }
+            "--samples" => {
+                i += 1;
+                n = args
+                    .get(i)
+                    .ok_or("--samples needs a value")?
+                    .parse()
+                    .map_err(|_| "bad samples".to_string())?;
+            }
+            "--features" => {
+                i += 1;
+                d = args
+                    .get(i)
+                    .ok_or("--features needs a value")?
+                    .parse()
+                    .map_err(|_| "bad features".to_string())?;
+            }
+            "--classes" => {
+                i += 1;
+                c = args
+                    .get(i)
+                    .ok_or("--classes needs a value")?
+                    .parse()
+                    .map_err(|_| "bad classes".to_string())?;
+            }
+            "--epochs" => {
+                i += 1;
+                epochs = args
+                    .get(i)
+                    .ok_or("--epochs needs a value")?
+                    .parse()
+                    .map_err(|_| "bad epochs".to_string())?;
+            }
+            "--lr-shift" => {
+                i += 1;
+                lr_shift = args
+                    .get(i)
+                    .ok_or("--lr-shift needs a value")?
+                    .parse()
+                    .map_err(|_| "bad lr-shift".to_string())?;
+            }
+            "--hidden" => {
+                i += 1;
+                hidden = args
+                    .get(i)
+                    .ok_or("--hidden needs a value")?
+                    .parse()
+                    .map_err(|_| "bad hidden".to_string())?;
+            }
+            "--lr2-shift" => {
+                i += 1;
+                lr2_shift = args
+                    .get(i)
+                    .ok_or("--lr2-shift needs a value")?
+                    .parse()
+                    .map_err(|_| "bad lr2-shift".to_string())?;
+            }
+            "--rtt-ms" => {
+                i += 1;
+                rtt_ms = args
+                    .get(i)
+                    .ok_or("--rtt-ms needs a value")?
+                    .parse()
+                    .map_err(|_| "bad rtt-ms".to_string())?;
+            }
+            "--seed" => {
+                i += 1;
+                seed = args
+                    .get(i)
+                    .ok_or("--seed needs a value")?
+                    .parse()
+                    .map_err(|_| "bad seed".to_string())?;
+            }
             other => return Err(format!("unknown option '{other}'\n{USAGE}")),
         }
         i += 1;
@@ -639,22 +758,34 @@ pub fn run_cli(args: &[String]) -> Result<(), String> {
             curve.push(pmlp.loss(&ds));
         }
         let (emlp, comm) = private_train_mlp(&ds, &init, epochs, lr_shift, lr2_shift, profile);
-        let exact = emlp.w1 == pmlp.w1 && emlp.w2 == pmlp.w2 && emlp.b1 == pmlp.b1 && emlp.b2 == pmlp.b2;
+        let exact =
+            emlp.w1 == pmlp.w1 && emlp.w2 == pmlp.w2 && emlp.b1 == pmlp.b1 && emlp.b2 == pmlp.b2;
         println!("Private MLP training — backpropagation THROUGH ReLU under real 3-party ABY3");
         println!("data secret-shared; forward + backprop + update all oblivious (gadget-composed)");
         println!(
             "architecture: {d} -> {hidden} (ReLU) -> {c} | epochs={epochs}, lr1=2^-{lr_shift}, lr2=2^-{lr2_shift}\n"
         );
         println!("  loss (MSE) curve : {curve:?}");
-        println!("  loss {} -> {}   ({:.0}% reduction)", l0, curve.last().unwrap(),
-            100.0 * (l0 - curve.last().unwrap()) as f64 / l0.max(1) as f64);
+        println!(
+            "  loss {} -> {}   ({:.0}% reduction)",
+            l0,
+            curve.last().unwrap(),
+            100.0 * (l0 - curve.last().unwrap()) as f64 / l0.max(1) as f64
+        );
         println!("  train accuracy   : {:.0}%", pmlp.accuracy(&ds) * 100.0);
         println!(
             "  encrypted == plaintext model (backprop through ReLU) : {}",
-            if exact { "EXACT (bit-for-bit)" } else { "MISMATCH" }
+            if exact {
+                "EXACT (bit-for-bit)"
+            } else {
+                "MISMATCH"
+            }
         );
         println!("  FHE bootstraps   : 0");
-        println!("  MPC wire traffic : {} messages, {} bytes", comm.messages, comm.bytes);
+        println!(
+            "  MPC wire traffic : {} messages, {} bytes",
+            comm.messages, comm.bytes
+        );
         println!(
             "\n  note: integer SGD diverges past the stable regime without regularization\n\
              \x20       (an ML matter); the *private backprop* is exact regardless."
@@ -693,7 +824,10 @@ pub fn run_cli(args: &[String]) -> Result<(), String> {
     };
 
     if json {
-        println!("{}", serde_json::to_string_pretty(&report).map_err(|e| e.to_string())?);
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&report).map_err(|e| e.to_string())?
+        );
         return Ok(());
     }
 
@@ -703,15 +837,28 @@ pub fn run_cli(args: &[String]) -> Result<(), String> {
         "dataset: {n} samples, {d} features, {c} classes | epochs={epochs}, lr=2^-{lr_shift}\n"
     );
     println!("  loss (MSE) curve : {curve:?}");
-    println!("  loss {} -> {}   ({:.0}% reduction)", loss_start, loss_end,
-        100.0 * (loss_start - loss_end) as f64 / loss_start.max(1) as f64);
+    println!(
+        "  loss {} -> {}   ({:.0}% reduction)",
+        loss_start,
+        loss_end,
+        100.0 * (loss_start - loss_end) as f64 / loss_start.max(1) as f64
+    );
     println!("  train accuracy   : {:.0}%", train_acc * 100.0);
     println!(
         "  encrypted == plaintext model : {}",
-        if exact { "EXACT (bit-for-bit)" } else { "MISMATCH" }
+        if exact {
+            "EXACT (bit-for-bit)"
+        } else {
+            "MISMATCH"
+        }
     );
-    println!("  FHE bootstraps   : 0  (MPC training; model then deployable for no-bootstrap inference)");
-    println!("  MPC wire traffic : {} messages, {} bytes", comm.messages, comm.bytes);
+    println!(
+        "  FHE bootstraps   : 0  (MPC training; model then deployable for no-bootstrap inference)"
+    );
+    println!(
+        "  MPC wire traffic : {} messages, {} bytes",
+        comm.messages, comm.bytes
+    );
 
     // The lifecycle: classify a fresh example (drawn from the same
     // ground-truth model) under the trained model, revealing only the class.
@@ -719,7 +866,11 @@ pub fn run_cli(args: &[String]) -> Result<(), String> {
     let pred = private_predict(&w, &b, &tx, profile);
     println!(
         "\n  private inference on a held-out example -> class {pred}  (true {tlabel}, {})",
-        if pred == tlabel { "correct" } else { "misclassified" }
+        if pred == tlabel {
+            "correct"
+        } else {
+            "misclassified"
+        }
     );
     Ok(())
 }
@@ -742,7 +893,10 @@ mod tests {
         }
         let l1 = loss(&w, &b, &ds);
         assert!(l1 < l0, "loss must decrease: {l0} -> {l1}");
-        assert!(accuracy(&w, &b, &ds) > 0.6, "should fit separable data reasonably");
+        assert!(
+            accuracy(&w, &b, &ds) > 0.6,
+            "should fit separable data reasonably"
+        );
     }
 
     #[test]
@@ -761,7 +915,10 @@ mod tests {
             curve.push(mlp.loss(&ds));
         }
         for w in curve.windows(2) {
-            assert!(w[1] <= w[0], "loss must be monotone in the stable regime: {curve:?}");
+            assert!(
+                w[1] <= w[0],
+                "loss must be monotone in the stable regime: {curve:?}"
+            );
         }
         assert!(*curve.last().unwrap() < l0);
     }

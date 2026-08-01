@@ -2,15 +2,15 @@
 
 pub mod aby3_protocol;
 pub mod aby3_verify;
-pub mod attestations;
-pub mod garbled;
-pub mod gc_protocol;
 pub mod arith;
+pub mod attestations;
 pub mod bits;
 pub mod falcon;
 pub mod falcon_mpc;
 pub mod field;
 pub mod fp_protocol;
+pub mod garbled;
+pub mod gc_protocol;
 pub mod identity;
 pub mod net;
 pub mod protocol;
@@ -23,8 +23,8 @@ pub mod types;
 pub use arith::*;
 pub use net::*;
 pub use protocol::{
-    a2b_party, add_party, mul_party, reveal, scalar_mul_party,
-    share_input, share_public, sub_party, PartyShare,
+    a2b_party, add_party, mul_party, reveal, scalar_mul_party, share_input, share_public,
+    sub_party, PartyShare,
 };
 pub use security::{
     require_security, Abort, AbortReason, AttestedSecurity, Checked, Security, SecurityGateError,

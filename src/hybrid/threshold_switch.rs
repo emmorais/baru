@@ -262,7 +262,11 @@ pub fn checked_fhe_to_shares(
     let opened = combine(
         bfv,
         &masked,
-        &[partials[0].clone(), partials[1].clone(), partials[2].clone()],
+        &[
+            partials[0].clone(),
+            partials[1].clone(),
+            partials[2].clone(),
+        ],
     );
     let y = opened[0] & mask_of(nbits);
 
@@ -292,7 +296,11 @@ mod tests {
     const NBITS: usize = 16;
 
     fn params() -> BfvParams {
-        BfvParams { n: 1024, log2_q: 100, log2_t: 20 }
+        BfvParams {
+            n: 1024,
+            log2_q: 100,
+            log2_t: 20,
+        }
     }
 
     /// Build three parties sharing a consistent ring of pairwise keys.
@@ -370,10 +378,7 @@ mod tests {
         let ct = bfv.encrypt_poly(&pk, &m);
 
         let comps = checked_fhe_to_shares(&parties, &ct, NBITS, 11).expect("no mismatch");
-        let sum = comps
-            .iter()
-            .fold(0u128, |a, &c| a.wrapping_add(c))
-            & ((1u128 << NBITS) - 1);
+        let sum = comps.iter().fold(0u128, |a, &c| a.wrapping_add(c)) & ((1u128 << NBITS) - 1);
         assert_eq!(sum as u64, secret, "shares must reconstruct the plaintext");
     }
 
@@ -430,10 +435,7 @@ mod tests {
         m[0] = secret;
         let ct = bfv.encrypt_poly(&pk, &m);
         let comps = checked_fhe_to_shares(&parties, &ct, NBITS, 5).expect("no mismatch");
-        let sum = comps
-            .iter()
-            .fold(0u128, |a, &c| a.wrapping_add(c))
-            & ((1u128 << NBITS) - 1);
+        let sum = comps.iter().fold(0u128, |a, &c| a.wrapping_add(c)) & ((1u128 << NBITS) - 1);
         assert_eq!(
             sum as u64, secret,
             "40 bits of flooding must not break correctness"

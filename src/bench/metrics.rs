@@ -59,7 +59,11 @@ pub fn wilson_interval(successes: usize, n: usize) -> (f64, f64) {
 /// Returns `None` when one class is absent — AUC is undefined there, and a
 /// benchmark must say "undefined" rather than print 0.5 or 1.0.
 pub fn auc(scores: &[i64], positive: &[bool]) -> Option<f64> {
-    assert_eq!(scores.len(), positive.len(), "scores/labels length mismatch");
+    assert_eq!(
+        scores.len(),
+        positive.len(),
+        "scores/labels length mismatch"
+    );
     let n_pos = positive.iter().filter(|&&p| p).count();
     let n_neg = positive.len() - n_pos;
     if n_pos == 0 || n_neg == 0 {
@@ -81,7 +85,10 @@ pub fn auc(scores: &[i64], positive: &[bool]) -> Option<f64> {
         }
         i = j + 1;
     }
-    let rank_sum: f64 = (0..scores.len()).filter(|&i| positive[i]).map(|i| ranks[i]).sum();
+    let rank_sum: f64 = (0..scores.len())
+        .filter(|&i| positive[i])
+        .map(|i| ranks[i])
+        .sum();
     let u = rank_sum - n_pos as f64 * (n_pos as f64 + 1.0) / 2.0;
     Some(u / (n_pos as f64 * n_neg as f64))
 }
@@ -119,7 +126,10 @@ impl ClassificationMetrics {
     pub fn compute(logits: &[Vec<i64>], labels: &[u8], nclasses: usize) -> Self {
         assert_eq!(logits.len(), labels.len(), "logits/labels length mismatch");
         let n = labels.len();
-        let preds: Vec<usize> = logits.iter().map(|l| crate::gadgets::argmax_ref(l)).collect();
+        let preds: Vec<usize> = logits
+            .iter()
+            .map(|l| crate::gadgets::argmax_ref(l))
+            .collect();
 
         let mut confusion = vec![vec![0usize; nclasses]; nclasses];
         for (&t, &p) in labels.iter().zip(&preds) {
@@ -137,7 +147,11 @@ impl ClassificationMetrics {
             .collect();
         // Classes with no support are skipped rather than counted as 0, which
         // would silently drag the mean down on a subset that misses a class.
-        let present: Vec<f64> = per_class_recall.iter().copied().filter(|r| !r.is_nan()).collect();
+        let present: Vec<f64> = per_class_recall
+            .iter()
+            .copied()
+            .filter(|r| !r.is_nan())
+            .collect();
         let balanced_accuracy = if present.is_empty() {
             f64::NAN
         } else {
@@ -145,7 +159,11 @@ impl ClassificationMetrics {
         };
 
         let correct: usize = (0..nclasses).map(|c| confusion[c][c]).sum();
-        let accuracy = if n == 0 { f64::NAN } else { correct as f64 / n as f64 };
+        let accuracy = if n == 0 {
+            f64::NAN
+        } else {
+            correct as f64 / n as f64
+        };
 
         // AUC: the binary case uses the decision margin, which is the score the
         // model actually ranks by; the multiclass case averages one-vs-rest.

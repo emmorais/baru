@@ -70,7 +70,6 @@ pub enum MpcMsg {
         value: u128,
     },
 
-
     /// A whole batch of reveal contributions in one message — the batched form
     /// of [`MpcMsg::RevealShare`], used by the malicious layer.
     ///

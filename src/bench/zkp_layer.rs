@@ -111,9 +111,8 @@ fn measure(width: usize) -> LayerCost {
         .unwrap_or_else(|e| panic!("compile width={width}: {e}"));
     let compile_ms = t0.elapsed().as_secs_f64() * 1e3;
 
-    let mut priv_map: HashMap<String, i64> = (0..width)
-        .map(|i| (format!("x{i}"), inputs[i]))
-        .collect();
+    let mut priv_map: HashMap<String, i64> =
+        (0..width).map(|i| (format!("x{i}"), inputs[i])).collect();
     priv_map.insert("bias".to_string(), bias);
 
     let mut pubs: HashMap<String, i64> = HashMap::new();
@@ -206,7 +205,11 @@ mod tests {
                 "width {}: proof did not verify or claimed the wrong value",
                 row.width
             );
-            assert!(row.constraints > 0, "width {} produced no constraints", row.width);
+            assert!(
+                row.constraints > 0,
+                "width {} produced no constraints",
+                row.width
+            );
         }
     }
 
@@ -232,8 +235,12 @@ mod tests {
     #[test]
     fn the_reference_exercises_negative_activations() {
         let width = 16;
-        let weights: Vec<i64> = (0..width).map(|i| ((i as i64 % 7) - 3) * SCALE / 4).collect();
-        let inputs: Vec<i64> = (0..width).map(|i| ((i as i64 % 5) - 2) * SCALE / 2).collect();
+        let weights: Vec<i64> = (0..width)
+            .map(|i| ((i as i64 % 7) - 3) * SCALE / 4)
+            .collect();
+        let inputs: Vec<i64> = (0..width)
+            .map(|i| ((i as i64 % 5) - 2) * SCALE / 2)
+            .collect();
         assert!(
             weights.iter().any(|w| *w < 0) && inputs.iter().any(|x| *x < 0),
             "the sweep must include negative weights and inputs"

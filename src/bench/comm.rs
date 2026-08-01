@@ -253,7 +253,6 @@ impl NetworkProfile {
         self.bandwidth_bytes_per_sec = Some(bytes_per_sec);
         self
     }
-
 }
 
 /// Wraps a `Transport`, delaying message *arrival* by [`NetworkProfile`]
@@ -293,36 +292,35 @@ enum Delayed {
 impl<T: Transport + 'static> LatencyTransport<T> {
     pub fn new(inner: T, profile: NetworkProfile) -> Self {
         let inner = Arc::new(inner);
-        let queue = if profile.one_way_latency.is_zero()
-            && profile.bandwidth_bytes_per_sec.is_none()
-        {
-            None
-        } else {
-            let (tx, rx) = std::sync::mpsc::channel::<Delayed>();
-            let worker_inner = inner.clone();
-            thread::spawn(move || {
-                // Exits when every sender handle is dropped.
-                for item in rx {
-                    match item {
-                        Delayed::Send(at, to, msg) => {
-                            let now = std::time::Instant::now();
-                            if at > now {
-                                thread::sleep(at - now);
+        let queue =
+            if profile.one_way_latency.is_zero() && profile.bandwidth_bytes_per_sec.is_none() {
+                None
+            } else {
+                let (tx, rx) = std::sync::mpsc::channel::<Delayed>();
+                let worker_inner = inner.clone();
+                thread::spawn(move || {
+                    // Exits when every sender handle is dropped.
+                    for item in rx {
+                        match item {
+                            Delayed::Send(at, to, msg) => {
+                                let now = std::time::Instant::now();
+                                if at > now {
+                                    thread::sleep(at - now);
+                                }
+                                worker_inner.send(to, msg);
                             }
-                            worker_inner.send(to, msg);
-                        }
-                        Delayed::Broadcast(at, msg) => {
-                            let now = std::time::Instant::now();
-                            if at > now {
-                                thread::sleep(at - now);
+                            Delayed::Broadcast(at, msg) => {
+                                let now = std::time::Instant::now();
+                                if at > now {
+                                    thread::sleep(at - now);
+                                }
+                                worker_inner.broadcast(msg);
                             }
-                            worker_inner.broadcast(msg);
                         }
                     }
-                }
-            });
-            Some(Mutex::new(tx))
-        };
+                });
+                Some(Mutex::new(tx))
+            };
         LatencyTransport {
             inner,
             profile,

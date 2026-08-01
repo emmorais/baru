@@ -66,12 +66,20 @@ const NUM_PRIMES_MAX: usize = NUM_PRIMES_WIDE;
 #[inline]
 fn addmod(a: u64, b: u64, p: u64) -> u64 {
     let s = a + b;
-    if s >= p { s - p } else { s }
+    if s >= p {
+        s - p
+    } else {
+        s
+    }
 }
 
 #[inline]
 fn submod(a: u64, b: u64, p: u64) -> u64 {
-    if a >= b { a - b } else { a + p - b }
+    if a >= b {
+        a - b
+    } else {
+        a + p - b
+    }
 }
 
 #[inline]
@@ -207,7 +215,10 @@ impl Shoup {
     #[inline]
     fn new(w: u64, p: u64) -> Shoup {
         debug_assert!(w < p && p < (1u64 << 63));
-        Shoup { w, q: (((w as u128) << 64) / p as u128) as u64 }
+        Shoup {
+            w,
+            q: (((w as u128) << 64) / p as u128) as u64,
+        }
     }
 
     /// `w · x mod p`, for `x < p`.
@@ -258,7 +269,10 @@ fn build_twiddles(p: u64, root: u64, n: usize) -> Vec<Shoup> {
 impl Plan {
     fn new(p: u64, root_max: u64, n: usize) -> Plan {
         assert!(n.is_power_of_two() && n <= MAX_N);
-        assert!(p < (1u64 << 63), "Shoup multiplication needs p < 2^63, got {p}");
+        assert!(
+            p < (1u64 << 63),
+            "Shoup multiplication needs p < 2^63, got {p}"
+        );
         // ψ = root^(ROOT_ORDER / 2n) is a primitive 2n-th root of unity.
         let psi_g = powmod(root_max, ROOT_ORDER / (2 * n as u64), p);
         let psi_inv_g = invmod(psi_g, p);
@@ -418,6 +432,7 @@ fn map_plans<T: Send>(
 
 // ─── The CRT accumulator ─────────────────────────────────────────────────────
 
+use crate::fhe::bigint::IntN;
 /// Two's-complement 256-bit integer: enough for `|c[k]| ≤ 2^210` and for the
 /// CRT modulus `Π pᵢ ≈ 2^252`.
 ///
@@ -427,7 +442,6 @@ fn map_plans<T: Send>(
 /// `mod_u64` per limb per prime, so widening it would tax every scheme in the
 /// crate for the benefit of one.
 pub use crate::fhe::bigint::{I256, I512};
-use crate::fhe::bigint::IntN;
 
 // ─── The exact product ────────────────────────────────────────────────────────
 
@@ -457,9 +471,21 @@ fn build_crt_consts<const L: usize>(k: usize) -> CrtConst<L> {
     }
     let half = modulus.shr(1);
     let inv_prefix: Vec<u64> = (0..k)
-        .map(|i| if i == 0 { 1 } else { invmod(prefix[i].mod_u64(ps[i]), ps[i]) })
+        .map(|i| {
+            if i == 0 {
+                1
+            } else {
+                invmod(prefix[i].mod_u64(ps[i]), ps[i])
+            }
+        })
         .collect();
-    CrtConst { ps, prefix, inv_prefix, modulus, half }
+    CrtConst {
+        ps,
+        prefix,
+        inv_prefix,
+        modulus,
+        half,
+    }
 }
 
 fn crt_consts() -> &'static CrtConst<4> {
@@ -794,7 +820,11 @@ mod tests {
             let lo = (p00 & 0xFFFF_FFFF_FFFF_FFFF) | (mid << 64);
             let hi = p11 + (p01 >> 64) + (p10 >> 64) + (mid >> 64);
             let m = I256::from_hi_lo(hi, lo);
-            if neg { m.wrapping_neg() } else { m }
+            if neg {
+                m.wrapping_neg()
+            } else {
+                m
+            }
         }
         let mut acc = vec![I256::ZERO; n];
         for (i, &ai) in a.iter().enumerate() {
@@ -819,9 +849,15 @@ mod tests {
         let mut s = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
         (0..n)
             .map(|_| {
-                s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                s = s
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
                 let mag = ((s >> 3) as u128) & ((1u128 << bits) - 1);
-                if s & 1 == 0 { mag as i128 } else { -(mag as i128) }
+                if s & 1 == 0 {
+                    mag as i128
+                } else {
+                    -(mag as i128)
+                }
             })
             .collect()
     }
@@ -834,7 +870,10 @@ mod tests {
         assert!(NUM_PRIMES <= NUM_PRIMES_WIDE);
         for (&p, &r) in pr.p.iter().zip(&pr.root) {
             assert!(is_prime(p), "{p} must be prime");
-            assert!((p - 1).is_multiple_of(ROOT_ORDER), "{p} must be ≡ 1 mod {ROOT_ORDER}");
+            assert!(
+                (p - 1).is_multiple_of(ROOT_ORDER),
+                "{p} must be ≡ 1 mod {ROOT_ORDER}"
+            );
             // r must have order exactly ROOT_ORDER.
             assert_eq!(powmod(r, ROOT_ORDER, p), 1);
             assert_ne!(powmod(r, ROOT_ORDER / 2, p), 1);
@@ -852,14 +891,23 @@ mod tests {
         let narrow = crt_consts();
         assert_eq!(narrow.ps.len(), NUM_PRIMES);
         // half = Π p / 2 must exceed 2^249, i.e. bit 249 of `half` is set or above.
-        assert!(!narrow.half.shr(249).is_zero(), "narrow CRT modulus lost its headroom");
+        assert!(
+            !narrow.half.shr(249).is_zero(),
+            "narrow CRT modulus lost its headroom"
+        );
 
         // Wide: q=2^190 at n=8192 ⇒ |c| ≤ n·(q/2)² = 2^392.
         let wide = crt_consts_wide();
         assert_eq!(wide.ps.len(), NUM_PRIMES_WIDE);
-        assert!(!wide.half.shr(392).is_zero(), "wide CRT modulus too small for q=2^190 at n=8192");
+        assert!(
+            !wide.half.shr(392).is_zero(),
+            "wide CRT modulus too small for q=2^190 at n=8192"
+        );
         // …and it must still fit the accumulator (no wraparound at 512 bits).
-        assert!(!wide.modulus.is_negative(), "wide CRT modulus overflowed I512");
+        assert!(
+            !wide.modulus.is_negative(),
+            "wide CRT modulus overflowed I512"
+        );
     }
 
     /// [`Shoup::mul`] is only valid for `p < 2^63` (it needs `2p < 2^64` so the
@@ -869,8 +917,14 @@ mod tests {
     #[test]
     fn primes_admit_shoup() {
         for &p in &primes().p {
-            assert!(p < (1u64 << 63), "p = {p} is too large for Shoup multiplication");
-            assert!(p.checked_mul(2).is_some(), "2p must not overflow u64 (p = {p})");
+            assert!(
+                p < (1u64 << 63),
+                "p = {p} is too large for Shoup multiplication"
+            );
+            assert!(
+                p.checked_mul(2).is_some(),
+                "2p must not overflow u64 (p = {p})"
+            );
         }
     }
 
@@ -889,12 +943,20 @@ mod tests {
             };
             for _ in 0..2000 {
                 let (w, x) = (next(), next());
-                assert_eq!(Shoup::new(w, p).mul(x, p), mulmod(w, x, p), "p={p} w={w} x={x}");
+                assert_eq!(
+                    Shoup::new(w, p).mul(x, p),
+                    mulmod(w, x, p),
+                    "p={p} w={w} x={x}"
+                );
             }
             // Boundaries: 0, 1, p−1 in both positions.
             for &w in &[0u64, 1, p - 1] {
                 for &x in &[0u64, 1, p - 1] {
-                    assert_eq!(Shoup::new(w, p).mul(x, p), mulmod(w, x, p), "p={p} w={w} x={x}");
+                    assert_eq!(
+                        Shoup::new(w, p).mul(x, p),
+                        mulmod(w, x, p),
+                        "p={p} w={w} x={x}"
+                    );
                 }
             }
         }
@@ -919,7 +981,11 @@ mod tests {
                 }
                 // Mask to `bits`, then apply a sign.
                 let v = v.shr(256 - bits);
-                if next() & 1 == 0 { v } else { v.wrapping_neg() }
+                if next() & 1 == 0 {
+                    v
+                } else {
+                    v.wrapping_neg()
+                }
             })
             .collect()
     }
@@ -941,7 +1007,11 @@ mod tests {
                     acc = acc.wrapping_add(xw.mul_u64(limb).shl(64 * i as u32));
                 }
             }
-            if neg { acc.wrapping_neg() } else { acc }
+            if neg {
+                acc.wrapping_neg()
+            } else {
+                acc
+            }
         }
         let mut out = vec![I512::ZERO; n];
         for i in 0..n {
@@ -963,7 +1033,11 @@ mod tests {
         for n in [1usize, 2, 8, 32] {
             let a = sample_i256(n, 40, n as u64 * 3 + 1);
             let b = sample_i256(n, 40, n as u64 * 5 + 7);
-            assert_eq!(exact_negacyclic_product_wide(&a, &b, n), schoolbook_wide(&a, &b, n), "n={n}");
+            assert_eq!(
+                exact_negacyclic_product_wide(&a, &b, n),
+                schoolbook_wide(&a, &b, n),
+                "n={n}"
+            );
         }
     }
 
@@ -974,7 +1048,10 @@ mod tests {
         let n = 64;
         let a = sample_i256(n, 189, 0xC0FFEE);
         let b = sample_i256(n, 189, 0xBEEF);
-        assert_eq!(exact_negacyclic_product_wide(&a, &b, n), schoolbook_wide(&a, &b, n));
+        assert_eq!(
+            exact_negacyclic_product_wide(&a, &b, n),
+            schoolbook_wide(&a, &b, n)
+        );
     }
 
     /// The wide path must agree with the narrow one wherever both apply — the
@@ -1023,7 +1100,11 @@ mod tests {
         for &n in &[8usize, 16, 64] {
             let a = pseudo(n, 1, 20);
             let b = pseudo(n, 2, 20);
-            assert_eq!(exact_negacyclic_product(&a, &b, n), schoolbook(&a, &b, n), "n={n}");
+            assert_eq!(
+                exact_negacyclic_product(&a, &b, n),
+                schoolbook(&a, &b, n),
+                "n={n}"
+            );
         }
     }
 
@@ -1068,10 +1149,16 @@ mod tests {
         let n = 16;
         let zero = vec![0i128; n];
         let a = pseudo(n, 3, 60);
-        assert_eq!(exact_negacyclic_product(&zero, &a, n), schoolbook(&zero, &a, n));
+        assert_eq!(
+            exact_negacyclic_product(&zero, &a, n),
+            schoolbook(&zero, &a, n)
+        );
         let mut neg = vec![0i128; n];
         neg[0] = -(1i128 << 99);
         neg[1] = (1i128 << 99) - 1;
-        assert_eq!(exact_negacyclic_product(&neg, &a, n), schoolbook(&neg, &a, n));
+        assert_eq!(
+            exact_negacyclic_product(&neg, &a, n),
+            schoolbook(&neg, &a, n)
+        );
     }
 }

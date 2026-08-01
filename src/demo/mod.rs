@@ -180,7 +180,11 @@ pub fn classify(img: &[i64], expected: u8, profile: NetworkProfile) -> DemoRun {
             }
             let score = score.unwrap();
             let thr = be.share_secret(
-                if me == 0 { residue(THRESHOLD, nbits) } else { 0 },
+                if me == 0 {
+                    residue(THRESHOLD, nbits)
+                } else {
+                    0
+                },
                 nbits,
                 0,
             );
@@ -246,8 +250,7 @@ pub fn run_cli(args: &[String]) -> Result<(), String> {
         }
         i += 1;
     }
-    let mut profile =
-        NetworkProfile::fixed_latency(std::time::Duration::from_micros(rtt_ms * 500));
+    let mut profile = NetworkProfile::fixed_latency(std::time::Duration::from_micros(rtt_ms * 500));
     if let Some(mbps) = bandwidth_mbps {
         profile = profile.with_bandwidth(mbps * 1e6 / 8.0);
     }
@@ -258,9 +261,12 @@ pub fn run_cli(args: &[String]) -> Result<(), String> {
     println!("╚══════════════════════════════════════════════════════════════════╝");
     println!();
     println!("ring X^{RING_N}+1, q=2^100, t=2^{LOG2_T} | 784-pixel image = ONE ciphertext");
-    println!("network: rtt={rtt_ms}ms, bandwidth={}", bandwidth_mbps
-        .map(|b| format!("{b}Mbps"))
-        .unwrap_or_else(|| "unlimited".into()));
+    println!(
+        "network: rtt={rtt_ms}ms, bandwidth={}",
+        bandwidth_mbps
+            .map(|b| format!("{b}Mbps"))
+            .unwrap_or_else(|| "unlimited".into())
+    );
     println!();
 
     for (label, img, expected) in [
@@ -313,6 +319,9 @@ mod tests {
         assert_eq!(zero.predicted, 0, "the '0' sample must classify as 0");
         let one = classify(&mnist_data::IMG_ONE, 1, NetworkProfile::INSTANT);
         assert_eq!(one.predicted, 1, "the '1' sample must classify as 1");
-        assert!(zero.comm.messages > 0, "the decision must be a real MPC protocol");
+        assert!(
+            zero.comm.messages > 0,
+            "the decision must be a real MPC protocol"
+        );
     }
 }

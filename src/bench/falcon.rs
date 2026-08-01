@@ -43,19 +43,19 @@ use std::time::Instant;
 use serde::Serialize;
 
 use crate::bench::comm::{CommStats, CountingTransport, NetworkProfile};
+use crate::bench::hybrid_nn::{run_parties, MpcTransport};
 use crate::crypto::aby3_protocol::PartyShare;
 use crate::crypto::falcon_mpc::{drelu_batch, WrapPreproc, PC_ID_BLOCK};
 use crate::crypto::field::Fp;
 use crate::crypto::fp_protocol::share_component as fp_component;
 use crate::crypto::net::{InprocHandle, Mailbox, PartyId};
-use crate::bench::hybrid_nn::{run_parties, MpcTransport};
 use crate::crypto::types::Fr;
 use crate::interpreter::backend::{Backend, ShareRef};
 use crate::interpreter::parse;
+use crate::interpreter::transport_backend::TransportBackend;
 use crate::mpcc::exec::{run_flat_with, Batching};
 use crate::mpcc::opt::reassociate_reductions;
 use crate::zkp::circuit_compiler::CircuitCompiler;
-use crate::interpreter::transport_backend::TransportBackend;
 
 /// One route's measured cost for `n` sign extractions.
 #[derive(Debug, Clone, Serialize)]
@@ -136,8 +136,13 @@ fn wrap_preproc(seed: u64, l_bits: u32, me: PartyId) -> WrapPreproc {
     let x = ((xs[0] as u128 + xs[1] as u128 + xs[2] as u128) & mask) as u64;
     let beta = seed & 1;
     WrapPreproc {
-        x: PartyShare { left: xs[me % 3] as u128, right: xs[(me + 1) % 3] as u128 },
-        bits: (0..l_bits).map(|i| fp_component(Fp::new((x >> i) & 1), 0, me)).collect(),
+        x: PartyShare {
+            left: xs[me % 3] as u128,
+            right: xs[(me + 1) % 3] as u128,
+        },
+        bits: (0..l_bits)
+            .map(|i| fp_component(Fp::new((x >> i) & 1), 0, me))
+            .collect(),
         delta: {
             let d = crate::crypto::falcon::wrap3(xs[0], xs[1], xs[2], l_bits);
             [u64::from(me == 0) * d, u64::from(me == 2) * d]
@@ -172,7 +177,10 @@ where
         }));
     }
     let t0 = Instant::now();
-    let out: Vec<R> = joins.into_iter().map(|j| j.join().expect("party panicked")).collect();
+    let out: Vec<R> = joins
+        .into_iter()
+        .map(|j| j.join().expect("party panicked"))
+        .collect();
     let ms = t0.elapsed().as_secs_f64() * 1000.0;
     (out, comm.unwrap().stats(), ms)
 }
@@ -180,7 +188,9 @@ where
 /// Compare the three routes on `n` sign extractions at ring width `l_bits`.
 pub fn run(n: usize, l_bits: u32, profile: NetworkProfile) -> FalconReport {
     let l = 1u64 << l_bits;
-    let vals: Vec<u64> = (0..n).map(|i| (i as u64).wrapping_mul(0x9E37) % l).collect();
+    let vals: Vec<u64> = (0..n)
+        .map(|i| (i as u64).wrapping_mul(0x9E37) % l)
+        .collect();
     let want: Vec<u64> = vals
         .iter()
         .map(|&v| u64::from(crate::crypto::falcon::signed(v, l_bits) >= 0))
@@ -194,11 +204,15 @@ pub fn run(n: usize, l_bits: u32, profile: NetworkProfile) -> FalconReport {
             .iter()
             .map(|&v| {
                 let s = split(v, l);
-                PartyShare { left: s[me % 3] as u128, right: s[(me + 1) % 3] as u128 }
+                PartyShare {
+                    left: s[me % 3] as u128,
+                    right: s[(me + 1) % 3] as u128,
+                }
             })
             .collect();
-        let pre: Vec<WrapPreproc> =
-            (0..vs.len()).map(|i| wrap_preproc(i as u64, l_bits, me)).collect();
+        let pre: Vec<WrapPreproc> = (0..vs.len())
+            .map(|i| wrap_preproc(i as u64, l_bits, me))
+            .collect();
         drelu_batch(&a, &pre, l_bits, PC_ID_BLOCK, me, mbx)
     });
     let falcon_bits: Vec<u64> = (0..n)
@@ -239,7 +253,9 @@ pub fn run(n: usize, l_bits: u32, profile: NetworkProfile) -> FalconReport {
                 // Revealing here would charge this route one opening per
                 // element — 2n messages — for an output the other side leaves
                 // shared. The reconstruction happens outside the measurement.
-                bits.iter().map(|b| be.my_additive_component(b)).collect::<Vec<_>>()
+                bits.iter()
+                    .map(|b| be.my_additive_component(b))
+                    .collect::<Vec<_>>()
             }
         });
         let ms = t0.elapsed().as_secs_f64() * 1000.0;
@@ -274,12 +290,18 @@ pub fn run(n: usize, l_bits: u32, profile: NetworkProfile) -> FalconReport {
         for k in 1..n {
             src = format!("(+ {src} (> x{k} {ZERO_LIT}))");
         }
-        let binds: HashMap<String, i64> =
-            vals.iter().enumerate().map(|(k, &v)| (format!("x{k}"), signed_i64(v, l_bits))).collect();
+        let binds: HashMap<String, i64> = vals
+            .iter()
+            .enumerate()
+            .map(|(k, &v)| (format!("x{k}"), signed_i64(v, l_bits)))
+            .collect();
         let mut order: Vec<String> = binds.keys().cloned().collect();
         order.sort();
 
-        match parse(&src).ok().and_then(|e| CircuitCompiler::new().compile_fhe(&e).ok()) {
+        match parse(&src)
+            .ok()
+            .and_then(|e| CircuitCompiler::new().compile_fhe(&e).ok())
+        {
             Some(circuit) => {
                 let flat = reassociate_reductions(&circuit.flat_ops, &circuit.output_wire);
                 let ops = flat.len();
@@ -290,10 +312,7 @@ pub fn run(n: usize, l_bits: u32, profile: NetworkProfile) -> FalconReport {
                     let (flat, out_wire, binds, order) =
                         (flat.clone(), out_wire.clone(), binds.clone(), order.clone());
                     move |be: &mut TransportBackend<MpcTransport>| {
-                        let vals: Vec<Fr> = order
-                            .iter()
-                            .map(|k| residue(binds[k], nb))
-                            .collect();
+                        let vals: Vec<Fr> = order.iter().map(|k| residue(binds[k], nb)).collect();
                         // Public sharing, as the other routes use: the inputs
                         // are not what is being measured.
                         let env: HashMap<String, ShareRef> = order
@@ -301,17 +320,16 @@ pub fn run(n: usize, l_bits: u32, profile: NetworkProfile) -> FalconReport {
                             .cloned()
                             .zip(vals.iter().map(|&v| be.share_public(v, nb)))
                             .collect();
-                        let (r, _) =
-                            run_flat_with(be, &flat, &env, &out_wire, nb, Batching::Level)
-                                .expect("circuit executes");
+                        let (r, _) = run_flat_with(be, &flat, &env, &out_wire, nb, Batching::Level)
+                            .expect("circuit executes");
                         be.my_additive_component(&r)
                     }
                 });
                 let ms = t0.elapsed().as_secs_f64() * 1000.0;
                 // The compiled expression yields the *sum* of the sign bits, so
                 // agreement is checked on that rather than bit by bit.
-                let got = out[0].wrapping_add(out[1]).wrapping_add(out[2])
-                    & ((1u128 << l_bits) - 1);
+                let got =
+                    out[0].wrapping_add(out[1]).wrapping_add(out[2]) & ((1u128 << l_bits) - 1);
                 agree &= got == want.iter().sum::<u64>() as u128;
                 routes.push(RouteCost {
                     route: format!("baru-compiled ({ops} ops)"),
@@ -333,7 +351,12 @@ pub fn run(n: usize, l_bits: u32, profile: NetworkProfile) -> FalconReport {
         }
     }
 
-    FalconReport { n, l_bits, routes, agree }
+    FalconReport {
+        n,
+        l_bits,
+        routes,
+        agree,
+    }
 }
 
 /// Cost of one MedMNIST-shaped inference done **entirely in RSS**, Falcon's way.
@@ -380,7 +403,10 @@ pub fn run_net(l_bits: u32, d: u32, classes: usize, profile: NetworkProfile) -> 
             let me = mbx.id();
             let sh = |v: u64| {
                 let s = [v / 3, v / 3, v - 2 * (v / 3)];
-                PartyShare { left: s[me % 3] as u128, right: s[(me + 1) % 3] as u128 }
+                PartyShare {
+                    left: s[me % 3] as u128,
+                    right: s[(me + 1) % 3] as u128,
+                }
             };
             let mut op = 1u64;
             let mut bump = |n: u64| {
@@ -391,15 +417,17 @@ pub fn run_net(l_bits: u32, d: u32, classes: usize, profile: NetworkProfile) -> 
 
             // conv1: 1×28×28 → 8×26×26
             let img: Vec<PartyShare> = (0..28 * 28).map(|i| sh((i % 7) as u64)).collect();
-            let k1: Vec<Vec<PartyShare>> =
-                (0..8).map(|o| (0..9).map(|t| sh(((o + t) % 3) as u64)).collect()).collect();
+            let k1: Vec<Vec<PartyShare>> = (0..8)
+                .map(|o| (0..9).map(|t| sh(((o + t) % 3) as u64)).collect())
+                .collect();
             let c1 = conv_batch(&img, &k1, 1, 28, 28, 3, l_bits, bump(64), me, &mbx);
             let a1 = nonlin(&c1, d, l_bits, &mut bump, me, &mbx);
             let p1 = pool2x2(&a1, 8, 26, 26, l_bits, &mut bump, me, &mbx);
 
             // conv2: 8×13×13 → 16×11×11
-            let k2: Vec<Vec<PartyShare>> =
-                (0..16).map(|o| (0..72).map(|t| sh(((o + t) % 3) as u64)).collect()).collect();
+            let k2: Vec<Vec<PartyShare>> = (0..16)
+                .map(|o| (0..72).map(|t| sh(((o + t) % 3) as u64)).collect())
+                .collect();
             let c2 = conv_batch(&p1, &k2, 8, 13, 13, 3, l_bits, bump(64), me, &mbx);
             let a2 = nonlin(&c2, d, l_bits, &mut bump, me, &mbx);
             let p2 = pool2x2(&a2, 16, 11, 11, l_bits, &mut bump, me, &mbx);
@@ -410,8 +438,9 @@ pub fn run_net(l_bits: u32, d: u32, classes: usize, profile: NetworkProfile) -> 
                 .collect();
             let z1 = dense_batch(&p2, &w1, l_bits, bump(64), me, &mbx);
             let h1 = nonlin(&z1, d, l_bits, &mut bump, me, &mbx);
-            let w2: Vec<Vec<PartyShare>> =
-                (0..classes).map(|o| (0..128).map(|t| sh(((o + t) % 3) as u64)).collect()).collect();
+            let w2: Vec<Vec<PartyShare>> = (0..classes)
+                .map(|o| (0..128).map(|t| sh(((o + t) % 3) as u64)).collect())
+                .collect();
             dense_batch(&h1, &w2, l_bits, bump(64), me, &mbx).len()
         }));
     }
@@ -453,11 +482,17 @@ fn nonlin<T: crate::crypto::net::Transport>(
             let r = ((i as u64).wrapping_mul(41) % (l / 8)) + 1;
             let three = |v: u64| {
                 let s = [v, 0, 0];
-                PartyShare { left: s[me % 3] as u128, right: s[(me + 1) % 3] as u128 }
+                PartyShare {
+                    left: s[me % 3] as u128,
+                    right: s[(me + 1) % 3] as u128,
+                }
             };
             let rs = [r / 3, r / 3, r - 2 * (r / 3)];
             TruncPreproc {
-                r: PartyShare { left: rs[me % 3] as u128, right: rs[(me + 1) % 3] as u128 },
+                r: PartyShare {
+                    left: rs[me % 3] as u128,
+                    right: rs[(me + 1) % 3] as u128,
+                },
                 r_shifted: three(r >> d),
                 r_lo: three(r & ((1u64 << d) - 1)),
                 sel: sel_pre(9000 + i as u64, l_bits, me),
@@ -465,8 +500,12 @@ fn nonlin<T: crate::crypto::net::Transport>(
         })
         .collect();
     let t = truncate_batch(z, &tp, d, l_bits, bump(256), me, mbx);
-    let wp: Vec<_> = (0..n).map(|i| wrap_preproc(7000 + i as u64, l_bits, me)).collect();
-    let sp: Vec<_> = (0..n).map(|i| sel_pre(8000 + i as u64, l_bits, me)).collect();
+    let wp: Vec<_> = (0..n)
+        .map(|i| wrap_preproc(7000 + i as u64, l_bits, me))
+        .collect();
+    let sp: Vec<_> = (0..n)
+        .map(|i| sel_pre(8000 + i as u64, l_bits, me))
+        .collect();
     relu_batch(&t, &wp, &sp, l_bits, bump(256), me, mbx)
 }
 
@@ -499,10 +538,18 @@ fn pool2x2<T: crate::crypto::net::Transport>(
     }
     let nw = windows.len();
     let wp: Vec<Vec<_>> = (0..nw)
-        .map(|i| (0..3).map(|k| wrap_preproc((i * 11 + k) as u64, l_bits, me)).collect())
+        .map(|i| {
+            (0..3)
+                .map(|k| wrap_preproc((i * 11 + k) as u64, l_bits, me))
+                .collect()
+        })
         .collect();
     let sp: Vec<Vec<_>> = (0..nw)
-        .map(|i| (0..3).map(|k| sel_pre((i * 13 + k) as u64, l_bits, me)).collect())
+        .map(|i| {
+            (0..3)
+                .map(|k| sel_pre((i * 13 + k) as u64, l_bits, me))
+                .collect()
+        })
         .collect();
     maxpool_batch(&windows, &wp, &sp, l_bits, bump(1024), me, mbx)
 }
@@ -514,7 +561,10 @@ fn sel_pre(seed: u64, l_bits: u32, me: PartyId) -> crate::crypto::falcon_mpc::Se
     let _ = l_bits;
     crate::crypto::falcon_mpc::SelectPreproc {
         c_bit: [c[me % 3], c[(me + 1) % 3]],
-        c_ring: PartyShare { left: cr[me % 3], right: cr[(me + 1) % 3] },
+        c_ring: PartyShare {
+            left: cr[me % 3],
+            right: cr[(me + 1) % 3],
+        },
     }
 }
 
@@ -534,8 +584,16 @@ mod tests {
     fn every_nonlinearity_mode_computes_the_same_comparison() {
         const NBITS: usize = 20;
         let l = 1i128 << NBITS;
-        let cases: Vec<(i128, i128)> =
-            vec![(5, 3), (3, 5), (0, 0), (-7, 2), (2, -7), (-1, -1), (100, -100), (-100, 100)];
+        let cases: Vec<(i128, i128)> = vec![
+            (5, 3),
+            (3, 5),
+            (0, 0),
+            (-7, 2),
+            (2, -7),
+            (-1, -1),
+            (100, -100),
+            (-100, 100),
+        ];
         let want: Vec<u64> = cases.iter().map(|&(a, b)| u64::from(a < b)).collect();
 
         let mut seen = Vec::new();
@@ -549,7 +607,10 @@ mod tests {
                     let pairs: Vec<_> = cs
                         .iter()
                         .map(|&(a, b)| {
-                            (be.share_public(enc(a), NBITS), be.share_public(enc(b), NBITS))
+                            (
+                                be.share_public(enc(a), NBITS),
+                                be.share_public(enc(b), NBITS),
+                            )
                         })
                         .collect();
                     let bits = be.lt_batch(&pairs);
@@ -557,10 +618,18 @@ mod tests {
                 }
             });
             let got: Vec<u64> = out[0].iter().map(|&v| (v & 1) as u64).collect();
-            assert_eq!(got, want, "{} disagreed with plaintext (a < b)", mode.label());
+            assert_eq!(
+                got,
+                want,
+                "{} disagreed with plaintext (a < b)",
+                mode.label()
+            );
             seen.push(got);
         }
-        assert!(seen.windows(2).all(|w| w[0] == w[1]), "modes must agree with each other");
+        assert!(
+            seen.windows(2).all(|w| w[0] == w[1]),
+            "modes must agree with each other"
+        );
     }
 }
 
@@ -579,9 +648,19 @@ pub fn run_cli(args: &[String]) -> Result<(), String> {
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
-            "--n" => n = it.next().ok_or("--n needs a value")?.parse().map_err(|_| "bad --n")?,
+            "--n" => {
+                n = it
+                    .next()
+                    .ok_or("--n needs a value")?
+                    .parse()
+                    .map_err(|_| "bad --n")?
+            }
             "--bits" => {
-                bits = it.next().ok_or("--bits needs a value")?.parse().map_err(|_| "bad --bits")?
+                bits = it
+                    .next()
+                    .ok_or("--bits needs a value")?
+                    .parse()
+                    .map_err(|_| "bad --bits")?
             }
             "--net" => net = true,
             "--json" => json = true,
@@ -595,7 +674,10 @@ pub fn run_cli(args: &[String]) -> Result<(), String> {
     if net {
         let r = run_net(bits, 8, 2, NetworkProfile::INSTANT);
         if json {
-            println!("{}", serde_json::to_string_pretty(&r).map_err(|e| e.to_string())?);
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&r).map_err(|e| e.to_string())?
+            );
             return Ok(());
         }
         println!("MedMNIST-shaped inference, entirely in RSS (Falcon's approach)");
@@ -617,11 +699,17 @@ pub fn run_cli(args: &[String]) -> Result<(), String> {
     }
     let r = run(n, bits, NetworkProfile::INSTANT);
     if json {
-        println!("{}", serde_json::to_string_pretty(&r).map_err(|e| e.to_string())?);
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&r).map_err(|e| e.to_string())?
+        );
         return Ok(());
     }
     println!("Sign extraction: Falcon's wrap3 vs Baru's routes");
-    println!("n = {}, ring width = {} bits, same transport\n", r.n, r.l_bits);
+    println!(
+        "n = {}, ring width = {} bits, same transport\n",
+        r.n, r.l_bits
+    );
     println!(
         "  {:<26}{:>9}{:>12}{:>10}{:>12}{:>9}",
         "route", "messages", "bytes", "B/sign", "ring elems", "ms"
@@ -639,18 +727,26 @@ pub fn run_cli(args: &[String]) -> Result<(), String> {
     }
     println!(
         "\n  all routes agree on every sign bit: {}",
-        if r.agree { "yes" } else { "NO — costs are not comparable" }
+        if r.agree {
+            "yes"
+        } else {
+            "NO — costs are not comparable"
+        }
     );
 
-    println!(
-        "\n  Per-sign information content, once the encoding is accounted for:"
-    );
+    println!("\n  Per-sign information content, once the encoding is accounted for:");
     for c in &r.routes {
         let elems = c.ring_elements() as f64 / r.n as f64;
         let note = if c.route.starts_with("falcon") {
-            format!("{:.1} B — Z_p, already bit-packed at 6 bits", c.bytes as f64 / r.n as f64)
+            format!(
+                "{:.1} B — Z_p, already bit-packed at 6 bits",
+                c.bytes as f64 / r.n as f64
+            )
         } else if c.route.starts_with("baru-gc") {
-            format!("~{:.0} B — garbled tables, already Vec<u8>", c.bytes as f64 / r.n as f64)
+            format!(
+                "~{:.0} B — garbled tables, already Vec<u8>",
+                c.bytes as f64 / r.n as f64
+            )
         } else {
             format!(
                 "~{:.0} B — {elems:.0} elements x 1 bit (a2b works on BIT shares, \

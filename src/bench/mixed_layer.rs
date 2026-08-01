@@ -140,7 +140,9 @@ pub fn run(n: usize) -> Result<Vec<Point>, String> {
         }
         let placement = Placement::by_kind(routing.clone()).sink_to_fhe(&flat);
         let refinements = placement.refinements();
-        let (r, st) = run_mixed(&mut be, &fhe, &ck, &flat, &env, &out_wire, NBITS, &placement)?;
+        let (r, st) = run_mixed(
+            &mut be, &fhe, &ck, &flat, &env, &out_wire, NBITS, &placement,
+        )?;
         let got = to_signed(be.reveal(&r, None));
 
         pts.push(Point {
@@ -229,7 +231,11 @@ pub fn run_cli(args: &[String]) -> Result<(), String> {
                     .next()
                     .ok_or("--rtt-ms needs a value")?
                     .split(',')
-                    .map(|x| x.trim().parse::<u64>().map_err(|_| "bad --rtt-ms".to_string()))
+                    .map(|x| {
+                        x.trim()
+                            .parse::<u64>()
+                            .map_err(|_| "bad --rtt-ms".to_string())
+                    })
                     .collect::<Result<_, _>>()?
             }
             "-h" | "--help" => {
@@ -480,13 +486,23 @@ pub fn run_deployed(
              with a larger ring."
         ));
     }
-    let s = Bfv::new(BfvParams { n: 4096, log2_q: 100, log2_t });
+    let s = Bfv::new(BfvParams {
+        n: 4096,
+        log2_q: 100,
+        log2_t,
+    });
     let (ck, _pk) = s.keygen();
 
     let share = move |be: &mut TransportBackend<MpcTransport>, me: usize, v: &[i64]| {
         let vals: Vec<Fr> = v
             .iter()
-            .map(|&x| if me == 0 { (x as i128).rem_euclid(1i128 << w) as Fr } else { 0 })
+            .map(|&x| {
+                if me == 0 {
+                    (x as i128).rem_euclid(1i128 << w) as Fr
+                } else {
+                    0
+                }
+            })
             .collect();
         be.share_secret_batch(&vals, w, 0)
     };
@@ -534,7 +550,9 @@ pub fn run_deployed(
                 let av = share(be, me, &a2);
                 let bv = share(be, me, &b2);
                 let mine = |v: &[ShareRef], be: &TransportBackend<MpcTransport>| -> Vec<i64> {
-                    v.iter().map(|s| be.my_additive_component(s) as i64).collect()
+                    v.iter()
+                        .map(|s| be.my_additive_component(s) as i64)
+                        .collect()
                 };
                 (mine(&av, be), mine(&bv, be))
             }
@@ -608,7 +626,10 @@ pub fn run_deployed(
         let t = std::time::Instant::now();
         let w_mask = (1u64 << w) - 1;
         let split = |v: &[i64], rng: &mut rand::rngs::ThreadRng| -> Vec<Vec<i64>> {
-            let p0: Vec<i64> = v.iter().map(|_| (rng.gen::<u64>() & w_mask) as i64).collect();
+            let p0: Vec<i64> = v
+                .iter()
+                .map(|_| (rng.gen::<u64>() & w_mask) as i64)
+                .collect();
             let p1: Vec<i64> = v
                 .iter()
                 .zip(&p0)
@@ -626,8 +647,14 @@ pub fn run_deployed(
             let ca = s.encrypt_poly(&ck, &s.pack_input(&a_parts[p]));
             let cb = s.encrypt_poly(&ck, &s.pack_weights(&[b_parts[p].clone()]));
             link += s.ct_bytes(&ca) + s.ct_bytes(&cb);
-            ct_a = Some(match ct_a { None => ca, Some(x) => s.add(&x, &ca) });
-            ct_b = Some(match ct_b { None => cb, Some(x) => s.add(&x, &cb) });
+            ct_a = Some(match ct_a {
+                None => ca,
+                Some(x) => s.add(&x, &ca),
+            });
+            ct_b = Some(match ct_b {
+                None => cb,
+                Some(x) => s.add(&x, &cb),
+            });
         }
         sleep_link(&profile, link, 1);
         let prod = s.mul(&ct_a.expect("a"), &ct_b.expect("b"));
@@ -667,8 +694,14 @@ pub fn run_deployed(
         use crate::mpcc::vm::ShareEngine;
         let t = std::time::Instant::now();
         let mut eng = Semi2kEngine::new(2, w as u32)?;
-        let av: Vec<_> = a.iter().map(|&x| eng.input((x as i128).rem_euclid(1i128 << w) as u64, 0)).collect();
-        let bv: Vec<_> = b.iter().map(|&x| eng.input((x as i128).rem_euclid(1i128 << w) as u64, 1)).collect();
+        let av: Vec<_> = a
+            .iter()
+            .map(|&x| eng.input((x as i128).rem_euclid(1i128 << w) as u64, 0))
+            .collect();
+        let bv: Vec<_> = b
+            .iter()
+            .map(|&x| eng.input((x as i128).rem_euclid(1i128 << w) as u64, 1))
+            .collect();
         let pairs: Vec<_> = av.into_iter().zip(bv).collect();
         let prods = eng.mul_batch(&pairs);
         let mut acc = prods[0].clone();

@@ -123,9 +123,17 @@ pub struct BgvParams {
 impl BgvParams {
     /// Secure depth-1 default — deliberately identical to [`crate::fhe::bfv`]'s
     /// so the two encodings can be compared at equal parameters.
-    pub const DEFAULT: BgvParams = BgvParams { n: 4096, log2_q: 100, t: 1 << 20 };
+    pub const DEFAULT: BgvParams = BgvParams {
+        n: 4096,
+        log2_q: 100,
+        t: 1 << 20,
+    };
     /// Small ring for fast unit tests (NOT secure — testing only).
-    pub const TEST_SMALL: BgvParams = BgvParams { n: 64, log2_q: 100, t: 1 << 20 };
+    pub const TEST_SMALL: BgvParams = BgvParams {
+        n: 64,
+        log2_q: 100,
+        t: 1 << 20,
+    };
 
     fn q_mask(&self) -> u128 {
         (1u128 << self.log2_q) - 1
@@ -147,7 +155,10 @@ impl BgvParams {
 type Poly = Vec<u128>;
 
 fn poly_add(a: &[u128], b: &[u128], mask: u128) -> Poly {
-    a.iter().zip(b).map(|(x, y)| x.wrapping_add(*y) & mask).collect()
+    a.iter()
+        .zip(b)
+        .map(|(x, y)| x.wrapping_add(*y) & mask)
+        .collect()
 }
 
 fn center(c: u128, p: &BgvParams) -> i128 {
@@ -205,7 +216,9 @@ fn scale_by_t(e: &[u128], p: &BgvParams) -> Poly {
     // A multiply rather than a shift, so a prime `t` works too. For a ternary
     // `x` held as `0 / 1 / u128::MAX`, wrapping multiplication gives `−t mod q`
     // in the `−1` case, which is what the mask then selects.
-    e.iter().map(|&x| x.wrapping_mul(p.t as u128) & mask).collect()
+    e.iter()
+        .map(|&x| x.wrapping_mul(p.t as u128) & mask)
+        .collect()
 }
 
 // ─── Keys & ciphertexts ───────────────────────────────────────────────────────
@@ -262,8 +275,18 @@ impl Bgv {
         let b: Poly = (0..p.n)
             .map(|i| 0u128.wrapping_sub(a_s[i]).wrapping_sub(te[i]) & mask)
             .collect();
-        let client = bincode::serialize(&KeyBundle { s: s.clone(), b: b.clone(), a: a.clone() }).unwrap();
-        let server = bincode::serialize(&KeyBundle { s: Vec::new(), b, a }).unwrap();
+        let client = bincode::serialize(&KeyBundle {
+            s: s.clone(),
+            b: b.clone(),
+            a: a.clone(),
+        })
+        .unwrap();
+        let server = bincode::serialize(&KeyBundle {
+            s: Vec::new(),
+            b,
+            a,
+        })
+        .unwrap();
         (client, server)
     }
 
@@ -292,7 +315,9 @@ impl Bgv {
                 ub[i].wrapping_add(te1[i]).wrapping_add(mi) & mask
             })
             .collect();
-        let c1: Poly = (0..p.n).map(|i| ua[i].wrapping_add(te2[i]) & mask).collect();
+        let c1: Poly = (0..p.n)
+            .map(|i| ua[i].wrapping_add(te2[i]) & mask)
+            .collect();
         BgvCt { c: vec![c0, c1] }
     }
 
@@ -416,7 +441,13 @@ impl Bgv {
         let n = a.c.len().max(b.c.len());
         let zero = vec![0u128; self.params.n];
         let c: Vec<Vec<u128>> = (0..n)
-            .map(|i| poly_add(a.c.get(i).unwrap_or(&zero), b.c.get(i).unwrap_or(&zero), mask))
+            .map(|i| {
+                poly_add(
+                    a.c.get(i).unwrap_or(&zero),
+                    b.c.get(i).unwrap_or(&zero),
+                    mask,
+                )
+            })
             .collect();
         BgvCt { c }
     }
@@ -572,7 +603,11 @@ mod tests {
             let cb = s.encrypt_scalar(&pk, b);
             let cm = s.mul(&ca, &cb);
             assert_eq!(cm.key_pow(), 2, "product must be degree-2 (no relin)");
-            assert_eq!(s.decrypt_scalar(&ck, &cm), (a * b) % (1 << 20), "{a}*{b} under s²");
+            assert_eq!(
+                s.decrypt_scalar(&ck, &cm),
+                (a * b) % (1 << 20),
+                "{a}*{b} under s²"
+            );
         }
     }
 
@@ -585,7 +620,11 @@ mod tests {
         let t = s.params.t();
         for v in [-1i64, -7, -1000, -(1 << 18)] {
             let ct = s.encrypt_scalar(&pk, (v.rem_euclid(t as i64)) as u64);
-            assert_eq!(s.to_signed(s.decrypt_scalar(&ck, &ct)), v, "encrypt/decrypt {v}");
+            assert_eq!(
+                s.to_signed(s.decrypt_scalar(&ck, &ct)),
+                v,
+                "encrypt/decrypt {v}"
+            );
         }
         // and through a multiplication
         let ca = s.encrypt_scalar(&pk, (-6i64).rem_euclid(t as i64) as u64);
@@ -600,7 +639,11 @@ mod tests {
         let s = scheme();
         let (ck, pk) = s.keygen();
         let x = vec![3i64, -4, 5, -1];
-        let w = vec![vec![2i64, 3, -1, 4], vec![-5i64, 1, 0, 2], vec![7i64, -7, 2, 2]];
+        let w = vec![
+            vec![2i64, 3, -1, 4],
+            vec![-5i64, 1, 0, 2],
+            vec![7i64, -7, 2, 2],
+        ];
         let cx = s.encrypt_poly(&pk, &s.pack_input(&x));
         let cw = s.encrypt_poly(&pk, &s.pack_weights(&w));
         let prod = s.mul(&cx, &cw);
@@ -620,7 +663,11 @@ mod tests {
         let mut m = vec![0u64; s.params.n];
         m[0] = 3;
         let out = s.mul_plain_poly(&ct, &m);
-        assert_eq!(out.key_pow(), 1, "plaintext multiply must not raise the degree");
+        assert_eq!(
+            out.key_pow(),
+            1,
+            "plaintext multiply must not raise the degree"
+        );
         assert_eq!(s.decrypt_scalar(&ck, &out), 63);
     }
 
@@ -654,11 +701,19 @@ mod tests {
     #[test]
     fn prime_plaintext_modulus_round_trips() {
         // n=64 needs t ≡ 1 mod 128; 3329 is prime and 26·128 + 1.
-        let s = Bgv::new(BgvParams { n: 64, log2_q: 100, t: 3329 });
+        let s = Bgv::new(BgvParams {
+            n: 64,
+            log2_q: 100,
+            t: 3329,
+        });
         assert!(s.params.supports_slots());
         let (ck, pk) = s.keygen();
         for v in [0u64, 1, 17, 3328] {
-            assert_eq!(s.decrypt_scalar(&ck, &s.encrypt_scalar(&pk, v)), v, "scalar {v}");
+            assert_eq!(
+                s.decrypt_scalar(&ck, &s.encrypt_scalar(&pk, v)),
+                v,
+                "scalar {v}"
+            );
         }
         let m: Vec<u64> = (0..s.params.n as u64).map(|i| i % 3329).collect();
         assert_eq!(s.decrypt_poly(&ck, &s.encrypt_poly(&pk, &m)), m);
@@ -729,7 +784,11 @@ mod tests {
         let out = s.decrypt_poly(&ck, &prod);
         for (r, row) in w.iter().enumerate() {
             let expected: i64 = x.iter().zip(row).map(|(a, b)| a * b).sum();
-            assert_eq!(s.to_signed(out[s.matvec_output_position(x.len(), r)]), expected, "row {r}");
+            assert_eq!(
+                s.to_signed(out[s.matvec_output_position(x.len(), r)]),
+                expected,
+                "row {r}"
+            );
         }
     }
 
@@ -745,7 +804,11 @@ mod tests {
     #[ignore] // n=4096 ring — slow in debug, fast in release
     fn measures_post_multiply_noise_budget() {
         for (log2_t, wmag) in [(20u32, 8i64), (24, 8), (20, 64)] {
-            let p = BgvParams { n: 4096, log2_q: 100, t: 1u64 << log2_t };
+            let p = BgvParams {
+                n: 4096,
+                log2_q: 100,
+                t: 1u64 << log2_t,
+            };
             let s = Bgv::new(p);
             let (ck, pk) = s.keygen();
             let t = p.t();

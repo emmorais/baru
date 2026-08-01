@@ -45,8 +45,8 @@
 use std::collections::HashMap;
 
 use binius_frontend::{CircuitBuilder, Wire};
-use binius_verifier::config::StdChallenger;
 use binius_prover::OptimalPackedB128;
+use binius_verifier::config::StdChallenger;
 use binius_verifier::hash::sha256::Sha256HashSuite;
 use serde::{Deserialize, Serialize};
 
@@ -171,17 +171,16 @@ impl Ir {
                     // would need a 64-way multiplexer, which is a different
                     // construction rather than a bigger one.
                     BinOp::AshLeft | BinOp::AshRight => {
-                        let amount = match self.ops.get(y as usize) {
-                            Some(Op::Const(n)) if (0..64).contains(n) => *n as u32,
-                            _ => {
-                                return Err(
+                        let amount =
+                            match self.ops.get(y as usize) {
+                                Some(Op::Const(n)) if (0..64).contains(n) => *n as u32,
+                                _ => return Err(
                                     "binius64: shift amounts must be public constants in 0..64; \
                                      a secret shift needs a multiplexer construction that does \
                                      not exist here"
                                         .to_string(),
-                                )
-                            }
-                        };
+                                ),
+                            };
                         // The constant node stays in the IR but is unused by the
                         // shift, which is harmless — it compiles to a constant
                         // wire nothing reads.
@@ -343,7 +342,10 @@ fn emit_divmod(b: &CircuitBuilder, a: Wire, d: Wire, q: Wire, r: Wire) {
     let abs_r = abs(b, r);
     let abs_d = abs(b, d);
     b.assert_true("div/remainder-magnitude", signed_lt(b, abs_r, abs_d));
-    b.assert_false("div/divisor-not-int-min", b.icmp_ult(abs_d, b.add_constant_64(1)));
+    b.assert_false(
+        "div/divisor-not-int-min",
+        b.icmp_ult(abs_d, b.add_constant_64(1)),
+    );
 
     // 5. Truncation toward zero: the remainder takes the dividend's sign, or is
     //    zero. Without this, (q, r) and (q±1, r∓d) would both satisfy 1–4.
@@ -599,7 +601,12 @@ impl ZKPBackend for Binius64Real {
         use binius_verifier::Verifier;
 
         let ir = Self::ir_of(circuit)?;
-        let Built { circuit: built, named: wires, divmod_wires, .. } = build(&ir);
+        let Built {
+            circuit: built,
+            named: wires,
+            divmod_wires,
+            ..
+        } = build(&ir);
 
         // Populate the witness. Every declared input must be supplied — a
         // missing one is an error, not a zero, because silently substituting
@@ -675,7 +682,12 @@ impl ZKPBackend for Binius64Real {
         use binius_verifier::Verifier;
 
         let ir = Self::ir_of(circuit)?;
-        let Built { circuit: built, named: wires, divmod_wires, .. } = build(&ir);
+        let Built {
+            circuit: built,
+            named: wires,
+            divmod_wires,
+            ..
+        } = build(&ir);
 
         // The public values the *verifier* was given are the statement. They
         // must also match what the proof carries, or a prover could prove one
@@ -724,10 +736,8 @@ impl ZKPBackend for Binius64Real {
         let verifier = Verifier::<Sha256HashSuite>::setup(cs, LOG_INV_RATE)
             .map_err(|e| format!("binius64: verifier setup failed: {e}"))?;
 
-        let mut transcript = VerifierTranscript::new(
-            StdChallenger::default(),
-            proof.proof_data.clone(),
-        );
+        let mut transcript =
+            VerifierTranscript::new(StdChallenger::default(), proof.proof_data.clone());
         match verifier.verify(value_vec.public(), &mut transcript) {
             Ok(()) => transcript
                 .finalize()

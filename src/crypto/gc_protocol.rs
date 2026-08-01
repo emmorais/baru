@@ -69,8 +69,8 @@ use crate::crypto::aby3_protocol::{
     add_party, mul_batch_party, scalar_mul_party, share_input_batch, sub_party, PartyShare,
 };
 use crate::crypto::garbled::{eval_and, eval_xor, AndTable, Garbler, Label};
-use crate::crypto::security::{Abort, AbortReason, Checked};
 use crate::crypto::net::{serialize_msg, Mailbox, MpcMsg, PartyId, Transport};
+use crate::crypto::security::{Abort, AbortReason, Checked};
 use crate::crypto::types::Fr;
 
 const LABEL_BYTES: usize = 16;
@@ -156,7 +156,11 @@ impl Shape {
     }
     /// Garble one item, returning `(input_zero_labels_x, input_zero_labels_y,
     /// tables, per-output-bit garbler mask)`.
-    fn garble(&self, g: &mut Garbler, nbits: usize) -> (Vec<Label>, Vec<Label>, Vec<AndTable>, Vec<bool>) {
+    fn garble(
+        &self,
+        g: &mut Garbler,
+        nbits: usize,
+    ) -> (Vec<Label>, Vec<Label>, Vec<AndTable>, Vec<bool>) {
         match self {
             Shape::Comparator => {
                 let c = g.garble_comparator(nbits);
@@ -174,7 +178,13 @@ impl Shape {
 /// two summands, evaluate one item and return the observed output bits
 /// (`out ⊕ mask`). Mirrors the gate order and deterministic tweaks of the
 /// garbler (`crypto::garbled`), so no tweaks travel on the wire.
-fn eval_item(shape: Shape, nbits: usize, tables: &[AndTable], xa: &[Label], ya: &[Label]) -> Vec<bool> {
+fn eval_item(
+    shape: Shape,
+    nbits: usize,
+    tables: &[AndTable],
+    xa: &[Label],
+    ya: &[Label],
+) -> Vec<bool> {
     // Ripple-carry adder over the two summands, shared by both shapes.
     // Produces the `nbits` sum labels (mod 2^nbits); ANDs consume tables 0..nbits-1.
     let mut s = vec![[0u8; LABEL_BYTES]; nbits];
@@ -195,7 +205,11 @@ fn eval_item(shape: Shape, nbits: usize, tables: &[AndTable], xa: &[Label], ya: 
             };
             let and = eval_and(&u, &v, &tables[ti], 2 * i as u64);
             ti += 1;
-            carry = if carry_const0 { and } else { eval_xor(&and, &carry) };
+            carry = if carry_const0 {
+                and
+            } else {
+                eval_xor(&and, &carry)
+            };
             carry_const0 = false;
         }
     }
@@ -273,7 +287,11 @@ fn garble_evaluate<T: Transport>(
 
     let n = xs.len().max(ys.len()).max(1);
     let n = if is_garbler(me) {
-        if me == 0 { xs.len() } else { ys.len() }
+        if me == 0 {
+            xs.len()
+        } else {
+            ys.len()
+        }
     } else {
         n
     };
@@ -318,21 +336,37 @@ fn garble_evaluate<T: Transport>(
         }
         mbx.send(
             EVALUATOR,
-            serialize_msg(&MpcMsg::GcFromGarbler { op_id, garbler: me, payload }),
+            serialize_msg(&MpcMsg::GcFromGarbler {
+                op_id,
+                garbler: me,
+                payload,
+            }),
         );
-        GcOutput { masks, observed: Vec::new(), table_mismatch: false }
+        GcOutput {
+            masks,
+            observed: Vec::new(),
+            table_mismatch: false,
+        }
     } else {
         // Evaluator: collect both garblers' payloads (any order).
         let mut p0: Option<Vec<u8>> = None;
         let mut p1: Option<Vec<u8>> = None;
         while p0.is_none() || p1.is_none() {
             let (_from, m) = mbx
-                .recv_matching(TIMEOUT_MS, |m| {
-                    matches!(m, MpcMsg::GcFromGarbler { op_id: o, .. } if *o == op_id)
-                })
+                .recv_matching(
+                    TIMEOUT_MS,
+                    |m| matches!(m, MpcMsg::GcFromGarbler { op_id: o, .. } if *o == op_id),
+                )
                 .unwrap_or_else(|| panic!("gc: evaluator timeout on op_id={op_id}"));
-            if let MpcMsg::GcFromGarbler { garbler, payload, .. } = m {
-                if garbler == 0 { p0 = Some(payload); } else { p1 = Some(payload); }
+            if let MpcMsg::GcFromGarbler {
+                garbler, payload, ..
+            } = m
+            {
+                if garbler == 0 {
+                    p0 = Some(payload);
+                } else {
+                    p1 = Some(payload);
+                }
             }
         }
         let p0 = p0.unwrap();
@@ -344,7 +378,11 @@ fn garble_evaluate<T: Transport>(
         let digest_bytes = if verify { 32 } else { 0 };
         let n = (p1.len() - digest_bytes) / g1_per;
         debug_assert_eq!(p0.len(), n * g0_per, "garbler-0 payload size");
-        debug_assert_eq!(p1.len(), n * g1_per + digest_bytes, "garbler-1 payload size");
+        debug_assert_eq!(
+            p1.len(),
+            n * g1_per + digest_bytes,
+            "garbler-1 payload size"
+        );
 
         let mut observed = Vec::with_capacity(n);
         let mut seen_tables: Vec<Vec<AndTable>> = Vec::new();
@@ -353,12 +391,19 @@ fn garble_evaluate<T: Transport>(
             let mut tables = Vec::with_capacity(n_and);
             for t in 0..n_and {
                 let o = base0 + t * TABLE_BYTES;
-                tables.push(AndTable { tg: read_label(&p0, o), te: read_label(&p0, o + LABEL_BYTES) });
+                tables.push(AndTable {
+                    tg: read_label(&p0, o),
+                    te: read_label(&p0, o + LABEL_BYTES),
+                });
             }
             let xbase = base0 + n_and * TABLE_BYTES;
-            let xa: Vec<Label> = (0..nbits).map(|i| read_label(&p0, xbase + i * LABEL_BYTES)).collect();
+            let xa: Vec<Label> = (0..nbits)
+                .map(|i| read_label(&p0, xbase + i * LABEL_BYTES))
+                .collect();
             let ybase = item * g1_per;
-            let ya: Vec<Label> = (0..nbits).map(|i| read_label(&p1, ybase + i * LABEL_BYTES)).collect();
+            let ya: Vec<Label> = (0..nbits)
+                .map(|i| read_label(&p1, ybase + i * LABEL_BYTES))
+                .collect();
             observed.push(eval_item(shape, nbits, &tables, &xa, &ya));
             if verify {
                 seen_tables.push(tables);
@@ -371,7 +416,11 @@ fn garble_evaluate<T: Transport>(
             let claimed = &p1[n * g1_per..];
             table_digest(&seen_tables) != claimed
         };
-        GcOutput { masks: Vec::new(), observed, table_mismatch }
+        GcOutput {
+            masks: Vec::new(),
+            observed,
+            table_mismatch,
+        }
     }
 }
 
@@ -394,7 +443,11 @@ fn y2a<T: Transport>(
     // Flatten to per-(item,bit) so we can batch the XOR multiply.
     let total = n * width;
     let mut next_id = id_base;
-    let take = |n: &mut u64| { let v = *n; *n += 1; v };
+    let take = |n: &mut u64| {
+        let v = *n;
+        *n += 1;
+        v
+    };
 
     // Re-share observed bits (owner = evaluator) and mask bits (owner = P0).
     //
@@ -410,7 +463,11 @@ fn y2a<T: Transport>(
     let obs_vals: Vec<Fr> = (0..n)
         .flat_map(|item| {
             (0..width).map(move |b| {
-                if me == EVALUATOR { out.observed[item][b] as Fr } else { 0 }
+                if me == EVALUATOR {
+                    out.observed[item][b] as Fr
+                } else {
+                    0
+                }
             })
         })
         .collect();
@@ -431,7 +488,12 @@ fn y2a<T: Transport>(
         .collect();
     let prods = mul_batch_party(&pairs, prod_base, me, mbx);
     let xor_bits: Vec<PartyShare> = (0..total)
-        .map(|k| sub_party(&add_party(&obs_sh[k], &mask_sh[k]), &scalar_mul_party(&prods[k], 2)))
+        .map(|k| {
+            sub_party(
+                &add_party(&obs_sh[k], &mask_sh[k]),
+                &scalar_mul_party(&prods[k], 2),
+            )
+        })
         .collect();
 
     // Recompose Σ 2ⁱ·bitᵢ per item (local).
@@ -482,7 +544,11 @@ pub fn gc_lt_batch<T: Transport>(
     if n == 0 {
         return Vec::new();
     }
-    let mask = if nbits >= 128 { Fr::MAX } else { (1u128 << nbits) - 1 };
+    let mask = if nbits >= 128 {
+        Fr::MAX
+    } else {
+        (1u128 << nbits) - 1
+    };
     // pre = a − b (local); x = s₀+s₁ (garbler 0), y = s₂ (garbler 1).
     let diffs: Vec<PartyShare> = (0..n).map(|i| sub_party(&a[i], &b[i])).collect();
     let (xs, ys) = summands(&diffs, mask, me);
@@ -511,7 +577,11 @@ pub fn gc_lt_batch_table_checked<T: Transport>(
     if n == 0 {
         return Ok(Vec::new());
     }
-    let mask = if nbits >= 128 { Fr::MAX } else { (1u128 << nbits) - 1 };
+    let mask = if nbits >= 128 {
+        Fr::MAX
+    } else {
+        (1u128 << nbits) - 1
+    };
     let diffs: Vec<PartyShare> = (0..n).map(|i| sub_party(&a[i], &b[i])).collect();
     let (xs, ys) = summands(&diffs, mask, me);
     let out = garble_evaluate(Shape::Comparator, nbits, &xs, &ys, op_id, me, mbx, true);
@@ -524,7 +594,10 @@ pub fn gc_lt_batch_table_checked<T: Transport>(
     // when `mismatch` is set; the caller must honour the `Err`.
     let shares = y2a(&out, n, 1, nbits, op_id + 1, me, mbx);
     if mismatch {
-        return Err(Abort::new(AbortReason::GarbleMismatch, "gc table cross-check"));
+        return Err(Abort::new(
+            AbortReason::GarbleMismatch,
+            "gc table cross-check",
+        ));
     }
     Ok(shares)
 }
@@ -597,10 +670,23 @@ pub fn gc_relu_batch<T: Transport>(
     if n == 0 {
         return Vec::new();
     }
-    let mask = if nbits >= 128 { Fr::MAX } else { (1u128 << nbits) - 1 };
+    let mask = if nbits >= 128 {
+        Fr::MAX
+    } else {
+        (1u128 << nbits) - 1
+    };
     let (xs, ys) = summands(vals, mask, me);
     let width = nbits - shift;
-    let out = garble_evaluate(Shape::Relu { shift }, nbits, &xs, &ys, op_id, me, mbx, false);
+    let out = garble_evaluate(
+        Shape::Relu { shift },
+        nbits,
+        &xs,
+        &ys,
+        op_id,
+        me,
+        mbx,
+        false,
+    );
     y2a(&out, n, width, nbits, op_id + 1, me, mbx)
 }
 
@@ -610,7 +696,10 @@ pub fn gc_relu_batch<T: Transport>(
 fn summands(shares: &[PartyShare], mask: Fr, me: PartyId) -> (Vec<Fr>, Vec<Fr>) {
     match me {
         0 => (
-            shares.iter().map(|s| s.left.wrapping_add(s.right) & mask).collect(),
+            shares
+                .iter()
+                .map(|s| s.left.wrapping_add(s.right) & mask)
+                .collect(),
             Vec::new(),
         ),
         1 => (Vec::new(), shares.iter().map(|s| s.right & mask).collect()),
@@ -716,7 +805,11 @@ mod tests {
                     let raw = reveal(s, rid + i as u64, None, me, mbx);
                     let m = (1i128 << nbits) - 1;
                     let x = raw as i128 & m;
-                    if x >= (1i128 << (nbits - 1)) { (x - (1i128 << nbits)) as i64 } else { x as i64 }
+                    if x >= (1i128 << (nbits - 1)) {
+                        (x - (1i128 << nbits)) as i64
+                    } else {
+                        x as i64
+                    }
                 })
                 .collect::<Vec<i64>>()
         });

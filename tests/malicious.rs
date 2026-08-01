@@ -14,17 +14,15 @@
 use std::sync::Arc;
 
 use baru::crypto::aby3_protocol::{reveal, share_input, PartyShare};
-use baru::crypto::gc_protocol::gc_lt_batch_table_checked;
 use baru::crypto::aby3_verify::{
     a2b_batch_checked, add, check, generate_mac_pairs, lt_batch_checked, mac_existing_batch,
     mul_batch_checked, reveal_checked, share_public, MalShare, Verifier,
 };
+use baru::crypto::gc_protocol::gc_lt_batch_table_checked;
 use baru::crypto::net::{
     deserialize_msg, serialize_msg, InprocHandle, Mailbox, Message, MpcMsg, PartyId, Transport,
 };
-use baru::crypto::security::{
-    require_security, AbortReason, AttestedSecurity, Checked, Security,
-};
+use baru::crypto::security::{require_security, AbortReason, AttestedSecurity, Checked, Security};
 use baru::crypto::types::Fr;
 use baru::interpreter::backend::Backend;
 use baru::interpreter::malicious_backend::MaliciousBackend;
@@ -158,7 +156,10 @@ fn session(
 fn run(
     a: Fr,
     b: Fr,
-    corrupt: Option<(PartyId, Arc<dyn Fn(PartyId, &MpcMsg) -> Option<MpcMsg> + Send + Sync>)>,
+    corrupt: Option<(
+        PartyId,
+        Arc<dyn Fn(PartyId, &MpcMsg) -> Option<MpcMsg> + Send + Sync>,
+    )>,
 ) -> Vec<(Fr, Checked<()>)> {
     run_with(a, b, corrupt, None)
 }
@@ -167,7 +168,10 @@ fn run(
 fn run_with(
     a: Fr,
     b: Fr,
-    corrupt: Option<(PartyId, Arc<dyn Fn(PartyId, &MpcMsg) -> Option<MpcMsg> + Send + Sync>)>,
+    corrupt: Option<(
+        PartyId,
+        Arc<dyn Fn(PartyId, &MpcMsg) -> Option<MpcMsg> + Send + Sync>,
+    )>,
     local_mul_offset: Option<Fr>,
 ) -> Vec<(Fr, Checked<()>)> {
     let handles = InprocHandle::create(3);
@@ -190,14 +194,14 @@ fn run_with(
             }
         }));
     }
-    joins.into_iter().map(|j| j.join().expect("party panicked")).collect()
+    joins
+        .into_iter()
+        .map(|j| j.join().expect("party panicked"))
+        .collect()
 }
 
 /// Verdicts of the two honest parties when `corrupt` is the corrupt one.
-fn honest_verdicts(
-    results: &[(Fr, Checked<()>)],
-    corrupt: PartyId,
-) -> Vec<&Checked<()>> {
+fn honest_verdicts(results: &[(Fr, Checked<()>)], corrupt: PartyId) -> Vec<&Checked<()>> {
     results
         .iter()
         .enumerate()
@@ -222,8 +226,10 @@ fn honest_run_agrees_and_does_not_abort() {
 /// how it is encoded.
 fn tamper(base_op_id: u64, bits: u32, data: &[u8], f: impl Fn(u128) -> u128) -> MpcMsg {
     let n = data.len() * 8 / bits as usize;
-    let vals: Vec<u128> =
-        baru::crypto::aby3_protocol::unpack_ring(data, n, bits).into_iter().map(f).collect();
+    let vals: Vec<u128> = baru::crypto::aby3_protocol::unpack_ring(data, n, bits)
+        .into_iter()
+        .map(f)
+        .collect();
     MpcMsg::TaggedZBatch {
         base_op_id,
         bits,
@@ -245,12 +251,11 @@ fn corrupted_multiplication_is_caught() {
                 // Offset the *value* half of the batch only, leaving the MAC
                 // half consistent — the subtle attack, not a blunt one.
                 let n = data.len() * 8 / *bits as usize;
-                let vals: Vec<u128> =
-                    baru::crypto::aby3_protocol::unpack_ring(data, n, *bits)
-                        .into_iter()
-                        .enumerate()
-                        .map(|(i, v)| if i == 0 { v.wrapping_add(1) } else { v })
-                        .collect();
+                let vals: Vec<u128> = baru::crypto::aby3_protocol::unpack_ring(data, n, *bits)
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, v)| if i == 0 { v.wrapping_add(1) } else { v })
+                    .collect();
                 Some(MpcMsg::TaggedZBatch {
                     base_op_id: *base_op_id,
                     bits: *bits,
@@ -280,9 +285,13 @@ fn corrupted_multiplication_is_caught() {
 #[test]
 fn an_error_that_cannot_change_the_result_is_not_claimed_to_be_caught() {
     let rule = Arc::new(|_to: PartyId, m: &MpcMsg| match m {
-        MpcMsg::TaggedZBatch { base_op_id, bits, data } if *base_op_id == 20 => {
-            Some(tamper(*base_op_id, *bits, data, |v| v.wrapping_add(1u128 << 100)))
-        }
+        MpcMsg::TaggedZBatch {
+            base_op_id,
+            bits,
+            data,
+        } if *base_op_id == 20 => Some(tamper(*base_op_id, *bits, data, |v| {
+            v.wrapping_add(1u128 << 100)
+        })),
         _ => None,
     });
     let results = run(6, 7, Some((1, rule)));
@@ -308,7 +317,9 @@ fn inconsistent_input_sharing_is_caught() {
     });
     let results = run(6, 7, Some((0, rule)));
     for verdict in honest_verdicts(&results, 0) {
-        let abort = verdict.as_ref().expect_err("inconsistent dealing must abort");
+        let abort = verdict
+            .as_ref()
+            .expect_err("inconsistent dealing must abort");
         assert!(
             matches!(
                 abort.reason,
@@ -373,9 +384,11 @@ fn a_reveal_lie_told_to_only_the_non_holder_is_caught_by_the_transcript() {
 #[test]
 fn abort_is_a_result_not_a_panic() {
     let rule = Arc::new(|_to: PartyId, m: &MpcMsg| match m {
-        MpcMsg::TaggedZBatch { base_op_id, bits, data } if *base_op_id == 20 => {
-            Some(tamper(*base_op_id, *bits, data, |v| v.wrapping_add(1)))
-        }
+        MpcMsg::TaggedZBatch {
+            base_op_id,
+            bits,
+            data,
+        } if *base_op_id == 20 => Some(tamper(*base_op_id, *bits, data, |v| v.wrapping_add(1))),
         _ => None,
     });
     // `run` joins every thread and would propagate a panic; reaching this
@@ -390,12 +403,7 @@ fn abort_is_a_result_not_a_panic() {
 ///
 /// Multiplying `[r]·[x]` instead would appear to work here and is *unsound* —
 /// see `MacPair`'s documentation for the selective-failure attack it opens.
-fn pair_mac_session(
-    me: PartyId,
-    mbx: &Mailbox<impl Transport>,
-    a: Fr,
-    b: Fr,
-) -> (Fr, Checked<()>) {
+fn pair_mac_session(me: PartyId, mbx: &Mailbox<impl Transport>, a: Fr, b: Fr) -> (Fr, Checked<()>) {
     let keys = mbx.prf_keys(me);
     let mut v = Verifier::new(me, &keys);
 
@@ -419,7 +427,10 @@ fn pair_mac_session(
 fn run_pair_mac(
     a: Fr,
     b: Fr,
-    corrupt: Option<(PartyId, Arc<dyn Fn(PartyId, &MpcMsg) -> Option<MpcMsg> + Send + Sync>)>,
+    corrupt: Option<(
+        PartyId,
+        Arc<dyn Fn(PartyId, &MpcMsg) -> Option<MpcMsg> + Send + Sync>,
+    )>,
 ) -> Vec<(Fr, Checked<()>)> {
     let handles = InprocHandle::create(3);
     let mut joins = Vec::new();
@@ -439,7 +450,10 @@ fn run_pair_mac(
             }
         }));
     }
-    joins.into_iter().map(|j| j.join().expect("party panicked")).collect()
+    joins
+        .into_iter()
+        .map(|j| j.join().expect("party panicked"))
+        .collect()
 }
 
 #[test]
@@ -448,7 +462,10 @@ fn pair_based_macs_give_a_correct_honest_run() {
         let results = run_pair_mac(a, b, None);
         for (value, verdict) in &results {
             assert_eq!(*value, a.wrapping_mul(b));
-            assert!(verdict.is_ok(), "honest pair-MAC run must not abort: {verdict:?}");
+            assert!(
+                verdict.is_ok(),
+                "honest pair-MAC run must not abort: {verdict:?}"
+            );
         }
     }
 }
@@ -461,9 +478,11 @@ fn pair_based_macs_give_a_correct_honest_run() {
 #[test]
 fn cheating_in_pair_generation_is_caught() {
     let rule = Arc::new(|_to: PartyId, m: &MpcMsg| match m {
-        MpcMsg::TaggedZBatch { base_op_id, bits, data } if *base_op_id == 10 => {
-            Some(tamper(*base_op_id, *bits, data, |v| v.wrapping_add(1)))
-        }
+        MpcMsg::TaggedZBatch {
+            base_op_id,
+            bits,
+            data,
+        } if *base_op_id == 10 => Some(tamper(*base_op_id, *bits, data, |v| v.wrapping_add(1))),
         _ => None,
     });
     let results = run_pair_mac(6, 7, Some((1, rule)));
@@ -560,7 +579,10 @@ fn run_a2b(
     a: Fr,
     b: Fr,
     nbits: usize,
-    corrupt: Option<(PartyId, Arc<dyn Fn(PartyId, &MpcMsg) -> Option<MpcMsg> + Send + Sync>)>,
+    corrupt: Option<(
+        PartyId,
+        Arc<dyn Fn(PartyId, &MpcMsg) -> Option<MpcMsg> + Send + Sync>,
+    )>,
 ) -> Vec<(Vec<Fr>, Fr, Checked<()>)> {
     let handles = InprocHandle::create(3);
     let mut joins = Vec::new();
@@ -580,7 +602,10 @@ fn run_a2b(
             }
         }));
     }
-    joins.into_iter().map(|j| j.join().expect("party panicked")).collect()
+    joins
+        .into_iter()
+        .map(|j| j.join().expect("party panicked"))
+        .collect()
 }
 
 /// The malicious decomposition must be bit-exact against the plaintext one, and
@@ -598,17 +623,31 @@ fn malicious_a2b_and_comparison_are_bit_exact() {
     // bit then reports the wrong answer. That is a property of the
     // comparison itself, shared with the semi-honest path, not of the
     // malicious upgrade.
-    for (a, b) in [(5u128, 9u128), (9, 5), (0, 0), (255, 1), (100, 20), (20, 100), (7, 7)] {
+    for (a, b) in [
+        (5u128, 9u128),
+        (9, 5),
+        (0, 0),
+        (255, 1),
+        (100, 20),
+        (20, 100),
+        (7, 7),
+    ] {
         let results = run_a2b(a, b, nbits, None);
-        let a_signed = ((a & mask) as i128) - if a & (1 << (nbits - 1)) != 0 { 1 << nbits } else { 0 };
-        let b_signed = ((b & mask) as i128) - if b & (1 << (nbits - 1)) != 0 { 1 << nbits } else { 0 };
+        let a_signed = ((a & mask) as i128)
+            - if a & (1 << (nbits - 1)) != 0 {
+                1 << nbits
+            } else {
+                0
+            };
+        let b_signed = ((b & mask) as i128)
+            - if b & (1 << (nbits - 1)) != 0 {
+                1 << nbits
+            } else {
+                0
+            };
         for (bits, lt, verdict) in &results {
             assert!(verdict.is_ok(), "honest a2b must not abort: {verdict:?}");
-            let recomposed: u128 = bits
-                .iter()
-                .enumerate()
-                .map(|(k, bit)| (bit & 1) << k)
-                .sum();
+            let recomposed: u128 = bits.iter().enumerate().map(|(k, bit)| (bit & 1) << k).sum();
             assert_eq!(recomposed, a & mask, "decomposition of {a} is wrong");
             assert_eq!(
                 *lt & 1,
@@ -627,7 +666,11 @@ fn cheating_inside_bit_decomposition_is_caught() {
     // Corrupt the carry-save round of the first decomposition (op ids are
     // allocated from 1_000 upward inside `a2b_batch_checked`).
     let rule = Arc::new(|_to: PartyId, m: &MpcMsg| match m {
-        MpcMsg::TaggedZBatch { base_op_id, bits, data } if *base_op_id > 1_000 && *base_op_id < 5_000 => {
+        MpcMsg::TaggedZBatch {
+            base_op_id,
+            bits,
+            data,
+        } if *base_op_id > 1_000 && *base_op_id < 5_000 => {
             Some(tamper(*base_op_id, *bits, data, |v| v.wrapping_add(1)))
         }
         _ => None,
@@ -687,7 +730,10 @@ fn run_backend<R: Send + 'static>(
             (out, verdict)
         }));
     }
-    joins.into_iter().map(|j| j.join().expect("party panicked")).collect()
+    joins
+        .into_iter()
+        .map(|j| j.join().expect("party panicked"))
+        .collect()
 }
 
 /// The backend must attest malicious security — and, unlike everything else in
@@ -722,7 +768,10 @@ fn backend_arithmetic_is_correct_and_verifies() {
         be.reveal(&diff, None)
     });
     for (value, verdict) in &results {
-        assert!(verdict.is_ok(), "honest backend run must verify: {verdict:?}");
+        assert!(
+            verdict.is_ok(),
+            "honest backend run must verify: {verdict:?}"
+        );
         assert_eq!(*value, 12 * 5 + 12 - 5);
     }
 }
@@ -840,7 +889,10 @@ fn gc_table_checked_comparison_is_correct() {
                 reveal(&out[0], 900, None, i, &mbx)
             }));
         }
-        let vals: Vec<Fr> = joins.into_iter().map(|j| j.join().expect("party panicked")).collect();
+        let vals: Vec<Fr> = joins
+            .into_iter()
+            .map(|j| j.join().expect("party panicked"))
+            .collect();
         for v in vals {
             assert_eq!(v & 1, (a < b) as u128, "gc lt {a} {b}");
         }
@@ -879,20 +931,25 @@ fn a_substituted_garbled_circuit_is_caught() {
         let rule = rule.clone();
         joins.push(std::thread::spawn(move || {
             let corrupt = i == 0;
-            let mbx = Mailbox::new(Deviant::wrap(h, move |to, m| {
-                if corrupt {
-                    rule(to, m)
-                } else {
-                    None
-                }
-            }));
+            let mbx = Mailbox::new(Deviant::wrap(
+                h,
+                move |to, m| {
+                    if corrupt {
+                        rule(to, m)
+                    } else {
+                        None
+                    }
+                },
+            ));
             let x = share_input(3, 1, 0, i, &mbx);
             let y = share_input(9, 2, 1, i, &mbx);
             gc_lt_batch_table_checked(&[x], &[y], nbits, 100, i, &mbx).map(|_| ())
         }));
     }
-    let results: Vec<Checked<()>> =
-        joins.into_iter().map(|j| j.join().expect("party panicked")).collect();
+    let results: Vec<Checked<()>> = joins
+        .into_iter()
+        .map(|j| j.join().expect("party panicked"))
+        .collect();
     // The evaluator is the party that holds both payloads and does the check.
     let abort = results[2]
         .as_ref()

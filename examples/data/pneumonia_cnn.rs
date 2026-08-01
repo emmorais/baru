@@ -16123,15 +16123,13 @@ pub static TEST_IMAGES: [[i64; 784]; 300] = [
 /// `(kernels[out_c][in_c*K*K], bias[out_c], in_c, in_h, in_w)`; every one is
 /// another FHE conv + MPC nonlinearity + scheme switch, and no bootstrap.
 pub fn extra_conv_layers() -> Vec<(Vec<Vec<i64>>, Vec<i64>, usize, usize, usize)> {
-    vec![
-        (
-            CONV1_W.iter().map(|r| r.to_vec()).collect(),
-            CONV1_B.to_vec(),
-            CONV1_IN_C,
-            CONV1_IN_H,
-            CONV1_IN_W,
-        )
-    ]
+    vec![(
+        CONV1_W.iter().map(|r| r.to_vec()).collect(),
+        CONV1_B.to_vec(),
+        CONV1_IN_C,
+        CONV1_IN_H,
+        CONV1_IN_W,
+    )]
 }
 
 /// Hidden dense layers in order, each `(weights[out][in], bias[out])`.

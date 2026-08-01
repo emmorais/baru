@@ -217,7 +217,9 @@ pub trait Backend: Send + Sync {
     /// simulator this is simply the three `Share3` components.
     fn export_additive(&mut self, a: &ShareRef) -> Vec<Fr> {
         let _ = a;
-        panic!("export_additive: this MPC backend does not support share export (see crate::hybrid)")
+        panic!(
+            "export_additive: this MPC backend does not support share export (see crate::hybrid)"
+        )
     }
 
     /// Install raw additive components (wrapping sum ≡ secret mod `2^nbits`)
@@ -226,6 +228,8 @@ pub trait Backend: Send + Sync {
     /// the sum is what matters).
     fn import_additive(&mut self, components: &[Fr], nbits: usize) -> ShareRef {
         let _ = (components, nbits);
-        panic!("import_additive: this MPC backend does not support share import (see crate::hybrid)")
+        panic!(
+            "import_additive: this MPC backend does not support share import (see crate::hybrid)"
+        )
     }
 }

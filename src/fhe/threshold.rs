@@ -255,7 +255,14 @@ pub fn partial_decrypt(
     let p = &bfv.params;
     let mask = p.q_mask();
     let c1_s = poly_mul_mod(&ct.c[1], s_component, p);
-    let e = smudge_from_seed(pair_seed, b"baru/fhe/threshold/smudge", ctr, p.n, smudge_bits, p);
+    let e = smudge_from_seed(
+        pair_seed,
+        b"baru/fhe/threshold/smudge",
+        ctr,
+        p.n,
+        smudge_bits,
+        p,
+    );
     let d: Poly = (0..p.n)
         .map(|i| c1_s[i].wrapping_add(e[i]) & mask)
         .collect();
@@ -317,9 +324,7 @@ pub fn encrypt_derandomized(
             ub[i].wrapping_add(e1[i]).wrapping_add(mi << shift) & mask
         })
         .collect();
-    let c1: Poly = (0..p.n)
-        .map(|i| ua[i].wrapping_add(e2[i]) & mask)
-        .collect();
+    let c1: Poly = (0..p.n).map(|i| ua[i].wrapping_add(e2[i]) & mask).collect();
     BfvCt { c: vec![c0, c1] }
 }
 
@@ -357,7 +362,11 @@ mod tests {
     use crate::fhe::bfv::BfvParams;
 
     fn params() -> BfvParams {
-        BfvParams { n: 1024, log2_q: 100, log2_t: 20 }
+        BfvParams {
+            n: 1024,
+            log2_q: 100,
+            log2_t: 20,
+        }
     }
 
     #[test]
@@ -372,7 +381,11 @@ mod tests {
         let (b, a) = super::super::bfv::public_parts(&pk);
         let c1 = encrypt_derandomized(&bfv, &b, &a, &m, &seed, 1);
         let c2 = encrypt_derandomized(&bfv, &b, &a, &m, &seed, 1);
-        assert_eq!(ct_digest(&c1), ct_digest(&c2), "derandomization must be exact");
+        assert_eq!(
+            ct_digest(&c1),
+            ct_digest(&c2),
+            "derandomization must be exact"
+        );
         let _ = ek;
     }
 
@@ -400,7 +413,11 @@ mod tests {
         let m: Vec<u64> = (0..16).map(|i| i * 3 + 1).collect();
         let ct = encrypt_derandomized(&bfv, &b, &a, &m, &[9u8; 32], 5);
         let got = bfv.decrypt_poly(&ck, &ct);
-        assert_eq!(&got[..16], &m[..], "derandomizing must not change semantics");
+        assert_eq!(
+            &got[..16],
+            &m[..],
+            "derandomizing must not change semantics"
+        );
     }
 
     #[test]
@@ -415,11 +432,14 @@ mod tests {
 
         // Pairwise seeds: component i is held by P_i and P_{i-1}.
         let seeds = [[1u8; 32], [2u8; 32], [3u8; 32]];
-        let partials: [PartialDecryption; 3] = std::array::from_fn(|i| {
-            partial_decrypt(&bfv, &ct, &shares[i].left, &seeds[i], 0, 8)
-        });
+        let partials: [PartialDecryption; 3] =
+            std::array::from_fn(|i| partial_decrypt(&bfv, &ct, &shares[i].left, &seeds[i], 0, 8));
         let got = combine(&bfv, &ct, &partials);
-        assert_eq!(&got[..8], &m[..], "threshold decryption must agree with the plain one");
+        assert_eq!(
+            &got[..8],
+            &m[..],
+            "threshold decryption must agree with the plain one"
+        );
     }
 
     /// The load-bearing property: the two parties that hold a key component
@@ -455,7 +475,10 @@ mod tests {
         let honest = partial_decrypt(&bfv, &ct, &shares[1].left, &pair_seed, 0, 8);
         let mut cheating = honest.clone();
         cheating.d[0] = cheating.d[0].wrapping_add(1);
-        assert_ne!(honest, cheating, "the co-holder's comparison must catch this");
+        assert_ne!(
+            honest, cheating,
+            "the co-holder's comparison must catch this"
+        );
     }
 
     /// The gate that actually matters: does threshold decryption still recover
@@ -497,10 +520,18 @@ mod tests {
     #[test]
     fn smudging_headroom_matches_the_measured_design_note() {
         // §6a measured |e_mult| ≈ 2^38.6 at n=4096, q=2^100, t=2^20.
-        let p = BfvParams { n: 4096, log2_q: 100, log2_t: 20 };
+        let p = BfvParams {
+            n: 4096,
+            log2_q: 100,
+            log2_t: 20,
+        };
         assert_eq!(smudging_headroom_bits(&p, 39), 40);
         // t = 2^24 is about 8 bits worse, as the note says.
-        let p24 = BfvParams { n: 4096, log2_q: 100, log2_t: 24 };
+        let p24 = BfvParams {
+            n: 4096,
+            log2_q: 100,
+            log2_t: 24,
+        };
         assert_eq!(smudging_headroom_bits(&p24, 43), 32);
     }
 

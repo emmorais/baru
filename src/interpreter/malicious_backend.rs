@@ -158,10 +158,7 @@ impl<T: Transport> MaliciousBackend<T> {
     }
 
     /// Give already-shared values MACs, one batched opening for the whole slice.
-    fn attach_macs(
-        &mut self,
-        vals: &[crate::crypto::aby3_protocol::PartyShare],
-    ) -> Vec<MalShare> {
+    fn attach_macs(&mut self, vals: &[crate::crypto::aby3_protocol::PartyShare]) -> Vec<MalShare> {
         if vals.is_empty() {
             return Vec::new();
         }
@@ -318,10 +315,7 @@ impl<T: Transport + 'static> Backend for MaliciousBackend<T> {
         let nbits = a.nbits.max(b.nbits);
         let diff = self.sub(a, b);
         let d = self.get(&diff);
-        let bits = self
-            .a2b_many(&[d], nbits)
-            .pop()
-            .expect("one lane");
+        let bits = self.a2b_many(&[d], nbits).pop().expect("one lane");
         let one = self.one();
         let terms: Vec<MalShare> = bits.iter().map(|bit| sub(&one, bit)).collect();
         let ms = self.product_tree(terms);
@@ -376,15 +370,9 @@ impl<T: Transport + 'static> Backend for MaliciousBackend<T> {
         self.interactive_calls += 1;
         let ms = self.get(a);
         let id = self.alloc_id();
-        reveal_batch_checked(
-            &[ms.val],
-            id,
-            self.me,
-            &self.mailbox,
-            &mut self.verifier,
-        )
-        .pop()
-        .expect("one value")
+        reveal_batch_checked(&[ms.val], id, self.me, &self.mailbox, &mut self.verifier)
+            .pop()
+            .expect("one value")
     }
 
     fn a2b(&mut self, a: &ShareRef, nbits: usize) -> Vec<ShareRef> {

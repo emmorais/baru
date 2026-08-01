@@ -118,7 +118,9 @@ fn from_limbs(limbs: &[u64], n: usize) -> Vec<I256> {
     (0..n)
         .map(|k| {
             let w = &limbs[4 * k..4 * k + 4];
-            I256 { limbs: [w[0], w[1], w[2], w[3]] }
+            I256 {
+                limbs: [w[0], w[1], w[2], w[3]],
+            }
         })
         .collect()
 }
@@ -155,7 +157,11 @@ fn check_lengths(parts: &[(&str, usize)], n: usize) -> Result<(), NtlError> {
 /// outputs, different algorithm. Returns [`NtlError::Overflow`] if a result
 /// coefficient does not fit `I256`; the NTT version has the same limitation but
 /// wraps silently instead of reporting it.
-pub fn try_exact_negacyclic_product(a: &[i128], b: &[i128], n: usize) -> Result<Vec<I256>, NtlError> {
+pub fn try_exact_negacyclic_product(
+    a: &[i128],
+    b: &[i128],
+    n: usize,
+) -> Result<Vec<I256>, NtlError> {
     check_lengths(&[("a", a.len()), ("b", b.len())], n)?;
     let (la, lb) = (to_limbs(a), to_limbs(b));
     let mut out = vec![0u64; 4 * n];
@@ -193,7 +199,12 @@ pub fn try_exact_bfv_tensor(
     n: usize,
 ) -> Result<(Vec<I256>, Vec<I256>, Vec<I256>), NtlError> {
     check_lengths(
-        &[("a0", a0.len()), ("a1", a1.len()), ("b0", b0.len()), ("b1", b1.len())],
+        &[
+            ("a0", a0.len()),
+            ("a1", a1.len()),
+            ("b0", b0.len()),
+            ("b1", b1.len()),
+        ],
         n,
     )?;
     let (la0, la1) = (to_limbs(a0), to_limbs(a1));
@@ -254,12 +265,20 @@ mod tests {
         let mut s = seed | 1;
         (0..n)
             .map(|_| {
-                s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                s = s
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
                 let hi = (s >> 1) as u128;
-                s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                s = s
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
                 let lo = (s >> 1) as u128;
                 let mag = (((hi << 64) | lo) % (1u128 << bits)) as i128;
-                if s & 1 == 0 { mag } else { -mag }
+                if s & 1 == 0 {
+                    mag
+                } else {
+                    -mag
+                }
             })
             .collect()
     }
@@ -292,7 +311,11 @@ mod tests {
         for n in [1usize, 2, 4, 8, 16, 32] {
             let a = sample(n, 20, n as u64 * 7 + 1);
             let b = sample(n, 20, n as u64 * 13 + 5);
-            assert_eq!(exact_negacyclic_product(&a, &b, n), schoolbook_small(&a, &b, n), "n={n}");
+            assert_eq!(
+                exact_negacyclic_product(&a, &b, n),
+                schoolbook_small(&a, &b, n),
+                "n={n}"
+            );
         }
     }
 
@@ -391,7 +414,10 @@ mod tests {
         let m = i128::MAX;
         let a = vec![m; n];
         let b = vec![m, -m, -m, -m];
-        assert_eq!(try_exact_negacyclic_product(&a, &b, n), Err(NtlError::Overflow));
+        assert_eq!(
+            try_exact_negacyclic_product(&a, &b, n),
+            Err(NtlError::Overflow)
+        );
     }
 
     #[test]

@@ -30,9 +30,9 @@
 use crate::crypto::aby3_protocol::{reveal_components_packed_party, PartyShare};
 use crate::crypto::falcon;
 use crate::crypto::field::{Fp, FpShare};
-use crate::crypto::types::Fr;
 use crate::crypto::fp_protocol::{mul_batch, reveal_batch, share_component};
 use crate::crypto::net::{Mailbox, PartyId, Transport};
+use crate::crypto::types::Fr;
 
 /// Op-id slots reserved by one `private_compare` call: one per batched
 /// multiplication round, plus the reveal, with headroom.
@@ -91,13 +91,17 @@ pub fn private_compare<T: Transport>(
     for i in (0..l).rev() {
         suffix[i] = suffix[i + 1] + w[i];
     }
-    let mut layer: Vec<FpShare> =
-        (0..l).map(|i| add_public(u[i] + suffix[i + 1], Fp::ONE, me)).collect();
+    let mut layer: Vec<FpShare> = (0..l)
+        .map(|i| add_public(u[i] + suffix[i + 1], Fp::ONE, me))
+        .collect();
 
     // Rounds 2..: multiply the c[i] together as a balanced tree.
     while layer.len() > 1 {
-        let pairs: Vec<(FpShare, FpShare)> =
-            layer.chunks(2).filter(|c| c.len() == 2).map(|c| (c[0], c[1])).collect();
+        let pairs: Vec<(FpShare, FpShare)> = layer
+            .chunks(2)
+            .filter(|c| c.len() == 2)
+            .map(|c| (c[0], c[1]))
+            .collect();
         let mut next = mul_batch(&pairs, op, me, mbx);
         op += 1;
         if layer.len() % 2 == 1 {
@@ -141,13 +145,18 @@ pub fn private_compare_batch<T: Transport>(
         return Vec::new();
     }
     let l = items[0].0.len();
-    assert!(items.iter().all(|(b, _)| b.len() == l), "batch must share one bit width");
+    assert!(
+        items.iter().all(|(b, _)| b.len() == l),
+        "batch must share one bit width"
+    );
     assert_eq!(betas.len(), n, "one blinding bit per item");
     assert_eq!(masks.len(), n, "one mask per item");
     let mut op = base_op_id;
 
-    let signs: Vec<FpShare> =
-        betas.iter().map(|b| add_public(-(*b + *b), Fp::ONE, me)).collect();
+    let signs: Vec<FpShare> = betas
+        .iter()
+        .map(|b| add_public(-(*b + *b), Fp::ONE, me))
+        .collect();
 
     // One batched round for every u[i] of every item.
     let mut u_pairs = Vec::with_capacity(n * l);
@@ -210,7 +219,10 @@ pub fn private_compare_batch<T: Transport>(
         layers.iter().zip(masks).map(|(l, m)| (l[0], *m)).collect();
     let d = mul_batch(&mask_pairs, op, me, mbx);
     op += 1;
-    reveal_batch(&d, op, me, mbx).into_iter().map(|v| !v.is_zero()).collect()
+    reveal_batch(&d, op, me, mbx)
+        .into_iter()
+        .map(|v| !v.is_zero())
+        .collect()
 }
 
 /// What preprocessing supplies for one `Π_WA`, per element.
@@ -308,8 +320,7 @@ pub fn wrap3_batch<T: Transport>(
     }
     let betas: Vec<FpShare> = pc_slots.iter().map(|&i| pre[i].beta_fp).collect();
     let masks: Vec<FpShare> = pc_slots.iter().map(|&i| pre[i].m).collect();
-    let bprimes =
-        private_compare_batch(&pc_items, &betas, &masks, base_op_id + 1, me, mbx);
+    let bprimes = private_compare_batch(&pc_items, &betas, &masks, base_op_id + 1, me, mbx);
 
     // 5. θ = β₁+β₂+β₃ + α − η − δ (mod 2), all local on replicated bits.
     let mut out = Vec::with_capacity(n);
@@ -406,7 +417,10 @@ pub fn select_batch<T: Transport>(
     mbx: &Mailbox<T>,
 ) -> Vec<PartyShare> {
     let n = x.len();
-    assert!(y.len() == n && b.len() == n && pre.len() == n, "select_batch length mismatch");
+    assert!(
+        y.len() == n && b.len() == n && pre.len() == n,
+        "select_batch length mismatch"
+    );
     if n == 0 {
         return Vec::new();
     }
@@ -422,7 +436,10 @@ pub fn select_batch<T: Transport>(
         })
         .collect();
     let comps = reveal_components_packed_party(&masked, 1, base_op_id, me, mbx);
-    let e: Vec<u64> = comps.iter().map(|c| ((c[0] ^ c[1] ^ c[2]) & 1) as u64).collect();
+    let e: Vec<u64> = comps
+        .iter()
+        .map(|c| ((c[0] ^ c[1] ^ c[2]) & 1) as u64)
+        .collect();
 
     // 2. d = ⟦b⟧_L, chosen locally now that e is public.
     let d: Vec<PartyShare> = e
@@ -451,7 +468,8 @@ pub fn select_batch<T: Transport>(
         })
         .collect();
     let pairs: Vec<(PartyShare, PartyShare)> = diffs.into_iter().zip(d).collect();
-    let prod = crate::crypto::aby3_protocol::mul_batch_party_at(&pairs, l_bits, base_op_id + 1, me, mbx);
+    let prod =
+        crate::crypto::aby3_protocol::mul_batch_party_at(&pairs, l_bits, base_op_id + 1, me, mbx);
     prod.into_iter()
         .zip(x)
         .map(|(pz, xi)| PartyShare {
@@ -666,14 +684,8 @@ pub fn truncate_batch<T: Transport>(
     // bit-shares only have to be valid mod 2^4. That precondition is what
     // makes the narrowing safe here and not in the general `lt` path — and it
     // is worth 32x, because this a2b was 96% of an all-RSS network.
-    let bits = crate::crypto::aby3_protocol::a2b_batch_party_at(
-        &diffs,
-        w,
-        4,
-        base_op_id + 1,
-        me,
-        mbx,
-    );
+    let bits =
+        crate::crypto::aby3_protocol::a2b_batch_party_at(&diffs, w, 4, base_op_id + 1, me, mbx);
     let borrow_bits: Vec<[u64; 2]> = bits
         .iter()
         .map(|bv| {
@@ -692,7 +704,10 @@ pub fn truncate_batch<T: Transport>(
         .collect();
     let sel: Vec<SelectPreproc> = pre
         .iter()
-        .map(|p| SelectPreproc { c_bit: p.sel.c_bit, c_ring: p.sel.c_ring.clone() })
+        .map(|p| SelectPreproc {
+            c_bit: p.sel.c_bit,
+            c_ring: p.sel.c_ring.clone(),
+        })
         .collect();
     let borrow = select_batch(
         &zeros,
@@ -799,7 +814,15 @@ pub fn layer_batch<T: Transport>(
     mbx: &Mailbox<T>,
 ) -> Vec<PartyShare> {
     let z = dense_batch(x, w, l_bits, base_op_id, me, mbx);
-    let t = truncate_batch(&z, &pre.trunc, d, l_bits, base_op_id + 4 * PC_ID_BLOCK, me, mbx);
+    let t = truncate_batch(
+        &z,
+        &pre.trunc,
+        d,
+        l_bits,
+        base_op_id + 4 * PC_ID_BLOCK,
+        me,
+        mbx,
+    );
     relu_batch(
         &t,
         &pre.wrap,
@@ -830,7 +853,10 @@ pub fn dense_batch<T: Transport>(
     mbx: &Mailbox<T>,
 ) -> Vec<PartyShare> {
     let inn = x.len();
-    assert!(w.iter().all(|row| row.len() == inn), "weight rows must match the input width");
+    assert!(
+        w.iter().all(|row| row.len() == inn),
+        "weight rows must match the input width"
+    );
     if w.is_empty() {
         return Vec::new();
     }
@@ -841,9 +867,8 @@ pub fn dense_batch<T: Transport>(
             pairs.push((wk.clone(), xk.clone()));
         }
     }
-    let prods = crate::crypto::aby3_protocol::mul_batch_party_at(
-        &pairs, l_bits, base_op_id, me, mbx,
-    );
+    let prods =
+        crate::crypto::aby3_protocol::mul_batch_party_at(&pairs, l_bits, base_op_id, me, mbx);
     w.iter()
         .enumerate()
         .map(|(j, _)| {
@@ -903,7 +928,10 @@ mod tests {
                 })
             })
             .collect();
-        joins.into_iter().map(|j| j.join().expect("party panicked")).collect()
+        joins
+            .into_iter()
+            .map(|j| j.join().expect("party panicked"))
+            .collect()
     }
 
     /// The transport `Π_PC` must compute `x ≥ r`, matching the local simulation
@@ -928,15 +956,8 @@ mod tests {
                 let b = share_component(Fp::new(beta), 0, me);
                 // Any unit works as the mask; 1 keeps the test deterministic.
                 let m = share_component(Fp::ONE, 0, me);
-                let bprime = private_compare(
-                    &bits,
-                    r,
-                    &b,
-                    &m,
-                    (k as u64 + 1) * PC_ID_BLOCK,
-                    me,
-                    mbx,
-                );
+                let bprime =
+                    private_compare(&bits, r, &b, &m, (k as u64 + 1) * PC_ID_BLOCK, me, mbx);
                 got.push(u64::from(bprime) ^ beta);
             }
             got
@@ -962,8 +983,9 @@ mod tests {
                 let me = mbx.id();
                 let (x, r) = (0x5A5A_5A5Au64, 0x3C3C_3C3Cu64);
                 for k in 0..n {
-                    let bits: Vec<FpShare> =
-                        (0..l).map(|i| share_component(Fp::new((x >> i) & 1), 0, me)).collect();
+                    let bits: Vec<FpShare> = (0..l)
+                        .map(|i| share_component(Fp::new((x >> i) & 1), 0, me))
+                        .collect();
                     let b = share_component(Fp::ZERO, 0, me);
                     let m = share_component(Fp::ONE, 0, me);
                     let out =
@@ -1011,7 +1033,10 @@ mod tests {
             db as f64 / elements as f64
         );
 
-        assert_eq!(dm, rounds, "one directed message per party per batched round");
+        assert_eq!(
+            dm, rounds,
+            "one directed message per party per batched round"
+        );
         // ~1 byte per field element plus framing: the check that the narrow
         // encoding is really in use rather than u128 slots, which would be 16×.
         assert!(
@@ -1046,12 +1071,14 @@ mod tests {
                     .collect();
                 let betas: Vec<FpShare> =
                     (0..n).map(|_| share_component(Fp::ZERO, 0, me)).collect();
-                let masks: Vec<FpShare> =
-                    (0..n).map(|_| share_component(Fp::ONE, 0, me)).collect();
+                let masks: Vec<FpShare> = (0..n).map(|_| share_component(Fp::ONE, 0, me)).collect();
                 private_compare_batch(&items, &betas, &masks, PC_ID_BLOCK, me, &mbx)
             }));
         }
-        let outs: Vec<_> = joins.into_iter().map(|j| j.join().expect("panic")).collect();
+        let outs: Vec<_> = joins
+            .into_iter()
+            .map(|j| j.join().expect("panic"))
+            .collect();
         for o in &outs[1..] {
             assert_eq!(o, &outs[0], "parties must agree");
         }
@@ -1208,7 +1235,8 @@ mod tests {
         for (i, want) in expected.iter().enumerate() {
             let got = (out[0][i][0] ^ out[1][i][0] ^ out[2][i][0]) & 1;
             assert_eq!(
-                got, *want,
+                got,
+                *want,
                 "DReLU at value {i} (signed {})",
                 crate::crypto::falcon::signed(i as u64, LB)
             );
@@ -1234,14 +1262,21 @@ mod tests {
                     .map(|i| {
                         let v = (i as u64).wrapping_mul(0x9E37) % l;
                         let s = [v / 3, v / 3, v - 2 * (v / 3)];
-                        PartyShare { left: s[me % 3] as u128, right: s[(me + 1) % 3] as u128 }
+                        PartyShare {
+                            left: s[me % 3] as u128,
+                            right: s[(me + 1) % 3] as u128,
+                        }
                     })
                     .collect();
                 let pre: Vec<WrapPreproc> = (0..n)
                     .map(|i| {
                         let k = i as u64;
                         preproc(
-                            [k.wrapping_mul(53) % l, k.wrapping_mul(29) % l, k.wrapping_mul(17) % l],
+                            [
+                                k.wrapping_mul(53) % l,
+                                k.wrapping_mul(29) % l,
+                                k.wrapping_mul(17) % l,
+                            ],
                             (i % 2) as u64,
                             l_bits,
                             me,
@@ -1315,7 +1350,10 @@ mod tests {
         let _ = l;
         SelectPreproc {
             c_bit: [c[me % 3], c[(me + 1) % 3]],
-            c_ring: PartyShare { left: cr[me % 3], right: cr[(me + 1) % 3] },
+            c_ring: PartyShare {
+                left: cr[me % 3],
+                right: cr[(me + 1) % 3],
+            },
         }
     }
 
@@ -1346,7 +1384,13 @@ mod tests {
             .collect();
         let expected: Vec<u64> = vals
             .iter()
-            .map(|&v| if crate::crypto::falcon::signed(v, LB) >= 0 { v } else { 0 })
+            .map(|&v| {
+                if crate::crypto::falcon::signed(v, LB) >= 0 {
+                    v
+                } else {
+                    0
+                }
+            })
             .collect();
 
         let out = run3(move |me, mbx| {
@@ -1362,8 +1406,9 @@ mod tests {
                 .enumerate()
                 .map(|(i, m)| preproc(*m, (i % 2) as u64, LB, me))
                 .collect();
-            let sp: Vec<SelectPreproc> =
-                (0..a.len()).map(|i| sel_preproc(i as u64, LB, me)).collect();
+            let sp: Vec<SelectPreproc> = (0..a.len())
+                .map(|i| sel_preproc(i as u64, LB, me))
+                .collect();
             relu_batch(&a, &wp, &sp, LB, PC_ID_BLOCK, me, mbx)
         });
 
@@ -1371,7 +1416,8 @@ mod tests {
         for (i, want) in expected.iter().enumerate() {
             let got = ((out[0][i].left + out[1][i].left + out[2][i].left) & mask) as u64;
             assert_eq!(
-                got, *want,
+                got,
+                *want,
                 "ReLU at {i} (signed {})",
                 crate::crypto::falcon::signed(i as u64, LB)
             );
@@ -1422,11 +1468,17 @@ mod tests {
                 .collect();
             let wrap_pre: Vec<Vec<WrapPreproc>> = (0..nwin)
                 .map(|i| {
-                    (0..3).map(|k| preproc_seeded((i * 7 + k) as u64, LB, me)).collect()
+                    (0..3)
+                        .map(|k| preproc_seeded((i * 7 + k) as u64, LB, me))
+                        .collect()
                 })
                 .collect();
             let sel_pre: Vec<Vec<SelectPreproc>> = (0..nwin)
-                .map(|i| (0..3).map(|k| sel_preproc((i * 5 + k) as u64, LB, me)).collect())
+                .map(|i| {
+                    (0..3)
+                        .map(|k| sel_preproc((i * 5 + k) as u64, LB, me))
+                        .collect()
+                })
                 .collect();
             maxpool_batch(&windows, &wrap_pre, &sel_pre, LB, PC_ID_BLOCK, me, mbx)
         });
@@ -1482,7 +1534,10 @@ mod tests {
                 .iter()
                 .map(|&v| {
                     let s = [v / 3, v / 3, v - 2 * (v / 3)];
-                    PartyShare { left: s[me % 3] as u128, right: s[(me + 1) % 3] as u128 }
+                    PartyShare {
+                        left: s[me % 3] as u128,
+                        right: s[(me + 1) % 3] as u128,
+                    }
                 })
                 .collect();
             let pre: Vec<TruncPreproc> = (0..n)
@@ -1543,8 +1598,9 @@ mod tests {
         // Small non-negative values so W·x stays well inside the ring and the
         // truncation's `a + r` cannot wrap — the stated preconditions.
         let xv: Vec<u64> = (0..IN as u64).map(|k| k * 3 + 1).collect();
-        let wv: Vec<Vec<u64>> =
-            (0..OUT).map(|j| (0..IN).map(|k| ((j * 2 + k) % 5) as u64).collect()).collect();
+        let wv: Vec<Vec<u64>> = (0..OUT)
+            .map(|j| (0..IN).map(|k| ((j * 2 + k) % 5) as u64).collect())
+            .collect();
         let expected: Vec<u64> = wv
             .iter()
             .map(|row| {
@@ -1556,11 +1612,16 @@ mod tests {
         let out = run3(move |me, mbx| {
             let share = |v: u64| {
                 let s = [v / 3, v / 3, v - 2 * (v / 3)];
-                PartyShare { left: s[me % 3] as u128, right: s[(me + 1) % 3] as u128 }
+                PartyShare {
+                    left: s[me % 3] as u128,
+                    right: s[(me + 1) % 3] as u128,
+                }
             };
             let x: Vec<PartyShare> = xv.iter().map(|&v| share(v)).collect();
-            let w: Vec<Vec<PartyShare>> =
-                wv.iter().map(|r| r.iter().map(|&v| share(v)).collect()).collect();
+            let w: Vec<Vec<PartyShare>> = wv
+                .iter()
+                .map(|r| r.iter().map(|&v| share(v)).collect())
+                .collect();
             let pre = LayerPreproc {
                 trunc: (0..OUT)
                     .map(|i| {
@@ -1585,8 +1646,12 @@ mod tests {
                         }
                     })
                     .collect(),
-                wrap: (0..OUT).map(|i| preproc_seeded(2000 + i as u64, LB, me)).collect(),
-                sel: (0..OUT).map(|i| sel_preproc(3000 + i as u64, LB, me)).collect(),
+                wrap: (0..OUT)
+                    .map(|i| preproc_seeded(2000 + i as u64, LB, me))
+                    .collect(),
+                sel: (0..OUT)
+                    .map(|i| sel_preproc(3000 + i as u64, LB, me))
+                    .collect(),
             };
             layer_batch(&x, &w, &pre, D, LB, PC_ID_BLOCK, me, mbx)
         });

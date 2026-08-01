@@ -113,7 +113,10 @@ pub struct Placement {
 
 impl Placement {
     pub fn by_kind(map: HashMap<String, Side>) -> Self {
-        Placement { by_kind: map, by_wire: HashMap::new() }
+        Placement {
+            by_kind: map,
+            by_wire: HashMap::new(),
+        }
     }
 
     fn side_of(&self, op: &FlatOp) -> Side {
@@ -564,8 +567,17 @@ mod tests {
         asg.insert("add".to_string(), Side::Fhe);
         let mut be2 = Aby3Simulator::new();
         let env2 = bind(&mut be2);
-        let (r_mix, st_mix) =
-            run_mixed(&mut be2, &fhe, &ck, &flat, &env2, &out, NBITS, &Placement::by_kind(asg)).unwrap();
+        let (r_mix, st_mix) = run_mixed(
+            &mut be2,
+            &fhe,
+            &ck,
+            &flat,
+            &env2,
+            &out,
+            NBITS,
+            &Placement::by_kind(asg),
+        )
+        .unwrap();
         let got_mix = to_signed(be2.reveal(&r_mix, None));
 
         assert_eq!(got_mpc, want, "all-MPC route must match plaintext");
@@ -705,15 +717,17 @@ mod tests {
         let mut be2 = Aby3Simulator::new();
         let env2 = setup(&mut be2);
         let p_sunk = Placement::by_kind(kinds).sink_to_fhe(&flat);
-        let (r2, st2) =
-            run_mixed(&mut be2, &fhe, &ck, &flat, &env2, &out, NBITS, &p_sunk).unwrap();
+        let (r2, st2) = run_mixed(&mut be2, &fhe, &ck, &flat, &env2, &out, NBITS, &p_sunk).unwrap();
 
         assert_eq!(
             to_signed(be1.reveal(&r1, None)),
             to_signed(be2.reveal(&r2, None)),
             "moving the boundary must not change the value"
         );
-        assert!(p_sunk.refinements() > 0, "the rule should have moved something");
+        assert!(
+            p_sunk.refinements() > 0,
+            "the rule should have moved something"
+        );
         assert!(
             st2.to_mpc < st1.to_mpc,
             "sinking the addition should save a crossing back: {} -> {}",
@@ -740,8 +754,17 @@ mod tests {
         for (i, n) in ["a0", "b0", "a1", "b1"].iter().enumerate() {
             env.insert(n.to_string(), be.share_secret(vals[i] as Fr, NBITS, 0));
         }
-        let (r, st) =
-            run_mixed(&mut be, &fhe, &ck, &flat, &env, &out, NBITS, &Placement::by_kind(asg)).unwrap();
+        let (r, st) = run_mixed(
+            &mut be,
+            &fhe,
+            &ck,
+            &flat,
+            &env,
+            &out,
+            NBITS,
+            &Placement::by_kind(asg),
+        )
+        .unwrap();
         assert_eq!(to_signed(be.reveal(&r, None)), (3 * 2) * (4 * 5));
         assert_eq!(
             st.demoted_muls, 1,

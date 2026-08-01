@@ -347,7 +347,10 @@ pub fn run(
         .iter()
         .map(|img| model.forward_logits(img).0)
         .collect();
-    let preds: Vec<usize> = logits.iter().map(|l| crate::gadgets::argmax_ref(l)).collect();
+    let preds: Vec<usize> = logits
+        .iter()
+        .map(|l| crate::gadgets::argmax_ref(l))
+        .collect();
     let metrics = ClassificationMetrics::compute(&logits, &data.labels, model.nclasses());
     let plaintext_correct = metrics.correct;
 
@@ -473,10 +476,9 @@ pub fn sweep_crossover(
     let mut cells = Vec::new();
     for &rtt in rtts {
         for &bw in bws {
-            let profile = NetworkProfile::fixed_latency(std::time::Duration::from_micros(
-                rtt * 500,
-            ))
-            .with_bandwidth(bw * 1e6 / 8.0);
+            let profile =
+                NetworkProfile::fixed_latency(std::time::Duration::from_micros(rtt * 500))
+                    .with_bandwidth(bw * 1e6 / 8.0);
             for &p in protocols {
                 let mut tot = CnnTotals::default();
                 let mut ok = true;
@@ -856,7 +858,11 @@ fn print_report(r: &MedMnistReport) {
 /// Parse a comma-separated numeric list for the sweep grid flags.
 fn parse_list<T: std::str::FromStr>(s: &str) -> Result<Vec<T>, String> {
     s.split(',')
-        .map(|p| p.trim().parse().map_err(|_| format!("bad list entry {p:?}")))
+        .map(|p| {
+            p.trim()
+                .parse()
+                .map_err(|_| format!("bad list entry {p:?}"))
+        })
         .collect()
 }
 
