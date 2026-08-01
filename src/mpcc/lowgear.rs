@@ -61,7 +61,7 @@
 //!
 //! The responder's returned ciphertext has noise that depends on its private
 //! `y`, and the requester holds the secret key and can read that noise. So `y`
-//! must be hidden by **flooding** ([`Bgv::add_flooding_noise`]), and the
+//! must be hidden by **flooding** ([`crate::fhe::bgv::Bgv::add_flooding_noise`]), and the
 //! flooded noise must still decrypt. That single requirement pins the
 //! plaintext modulus:
 //!
@@ -85,7 +85,7 @@
 //! **Two bugs lived in this budget, so treat it as load bearing.** The flooding
 //! mask was `log2_bound + 1` bits rather than `log2_bound`, doubling the noise
 //! past `q/2` and silently invalidating *every* triple; and the parameter search
-//! accepted a set with 0.29 bits of slack. [`LowGearParams::validate`] now
+//! accepted a set with 0.29 bits of slack. `LowGearParams::validate` now
 //! demands 2 bits, and `deployed_parameters_produce_valid_triples` is not
 //! `#[ignore]`d — while it was, the first symptom was a wrong ReLU three layers
 //! up.
@@ -102,7 +102,7 @@
 //!   Overdrive paper and is deliberately *not* here — this is the LowGear
 //!   analogue of Semi2k, not of SPDZ.
 //! * **Local simulation.** Both parties run in this process; bytes are counted
-//!   as they would go on a wire ([`OleStats`]), exactly as Semi2k counts OT
+//!   as they would go on a wire (`OleStats`), exactly as Semi2k counts OT
 //!   traffic. No socket is involved, so this measures communication *volume*
 //!   and local CPU, not latency.
 
@@ -190,7 +190,7 @@ impl LowGearParams {
     /// `Modulus::Prime(t).order_bits()`, so the registry's `field_bits`, the
     /// domain programs are lowered for, and the bytes the engine charges all
     /// agree. `mpcc::protocols`' spec must carry this same number, and
-    /// [`tests::registry_field_bits_matches_the_engine`] enforces it.
+    /// `tests::registry_field_bits_matches_the_engine` enforces it.
     pub fn field_bits(&self) -> u32 {
         64 - self.t.leading_zeros()
     }

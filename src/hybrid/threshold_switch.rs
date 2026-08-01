@@ -195,10 +195,10 @@ pub fn checked_shares_to_fhe(
     ctr: u64,
 ) -> Result<BfvCt, SwitchMismatch> {
     let mut summed: Option<BfvCt> = None;
-    for j in 0..N {
+    for (j, &comp) in components.iter().enumerate().take(N) {
         let mut seen: Vec<BfvCt> = Vec::new();
         for p in parties {
-            if let Some(ct) = p.encrypt_component(j, components[j], nbits, ctr) {
+            if let Some(ct) = p.encrypt_component(j, comp, nbits, ctr) {
                 seen.push(ct);
             }
         }
@@ -227,7 +227,7 @@ pub fn checked_fhe_to_shares(
 ) -> Result<Vec<Fr>, SwitchMismatch> {
     // ── masks: both holders of each component must agree ──
     let mut masks = [0u64; N];
-    for j in 0..N {
+    for (j, slot) in masks.iter_mut().enumerate() {
         let seen: Vec<u64> = parties
             .iter()
             .filter_map(|p| p.mask_component(j, nbits, ctr))
@@ -236,7 +236,7 @@ pub fn checked_fhe_to_shares(
         if seen[0] != seen[1] {
             return Err(SwitchMismatch::Mask { component: j });
         }
-        masks[j] = seen[0];
+        *slot = seen[0];
     }
 
     // ── mask the ciphertext (deterministic: recomputable by anyone) ──

@@ -5,9 +5,9 @@
 //! exact negacyclic product of centered coefficients in `ℤ[X]/(X^n + 1)`. Two
 //! implementations exist:
 //!
-//! - [`Backend::Ntt`] — [`crate::fhe::ntt`], the hand-written multi-modular
+//! - `Backend::Ntt` — [`crate::fhe::ntt`], the hand-written multi-modular
 //!   NTT. Always available, pure Rust, no toolchain.
-//! - [`Backend::Ntl`] — [`crate::fhe::ntl`], NTL over GMP. Requires
+//! - `Backend::Ntl` — `crate::fhe::ntl`, NTL over GMP. Requires
 //!   `--features ntl`; ~2.5× faster (`baru bench-polymul`).
 //!
 //! The choice is a **process-global runtime switch**, not a compile-time one,
@@ -35,7 +35,7 @@
 //! # Why the results are interchangeable
 //!
 //! Both compute the same exact integer. `ntl.rs`'s tests assert this at
-//! `n = 4096` with ±2⁹⁹ coefficients, and [`tests::backends_agree`] below
+//! `n = 4096` with ±2⁹⁹ coefficients, and `tests::backends_agree` below
 //! re-checks it through this dispatch layer. So switching backends is a pure
 //! performance decision — no scheme's correctness, noise budget or security
 //! depends on it.
@@ -137,7 +137,7 @@ pub fn set_backend(b: Backend) -> Result<(), String> {
 ///
 /// The NTL backend is kept because it is a genuinely independent implementation
 /// and therefore a differential oracle for the one we rely on — see
-/// [`tests::backends_agree`] and `fhe::ntl`. It is no longer a performance
+/// `tests::backends_agree` and `fhe::ntl`. It is no longer a performance
 /// option.
 pub fn use_fastest() -> Backend {
     set_backend(Backend::Ntt).expect("the NTT backend is always available");

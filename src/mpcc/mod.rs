@@ -850,7 +850,7 @@ fn parse_args(args: &[String]) -> Result<Args, String> {
                 lower.domain = match v.as_str() {
                     "field128" => Domain::Field { bits: 128 },
                     other => match other.strip_prefix("ring").map(str::parse::<u32>) {
-                        Some(Ok(k)) if k >= 2 && k <= 128 => Domain::Ring { k },
+                        Some(Ok(k)) if (2..=128).contains(&k) => Domain::Ring { k },
                         _ => {
                             return Err(format!(
                                 "unknown domain `{other}` — expected `ringN` for 2 <= N <= 128 \

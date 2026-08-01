@@ -87,7 +87,7 @@ pub struct LayerPoint {
     /// `"measured"` — every count came from running this protocol.
     /// `"composed"` — the online half was measured here and the offline half
     /// was measured by a *different* benchmark and substituted. Only
-    /// `lowgear-she` is composed; see [`she_preprocessed`].
+    /// `lowgear-she` is composed; see `she_preprocessed`.
     pub provenance: &'static str,
 }
 

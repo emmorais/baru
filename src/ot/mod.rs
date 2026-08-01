@@ -13,11 +13,11 @@
 //!
 //! # What is here
 //!
-//! * [`base`] — Chou–Orlandi "simplest OT" over Ristretto255. Two exponentiations
+//! * `base` — Chou–Orlandi "simplest OT" over Ristretto255. Two exponentiations
 //!   for the receiver, two for the sender, one round each way. Public-key
 //!   operations, so a few tens of microseconds per OT: fine for a handful,
 //!   hopeless for millions.
-//! * [`iknp`] — IKNP OT extension. Turns `κ = 128` base OTs into as many cheap
+//! * `iknp` — IKNP OT extension. Turns `κ = 128` base OTs into as many cheap
 //!   OTs as you like, at one hash and `κ` bits of communication each. This is
 //!   what makes OT usable as a preprocessing primitive.
 //!

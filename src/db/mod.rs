@@ -7,16 +7,16 @@
 //! themselves sensitive (unpublished numbers, model weights, timing data).  So
 //! Baru writes every run to a store:
 //!
-//! * [`local::JsonlStore`] — a plain append-only file.  Always available, never
+//! * `local::JsonlStore` — a plain append-only file.  Always available, never
 //!   the reason a benchmark loses its result.
-//! * [`barudb::BaruDbStore`] — **BaruDB**
+//! * `barudb::BaruDbStore` — **BaruDB**
 //!   (<https://github.com/emmorais/barudb>, crate and binary `barudb`),
 //!   the encrypted searchable store, driven over a pipe.  Baru supplies the
 //!   schema and the keyword vocabulary; BaruDB owns the cryptography, and the
 //!   process boundary is what keeps that division real rather than merely
 //!   conventional.  The contract is `docs/barudb-api.md`.
 //!
-//! Both sit behind [`ResultStore`], so harnesses take a `--store` string and
+//! Both sit behind `ResultStore`, so harnesses take a `--store` string and
 //! neither knows nor cares which one it got.
 //!
 //! ## CLI

@@ -38,8 +38,8 @@
 //! # REPL commands (party 0)
 //!
 //!   :help                     language reference
-//!   :examples [category]      list examples (optionally filtered)
-//!   :example <n>              run example n
+//!   :examples `[category]`    list examples (optionally filtered)
+//!   :example `<n>`            run example n
 //!   :verbose [on|off]         toggle per-step evaluation tracing
 //!   :quit                     signal all parties to exit
 //!

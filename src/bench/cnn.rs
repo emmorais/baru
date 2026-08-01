@@ -80,7 +80,7 @@
 //!    16 224 round trips for D=28's 5408-wide conv output. That was 19.1 s of
 //!    a 20.4 s MPC segment — 88% of end-to-end runtime — while the ReLU it
 //!    was importing values for cost 0.6 s. Batching it
-//!    ([`import_raw_batch`]) costs the same bytes in three rounds: 19.1 s →
+//!    (`import_raw_batch`) costs the same bytes in three rounds: 19.1 s →
 //!    8 ms, and end-to-end 21.8 s → 2.6 s.
 //! 3. Only *then* do the comparisons matter, and [`Nonlin::Gc`] takes the
 //!    MPC segment a further 1.9×.
@@ -91,7 +91,7 @@
 //! 5. With MPC down to a fraction, the same breakdown applied to the FHE side
 //!    ([`FhePhases`]) showed **48% of it was encrypting scheme-switch masks**
 //!    — 39 of the inference's 52 encryptions. Masks are uniform and
-//!    query-independent, so `--precompute` ([`MaskPool`]) moves them offline:
+//!    query-independent, so `--precompute` (`MaskPool`) moves them offline:
 //!    online 1979 ms → 1312 ms here, 4.94 s → 2.90 s on the medical model.
 //!
 //! The cost centre is now the **FHE arithmetic proper** — the ct×ct products,
@@ -809,6 +809,10 @@ impl Masks<'_> {
     }
 }
 
+// The BFV context, its three keys and the two offline sources are each
+// independent here; the network profile and RNG are threaded through every
+// hybrid step alike.
+#[allow(clippy::too_many_arguments)]
 fn hybrid_matvec_open(
     s: &Bfv,
     ek: &crate::fhe::bfv::EncryptKey,
@@ -858,6 +862,9 @@ fn hybrid_matvec_open(
 /// pre-activations and per-output masks flattened in `(oc, oy, ox)` order —
 /// the same layout the MPC stage and the plaintext reference use.
 #[allow(clippy::type_complexity)]
+// Same shape as `hybrid_matvec_open`: context, keys, offline sources and the
+// layer's own geometry, none of which group into a cohesive struct.
+#[allow(clippy::too_many_arguments)]
 fn hybrid_conv_open(
     s: &Bfv,
     ek: &crate::fhe::bfv::EncryptKey,
@@ -951,6 +958,9 @@ fn pack_shares_to_fhe(
 /// max-pool — returning each party's additive share components of the pooled
 /// feature map (channel-major) plus the communication cost. Shared by the
 /// first conv and every extra conv layer.
+// The opened conv output, its masks, bias and shape, plus the quantisation
+// shift, ring width, network profile and protocol choice — all independent.
+#[allow(clippy::too_many_arguments)]
 fn mpc_conv_relu_pool(
     conv_open: Vec<u64>,
     conv_masks: Vec<[u64; 3]>,
@@ -1057,7 +1067,7 @@ pub struct FhePhases {
     /// Decrypting the masked product to open a layer.
     pub decrypt_ms: f64,
     /// Re-encrypting MPC shares back into a ciphertext (the switch's return
-    /// leg, [`pack_shares_to_fhe`]).
+    /// leg, `pack_shares_to_fhe`).
     pub reencrypt_ms: f64,
     /// How many `encrypt_poly` calls the whole inference made, by purpose.
     pub n_weight_enc: usize,
@@ -1297,7 +1307,7 @@ impl Nonlin {
         }
     }
 
-    /// The bare protocol name, for table headers where [`label`] would not fit.
+    /// The bare protocol name, for table headers where [`Nonlin::label`] would not fit.
     pub fn short(self) -> &'static str {
         match self {
             Nonlin::A2b => "a2b",
@@ -1436,8 +1446,10 @@ pub fn run_cnn_hybrid_in_session(
     let (mut fhe_ms, mut mpc_ms) = (0.0, 0.0);
     let mut comm = CommStats::default();
     let mut rng = rand::thread_rng();
-    let mut fhe_ph = FhePhases::default();
-    fhe_ph.keygen_ms = session.keygen_ms;
+    let mut fhe_ph = FhePhases {
+        keygen_ms: session.keygen_ms,
+        ..Default::default()
+    };
 
     // ── Offline, before the clock starts ──
     // The masks depend only on the network's *shape*, not on the patient's

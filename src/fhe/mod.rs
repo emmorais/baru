@@ -70,7 +70,7 @@ pub mod mock_backend;
 pub mod ntl;
 pub mod ntt;
 /// Runtime switch choosing which implementation computes the ring products
-/// every FHE scheme here depends on ([`ntt`], or [`ntl`] when built in).
+/// every FHE scheme here depends on ([`ntt`], or `ntl` when built in).
 pub mod poly;
 /// CRT slot packing — `n` independent values per ciphertext, for the
 /// elementwise products [`crate::mpcc::lowgear`] needs.

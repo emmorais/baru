@@ -78,6 +78,13 @@ pub const fn max_ring_bits(p: u64) -> u64 {
     p - 3
 }
 
+// The `p > ℓ + 2` bound, enforced at compile time rather than in a test.
+// Getting it wrong is silent — the `Π_PC` terms wrap and the zero test starts
+// answering a different question — so a modulus that cannot serve its ring
+// width should fail the build, not a test run someone might not do.
+const _: () = assert!(max_ring_bits(P) >= 32, "p = 37 must serve Falcon's ℓ = 32");
+const _: () = assert!(max_ring_bits(P_SECURENN) >= 64, "p = 67 must serve ℓ = 64");
+
 /// An element of `Z_p`, always held reduced.
 ///
 /// A newtype rather than a bare `u64` on purpose: the rest of the crate passes
@@ -615,11 +622,11 @@ mod tests {
     /// a different question.
     #[test]
     fn the_modulus_bound_holds_for_both_parameter_sets() {
-        let is_prime = |p: u64| (2..p).all(|d| p % d != 0);
+        let is_prime = |p: u64| (2..p).all(|d| !p.is_multiple_of(d));
         assert!(is_prime(P), "P must be prime");
         assert!(is_prime(P_SECURENN), "SecureNN's p must be prime");
-        assert!(P > 32 + 2, "p = 37 must serve Falcon's ℓ = 32");
-        assert!(P_SECURENN > 64 + 2, "p = 67 must serve ℓ = 64");
+        // The `p > ℓ + 2` bound itself is a compile-time assertion next to the
+        // constants, so it cannot be reached in a broken state here.
         assert_eq!(max_ring_bits(P), 34, "p = 37 covers ℓ up to 34");
         assert_eq!(max_ring_bits(P_SECURENN), 64, "p = 67 covers ℓ up to 64");
         // The wire width is what the communication comparison turns on.

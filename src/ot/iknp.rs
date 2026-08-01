@@ -41,7 +41,7 @@
 //! `H` must be correlation-robust: the sender evaluates it at `qⁱ` and
 //! `qⁱ ⊕ s` for a single fixed `s` across every row, so a plain
 //! collision-resistant hash is not enough in general. SHA-256 with per-row
-//! domain separation is the standard practical choice and what [`super::hash_block`]
+//! domain separation is the standard practical choice and what `super::hash_block`
 //! does.
 //!
 //! Against a **malicious receiver** this is broken, by design of the original

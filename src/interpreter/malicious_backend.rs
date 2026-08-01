@@ -13,7 +13,7 @@
 //! be.finish()?;            // ← the verdict. Do not trust `out` before this.
 //! ```
 //!
-//! **The output of a run is meaningless until [`Self::finish`] returns `Ok`.**
+//! **The output of a run is meaningless until [`MaliciousBackend::finish`] returns `Ok`.**
 //! That is inherent to security-with-abort, not an awkwardness of this
 //! implementation: the checks are deferred precisely so that the decision to
 //! abort cannot be timed to the data, which means the decision necessarily
@@ -24,7 +24,7 @@
 //! Adding malicious security usually means threading a `Result` through every
 //! operation, which here would have rippled through the whole evaluator. It is
 //! unnecessary: because every check is **deferred to one point**, the individual
-//! operations have nothing to report. Only [`Self::finish`] returns
+//! operations have nothing to report. Only [`MaliciousBackend::finish`] returns
 //! [`Checked`]. The design property that makes the protocol secure against
 //! selective failure is the same one that keeps the refactor small.
 //!

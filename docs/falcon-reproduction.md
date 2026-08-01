@@ -887,16 +887,18 @@ encrypted diagnosis, ms, `--precompute` on (so these are *online* figures):
 | **20 ms** falcon | 3873 | 6276 | 9585 | 11393 | 14998 | 18431 | **25543** | **34588** | **46850** |
 
 **The boundary is in bandwidth, and it moves with RTT.** Falcon wins below
-**20–30 Mbps at RTT 0** and below **10–15 Mbps at RTT 20 ms**; garbled circuits
-win above. Higher RTT shifts the crossover *down* — it shrinks the region where
+**~20 Mbps at RTT 0** and below **~10 Mbps at RTT 20 ms**; garbled circuits win
+above. Higher RTT shifts the crossover *down* — it shrinks the region where
 Falcon wins. Brackets, not interpolated points: those are the grid spacings
 actually measured.
 
-The 30 Mbps cell at RTT 0 is the boundary itself and behaves like it — across
-repeat runs the winner flips (8511 vs 8583 one run, 8621 vs 8614 the next, a
-0.1% spread). Neither ordering there should be quoted as a result; the finding
-is that the two protocols are indistinguishable at that point, which is what a
-crossover *is*.
+**The boundary is a band, not a line.** Around 20–30 Mbps at RTT 0 the winner
+flips between repeat runs: 30 Mbps gave 8511 vs 8583 one run and 8621 vs 8614
+the next; 20 Mbps gave 12357 vs 12167 one run and 12198 vs 12239 the next — a
+0.1–0.3% spread either way. No ordering inside that band should be quoted as a
+result. The finding is that the two protocols are *indistinguishable* there,
+which is what a crossover is; the quotable claims are the clear wins on either
+side (gc by 2× at 1 Gbit/s, falcon by 5% at 5 Mbps).
 
 ### Why, and the check that it is not a coincidence
 

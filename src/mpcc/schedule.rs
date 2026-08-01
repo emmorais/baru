@@ -16,7 +16,7 @@
 //!
 //! ASAP is optimal for depth, and depth is exactly the round count, so this is
 //! the minimum-round schedule for a fixed lowering.  It is also why
-//! [`crate::mpcc::lower`] does not need to emit vectorized instructions to get
+//! [`mod@crate::mpcc::lower`] does not need to emit vectorized instructions to get
 //! batching credit: 784 independent scalar `Mul`s all land at the same level and
 //! therefore in one round, which is how a batching protocol would run them.
 //!

@@ -1293,7 +1293,7 @@ enum PersistValue {
 
 impl Participant {
     /// A participant backed by the in-process
-    /// [`Aby3Simulator`](crate::interpreter::aby3_simulator::Aby3Simulator).
+    /// [`crate::interpreter::aby3_simulator::Aby3Simulator`].
     ///
     /// This is the right constructor for evaluating an expression on its own —
     /// a correctness baseline, a test, a plaintext-vs-MPC comparison — and it is

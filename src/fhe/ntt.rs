@@ -61,6 +61,11 @@ const NUM_PRIMES_WIDE: usize = 7;
 /// not split the table in two.
 const NUM_PRIMES_MAX: usize = NUM_PRIMES_WIDE;
 
+// The narrow profile takes a *prefix* of the shared table, so it can never ask
+// for more primes than the table holds. Enforced at compile time: violating it
+// would index out of bounds far from here.
+const _: () = assert!(NUM_PRIMES <= NUM_PRIMES_WIDE);
+
 // ─── Modular arithmetic (primes < 2^62, so products fit u128) ────────────────
 
 #[inline]
@@ -554,7 +559,7 @@ fn reduce_mod(v: &[i128], p: u64) -> Vec<u64> {
 /// Exact negacyclic product of two centered-coefficient polynomials, in ℤ:
 /// `c[k] = Σ_{i+j=k} a[i]·b[j] − Σ_{i+j=k+n} a[i]·b[j]`.
 ///
-/// Computed modulo [`NUM_PRIMES`] NTT-friendly primes in O(n log n) each and
+/// Computed modulo `NUM_PRIMES` NTT-friendly primes in O(n log n) each and
 /// reconstructed exactly by CRT (Garner), then centered. Requires
 /// `|c[k]| < Π pᵢ / 2`.
 pub fn exact_negacyclic_product(a: &[i128], b: &[i128], n: usize) -> Vec<I256> {
@@ -623,7 +628,7 @@ fn reduce_i256_mod(x: I256, p: u64) -> u64 {
 /// coefficients in, 512-bit exact accumulators out.
 ///
 /// Same construction as [`exact_negacyclic_product`] — the only differences are
-/// the operand width and that it uses all [`NUM_PRIMES_WIDE`] primes, giving a
+/// the operand width and that it uses all `NUM_PRIMES_WIDE` primes, giving a
 /// CRT modulus of ~2^441 instead of ~2^252.
 ///
 /// This exists for [`crate::mpcc::lowgear`], whose plaintext field must be wide
@@ -867,7 +872,6 @@ mod tests {
         let pr = primes();
         // One table serves both profiles; the narrow one takes a prefix.
         assert_eq!(pr.p.len(), NUM_PRIMES_MAX);
-        assert!(NUM_PRIMES <= NUM_PRIMES_WIDE);
         for (&p, &r) in pr.p.iter().zip(&pr.root) {
             assert!(is_prime(p), "{p} must be prime");
             assert!(
@@ -1014,9 +1018,9 @@ mod tests {
             }
         }
         let mut out = vec![I512::ZERO; n];
-        for i in 0..n {
-            for j in 0..n {
-                let p = mul(a[i], b[j]);
+        for (i, &ai) in a.iter().enumerate().take(n) {
+            for (j, &bj) in b.iter().enumerate().take(n) {
+                let p = mul(ai, bj);
                 let k = i + j;
                 if k < n {
                     out[k] = out[k].wrapping_add(p);

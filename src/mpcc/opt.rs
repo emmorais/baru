@@ -19,7 +19,7 @@
 //!   `k = 64` this is a ~64× saving.  Under ABY3, multiplying by a *public*
 //!   constant is already a free local scalar multiply, so the rewrite adds an
 //!   instruction and buys nothing.
-//! * **Reassociation** ([`reassociate`]) trades dependence depth and *nothing
+//! * **Reassociation** (`reassociate`) trades dependence depth and *nothing
 //!   else* — same instruction count, same gate count — so it isolates the
 //!   round term.  Which operator it pays for inverts between protocol
 //!   families: multiplication under secret sharing (one round each), addition
@@ -209,8 +209,6 @@ impl Rule {
         }
     }
 }
-
-/// Rewrite every operand of `op` through `subst`.
 
 /// Algebraic identities.  Every one holds exactly over wrapping two's-complement
 /// arithmetic, which is what `FlatOp` means by `IAdd32`/`IMul`.
@@ -1080,7 +1078,8 @@ fn reduction_sites(flat: &[FlatOp], output_wire: &str) -> Vec<String> {
             sites.push((leaves.len(), dst));
         }
     }
-    sites.sort_by(|a, b| b.0.cmp(&a.0));
+    // Widest reduction first: the deepest chain is where rebalancing pays most.
+    sites.sort_by_key(|&(leaves, _)| std::cmp::Reverse(leaves));
     sites.into_iter().map(|(_, d)| d).collect()
 }
 
@@ -1093,6 +1092,10 @@ fn producer_map(flat: &[FlatOp]) -> HashMap<String, usize> {
     }
     producer
 }
+
+/// The best rebalancing candidate found so far:
+/// `(leaf count, rewritten ops, leaf wires, root wire, consumed indices)`.
+type BestChain = (usize, Vec<FlatOp>, Vec<String>, String, Vec<usize>);
 
 /// Rebalance a fold whose combining operator is a **compound subgraph**, not a
 /// single instruction: `f(f(f(x0,x1),x2),x3)` → `f(f(x0,x1),f(x2,x3))`.
@@ -1120,7 +1123,7 @@ fn reassociate_reduction(flat: &[FlatOp], output_wire: &str, only: Option<&str>)
     // One chain per application. With no site pinned, take the **longest** —
     // a fold's inner roots are valid chains too, and rebalancing a prefix
     // leaves the tail serial.
-    let mut best: Option<(usize, Vec<FlatOp>, Vec<String>, String, Vec<usize>)> = None;
+    let mut best: Option<BestChain> = None;
     for root in 0..flat.len() {
         let dst = flat[root].dst();
         if only.is_some_and(|w| w != dst) {
@@ -1847,23 +1850,6 @@ mod tests {
         }
     }
 
-    /// CSE now runs inside `CircuitCompiler`, so a circuit that reaches any
-    /// backend is *already* free of duplicate subexpressions. That is the
-    /// property worth pinning — asserting that a second application shrinks it
-    /// further would only be true if the compiler had stopped doing its job.
-    ///
-    /// Both cases used to emit a duplicated product; commutativity is included
-    /// because the key sorts operands, so `x*y` and `y*x` must collide.
-    /// A maximum written as a left fold is the AI reduction that matters
-    /// (max-pooling, argmax), and its combining operator is a *compound*
-    /// subgraph — `acc + (x>acc)·(x−acc)`, four instructions — so
-    /// `Rule::Reassociate`, which only handles chains of a single associative
-    /// primitive, cannot see it.
-    ///
-    /// The rewrite must keep the circuit exactly equivalent and cut dependence
-    /// depth from `n−1` steps to `⌈log₂ n⌉`, leaving the instruction count
-    /// alone.
-
     /// Longest dependence path to `out`, in instructions — the quantity ASAP
     /// scheduling turns into a communication round count.
     fn flat_depth(flat: &[FlatOp], out: &str) -> usize {
@@ -1883,6 +1869,15 @@ mod tests {
         d.get(out).copied().unwrap_or(0)
     }
 
+    /// A maximum written as a left fold is the AI reduction that matters
+    /// (max-pooling, argmax), and its combining operator is a *compound*
+    /// subgraph — `acc + (x>acc)·(x−acc)`, four instructions — so
+    /// `Rule::Reassociate`, which only handles chains of a single associative
+    /// primitive, cannot see it.
+    ///
+    /// The rewrite must keep the circuit exactly equivalent and cut dependence
+    /// depth from `n−1` steps to `⌈log₂ n⌉`, leaving the instruction count
+    /// alone.
     #[test]
     fn compound_reduction_rebalances_and_stays_exact() {
         let mut e = String::from("x0");
@@ -1924,6 +1919,13 @@ mod tests {
         assert_eq!(rebuilt, flat, "a subtraction fold must not be reassociated");
     }
 
+    /// CSE now runs inside `CircuitCompiler`, so a circuit that reaches any
+    /// backend is *already* free of duplicate subexpressions. That is the
+    /// property worth pinning — asserting that a second application shrinks it
+    /// further would only be true if the compiler had stopped doing its job.
+    ///
+    /// Both cases used to emit a duplicated product; commutativity is included
+    /// because the key sorts operands, so `x*y` and `y*x` must collide.
     #[test]
     fn compiled_circuits_arrive_already_cse_d() {
         for src in ["(+ (* x y) (* x y))", "(+ (* x y) (* y x))"] {

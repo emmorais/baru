@@ -27,6 +27,10 @@ use baru::crypto::types::Fr;
 use baru::interpreter::backend::Backend;
 use baru::interpreter::malicious_backend::MaliciousBackend;
 
+/// How one party deviates: given the recipient and the honest message, return
+/// the message to actually send, or `None` to let it pass untouched.
+type TamperRule = Arc<dyn Fn(PartyId, &MpcMsg) -> Option<MpcMsg> + Send + Sync>;
+
 /// A transport that rewrites this party's outgoing messages.
 ///
 /// `rule` returns `Some(replacement)` to corrupt a message and `None` to let it
@@ -35,7 +39,7 @@ use baru::interpreter::malicious_backend::MaliciousBackend;
 #[derive(Clone)]
 struct Deviant {
     inner: InprocHandle,
-    rule: Arc<dyn Fn(PartyId, &MpcMsg) -> Option<MpcMsg> + Send + Sync>,
+    rule: TamperRule,
 }
 
 impl Deviant {
@@ -153,14 +157,7 @@ fn session(
 
 /// Run `session` on three parties, with `corrupt` (if any) rewriting its
 /// outgoing traffic. Returns each party's `(revealed, verdict)`.
-fn run(
-    a: Fr,
-    b: Fr,
-    corrupt: Option<(
-        PartyId,
-        Arc<dyn Fn(PartyId, &MpcMsg) -> Option<MpcMsg> + Send + Sync>,
-    )>,
-) -> Vec<(Fr, Checked<()>)> {
+fn run(a: Fr, b: Fr, corrupt: Option<(PartyId, TamperRule)>) -> Vec<(Fr, Checked<()>)> {
     run_with(a, b, corrupt, None)
 }
 
@@ -168,10 +165,7 @@ fn run(
 fn run_with(
     a: Fr,
     b: Fr,
-    corrupt: Option<(
-        PartyId,
-        Arc<dyn Fn(PartyId, &MpcMsg) -> Option<MpcMsg> + Send + Sync>,
-    )>,
+    corrupt: Option<(PartyId, TamperRule)>,
     local_mul_offset: Option<Fr>,
 ) -> Vec<(Fr, Checked<()>)> {
     let handles = InprocHandle::create(3);
@@ -424,14 +418,7 @@ fn pair_mac_session(me: PartyId, mbx: &Mailbox<impl Transport>, a: Fr, b: Fr) ->
     (revealed, verdict)
 }
 
-fn run_pair_mac(
-    a: Fr,
-    b: Fr,
-    corrupt: Option<(
-        PartyId,
-        Arc<dyn Fn(PartyId, &MpcMsg) -> Option<MpcMsg> + Send + Sync>,
-    )>,
-) -> Vec<(Fr, Checked<()>)> {
+fn run_pair_mac(a: Fr, b: Fr, corrupt: Option<(PartyId, TamperRule)>) -> Vec<(Fr, Checked<()>)> {
     let handles = InprocHandle::create(3);
     let mut joins = Vec::new();
     for (i, h) in handles.into_iter().enumerate() {
@@ -579,10 +566,7 @@ fn run_a2b(
     a: Fr,
     b: Fr,
     nbits: usize,
-    corrupt: Option<(
-        PartyId,
-        Arc<dyn Fn(PartyId, &MpcMsg) -> Option<MpcMsg> + Send + Sync>,
-    )>,
+    corrupt: Option<(PartyId, TamperRule)>,
 ) -> Vec<(Vec<Fr>, Fr, Checked<()>)> {
     let handles = InprocHandle::create(3);
     let mut joins = Vec::new();

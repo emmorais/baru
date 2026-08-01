@@ -397,11 +397,14 @@ pub fn conv2d(
     }
     let prods = be.mul_batch(&pairs);
     let mut out = Vec::with_capacity(out_shape.len());
-    for oc in 0..out_c {
+    // `zip` would silently shorten the output if these ever disagreed, so the
+    // invariant is asserted rather than absorbed.
+    debug_assert_eq!(bias.len(), out_c, "one bias per output channel");
+    for (oc, b) in bias.iter().enumerate().take(out_c) {
         for oy in 0..out_h {
             for ox in 0..out_w {
                 let base = ((oc * out_h + oy) * out_w + ox) * per_out;
-                let mut acc = bias[oc].clone();
+                let mut acc = b.clone();
                 for j in 0..per_out {
                     acc = be.add(&acc, &prods[base + j]);
                 }

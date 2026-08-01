@@ -16119,10 +16119,14 @@ pub static TEST_IMAGES: [[i64; 784]; 300] = [
     ],
 ];
 
+/// One extra conv layer: `(kernels[out_c][in_c*K*K], bias[out_c], in_c, in_h,
+/// in_w)`. Named so the signature below stays readable.
+pub type ExtraConvLayer = (Vec<Vec<i64>>, Vec<i64>, usize, usize, usize);
+
 /// The conv layers after the first, in order. Each is
 /// `(kernels[out_c][in_c*K*K], bias[out_c], in_c, in_h, in_w)`; every one is
 /// another FHE conv + MPC nonlinearity + scheme switch, and no bootstrap.
-pub fn extra_conv_layers() -> Vec<(Vec<Vec<i64>>, Vec<i64>, usize, usize, usize)> {
+pub fn extra_conv_layers() -> Vec<ExtraConvLayer> {
     vec![(
         CONV1_W.iter().map(|r| r.to_vec()).collect(),
         CONV1_B.to_vec(),

@@ -516,7 +516,7 @@ pub fn mul_party<T: Transport>(
 /// Batched [`mul_party`]: one message per party for the whole batch.
 ///
 /// Batches wider than this cannot be given collision-free α counters under
-/// the [`alpha_ctr`] encoding. It is astronomically larger than any real
+/// the `alpha_ctr` encoding. It is astronomically larger than any real
 /// batch (a full network is ~10⁵ multiplications), so the cap only guards a
 /// programming error.
 pub const MAX_BATCH: usize = 1 << 40;
@@ -539,7 +539,7 @@ fn alpha_ctr(op_id: u64, i: usize) -> u64 {
 /// masked by the same randomness. Reusing an α would be harmless for
 /// correctness (it always cancels in the sum) but a privacy leak: two
 /// products sharing an α expose their difference on the wire. See
-/// [`alpha_ctr`] for how collisions are ruled out.
+/// `alpha_ctr` for how collisions are ruled out.
 /// A batch of **dot products**, each resharing **once**.
 ///
 /// # Why this is not `mul_batch_party` plus local sums
@@ -843,7 +843,7 @@ fn ppa_add<T: Transport>(
 /// # Protocol
 ///
 /// 1. **Binary-share the three additive components** — free, via
-///    [`share_component`]: `a = a₀ + a₁ + a₂` and each `aⱼ` is already known
+///    `share_component`: `a = a₀ + a₁ + a₂` and each `aⱼ` is already known
 ///    to exactly the two parties a replicated sharing of it requires.
 /// 2. **Carry-save reduce 3 → 2.** In this arithmetic bit encoding
 ///    `x⊕y⊕z = x+y+z − 2(xy+xz+yz) + 4xyz` and

@@ -210,6 +210,10 @@ pub struct MixedStats {
 
 /// Evaluate `flat` with operations routed by `assignment` (keyed by operation
 /// kind, e.g. `"mul"`), converting representations at every crossing.
+// Eight independent inputs: two backends, a key, the program, its inputs, its
+// output wire, the ring width and the routing. No subset forms a cohesive
+// struct, so grouping would only add a layer to see through.
+#[allow(clippy::too_many_arguments)]
 pub fn run_mixed<A: FheArith>(
     be: &mut dyn Backend,
     fhe: &A,
@@ -250,10 +254,10 @@ pub fn run_mixed<A: FheArith>(
         let out = match side {
             Side::Fhe => {
                 st.fhe_ops += 1;
-                let mut get_ct = |w: &String,
-                                  env: &mut HashMap<String, Val<A::Ct>>,
-                                  st: &mut MixedStats,
-                                  be: &mut dyn Backend|
+                let get_ct = |w: &String,
+                              env: &mut HashMap<String, Val<A::Ct>>,
+                              st: &mut MixedStats,
+                              be: &mut dyn Backend|
                  -> Result<A::Ct, String> {
                     match env.get(w) {
                         Some(Val::Fhe(c)) => Ok(c.clone()),
@@ -435,7 +439,7 @@ pub fn packed_dot(
     }
     let mut ct_b: Option<crate::fhe::bfv::BfvCt> = None;
     for cv in &b_comps {
-        let ct = s.encrypt_poly(client_key, &s.pack_weights(&[cv.clone()]));
+        let ct = s.encrypt_poly(client_key, &s.pack_weights(std::slice::from_ref(cv)));
         ct_b = Some(match ct_b {
             None => ct,
             Some(acc) => s.add(&acc, &ct),

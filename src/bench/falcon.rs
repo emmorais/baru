@@ -568,71 +568,6 @@ fn sel_pre(seed: u64, l_bits: u32, me: PartyId) -> crate::crypto::falcon_mpc::Se
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::interpreter::transport_backend::NonlinMode;
-
-    /// The three comparison backends must be **interchangeable**: same inputs,
-    /// same bits out, whichever protocol runs underneath.
-    ///
-    /// This is what makes `NonlinMode` a choice rather than three separate
-    /// systems — and it is the check that has to pass before any cost
-    /// comparison between them means anything.
-    #[test]
-    #[ignore] // real 3-party transport
-    fn every_nonlinearity_mode_computes_the_same_comparison() {
-        const NBITS: usize = 20;
-        let l = 1i128 << NBITS;
-        let cases: Vec<(i128, i128)> = vec![
-            (5, 3),
-            (3, 5),
-            (0, 0),
-            (-7, 2),
-            (2, -7),
-            (-1, -1),
-            (100, -100),
-            (-100, 100),
-        ];
-        let want: Vec<u64> = cases.iter().map(|&(a, b)| u64::from(a < b)).collect();
-
-        let mut seen = Vec::new();
-        for mode in [NonlinMode::A2b, NonlinMode::Gc, NonlinMode::Falcon] {
-            let cs = cases.clone();
-            let (out, _) = run_parties(NetworkProfile::INSTANT, move |_me| {
-                let cs = cs.clone();
-                move |be: &mut TransportBackend<MpcTransport>| {
-                    be.set_nonlin(mode);
-                    let enc = |v: i128| ((v + l) % l) as u128;
-                    let pairs: Vec<_> = cs
-                        .iter()
-                        .map(|&(a, b)| {
-                            (
-                                be.share_public(enc(a), NBITS),
-                                be.share_public(enc(b), NBITS),
-                            )
-                        })
-                        .collect();
-                    let bits = be.lt_batch(&pairs);
-                    bits.iter().map(|x| be.reveal(x, None)).collect::<Vec<_>>()
-                }
-            });
-            let got: Vec<u64> = out[0].iter().map(|&v| (v & 1) as u64).collect();
-            assert_eq!(
-                got,
-                want,
-                "{} disagreed with plaintext (a < b)",
-                mode.label()
-            );
-            seen.push(got);
-        }
-        assert!(
-            seen.windows(2).all(|w| w[0] == w[1]),
-            "modes must agree with each other"
-        );
-    }
-}
-
 const USAGE: &str = "usage: baru bench-falcon [--n N] [--bits L] [--net] [--json]
 
 Falcon's sign extraction against Baru's own routes, on one transport.
@@ -768,4 +703,69 @@ pub fn run_cli(args: &[String]) -> Result<(), String> {
     // other is an artefact of how this crate serialises ring shares, and only
     // the first is a claim about Falcon.
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::interpreter::transport_backend::NonlinMode;
+
+    /// The three comparison backends must be **interchangeable**: same inputs,
+    /// same bits out, whichever protocol runs underneath.
+    ///
+    /// This is what makes `NonlinMode` a choice rather than three separate
+    /// systems — and it is the check that has to pass before any cost
+    /// comparison between them means anything.
+    #[test]
+    #[ignore] // real 3-party transport
+    fn every_nonlinearity_mode_computes_the_same_comparison() {
+        const NBITS: usize = 20;
+        let l = 1i128 << NBITS;
+        let cases: Vec<(i128, i128)> = vec![
+            (5, 3),
+            (3, 5),
+            (0, 0),
+            (-7, 2),
+            (2, -7),
+            (-1, -1),
+            (100, -100),
+            (-100, 100),
+        ];
+        let want: Vec<u64> = cases.iter().map(|&(a, b)| u64::from(a < b)).collect();
+
+        let mut seen = Vec::new();
+        for mode in [NonlinMode::A2b, NonlinMode::Gc, NonlinMode::Falcon] {
+            let cs = cases.clone();
+            let (out, _) = run_parties(NetworkProfile::INSTANT, move |_me| {
+                let cs = cs.clone();
+                move |be: &mut TransportBackend<MpcTransport>| {
+                    be.set_nonlin(mode);
+                    let enc = |v: i128| ((v + l) % l) as u128;
+                    let pairs: Vec<_> = cs
+                        .iter()
+                        .map(|&(a, b)| {
+                            (
+                                be.share_public(enc(a), NBITS),
+                                be.share_public(enc(b), NBITS),
+                            )
+                        })
+                        .collect();
+                    let bits = be.lt_batch(&pairs);
+                    bits.iter().map(|x| be.reveal(x, None)).collect::<Vec<_>>()
+                }
+            });
+            let got: Vec<u64> = out[0].iter().map(|&v| (v & 1) as u64).collect();
+            assert_eq!(
+                got,
+                want,
+                "{} disagreed with plaintext (a < b)",
+                mode.label()
+            );
+            seen.push(got);
+        }
+        assert!(
+            seen.windows(2).all(|w| w[0] == w[1]),
+            "modes must agree with each other"
+        );
+    }
 }

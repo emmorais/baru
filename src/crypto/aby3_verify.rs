@@ -86,7 +86,7 @@
 //! # One abort point, not many
 //!
 //! Every check here is **deferred**: mismatches are accumulated and the verdict
-//! is taken once, in [`Verifier::check`]. Aborting the instant a check fails
+//! is taken once, in [`check`]. Aborting the instant a check fails
 //! would leak, because *which* check fails and *when* can depend on the secret
 //! inputs — a corrupt party could inject an error that cancels only for
 //! particular values and learn a predicate on the data from whether the
@@ -105,7 +105,7 @@ const TIMEOUT_MS: u64 = 60_000;
 
 /// PRF counter domain for verification randomness.
 ///
-/// [`super::aby3_protocol::alpha_ctr`] maps operation ids into `op_id << 40`,
+/// `aby3_protocol::alpha_ctr` maps operation ids into `op_id << 40`,
 /// so ordinary protocol randomness lives in the low part of the counter space
 /// for any realistic op_id. Verification randomness is placed at the very top
 /// so it can never collide with it — a collision would reuse a mask and leak.
@@ -135,7 +135,7 @@ pub fn headroom_bits(used_bits: u32) -> u32 {
 /// Bits a product of two `nbits` values can occupy once `accumulated` of them
 /// are summed — the quantity [`headroom_bits`] must be fed.
 pub fn product_width(nbits: usize, accumulated: usize) -> u32 {
-    let acc_bits = (usize::BITS - accumulated.saturating_sub(1).leading_zeros()) as u32;
+    let acc_bits = usize::BITS - accumulated.saturating_sub(1).leading_zeros();
     2 * nbits as u32 + acc_bits
 }
 
@@ -154,7 +154,7 @@ pub struct Verifier {
     t_next: Sha256,
     t_prev: Sha256,
     /// Set when a check failed locally. The verdict is still deferred to
-    /// [`Self::check`] so the abort cannot be timed to a secret.
+    /// [`check`] so the abort cannot be timed to a secret.
     failed: Option<AbortReason>,
     /// Random pairs consumed so far, so no `ρ` is ever reused as a pad.
     pairs_drawn: u64,
@@ -467,7 +467,7 @@ pub fn reveal_batch_checked<T: Transport>(
 /// transcript it shares with the party that *does* hold it. If the sender told
 /// the two receivers different stories, or told the non-holder a value the
 /// holder disagrees with, the transcripts diverge and
-/// [`Verifier::check`] aborts. So a reveal costs exactly what it did before,
+/// [`check`] aborts. So a reveal costs exactly what it did before,
 /// and the whole cost of checking it is one hash comparison per session.
 pub fn reveal_checked<T: Transport>(
     share: &PartyShare,
@@ -830,6 +830,10 @@ fn ppa_add_batch_checked<T: Transport>(
 ///
 /// Every Baru comparison (`<`, `>`, `≤`, `≥`, ReLU, max-pool, argmax) reduces to
 /// this, so covering it covers the entire nonlinear surface.
+// `(nbits, op_id, me, mbx, keys, v)` is this crate's protocol-call convention,
+// carried by every checked operation; bundling it here alone would make this
+// function the odd one out rather than clearer.
+#[allow(clippy::too_many_arguments)]
 pub fn lt_batch_checked<T: Transport>(
     a: &[MalShare],
     b: &[MalShare],

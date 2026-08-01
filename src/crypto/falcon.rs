@@ -115,8 +115,8 @@ impl WrapRandomness {
 /// Falcon's DReLU discharges it structurally: it invokes `Π_WA` on the
 /// **doubled** summands `(2a₁, 2a₂, 2a₃)`, so the wrapped value is `2a mod L`,
 /// which is even, while `L − 1 = 2^ℓ − 1` is odd. The bad input is therefore
-/// unreachable there. [`wrap3_protocol_is_exact`] checks every input including
-/// `a = L−1`, and [`the_degenerate_input_is_unreachable_after_doubling`] pins
+/// unreachable there. `wrap3_protocol_is_exact` checks every input including
+/// `a = L−1`, and `the_degenerate_input_is_unreachable_after_doubling` pins
 /// the argument that makes it safe.
 pub fn wrap3_protocol(
     a_summands: [u64; 3],

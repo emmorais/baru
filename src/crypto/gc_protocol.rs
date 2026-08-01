@@ -267,6 +267,10 @@ fn table_digest(all: &[Vec<AndTable>]) -> [u8; 32] {
     h.finalize().into()
 }
 
+// `(op_id, me, mbx)` is the protocol-call convention; the rest — shape, width,
+// both operand vectors, the verify flag — are independent inputs with nothing
+// to group them by.
+#[allow(clippy::too_many_arguments)]
 fn garble_evaluate<T: Transport>(
     shape: Shape,
     nbits: usize,
@@ -318,14 +322,14 @@ fn garble_evaluate<T: Transport>(
                     push_label(&mut payload, &t.te);
                 }
                 let xv = xs[item];
-                for i in 0..nbits {
-                    push_label(&mut payload, &g.active(&x0[i], bit(xv, i)));
+                for (i, lbl) in x0.iter().enumerate().take(nbits) {
+                    push_label(&mut payload, &g.active(lbl, bit(xv, i)));
                 }
             } else {
                 // Garbler 1 ships active labels for y = s₂ only.
                 let yv = ys[item];
-                for i in 0..nbits {
-                    push_label(&mut payload, &g.active(&y0[i], bit(yv, i)));
+                for (i, lbl) in y0.iter().enumerate().take(nbits) {
+                    push_label(&mut payload, &g.active(lbl, bit(yv, i)));
                 }
             }
             masks.push(mask);

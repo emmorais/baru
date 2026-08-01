@@ -414,7 +414,7 @@ pub fn run_cli(args: &[String]) -> Result<(), String> {
 /// [`run`] above executes the assignment on an in-process simulator using
 /// `export_additive`, which hands one caller every party's share component —
 /// convenient, and not something a deployed party can do. Here each party
-/// produces only *its own* component ([`TransportBackend::my_additive_component`]),
+/// produces only *its own* component ([`my_additive_component`](crate::interpreter::transport_backend::TransportBackend::my_additive_component)),
 /// those components are encrypted separately and summed homomorphically, and
 /// the ciphertexts crossing the link are charged latency and bandwidth. That
 /// is the same accounting `crate::bench::cnn` uses, so the wall-clock is
@@ -566,7 +566,7 @@ pub fn run_deployed(
         let mut link_bytes = 0usize;
         for (pa, pb) in &parts {
             let ca = s.encrypt_poly(&ck, &s.pack_input(pa));
-            let cb = s.encrypt_poly(&ck, &s.pack_weights(&[pb.clone()]));
+            let cb = s.encrypt_poly(&ck, &s.pack_weights(std::slice::from_ref(pb)));
             link_bytes += s.ct_bytes(&ca) + s.ct_bytes(&cb);
             ct_a = Some(match ct_a {
                 None => ca,

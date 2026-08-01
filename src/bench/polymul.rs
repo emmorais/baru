@@ -19,7 +19,7 @@
 //! |---|---|---|---|
 //! | schoolbook | this file | O(n²) 256-bit MACs | the original; the thing that was replaced |
 //! | multi-modular NTT | [`crate::fhe::ntt`] | O(n log n) word ops × 4 primes | hand-written, ~200 lines we maintain |
-//! | NTL + GMP | [`crate::fhe::ntl`] | NTL's own choice | mature C++; needs `--features ntl` |
+//! | NTL + GMP | `crate::fhe::ntl` | NTL's own choice | mature C++; needs `--features ntl` |
 //!
 //! Timings are **total wall clock per product**, marshalling included — the
 //! NTL column pays for converting `2n` limbs into GMP integers and `4n` limbs

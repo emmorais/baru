@@ -172,7 +172,7 @@ pub fn eligibility(spec: &ProtocolSpec, dep: &Deployment) -> Result<(), String> 
 }
 
 /// The domain a protocol runs in, independent of any particular program —
-/// what [`crate::mpcc::lower`] should target so a measured run and a predicted
+/// what [`mod@crate::mpcc::lower`] should target so a measured run and a predicted
 /// one are comparable.
 pub fn native_domain(spec: &ProtocolSpec, ring_bits: u32) -> Domain {
     match spec.domain {

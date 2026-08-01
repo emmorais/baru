@@ -29,8 +29,8 @@
 //! make circuit identity depend on pretty-printing.
 //!
 //! So [`compile_circuit`](Binius64Real::compile_circuit) lowers the expression
-//! once into [`Ir`] — a flat, serializable list of operations over wire indices
-//! — and stores *that* in the circuit. [`build`] turns an `Ir` into a Binius
+//! once into `Ir` — a flat, serializable list of operations over wire indices
+//! — and stores *that* in the circuit. `build` turns an `Ir` into a Binius
 //! circuit deterministically, and is the only path either side uses.
 //!
 //! # Scope, stated
@@ -685,7 +685,6 @@ impl ZKPBackend for Binius64Real {
         let Built {
             circuit: built,
             named: wires,
-            divmod_wires,
             ..
         } = build(&ir);
 

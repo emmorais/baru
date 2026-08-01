@@ -310,6 +310,10 @@ mod tests {
                 .collect::<Vec<_>>()
         });
         let mut nonzero = 0;
+        // Indexed on purpose: each step reads the *same* position across all
+        // three parties' vectors, which an iterator over any one of them
+        // cannot express.
+        #[allow(clippy::needless_range_loop)]
         for i in 0..64usize {
             for p in 0..3usize {
                 assert_eq!(

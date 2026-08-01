@@ -575,7 +575,7 @@ pub(crate) fn read_frames<S: Read>(
 impl TcpTransport {
     /// Create a new TcpTransport for participant `id` with a list of addresses
     /// (one address per party, length == nparties). This starts a listener
-    /// thread bound to addrs[id].
+    /// thread bound to `addrs[id]`.
     pub fn new(id: PartyId, addrs: Vec<String>) -> Self {
         let inbox = Arc::new(Mutex::new(VecDeque::new()));
         let peers_seen = Arc::new(Mutex::new(HashSet::new()));

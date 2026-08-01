@@ -417,7 +417,7 @@ impl CircuitCompiler {
     }
 
     /// Disable common-subexpression elimination. For A/B measurement only —
-    /// see [`Self::cse_enabled`].
+    /// see `Self::cse_enabled`.
     pub fn without_cse(mut self) -> Self {
         self.cse_enabled = false;
         self
@@ -1810,7 +1810,7 @@ impl CircuitCompiler {
 /// collide. The output wire's definition is never eliminated — the caller's
 /// circuit signature depends on it.
 ///
-/// This lives here, beside [`CircuitCompiler::fold_constants`], rather than in
+/// This lives here, beside `CircuitCompiler::fold_constants`, rather than in
 /// `mpcc::opt` where it started, because **every** backend needs it: `mpcc` was
 /// the only consumer for a while, so a circuit handed to FHE or ZKP kept every
 /// redundant gate the source expression happened to contain. A fold written the

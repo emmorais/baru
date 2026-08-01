@@ -40,7 +40,7 @@
 //!   (`from_bytes_mod_order_wide`), which is unbiased, rather than by rejection
 //!   sampling on 32.
 //! * `a` is reused across a batch of OTs, which is what makes a batch cheap;
-//!   the per-index hash domain separation in [`super::hash_block`] is what keeps
+//!   the per-index hash domain separation in `super::hash_block` is what keeps
 //!   the derived keys independent.
 
 use curve25519_dalek::constants::RISTRETTO_BASEPOINT_TABLE;

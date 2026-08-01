@@ -492,9 +492,9 @@ fn private_train_mlp(
                     // product is independent, so the whole c×h outer product is
                     // one batched multiply and the summation is local.
                     let mut back_pairs = Vec::with_capacity(c * h);
-                    for cc in 0..c {
-                        for hh in 0..h {
-                            back_pairs.push((w2[cc][hh].clone(), delta2[cc].clone()));
+                    for (row, d2) in w2[..c].iter().zip(&delta2[..c]) {
+                        for wv in &row[..h] {
+                            back_pairs.push((wv.clone(), d2.clone()));
                         }
                     }
                     let back = be.mul_batch(&back_pairs);
@@ -523,14 +523,14 @@ fn private_train_mlp(
                     // layers keep separate learning rates, so the shifts are
                     // batched per rate rather than all together.
                     let mut g_pairs = Vec::with_capacity(c * h + h * d);
-                    for cc in 0..c {
-                        for hh in 0..h {
-                            g_pairs.push((delta2[cc].clone(), a1[hh].clone()));
+                    for d2 in &delta2[..c] {
+                        for a in &a1[..h] {
+                            g_pairs.push((d2.clone(), a.clone()));
                         }
                     }
-                    for hh in 0..h {
-                        for i in 0..d {
-                            g_pairs.push((delta1[hh].clone(), x[i].clone()));
+                    for d1 in &delta1[..h] {
+                        for xi in &x[..d] {
+                            g_pairs.push((d1.clone(), xi.clone()));
                         }
                     }
                     let grads = be.mul_batch(&g_pairs);

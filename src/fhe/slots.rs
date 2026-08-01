@@ -7,7 +7,7 @@
 //! `m(X) = Σ xᵢ Xⁱ`. That is the right encoding for an inner product, because
 //! a polynomial product *is* a convolution and the reversed-weight trick lands
 //! each row's dot product on a known coefficient
-//! ([`crate::fhe::bfv::pack_weights`]).
+//! (`crate::fhe::bfv::pack_weights`).
 //!
 //! It is the wrong encoding for anything elementwise. `m(X)²` has coefficient
 //! `Σ_{i+j=k} xᵢxⱼ` — every output is polluted by cross terms, so `xᵢ²` is not
@@ -35,8 +35,8 @@
 //! componentwise multiplication**. Those `n` components are the "slots".
 //!
 //! That map is exactly the negacyclic NTT: twist by `ψ^j`, then a standard
-//! NTT. [`decode`] is the forward direction (coefficients → slots) and
-//! [`encode`] the inverse. Both are O(n log n) and run on *plaintexts* only,
+//! NTT. `decode` is the forward direction (coefficients → slots) and
+//! `encode` the inverse. Both are O(n log n) and run on *plaintexts* only,
 //! so they cost nothing against a ciphertext operation.
 //!
 //! # Relationship to `fhe::ntt`
@@ -335,9 +335,9 @@ mod tests {
     /// agree with.
     fn negacyclic_mul(a: &[u64], b: &[u64], n: usize, t: u64) -> Vec<u64> {
         let mut out = vec![0u64; n];
-        for i in 0..n {
-            for j in 0..n {
-                let p = mulmod(a[i], b[j], t);
+        for (i, &ai) in a.iter().enumerate().take(n) {
+            for (j, &bj) in b.iter().enumerate().take(n) {
+                let p = mulmod(ai, bj, t);
                 let k = i + j;
                 if k < n {
                     out[k] = addmod(out[k], p, t);

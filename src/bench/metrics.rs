@@ -250,7 +250,7 @@ mod tests {
     fn balanced_accuracy_exposes_a_majority_class_collapse() {
         let mut logits = vec![vec![0i64, 1i64]; 100]; // always predicts class 1
         let mut labels = vec![1u8; 90];
-        labels.extend(std::iter::repeat(0u8).take(10));
+        labels.extend(std::iter::repeat_n(0u8, 10));
         logits.truncate(100);
         let m = ClassificationMetrics::compute(&logits, &labels, 2);
         assert!((m.accuracy - 0.90).abs() < 1e-12, "accuracy {}", m.accuracy);

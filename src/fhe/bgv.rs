@@ -34,7 +34,7 @@
 //!   roundoff. BGV's is driven by the *messages*: the `t·e·e'` term dominates,
 //!   so noise growth depends on `t`, not on the plaintext magnitudes. Budget
 //!   at the default parameters is worked out below and **measured** by
-//!   [`tests::measures_post_multiply_noise_budget`].
+//!   `tests::measures_post_multiply_noise_budget`.
 //!
 //! What is *not* different: the ring, the ring dimension, the ciphertext
 //! shape (2 elements fresh, 3 after a multiply), and therefore the number of
