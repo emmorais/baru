@@ -28,11 +28,9 @@
 //! | `Iknp` (OT extension) | semi-honest | trait path omits the KOS check; `simulate_checked` runs it |
 //! | `NaiveHash` (PSI) | semi-honest | leaks by construction; see `psi::Hiding` |
 //! | `DhPsi` | semi-honest | trait path ships no proof; `respond_proved`/`verify_exponent` close it |
-//! | `Pir` | semi-honest | Stage 6 (gated): no integrity against a malicious server |
 //! | `zkp::binius_real` | sound | real Binius64 prover/verifier; arithmetic, signed comparisons, shifts, division, `if`/`let` (enough for ReLU and Q16.16) (`tests/zkp_real.rs`) |
-//! | `zkp::binius64_backend` | **none** | retained placeholder, unused: `verify` never checks constraint satisfaction (`tests/zkp_soundness.rs`) |
 //! | `Bfv`, `Bgv` | semi-honest | `fhe::threshold` built and tested; boundary proof implemented but not reviewed; measured lambda is 30, not 40 (§6d) |
-//! | `CkksBackend`, `TfheBackend` | semi-honest | Stage 6 (gated): third-party randomness, cannot derandomise |
+//! | `TfheBackend` | semi-honest | Stage 6 (gated): third-party randomness, cannot derandomise |
 //!
 //! [`crate::interpreter::malicious_backend::MaliciousBackend`] is the only
 //! engine that attests [`Security::Malicious`], and it attests it because the
@@ -124,15 +122,6 @@ attest!(
      which is the deviation that corrupts the receiver's output"
 );
 
-// ─── Private information retrieval ───────────────────────────────────────────
-
-attest!(
-    crate::pir::Pir,
-    Security::SemiHonest,
-    "no integrity: a malicious server can return a wrong or malformed answer and the \
-     client cannot tell"
-);
-
 // ─── FHE backends ────────────────────────────────────────────────────────────
 
 attest!(
@@ -156,13 +145,6 @@ attest!(
     Security::SemiHonest,
     "third-party library: Baru cannot derandomise its internal sampling, so the \
      recompute-and-compare argument does not apply"
-);
-
-attest!(
-    crate::fhe::ckks_backend::CkksBackend,
-    Security::SemiHonest,
-    "third-party library (SEAL): internal randomness is not derandomisable from our \
-     PRF keys, and CKKS is approximate, so bit-identical comparison is not available"
 );
 
 #[cfg(test)]
@@ -194,16 +176,12 @@ mod tests {
     ///
     /// | Scheme | Why it is gated |
     /// |---|---|
-    /// | `Pir` | Integrity for single-server PIR is an open problem, and PIR already loses to downloading the database by 13× here |
-    /// | `TfheBackend`, `CkksBackend` | Third-party libraries whose internal sampling Baru cannot derandomise, so recompute-and-compare does not apply; CKKS is approximate, so bit-identical comparison is unavailable in principle |
+    /// | `TfheBackend` | A third-party library whose internal sampling Baru cannot derandomise, so recompute-and-compare does not apply; CKKS is approximate, so bit-identical comparison is unavailable in principle |
     /// | `Bfv` | `fhe::threshold` is built and tested, but externally supplied ciphertexts still need the boundary proof that replication provably cannot substitute for |
     /// | `Iknp`, `ChouOrlandi`, `DhPsi` | The checked entry points exist; the `OtProtocol`/`PsiProtocol` trait paths still call the unchecked ones |
     #[test]
     fn research_grade_gaps_refuse_malicious_security() {
-        let pir = crate::pir::Pir::new(crate::fhe::bfv::BfvParams::TEST_SMALL, 8, 4)
-            .expect("a small PIR instance");
         let cases: Vec<(&'static str, &dyn AttestedSecurity)> = vec![
-            ("pir", &pir),
             ("tfhe", &crate::fhe::tfhe_backend::TfheBackend),
             ("iknp", &crate::ot::iknp::Iknp),
             ("chou-orlandi", &crate::ot::base::ChouOrlandi),

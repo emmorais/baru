@@ -12,7 +12,6 @@
 \newlabel{sec:intro@cref}{{[section][1][]1}{[1][1][]1}{}{}{}}
 \citation{FV}
 \citation{BGV}
-\citation{CKKS}
 \citation{TFHE}
 \citation{Binius}
 \citation{Beaver}
@@ -49,8 +48,6 @@
 \citation{Falcon}
 \citation{FV}
 \citation{BGV}
-\citation{SEAL}
-\citation{CKKS}
 \citation{TFHErs}
 \citation{TFHE}
 \citation{Cheetah}
@@ -121,13 +118,12 @@
 \newlabel{sec:netmodel}{{6.2}{8}{A validated network model}{subsection.6.2}{}}
 \newlabel{sec:netmodel@cref}{{[subsection][2][6]6.2}{[1][8][]8}{}{}{}}
 \@writefile{toc}{\contentsline {subsection}{\numberline {6.3}Bit-exactness as a gate on quoting cost}{8}{subsection.6.3}\protected@file@percent }
-\@writefile{lot}{\contentsline {table}{\numberline {7}{\ignorespaces One private layer with both operands secret plus a \ensuremath  {\mathrm  {ReLU}}{}; WAN, two parties, preprocessing charged per triple \emph  {consumed}.}}{9}{table.7}\protected@file@percent }
-\newlabel{tab:layer}{{7}{9}{One private layer with both operands secret plus a \ReLU {}; WAN, two parties, preprocessing charged per triple \emph {consumed}}{table.7}{}}
-\newlabel{tab:layer@cref}{{[table][7][]7}{[1][9][]9}{}{}{}}
 \@writefile{toc}{\contentsline {subsection}{\numberline {6.4}Machine-checked security attestations}{9}{subsection.6.4}\protected@file@percent }
 \newlabel{sec:attest}{{6.4}{9}{Machine-checked security attestations}{subsection.6.4}{}}
 \newlabel{sec:attest@cref}{{[subsection][4][6]6.4}{[1][9][]9}{}{}{}}
-\@writefile{toc}{\contentsline {subsection}{\numberline {6.5}Recording withdrawn results}{9}{subsection.6.5}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {6.5}Recording withdrawn results---and deleting the component}{9}{subsection.6.5}\protected@file@percent }
+\newlabel{sec:withdrawn-policy}{{6.5}{9}{Recording withdrawn results---and deleting the component}{subsection.6.5}{}}
+\newlabel{sec:withdrawn-policy@cref}{{[subsection][5][6]6.5}{[1][9][]9}{}{}{}}
 \@writefile{toc}{\contentsline {section}{\numberline {7}Cross-paradigm findings}{9}{section.7}\protected@file@percent }
 \newlabel{sec:cross}{{7}{9}{Cross-paradigm findings}{section.7}{}}
 \newlabel{sec:cross@cref}{{[section][7][]7}{[1][9][]9}{}{}{}}
@@ -138,8 +134,9 @@
 \citation{Silph}
 \citation{SING}
 \citation{Falcon}
-\citation{MedMNIST}
-\citation{MNIST}
+\@writefile{lot}{\contentsline {table}{\numberline {7}{\ignorespaces One private layer with both operands secret plus a \ensuremath  {\mathrm  {ReLU}}{}; WAN, two parties, preprocessing charged per triple \emph  {consumed}.}}{10}{table.7}\protected@file@percent }
+\newlabel{tab:layer}{{7}{10}{One private layer with both operands secret plus a \ReLU {}; WAN, two parties, preprocessing charged per triple \emph {consumed}}{table.7}{}}
+\newlabel{tab:layer@cref}{{[table][7][]7}{[1][9][]10}{}{}{}}
 \@writefile{lot}{\contentsline {table}{\numberline {8}{\ignorespaces Milliseconds per encrypted MedMNIST diagnosis; winner in bold. Both routes compute the same diagnosis bit-exactly, from one shared session, so only the protocol and the network vary.}}{10}{table.8}\protected@file@percent }
 \newlabel{tab:crossover}{{8}{10}{Milliseconds per encrypted MedMNIST diagnosis; winner in bold. Both routes compute the same diagnosis bit-exactly, from one shared session, so only the protocol and the network vary}{table.8}{}}
 \newlabel{tab:crossover@cref}{{[table][8][]8}{[1][10][]10}{}{}{}}
@@ -147,45 +144,46 @@
 \@writefile{toc}{\contentsline {subsection}{\numberline {7.3}The nonlinearity crossover is in bandwidth, and moves with RTT}{10}{subsection.7.3}\protected@file@percent }
 \newlabel{sec:crossover-nonlin}{{7.3}{10}{The nonlinearity crossover is in bandwidth, and moves with RTT}{subsection.7.3}{}}
 \newlabel{sec:crossover-nonlin@cref}{{[subsection][3][7]7.3}{[1][10][]10}{}{}{}}
-\@writefile{toc}{\contentsline {paragraph}{The boundary is a band, not a line.}{10}{section*.11}\protected@file@percent }
+\citation{MedMNIST}
+\citation{MNIST}
 \citation{Wilson}
 \@writefile{lot}{\contentsline {table}{\numberline {9}{\ignorespaces Private diagnosis on real biomedical images, image \emph  {and} weights encrypted, only the class index revealed.}}{11}{table.9}\protected@file@percent }
 \newlabel{tab:medmnist}{{9}{11}{Private diagnosis on real biomedical images, image \emph {and} weights encrypted, only the class index revealed}{table.9}{}}
 \newlabel{tab:medmnist@cref}{{[table][9][]9}{[1][11][]11}{}{}{}}
+\@writefile{toc}{\contentsline {paragraph}{The boundary is a band, not a line.}{11}{section*.11}\protected@file@percent }
 \@writefile{toc}{\contentsline {section}{\numberline {8}Case study: private medical image diagnosis}{11}{section.8}\protected@file@percent }
 \newlabel{sec:medmnist}{{8}{11}{Case study: private medical image diagnosis}{section.8}{}}
-\newlabel{sec:medmnist@cref}{{[section][8][]8}{[1][10][]11}{}{}{}}
+\newlabel{sec:medmnist@cref}{{[section][8][]8}{[1][11][]11}{}{}{}}
 \@writefile{toc}{\contentsline {paragraph}{Privacy costs nothing in accuracy, and this is shown rather than asserted.}{11}{section*.12}\protected@file@percent }
 \@writefile{toc}{\contentsline {paragraph}{Accuracy alone misreads a medical classifier.}{11}{section*.13}\protected@file@percent }
 \@writefile{toc}{\contentsline {paragraph}{The accuracy ceiling is the packing, not the crypto.}{11}{section*.14}\protected@file@percent }
-\@writefile{toc}{\contentsline {section}{\numberline {9}What the methodology caught in our own work}{11}{section.9}\protected@file@percent }
-\newlabel{sec:withdrawn}{{9}{11}{What the methodology caught in our own work}{section.9}{}}
-\newlabel{sec:withdrawn@cref}{{[section][9][]9}{[1][11][]11}{}{}{}}
-\@writefile{toc}{\contentsline {paragraph}{A ZKP backend that proved nothing.}{11}{section*.15}\protected@file@percent }
 \citation{LTV}
 \citation{YASHE}
 \citation{ABDucas}
 \citation{KirchnerFouque}
 \citation{DucasvanWoerden}
+\@writefile{toc}{\contentsline {section}{\numberline {9}What the methodology caught in our own work}{12}{section.9}\protected@file@percent }
+\newlabel{sec:withdrawn}{{9}{12}{What the methodology caught in our own work}{section.9}{}}
+\newlabel{sec:withdrawn@cref}{{[section][9][]9}{[1][12][]12}{}{}{}}
+\@writefile{toc}{\contentsline {paragraph}{A ZKP backend that proved nothing.}{12}{section*.15}\protected@file@percent }
 \@writefile{toc}{\contentsline {paragraph}{A privacy break in bit decomposition.}{12}{section*.16}\protected@file@percent }
 \@writefile{toc}{\contentsline {paragraph}{An insecure FHE scheme, removed rather than caveated.}{12}{section*.17}\protected@file@percent }
 \@writefile{toc}{\contentsline {paragraph}{A selective-failure channel that passes every functional test.}{12}{section*.18}\protected@file@percent }
 \@writefile{toc}{\contentsline {paragraph}{Comparison errors of framing.}{12}{section*.19}\protected@file@percent }
 \@writefile{toc}{\contentsline {paragraph}{Honest negatives retained.}{12}{section*.20}\protected@file@percent }
-\@writefile{toc}{\contentsline {section}{\numberline {10}Threats to validity}{12}{section.10}\protected@file@percent }
-\newlabel{sec:threats}{{10}{12}{Threats to validity}{section.10}{}}
-\newlabel{sec:threats@cref}{{[section][10][]10}{[1][12][]12}{}{}{}}
-\@writefile{toc}{\contentsline {paragraph}{Implementation quality.}{12}{section*.21}\protected@file@percent }
-\@writefile{toc}{\contentsline {paragraph}{Single machine.}{12}{section*.22}\protected@file@percent }
-\@writefile{toc}{\contentsline {paragraph}{The simulated network is a model.}{12}{section*.23}\protected@file@percent }
 \citation{CirC}
+\@writefile{toc}{\contentsline {section}{\numberline {10}Threats to validity}{13}{section.10}\protected@file@percent }
+\newlabel{sec:threats}{{10}{13}{Threats to validity}{section.10}{}}
+\newlabel{sec:threats@cref}{{[section][10][]10}{[1][12][]13}{}{}{}}
+\@writefile{toc}{\contentsline {paragraph}{Implementation quality.}{13}{section*.21}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Single machine.}{13}{section*.22}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{The simulated network is a model.}{13}{section*.23}\protected@file@percent }
 \@writefile{toc}{\contentsline {paragraph}{Two disclosed cryptographic gaps.}{13}{section*.24}\protected@file@percent }
 \@writefile{toc}{\contentsline {paragraph}{Workload breadth.}{13}{section*.25}\protected@file@percent }
 \@writefile{toc}{\contentsline {paragraph}{Not an adversarial evaluation.}{13}{section*.26}\protected@file@percent }
 \@writefile{toc}{\contentsline {section}{\numberline {11}Open problems}{13}{section.11}\protected@file@percent }
 \newlabel{sec:open}{{11}{13}{Open problems}{section.11}{}}
 \newlabel{sec:open@cref}{{[section][11][]11}{[1][13][]13}{}{}{}}
-\@writefile{toc}{\contentsline {section}{\numberline {12}Conclusion}{13}{section.12}\protected@file@percent }
 \bibstyle{plain}
 \bibdata{references}
 \bibcite{HEStandard}{1}
@@ -194,6 +192,7 @@
 \bibcite{Beaver}{4}
 \bibcite{SING}{5}
 \bibcite{YASHE}{6}
+\@writefile{toc}{\contentsline {section}{\numberline {12}Conclusion}{14}{section.12}\protected@file@percent }
 \bibcite{BGV}{7}
 \bibcite{HyCC}{8}
 \bibcite{Canetti}{9}
@@ -222,12 +221,11 @@
 \bibcite{Delphi}{32}
 \bibcite{ABY3}{33}
 \bibcite{CirC}{34}
-\bibcite{SEAL}{35}
-\bibcite{NTL}{36}
-\bibcite{TFHErs}{37}
-\bibcite{Falcon}{38}
-\bibcite{Wilson}{39}
-\bibcite{MedMNIST}{40}
-\bibcite{Yao}{41}
-\bibcite{HalfGates}{42}
-\gdef \@abspage@last{16}
+\bibcite{NTL}{35}
+\bibcite{TFHErs}{36}
+\bibcite{Falcon}{37}
+\bibcite{Wilson}{38}
+\bibcite{MedMNIST}{39}
+\bibcite{Yao}{40}
+\bibcite{HalfGates}{41}
+\gdef \@abspage@last{17}

@@ -123,30 +123,3 @@ fn test_real_tfhe_share_conversion_and_reencrypt() {
     assert_eq!((a.decrypt(&ck, &fresh) as u128) & 0xFFFF_FFFF, residue);
 }
 
-#[test]
-#[ignore] // slow: real SEAL keygen
-fn test_real_ckks_share_conversion_resets_depth() {
-    use baru::fhe::{CkksBackend, RealFheBackend};
-    use baru::hybrid::{mpc_reencrypt, RealFhe};
-
-    let client = CkksBackend::new();
-    let (ck, sk) = client.keygen();
-    let be = CkksBackend::with_server_keys(&sk);
-    let a = RealFhe(&be);
-
-    // Burn depth with a real ciphertext-ciphertext multiply (small positive
-    // value so the squared residue stays exactly representable in f64).
-    let x = be.encrypt(&ck, 21.0);
-    let squared = be.mul(&x, &x); // depth 1, value 441
-    assert!(squared.depth > 0, "multiply must consume depth");
-
-    // Interactive re-encryption restores a fresh, depth-0 ciphertext of the
-    // same value — the levelled-CKKS payoff of scheme switching: no
-    // bootstrapping circuit, one mask-and-open round instead.
-    let fresh = mpc_reencrypt(&a, &ck, &squared, 3, 32);
-    assert_eq!(fresh.depth, 0, "re-encrypted ciphertext must be fresh");
-    // Residue-class semantics (see hybrid module docs): the representative
-    // may carry k·2^32 from the share sum — reduce before comparing.
-    let got = (be.decrypt(&ck, &fresh).round() as i64) & 0xFFFF_FFFF;
-    assert_eq!(got, 441);
-}

@@ -2484,31 +2484,6 @@ impl Participant {
             Rc::new(RefCell::new(Types::NativeFunc(fhe_keygen_tfhe_fn))),
         );
 
-        // fhe-keygen-ckks  (SEAL CKKS backend — approximate real arithmetic;
-        // pair with circuits from fhe-compile-ckks)
-        let fhe_keygen_ckks_fn = Arc::new(move |args: Vec<Types>| -> Types {
-            if !args.is_empty() {
-                return ErrObj::raise("fhe-keygen-ckks takes no arguments");
-            }
-            use crate::fhe::RealFheBackend;
-            let be = crate::fhe::CkksBackend::new();
-            let (ck, sk) = be.keygen();
-            let kp = crate::fhe::backend::FheKeyPair {
-                backend_id: be.backend_id().to_string(),
-                client_key_bytes: ck,
-                server_key_bytes: sk,
-            };
-            let json = match serde_json::to_string(&kp) {
-                Ok(v) => v,
-                Err(e) => return ErrObj::raise(format!("fhe-keygen-ckks: serialise error: {}", e)),
-            };
-            Types::Str(json)
-        });
-        self.store.borrow_mut().insert(
-            "fhe-keygen-ckks".to_string(),
-            Rc::new(RefCell::new(Types::NativeFunc(fhe_keygen_ckks_fn))),
-        );
-
         // fhe-keygen-ckks-mock  (exact f64 twin of the CKKS backend)
         let fhe_keygen_ckks_mock_fn = Arc::new(move |args: Vec<Types>| -> Types {
             if !args.is_empty() {
@@ -2571,7 +2546,7 @@ impl Participant {
                     };
                     Types::FheCiphertext(handle)
                 }
-                "seal-ckks" | "ckks-mock" => {
+                "ckks-mock" => {
                     // Real-arithmetic backends encrypt the true value: fixed
                     // Q16.16 integers cross the boundary as v / 2^16.
                     let real = if is_fixed {
@@ -2593,21 +2568,12 @@ impl Participant {
                             nbits: None,
                         })
                     }
-                    if kp.backend_id == "seal-ckks" {
-                        enc(
-                            &crate::fhe::CkksBackend::new(),
-                            &kp.client_key_bytes,
-                            real,
-                            is_fixed,
-                        )
-                    } else {
-                        enc(
-                            &crate::fhe::MockCkksBackend,
-                            &kp.client_key_bytes,
-                            real,
-                            is_fixed,
-                        )
-                    }
+                    enc(
+                        &crate::fhe::MockCkksBackend,
+                        &kp.client_key_bytes,
+                        real,
+                        is_fixed,
+                    )
                 }
                 _ => {
                     let be = crate::fhe::MockFheBackend;
@@ -2662,15 +2628,11 @@ impl Participant {
             };
             use crate::fhe::FheBackend;
             let plain = match kp.backend_id.as_str() {
-                "seal-ckks" | "ckks-mock" => {
+                "ckks-mock" => {
                     // Real-arithmetic decrypt: recover the approximate real
                     // and re-enter the Q16.16 domain (or round to int).
                     use crate::fhe::RealFheBackend;
-                    let v = if kp.backend_id == "seal-ckks" {
-                        let be = crate::fhe::CkksBackend::new();
-                        let ct = be.deserialize_ct(&handle.bytes);
-                        be.decrypt(&kp.client_key_bytes, &ct)
-                    } else {
+                    let v = {
                         let be = crate::fhe::MockCkksBackend;
                         let ct = be.deserialize_ct(&handle.bytes);
                         be.decrypt(&kp.client_key_bytes, &ct)
@@ -2933,7 +2895,7 @@ impl Participant {
                 pub_keys.into_iter().zip(pub_nums).collect();
 
             match kp.backend_id.as_str() {
-                "seal-ckks" | "ckks-mock" => {
+                "ckks-mock" => {
                     // Real-arithmetic path: public inputs cross as true reals.
                     let pub_map_f: std::collections::HashMap<String, f64> = pub_map
                         .iter()
@@ -2960,18 +2922,13 @@ impl Participant {
                             nbits: None,
                         })
                     }
-                    if kp.backend_id == "seal-ckks" {
-                        let be = crate::fhe::CkksBackend::with_server_keys(&kp.server_key_bytes);
-                        run(&be, &circuit, &pub_map_f, enc_keys, &enc_cts)
-                    } else {
-                        run(
-                            &crate::fhe::MockCkksBackend,
-                            &circuit,
-                            &pub_map_f,
-                            enc_keys,
-                            &enc_cts,
-                        )
-                    }
+                    run(
+                        &crate::fhe::MockCkksBackend,
+                        &circuit,
+                        &pub_map_f,
+                        enc_keys,
+                        &enc_cts,
+                    )
                 }
                 "tfhe-rs-v1.6" => {
                     // Ensure the server key is installed (caller may have used
@@ -3074,12 +3031,6 @@ impl Participant {
                     let ct = mpc_share_to_fhe(&mut **be, &sref, &a, &kp.client_key_bytes);
                     pack(&a, &ct, |c| f.serialize_ct(c), &sref)
                 }
-                "seal-ckks" => {
-                    let f = crate::fhe::CkksBackend::new();
-                    let a = RealFhe(&f);
-                    let ct = mpc_share_to_fhe(&mut **be, &sref, &a, &kp.client_key_bytes);
-                    pack(&a, &ct, |c| f.serialize_ct(c), &sref)
-                }
                 "ckks-mock" => {
                     let f = crate::fhe::MockCkksBackend;
                     let a = RealFhe(&f);
@@ -3131,11 +3082,6 @@ impl Participant {
                     let f = crate::fhe::TfheBackend::new();
                     let ct = f.deserialize_ct(&handle.bytes);
                     fhe_to_mpc_share(&IntFhe(&f), &kp.client_key_bytes, &ct, &mut **be, nbits)
-                }
-                "seal-ckks" => {
-                    let f = crate::fhe::CkksBackend::new();
-                    let ct = f.deserialize_ct(&handle.bytes);
-                    fhe_to_mpc_share(&RealFhe(&f), &kp.client_key_bytes, &ct, &mut **be, nbits)
                 }
                 "ckks-mock" => {
                     let f = crate::fhe::MockCkksBackend;

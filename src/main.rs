@@ -33,9 +33,6 @@ fn main() -> Result<(), Box<dyn Error>> {
     if args.first().map(String::as_str) == Some("quantize") {
         return baru::ml::run_cli(&args[1..]).map_err(|e| e.into());
     }
-    if args.first().map(String::as_str) == Some("bench-ckks-compare") {
-        return baru::bench::ckks_compare::run_cli(&args[1..]).map_err(|e| e.into());
-    }
     if args.first().map(String::as_str) == Some("bench-hybrid-nn") {
         return baru::bench::hybrid_nn::run_cli(&args[1..]).map_err(|e| e.into());
     }
@@ -62,9 +59,6 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
     if args.first().map(String::as_str) == Some("bench-psi") {
         return baru::bench::psi::run_cli(&args[1..]).map_err(|e| e.into());
-    }
-    if args.first().map(String::as_str) == Some("bench-pir") {
-        return baru::bench::pir::run_cli(&args[1..]).map_err(|e| e.into());
     }
     if args.first().map(String::as_str) == Some("bench-medmnist") {
         return baru::bench::medmnist::run_cli(&args[1..]).map_err(|e| e.into());

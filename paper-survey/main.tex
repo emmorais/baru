@@ -51,7 +51,7 @@ assembly} rather than measurement.
 
 We take a different route. We survey the paradigms through a single artifact,
 \Baru{}, in which one source program runs on all of them---a plain interpreter,
-three-party replicated-secret-sharing MPC, garbled circuits, BFV/BGV/CKKS/TFHE
+three-party replicated-secret-sharing MPC, garbled circuits, BFV/BGV/TFHE
 homomorphic encryption, a Binius64 SNARK, and \emph{combinations} in which
 values cross between representations mid-computation without being exposed.
 Every backend is driven through the same transport, charged by the same byte and
@@ -141,11 +141,11 @@ comparison as weaker evidence than our internal ones.
 
 \paragraph{In scope.} Semi-honest and malicious three-party MPC over rings;
 garbled circuits in the honest-majority setting; RLWE-based FHE (BFV~\cite{FV},
-BGV~\cite{BGV}, CKKS~\cite{CKKS}) and TFHE~\cite{TFHE}; FHE$\leftrightarrow$MPC
+BGV~\cite{BGV}) and TFHE~\cite{TFHE}; FHE$\leftrightarrow$MPC
 scheme switching; SNARKs over 64-bit words (Binius64~\cite{Binius}); and the
 supporting primitives these need---oblivious transfer, private set intersection,
-private information retrieval, and Beaver-triple~\cite{Beaver} preprocessing from
-both OT and somewhat-homomorphic encryption (SHE).
+and Beaver-triple~\cite{Beaver} preprocessing from both OT and
+somewhat-homomorphic encryption (SHE).
 
 \paragraph{Out of scope.} Differential privacy and federated learning (a
 different threat model: they protect an \emph{aggregate}, not a computation);
@@ -270,11 +270,11 @@ Layer & Contents \\
 MPC & ABY3~\cite{ABY3} replicated shares over $\Z_{2^{128}}$; \textbf{triple-free} multiplication from pairwise PRFs; bit decomposition (carry-save $3\to2$ plus Kogge--Stone~\cite{KoggeStone}); batched primitives; \textbf{malicious security with abort} ($\le 1$ of 3 corrupt), following Chida et al.~\cite{Chida} in the ring adaptation of Eerikson et al.~\cite{Eerikson}; in-process and TCP transports \\
 Garbled & Half-gates~\cite{HalfGates}, free-XOR~\cite{FreeXOR}, fixed-key AES; comparator and fused $\ReLU\circ\text{rescale}$ circuits; OT-free label delivery in the three-party honest-majority setting \\
 Falcon & $\Pi_{\mathrm{PC}}$ private compare over $\Z_p$, $\Pi_{\mathrm{WA}}$ \bt{wrap3}, $\Pi_{\mathrm{DReLU}}$, $\Pi_{\mathrm{SS}}$, $\Pi_{\mathrm{Maxpool}}$, exact truncation---a reproduction of Falcon~\cite{Falcon} inside the same harness \\
-FHE & BFV~\cite{FV} and BGV~\cite{BGV} (depth-one, no evaluation keys), SEAL CKKS~\cite{SEAL,CKKS}, TFHE-rs~\cite{TFHErs,TFHE}; multi-modular NTT with Shoup butterflies; CRT slot packing; Cheetah-style~\cite{Cheetah} convolution packing \\
+FHE & BFV~\cite{FV} and BGV~\cite{BGV} (depth-one, no evaluation keys), TFHE-rs~\cite{TFHErs,TFHE}, an exact real-arithmetic backend; multi-modular NTT with Shoup butterflies; CRT slot packing; Cheetah-style~\cite{Cheetah} convolution packing \\
 Hybrid & MPC$\leftrightarrow$FHE switching both directions; re-encryption as a bootstrapping alternative; replicated threshold-key switch~\cite{AsharovMHE} \\
 ZKP & Expression-to-circuit compiler; real Binius64~\cite{Binius} prover and verifier \\
 Compiler & Backend-aware circuit IR, rewrite rules, cost models, protocol registry (dealer / Shamir / Semi2k~\cite{MPSPDZ} / LowGear~\cite{Overdrive}), per-operation protocol assignment \\
-Primitives & Chou--Orlandi~\cite{ChouOrlandi} and IKNP~\cite{IKNP} OT, DH-PSI, single-server BFV PIR \\
+Primitives & Chou--Orlandi~\cite{ChouOrlandi} and IKNP~\cite{IKNP} OT, DH-PSI \\
 \bottomrule
 \end{tabular}
 \caption{What the artifact implements. Every row is exercised by at least one
@@ -421,7 +421,7 @@ bootstraps} at cost linear in depth, on an engine supporting only a
 \small
 \begin{tabular}{@{}rccrrrcc@{}}
 \toprule
-depth & exact? & total & fhe & switch & mpc & our boots. & CKKS-competitor boots. \\
+depth & exact? & total & fhe & switch & mpc & our boots. & levelled-competitor boots. \\
 \midrule
 2  & \checkmark & \SI{145}{\milli\second}  & 20  & 59  & 54  & \textbf{0} & 0 \\
 8  & \checkmark & \SI{539}{\milli\second}  & 81  & 239 & 210 & \textbf{0} & 3 \\
@@ -582,11 +582,33 @@ the dimension most often lost when numbers move between papers, and making it a
 machine-checked property of running code---rather than prose in a limitations
 section---is cheap to implement and hard to get wrong by accident.
 
-\subsection{Recording withdrawn results}
+\subsection{Recording withdrawn results---and deleting the component}
+\label{sec:withdrawn-policy}
 
 Negative, superseded and withdrawn results are kept in the experimental record
 alongside the wins, with the reasoning that produced them.
 \Cref{sec:withdrawn} summarizes what this caught.
+
+The half that is easy to skip is the other one: \textbf{when a measurement
+condemns a component, the code is removed and the number retained}. An artifact
+that accumulates every paradigm it ever measured becomes unmaintainable and,
+worse, misleading---a reader assumes everything present is recommended. Removed on
+this basis: single-server PIR (loses to downloading the database by
+${\approx}13\times$, with \emph{no} crossover in $N$); the SEAL/CKKS backends
+(approximate comparison costs seconds per operation with real error, against
+milliseconds and bit-exact under MPC, and carried \SI{3.4}{\mega\byte} of
+vendored C++); an NTL polynomial backend (the hand-written NTT beat it
+$1.8\times$ at every size); and an unsound ZKP placeholder
+(\cref{sec:withdrawn}).
+
+Two consequences. \textbf{Figures here for a removed component are not
+reproducible from the current artifact}, and the experimental record says so at
+the point of measurement. And where a removed measurement still feeds a live
+claim, it survives as the smallest thing that can carry it: the
+levelled-competitor bootstrap counts in \cref{tab:deep} come from the level
+arithmetic of the CKKS sign approximation, now a 40-line dependency-free module
+whose figures are pinned by a test---precisely because the apparatus that produced
+them is gone.
 
 %==============================================================================
 \section{Cross-paradigm findings}

@@ -1,7 +1,7 @@
 //! A **real** Binius64 backend — an actual proof system, not a placeholder.
 //!
-//! [`super::binius64_backend`] ships a stand-in whose `verify` never checks
-//! that a witness satisfies the constraints; `tests/zkp_soundness.rs`
+//! A predecessor in this module shipped a stand-in whose `verify` never checked
+//! that a witness satisfied the constraints; a soundness test
 //! demonstrates that anyone holding the (public) circuit can forge an accepting
 //! proof. This module replaces it with the genuine Binius64 stack:
 //! `binius_frontend` to build the constraint system, `binius_prover` to prove,

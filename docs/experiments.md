@@ -389,6 +389,21 @@ implementation it replaced, at full ±2⁹⁹ coefficient width and n=4096.
 
 ### II.2 NTL as an oracle — and the Shoup butterfly that made it one
 
+> [!IMPORTANT]
+> **The NTL backend was removed on 2026-08-03.** Everything below is the record
+> of what it was for and what it taught us, kept because the Shoup-preconditioned
+> butterfly — the single biggest win on this path — came directly from profiling
+> it. It is written in the present tense of the time; read it as history.
+>
+> Why it went: once the NTT led NTL by 1.8× at every size, the backend was a C++
+> dependency (NTL + GMP + a `cc` build step) whose only remaining job was
+> differential validation. That job is covered by `fhe::ntt`'s schoolbook tests,
+> which run at **full ring dimension and ±2⁹⁹ coefficients** in 0.3 s — so the
+> claim below that "the O(n²) oracle is impractical" at those sizes no longer
+> holds, and had probably stopped holding once the NTT itself got fast. The
+> `--features ntl` invocations below will not work; `cpp/`, `src/fhe/ntl.rs` and
+> `build.rs` are gone, and the default build now needs no C++ toolchain at all.
+
 The multi-modular NTT is ~200 lines of hand-written modular arithmetic on the
 hottest path in the repo, validated against a schoolbook reference too slow to
 run at the sizes that matter. Both facts warranted a second opinion, so the same
@@ -493,7 +508,7 @@ BGV:  c(s) = m + t·e      message in the LOW bits   ⇒ tensor is reduced mod q
 
 BGV's multiply is therefore BFV's multiply *minus* the rescale, and its decrypt
 is a mask rather than a rounded divide. Measured
-(`baru bench-fhe-innerprod --poly all --reps 15`, packed 8×4 matvec, both
+(`baru bench-fhe-innerprod --reps 15`, packed 8×4 matvec, both
 operands encrypted, `n = 4096, q = 2^100, t = 2^20` for both):
 
 | scheme | multiply (NTT) | multiply (NTL) | ct bytes |
@@ -520,6 +535,24 @@ BFV and BGV are interchangeable on cost, and the lever that actually moves FHE
 is the ring arithmetic (II.2), not the scheme.
 
 ### II.4 CKKS comparisons: approximate, not impossible
+
+> [!IMPORTANT]
+> **The CKKS backends were removed on 2026-08-03, and `bench-ckks-compare` with
+> them.** This section is the reason — and the reason it was worth doing anyway.
+>
+> The finding stands: approximate comparison on CKKS is *possible*, contradicting
+> our own earlier doc comment, and the measurement below is what established that.
+> It is also what condemned it. Seconds per comparison with real error, against an
+> MPC comparison in milliseconds and bit-exact, is not a trade this pipeline can
+> take — and the backend carried 3.4 MB of vendored SEAL, a cmake/MSVC/bindgen
+> build, and a Windows helper script for a header the modern SDK stopped shipping.
+>
+> One thing was kept, because a live claim depends on it. The **level cost** of the
+> polynomial sign approximation grounds `bench-deep-nn`'s competitor-bootstraps
+> model — the baseline the zero-bootstrap headline is measured against (§III.2).
+> That arithmetic now lives in `fhe::leveled_relu_cost`, pure integer, no
+> dependency, with the figures pinned by a test precisely because the apparatus
+> that produced them is gone. The numbers below cannot be re-derived in-tree.
 
 `RealFheBackend`'s doc comment says comparisons are "impossible" on CKKS's
 approximate ciphertexts — true for *exact* comparison, but the CKKS/HEAAN
@@ -777,7 +810,15 @@ What the numbers say:
 
 ### III.4 Does faster ring arithmetic bring FHE closer to MPC? No
 
-`baru bench-hybrid-nn --poly all` runs the whole private-layer pipeline with
+> [!NOTE]
+> `--poly all` no longer exists. The runtime polynomial-backend switch it swept
+> was removed on 2026-08-03 with the NTL backend that motivated it (§II.2), so
+> this experiment cannot be re-run as written. The finding stands on its own —
+> swapping the ring arithmetic moved the FHE column and left the conclusion
+> unchanged — and is why the switch was not worth keeping once there was nothing
+> to swap.
+
+`baru bench-hybrid-nn --poly all` ran the whole private-layer pipeline with
 only the polynomial arithmetic swapped. Two measurement traps had to be cleared
 first, and both are worth recording because each produced a confident wrong
 answer.
@@ -1560,6 +1601,13 @@ before building the harder protocol — and it is a projection (measured per-OT
 cost × a literature OPRF code width), not a measured PSI.
 
 ### VI.3 Private information retrieval — and why we are not using it
+
+> [!IMPORTANT]
+> **`src/pir/` and `bench-pir` were removed on 2026-08-03.** The result below is
+> why: PIR loses to downloading the whole database by ~13×, with **no crossover in
+> N** — so there is no database size at which it becomes the right answer here.
+> A component that only ever demonstrates its own inapplicability does not need to
+> stay in the tree; the measurement does.
 
 `baru bench-pir`. Encrypting records at rest does not hide *which* record you
 read, and an access pattern over a patient database is itself a disclosure.

@@ -66,11 +66,9 @@ use crate::bench::Phase;
 use crate::crypto::net::InprocHandle;
 use crate::crypto::types::Fr;
 use crate::fhe::bfv::{Bfv, BfvAdapter, BfvCt, BfvParams};
-use crate::fhe::ckks_compare::{relu_approx_plain, CkksCompareBackend};
 // `Backend` is already taken by the MPC interpreter's trait, below.
-use crate::fhe::poly::{self, Backend as PolyBackend};
-use crate::fhe::{CkksBackend, FheBackend, MockFheBackend, RealFheBackend, TfheBackend};
-use crate::hybrid::{shares_to_fhe, FheAdapter, IntFhe, RealFhe};
+use crate::fhe::{FheBackend, MockFheBackend, TfheBackend};
+use crate::hybrid::{shares_to_fhe, FheAdapter, IntFhe};
 use crate::interpreter::backend::{Backend, ShareRef};
 use crate::interpreter::transport_backend::TransportBackend;
 
@@ -536,148 +534,6 @@ fn run_hybrid_tfhe(data: &LayerData, profile: NetworkProfile) -> StrategyReport 
     }
 }
 
-fn run_ckks_only(data: &LayerData, iterations: u32, profile: NetworkProfile) -> StrategyReport {
-    let mut t = Timer::new();
-    // The whole layer must live in the deep context: linear costs 1 level
-    // (one mul_plain), then the polynomial ReLU needs its full budget.
-    let levels = 1 + CkksCompareBackend::levels_for_relu(iterations);
-
-    let (ck, be, degree) = t.phase("keygen", || {
-        let client = CkksCompareBackend::new(levels);
-        let (ck, sk) = client.keygen();
-        let degree = client.degree();
-        let be = CkksCompareBackend::with_degree_and_server_keys(
-            degree.try_into().expect("degree fits"),
-            levels,
-            &sk,
-        );
-        (ck, be, degree)
-    });
-
-    let cts = t.phase("encrypt", || {
-        data.x
-            .iter()
-            .map(|&v| be.encrypt(&ck, v as f64))
-            .collect::<Vec<_>>()
-    });
-
-    t.phase("link-io", || {
-        let ct_size = be.serialize_ct(&cts[0]).len();
-        sleep_link(&profile, ct_size * cts.len(), 2);
-    });
-
-    let pre = t.phase("linear", || {
-        data.w
-            .iter()
-            .zip(&data.bias)
-            .map(|(row, &b)| {
-                let mut acc = be.mul_plain(&cts[0], row[0] as f64);
-                for (ct, &wi) in cts[1..].iter().zip(&row[1..]) {
-                    acc = be.add(&acc, &be.mul_plain(ct, wi as f64));
-                }
-                be.add_plain(&acc, b as f64)
-            })
-            .collect::<Vec<_>>()
-    });
-
-    // Activation-range calibration: a real deployment measures this on
-    // sample data (what `ml::QuantizationReport` exists for); here the
-    // plaintext reference plays that role.
-    let bound = data.pre.iter().map(|v| v.abs()).max().unwrap_or(1).max(1) as f64 * 1.25;
-
-    let relu = t.phase("relu", || {
-        pre.iter()
-            .map(|ct| be.relu_approx(ct, bound, iterations))
-            .collect::<Vec<_>>()
-    });
-
-    let output = t.phase("decrypt", || {
-        relu.iter()
-            .map(|ct| be.decrypt(&ck, ct).round() as i64)
-            .collect::<Vec<i64>>()
-    });
-
-    let approx_reference: Vec<i64> = data
-        .pre
-        .iter()
-        .map(|&v| relu_approx_plain(v as f64, bound, iterations).round() as i64)
-        .collect();
-    let ok = output
-        .iter()
-        .zip(&approx_reference)
-        .all(|(got, want)| (got - want).abs() <= 1);
-
-    StrategyReport {
-        strategy: "ckks".into(),
-        total_ms: t.total_ms(),
-        phases: t.phases,
-        ok,
-        max_abs_error_vs_exact: max_err(&output, &data.expected),
-        output,
-        comm: None,
-        notes: vec![
-            format!("deep context: degree={degree}, {levels} levels"),
-            format!("Newton-sign ReLU: {iterations} iterations, bound={bound:.0}"),
-            "ok = matches plain approx reference; err col = vs exact ReLU".into(),
-        ],
-    }
-}
-
-fn run_hybrid_ckks(data: &LayerData, profile: NetworkProfile) -> StrategyReport {
-    let mut t = Timer::new();
-    let (ck, be) = t.phase("keygen", || {
-        let client = CkksBackend::new();
-        let (ck, sk) = client.keygen();
-        (ck, CkksBackend::with_server_keys(&sk))
-    });
-
-    // The whole input vector is ONE SIMD ciphertext.
-    let x_ct = t.phase("encrypt", || {
-        let x_f: Vec<f64> = data.x.iter().map(|&v| v as f64).collect();
-        be.encrypt_vec(&ck, &x_f)
-    });
-
-    t.phase("link-io", || {
-        let ct_size = be.serialize_ct(&x_ct).len();
-        sleep_link(&profile, ct_size, 2);
-    });
-
-    let pre = t.phase("linear", || {
-        data.w
-            .iter()
-            .zip(&data.bias)
-            .map(|(row, &b)| {
-                let row_f: Vec<f64> = row.iter().map(|&v| v as f64).collect();
-                let dot = be.dot_plain(&x_ct, &row_f);
-                be.add_plain(&dot, b as f64)
-            })
-            .collect::<Vec<_>>()
-    });
-
-    let adapter = RealFhe(&be);
-    let (back, comm) = hybrid_mpc_relu(&mut t, &adapter, &ck, &pre, NBITS, profile);
-
-    let output = t.phase("decrypt", || {
-        back.iter()
-            .map(|ct| to_signed_n(adapter.decrypt(&ck, ct), NBITS))
-            .collect::<Vec<i64>>()
-    });
-
-    StrategyReport {
-        strategy: "hybrid-ckks".into(),
-        total_ms: t.total_ms(),
-        phases: t.phases,
-        ok: output == data.expected,
-        max_abs_error_vs_exact: max_err(&output, &data.expected),
-        output,
-        comm: Some(comm),
-        notes: vec![
-            "shallow SIMD context; whole input = 1 ciphertext (dot_plain)".into(),
-            "exact real-protocol ABY3 ReLU via scheme switch — no deep context needed".into(),
-        ],
-    }
-}
-
 /// The fully-private hybrid: weights AND input encrypted, on BFV — an RLWE
 /// lattice, so the standard `log q ≤ 109 at n = 4096` bound is the only
 /// constraint. One ct×ct matvec per weight chunk
@@ -981,41 +837,23 @@ fn max_err(got: &[i64], expected: &[i64]) -> i64 {
 pub enum Strategy {
     Mpc,
     Tfhe,
-    Ckks,
     HybridTfhe,
-    HybridCkks,
     HybridBfv,
     HybridMock,
 }
 
 impl Strategy {
-    /// The inverse of [`Strategy::parse`], and the same string each strategy
-    /// reports as `StrategyReport::strategy` — which is what lets the
-    /// cross-backend summary match rows up.
-    fn name(self) -> &'static str {
-        match self {
-            Strategy::Mpc => "mpc",
-            Strategy::Tfhe => "tfhe",
-            Strategy::Ckks => "ckks",
-            Strategy::HybridTfhe => "hybrid-tfhe",
-            Strategy::HybridCkks => "hybrid-ckks",
-            Strategy::HybridBfv => "hybrid-bfv",
-            Strategy::HybridMock => "hybrid-mock",
-        }
-    }
 
     fn parse(s: &str) -> Result<Strategy, String> {
         match s {
             "mpc" => Ok(Strategy::Mpc),
             "tfhe" => Ok(Strategy::Tfhe),
-            "ckks" => Ok(Strategy::Ckks),
             "hybrid-tfhe" => Ok(Strategy::HybridTfhe),
-            "hybrid-ckks" => Ok(Strategy::HybridCkks),
             "hybrid-bfv" => Ok(Strategy::HybridBfv),
             "hybrid-mock" => Ok(Strategy::HybridMock),
             other => Err(format!(
-                "unknown strategy '{other}' (expected mpc, tfhe, ckks, hybrid-tfhe, \
-                 hybrid-ckks, hybrid-bfv, hybrid-mock)"
+                "unknown strategy '{other}' (expected mpc, tfhe, hybrid-tfhe, \
+                 hybrid-bfv, hybrid-mock)"
             )),
         }
     }
@@ -1024,15 +862,12 @@ impl Strategy {
 pub fn run_strategy(
     s: Strategy,
     data: &LayerData,
-    relu_iterations: u32,
     profile: NetworkProfile,
 ) -> StrategyReport {
     match s {
         Strategy::Mpc => run_mpc_only(data, profile),
         Strategy::Tfhe => run_tfhe_only(data, profile),
-        Strategy::Ckks => run_ckks_only(data, relu_iterations, profile),
         Strategy::HybridTfhe => run_hybrid_tfhe(data, profile),
-        Strategy::HybridCkks => run_hybrid_ckks(data, profile),
         Strategy::HybridBfv => run_hybrid_bfv(data, profile),
         Strategy::HybridMock => run_hybrid_mock(data, profile),
     }
@@ -1052,15 +887,8 @@ options:
   --in N               input dimension (default 8)
   --out M              output dimension (default 2)
   --strategies LIST    comma-separated subset (default: all except mock)
-  --relu-iterations K  Newton iterations for the ckks strategy (default 2)
   --rtt-ms N           round-trip latency between any two machines (default 0)
   --bandwidth-mbps X   link bandwidth in Mbit/s (default: unlimited)
-  --poly B             polynomial backend for the Rust FHE schemes: ntt
-                       (default), ntl, or `all` to sweep both. Moves only the
-                       hybrid-bfv row — ckks/tfhe use SEAL
-                       and tfhe-rs, which have their own arithmetic, and mpc
-                       has no polynomials at all. Flat rows there are the
-                       expected result, not a bug. (ntl needs --features ntl)
   --json               emit reports as JSON
 ";
 
@@ -1078,17 +906,13 @@ fn fmt_ms(micros: u128) -> String {
 pub fn run_cli(args: &[String]) -> Result<(), String> {
     let mut in_dim = 8usize;
     let mut out_dim = 2usize;
-    let mut relu_iterations = 2u32;
     let mut rtt_ms: u64 = 0;
     let mut bandwidth_mbps: Option<f64> = None;
     let mut json = false;
-    let mut poly_sweep: Vec<PolyBackend> = vec![PolyBackend::Ntt];
     let mut strategies = vec![
         Strategy::Mpc,
         Strategy::HybridBfv,
-        Strategy::HybridCkks,
         Strategy::HybridTfhe,
-        Strategy::Ckks,
         Strategy::Tfhe,
     ];
 
@@ -1116,14 +940,6 @@ pub fn run_cli(args: &[String]) -> Result<(), String> {
                     .parse()
                     .map_err(|_| "--out needs a positive integer".to_string())?;
             }
-            "--relu-iterations" => {
-                i += 1;
-                relu_iterations = args
-                    .get(i)
-                    .ok_or("--relu-iterations needs a value")?
-                    .parse()
-                    .map_err(|_| "--relu-iterations needs a non-negative integer".to_string())?;
-            }
             "--rtt-ms" => {
                 i += 1;
                 rtt_ms = args
@@ -1149,21 +965,6 @@ pub fn run_cli(args: &[String]) -> Result<(), String> {
                     .map(Strategy::parse)
                     .collect::<Result<Vec<_>, _>>()?;
             }
-            "--poly" => {
-                i += 1;
-                let v = args.get(i).ok_or("--poly needs a value")?;
-                poly_sweep = if v == "all" {
-                    poly::available()
-                } else {
-                    let b = PolyBackend::parse(v)?;
-                    if !poly::is_available(b) {
-                        return Err(format!(
-                            "polynomial backend {v:?} is not in this build (rebuild with --features ntl)"
-                        ));
-                    }
-                    vec![b]
-                };
-            }
             other => return Err(format!("unknown option '{other}'\n{USAGE}")),
         }
         i += 1;
@@ -1180,12 +981,6 @@ pub fn run_cli(args: &[String]) -> Result<(), String> {
              and small --in/--out."
         );
     }
-    if strategies.contains(&Strategy::Ckks) {
-        eprintln!(
-            "warning: the pure-ckks strategy keygens a deep (degree-32768) context: \
-             expect tens of seconds before the layer even starts."
-        );
-    }
 
     let data = make_layer(in_dim, out_dim);
     if !json {
@@ -1200,13 +995,9 @@ pub fn run_cli(args: &[String]) -> Result<(), String> {
     }
 
     let mut reports = Vec::new();
-    let sweeping = poly_sweep.len() > 1;
-    for &pb in &poly_sweep {
-        if !json && sweeping {
-            println!("── polynomial backend: {} ──\n", pb.name());
-        }
+    {
         for &s in &strategies {
-            let r = poly::with_backend(pb, || run_strategy(s, &data, relu_iterations, profile))?;
+            let r = run_strategy(s, &data, profile);
             if !json {
                 let phases: Vec<String> = r
                     .phases
@@ -1237,47 +1028,18 @@ pub fn run_cli(args: &[String]) -> Result<(), String> {
                 }
                 println!();
             }
-            reports.push((pb, r));
+            reports.push(r);
         }
     }
 
     if json {
-        let payload: Vec<_> = reports
-            .iter()
-            .map(|(b, r)| serde_json::json!({ "poly_backend": b.name(), "report": r }))
-            .collect();
         println!(
             "{}",
-            serde_json::to_string_pretty(&payload).map_err(|e| e.to_string())?
+            serde_json::to_string_pretty(&reports).map_err(|e| e.to_string())?
         );
         return Ok(());
     }
 
-    // Same strategy, same layer, only the ring arithmetic swapped.
-    if sweeping {
-        let base = poly_sweep[0];
-        println!("total-time speedup vs {}:", base.name());
-        for &pb in poly_sweep.iter().skip(1) {
-            let line: Vec<String> = strategies
-                .iter()
-                .filter_map(|s| {
-                    let f = |b: PolyBackend| {
-                        reports
-                            .iter()
-                            .find(|(rb, r)| *rb == b && r.strategy == s.name())
-                            .map(|(_, r)| r.total_ms)
-                    };
-                    match (f(base), f(pb)) {
-                        (Some(a), Some(c)) if c > 0.0 => {
-                            Some(format!("{}={:.2}x", s.name(), a / c))
-                        }
-                        _ => None,
-                    }
-                })
-                .collect();
-            println!("  {:<4} {}", pb.name(), line.join("  "));
-        }
-    }
     Ok(())
 }
 
@@ -1367,18 +1129,5 @@ mod tests {
             r.output, data.expected
         );
         assert_eq!(r.max_abs_error_vs_exact, 0, "secure hybrid must be exact");
-    }
-
-    #[test]
-    #[ignore] // slow: real SEAL keygen (~seconds)
-    fn hybrid_ckks_matches_plaintext() {
-        let data = make_layer(8, 2);
-        let r = run_hybrid_ckks(&data, NetworkProfile::INSTANT);
-        assert!(
-            r.ok,
-            "hybrid-ckks output {:?} != expected {:?}",
-            r.output, data.expected
-        );
-        assert_eq!(r.max_abs_error_vs_exact, 0, "hybrid must be exact");
     }
 }

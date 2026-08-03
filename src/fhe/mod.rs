@@ -59,19 +59,9 @@ pub mod bigint;
 pub mod boundary;
 pub mod boundary_proof;
 pub mod circuit_emitter;
-pub mod ckks_backend;
-pub mod ckks_compare;
 pub mod conv_pack;
 pub mod mock_backend;
-/// NTL+GMP polynomial multiplication — a second implementation of what
-/// [`ntt`] computes, and the differential oracle for it. Opt-in: needs a C++
-/// toolchain plus NTL and GMP (`cargo test --features ntl`).
-#[cfg(feature = "ntl")]
-pub mod ntl;
 pub mod ntt;
-/// Runtime switch choosing which implementation computes the ring products
-/// every FHE scheme here depends on ([`ntt`], or `ntl` when built in).
-pub mod poly;
 /// CRT slot packing — `n` independent values per ciphertext, for the
 /// elementwise products [`crate::mpcc::lowgear`] needs.
 pub mod slots;
@@ -79,6 +69,16 @@ pub mod tfhe_backend;
 pub mod threshold;
 
 pub use backend::{FheBackend, FheCircuit, RealFheBackend};
-pub use ckks_backend::{CkksBackend, MockCkksBackend};
+pub use exact_real_backend::MockCkksBackend;
+/// The level cost of a polynomial-approximated comparison under a levelled
+/// scheme — the surviving measured result of the removed CKKS experiment, and
+/// what grounds `bench-deep-nn`'s competitor-bootstraps model.
+pub mod leveled_relu_cost;
+
+/// Exact real arithmetic in plain `f64` — the only evaluator of circuits
+/// compiled in real-arithmetic mode. Formerly the CKKS backend's exact twin;
+/// see the module header for why it outlived it.
+pub mod exact_real_backend;
+
 pub use mock_backend::MockFheBackend;
 pub use tfhe_backend::TfheBackend;

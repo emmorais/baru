@@ -26,7 +26,7 @@ counting different things. Cross-paradigm comparison is therefore mostly
 This paper takes a different route. We survey the paradigms through a single
 artifact, **Baru**, in which one source program runs on all of them — a plain
 interpreter, 3-party replicated-secret-sharing MPC, garbled circuits, BFV/BGV/
-CKKS/TFHE homomorphic encryption, a Binius64 SNARK, and *combinations* in which
+TFHE homomorphic encryption, a Binius64 SNARK, and *combinations* in which
 values cross between representations mid-computation without being exposed.
 Every backend is driven through the same transport, charged by the same byte and
 round accounting, and checked bit-exactly against the same plaintext reference.
@@ -108,11 +108,10 @@ comparison as weaker evidence than our internal ones.
 ## 2. Scope
 
 **In scope.** Semi-honest and malicious 3-party MPC over rings; garbled circuits
-in the honest-majority setting; RLWE-based FHE (BFV, BGV, CKKS) and TFHE;
+in the honest-majority setting; RLWE-based FHE (BFV, BGV) and TFHE;
 FHE↔MPC scheme switching; SNARKs over 64-bit words (Binius64); and the
 supporting primitives these need — oblivious transfer, private set intersection,
-private information retrieval, and Beaver-triple preprocessing from both OT and
-SHE.
+and Beaver-triple preprocessing from both OT and SHE.
 
 **Out of scope.** Differential privacy and federated learning (different threat
 model: they protect an *aggregate*, not a computation); trusted execution
@@ -221,11 +220,11 @@ argument per architecture; the research question becomes "which architecture is
 | **MPC** | ABY3 replicated shares over `Z_{2^128}`; **triple-free** multiplication from pairwise PRFs; bit decomposition (carry-save 3→2 + Kogge–Stone); batched primitives; **malicious security with abort** (≤1 of 3 corrupt); in-process and TCP transports |
 | **Garbled circuits** | Half-gates (Zahur–Rosulek–Evans), free-XOR, fixed-key AES; comparator and fused ReLU∘rescale circuits; OT-free label delivery in the 3-party honest-majority setting |
 | **Falcon** | `Π_PC` private compare over `Z_p`, `Π_WA` wrap3, `Π_DReLU`, `Π_SS`, `Π_Maxpool`, exact truncation — a reproduction of Falcon (PETS'21) inside the same harness |
-| **FHE** | BFV and BGV (depth-1, no evaluation keys), SEAL CKKS, TFHE-rs; multi-modular NTT with Shoup butterflies; CRT slot packing; Cheetah-style convolution packing |
+| **FHE** | BFV and BGV (depth-1, no evaluation keys), TFHE-rs, an exact real-arithmetic backend; multi-modular NTT with Shoup butterflies; CRT slot packing; Cheetah-style convolution packing |
 | **Hybrid** | MPC↔FHE switching both directions; re-encryption as a bootstrapping alternative; replicated threshold-key switch |
 | **ZKP** | Expression→circuit compiler; real Binius64 prover/verifier |
 | **Compiler** | Backend-aware circuit IR, rewrite rules, cost models, protocol registry (dealer / Shamir / Semi2k / LowGear), per-operation protocol assignment |
-| **Primitives** | Chou–Orlandi and IKNP OT, DH-PSI, single-server BFV PIR |
+| **Primitives** | Chou–Orlandi and IKNP OT, DH-PSI |
 
 ---
 
@@ -336,7 +335,7 @@ every layer boundary**, and a network of arbitrary depth runs with zero FHE
 bootstraps at cost linear in depth, on an engine supporting only a *single*
 multiplication.
 
-| depth | exact? | total | fhe | switch | mpc | our bootstraps | CKKS-competitor bootstraps |
+| depth | exact? | total | fhe | switch | mpc | our bootstraps | levelled-competitor bootstraps |
 |---|---|---|---|---|---|---|---|
 | 2 | ✓ | 145 ms | 20 | 59 | 54 | **0** | 0 |
 | 8 | ✓ | 539 ms | 81 | 239 | 210 | **0** | 3 |
@@ -467,6 +466,28 @@ limitations section — is cheap to implement and hard to get wrong by accident.
 Negative, superseded and withdrawn results are kept in the experimental record
 alongside the wins, with the reasoning that produced them. §9 summarizes what
 this caught.
+
+**And the losing component is deleted, while its result is kept.** This is the
+half that is easy to skip. An artifact that accumulates every paradigm it ever
+measured becomes unmaintainable and, worse, misleading — a reader assumes
+everything present is recommended. So when a measurement condemns a component, we
+remove the code and retain the number:
+
+| removed | the measurement that condemned it |
+|---|---|
+| single-server PIR | loses to downloading the database by ~13×, with **no crossover in N** |
+| SEAL/CKKS backends | approximate comparison costs seconds per operation with real error, against milliseconds and bit-exact under MPC; and 3.4 MB of vendored C++ |
+| NTL polynomial backend | the hand-written NTT beat it 1.8× at every size, once profiling NTL revealed the Shoup butterfly it was missing |
+| an unsound ZKP placeholder | its `verify` never checked constraint satisfaction — see §9 |
+
+Two consequences worth stating. First, **the numbers in this paper for a removed
+component are not reproducible from the current artifact**; §II.4 and §VI.3 of the
+experimental record say so at the point of measurement. Second, where a removed
+measurement still feeds a live claim, it survives as the smallest thing that can
+carry it: the levelled-competitor bootstrap counts in §5.4 come from the level
+arithmetic of the CKKS sign approximation, which now lives as a 40-line
+dependency-free module with its figures pinned by a test — precisely because the
+apparatus that produced them is gone.
 
 ---
 
