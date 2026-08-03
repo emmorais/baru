@@ -855,13 +855,76 @@ implementations rather than an argument.
 Lifting the bit is `Π_SS`, so that select is a real cost of interchangeability,
 not an artefact.
 
-**⚠️ Preprocessing is dealt, not generated.** `Π_WA` needs a mask with its bits
-shared over `Z_p` and its own `wrap3`, and `δ = wrap3(x₁,x₂,x₃)` is derivable by
-no party. Falcon generates these interactively (their Fig. 6); here they come
-from a common seed, so **all three parties can reconstruct the mask**. The
-online protocol and its costs are real; the offline phase is not yet. This is
-the same disclosed caveat the repo already carries for dealer-based BFV keygen,
-and it is the one thing between `NonlinMode::Falcon` and a deployable protocol.
+### Preprocessing: all four pieces now generated (2026-08-03)
+
+The offline phase used to be dealt from a seed every party could compute — which
+is to say there was no offline phase, only the shape of one. All four of its
+pieces are now produced by a real protocol.
+
+**Generated.** `Π_PC`'s blinding bit `β` and `Π_SS`'s selector `c` are **daBits**:
+the same bit shared consistently in two algebraic structures (`Z₂`+`Z_p` and
+`Z₂`+`Z_L` respectively). The construction turns on a fact about replicated
+sharing that makes it nearly free — *each additive component `bᵢ` is already known
+to exactly the two parties that must hold it*, so every `bᵢ` crosses structures
+with **no communication**, and only the XOR needs a protocol: two batched
+multiplications, no input sharing. Attempting the obvious shortcut (party 0 holds
+`(b₀,b₁)`, so let it contribute `c = b₀⊕b₁`) fails instructively: a *replicated*
+sharing of `c` needs `c` at two parties, and party 2 holds `(b₂,b₀)` and cannot
+compute it. `random_dabits_fp` / `random_dabits_ring`.
+
+**Also fixed, and it was a second leak nobody had written down.** `Π_PC` reveals
+`m · Π c[i]` and reads only its zero-ness; `m` was the constant **1**, so the raw
+product was revealed rather than just the predicate. `m` is now a uniformly random
+*unit*. It must be a unit, not merely random: at `p = 37` a zero mask makes the
+opening read zero whatever the product was — a **1-in-37 wrong answer**, not a tail
+event. `random_nonzero_masks` finds the zero draws and resamples; opening whether a
+*mask* is zero leaks nothing, since it is drawn independently of any input.
+
+**Now generated too: `x`, its bits, and `δ`** (`random_wrap_masks`). This was the
+hard one. The obstacle is `δ = wrap3(x₁,x₂,x₃,L)`: it is a function of all three
+components, so no party can compute it from its own view, and computing it *from
+shares* is exactly what `Π_WA` does. Falcon breaks the circularity with **bit
+composition** (their Fig. 6) — build `x` *out of* shared bits instead of sampling
+`x` and decomposing it:
+
+1. Draw `ℓ` daBits per element. Their `Z_p` images **are** the bits of `x`, free,
+   with no conversion; their ring images compose `x` by a local weighted sum.
+2. `δ` is **bit `ℓ` of the integer sum `x₁+x₂+x₃`**. This is the identity that
+   makes it cheap: `s = x₁+x₂+x₃ = wrap3_exact·L + x` with `wrap3_exact ∈ {0,1,2}`,
+   so `δ = wrap3_exact mod 2 = ⌊s/L⌋ mod 2`, which is exactly bit `ℓ` of `s`. One
+   `a2b` at width `ℓ+1` yields it — the wrap really does fall out of the carry
+   chain, and the low bits it also computes are discarded because step 1 already
+   produced them.
+3. Move `δ` from the ring into `Z₂` by opening `δ ⊕ r` against a fresh daBit. `r`
+   is a uniform secret bit, so the opened value is independent of `δ`.
+
+Two tests carry this, and they check different things. `composed_wrap_masks_are_­
+mutually_consistent` reconstructs all three objects and checks them against *each
+other* — the bits must be the binary expansion of the same `x` the ring shares
+reconstruct to, and `δ` must be that `x`'s own `wrap3`. Internal consistency alone
+would still pass for a `δ` convention off by one from `Π_WA`'s, so
+`drelu_over_composed_masks_matches_the_signed_value` runs the consuming protocol
+over **every value in the ring** at ℓ = 8, both boundaries included.
+
+**What it costs: one `a2b` per element, offline.** That is the very protocol
+Falcon's online phase exists to avoid, so Falcon is *not* cheaper than
+`NonlinMode::A2b` once offline and online are added together. It is cheaper
+**online**, which is the claim Falcon's tables make and the one measured below.
+Preprocessing is input-independent and can be generated before any query arrives,
+which is what makes the split meaningful rather than an accounting trick — but the
+total is worth stating plainly, because a reader comparing end-to-end costs would
+otherwise be misled.
+
+With this, a `NonlinMode::Falcon` run leaks nothing to a passive party: the mode
+is now covered by the same semi-honest attestation as the rest of
+`TransportBackend`. Before it landed, the mode was *below* semi-honest — all three
+parties could reconstruct the mask — and had no attestation entry of its own,
+which was a gap in the audit surface as much as in the protocol.
+
+**What making it real cost**, measured on one MedMNIST diagnosis: 128 → **173
+messages** (+35%), 8.5 → **8.6 MB** (+1.2%), 1112 → **1201 ms** (+8%), still
+bit-exact. Cheap in bytes, paid for in rounds — which shifts the crossover, so the
+table below was re-measured rather than left standing.
 
 ## The measured crossover (2026-08-01)
 
@@ -879,68 +942,138 @@ protocol and the network vary; every cell is checked against the plaintext
 argmax and the table refuses to print clean if any disagreed. Latency per
 encrypted diagnosis, ms, `--precompute` on (so these are *online* figures):
 
-| RTT | 1000 | 100 | 40 | 30 | 20 | 15 | 10 | 7 | 5 Mbps |
-|---|---|---|---|---|---|---|---|---|---|
-| **0 ms** gc | **638** | **3227** | **6554** | **8511** | 12357 | 16215 | 23915 | 33751 | 46869 |
-| **0 ms** falcon | 1279 | 3528 | 6750 | 8583 | **12167** | **15740** | **22828** | **31804** | **43794** |
-| **20 ms** gc | **2411** | **4839** | **8395** | **10292** | **14174** | **18046** | 25594 | 35618 | 48659 |
-| **20 ms** falcon | 3873 | 6276 | 9585 | 11393 | 14998 | 18431 | **25543** | **34588** | **46850** |
+### ⚠️ The crossover is withdrawn (2026-08-03)
 
-**The boundary is in bandwidth, and it moves with RTT.** Falcon wins below
-**~20 Mbps at RTT 0** and below **~10 Mbps at RTT 20 ms**; garbled circuits win
-above. Higher RTT shifts the crossover *down* — it shrinks the region where
-Falcon wins. Brackets, not interpolated points: those are the grid spacings
-actually measured.
+Re-measured with **all four** offline pieces interactive, i.e. with bit composition
+in place. The crossover does not survive it:
 
-**The boundary is a band, not a line.** Around 20–30 Mbps at RTT 0 the winner
-flips between repeat runs: 30 Mbps gave 8511 vs 8583 one run and 8621 vs 8614
-the next; 20 Mbps gave 12357 vs 12167 one run and 12198 vs 12239 the next — a
-0.1–0.3% spread either way. No ordering inside that band should be quoted as a
-result. The finding is that the two protocols are *indistinguishable* there,
-which is what a crossover is; the quotable claims are the clear wins on either
-side (gc by 2× at 1 Gbit/s, falcon by 5% at 5 Mbps).
+| RTT | 1000 | 100 | 60 | 40 | 30 | 20 | 15 | 10 Mbps |
+|---|---|---|---|---|---|---|---|---|
+| **0 ms** gc | **552** | **2801** | **4349** | **6260** | **9075** | **12075** | **15906** | **24292** |
+| **0 ms** falcon | 3363 | 7306 | 10028 | 13512 | 18643 | 25659 | 31411 | 44964 |
+| **20 ms** gc | **2296** | **4739** | **6234** | **8050** | **9828** | **14068** | **17775** | **25280** |
+| **20 ms** falcon | 8000 | 11872 | 14762 | 18025 | 21701 | 28962 | 35589 | 49253 |
 
-### Why, and the check that it is not a coincidence
+**Garbled circuits win at every point measured, at both round-trip times.** Falcon
+is 1.85–6.1× slower, and the ratio *widens* as bandwidth grows rather than
+narrowing — the opposite of a protocol whose advantage is bandwidth.
 
-At 1 Gbit/s and RTT 0 the two differ almost entirely in compute: 638 ms for `gc`
-against 1279 ms for `falcon`. So Falcon starts **~641 ms behind** and pays a
-further **67 messages** of round latency, against which it saves **1.6 MB**.
-Break-even is where the byte saving pays both back:
+What changed is one thing: preprocessing now costs an `a2b` per element. Falcon's
+online phase exists to avoid exactly that protocol, so paying for it offline hands
+back the entire saving and more. The previous table's crossover at 15–20 Mbps was
+real as a measurement and wrong as a claim about Falcon: it compared Falcon's
+online cost against `gc`'s *total* cost, because Falcon's preprocessing was dealt
+from a seed and therefore free.
 
-| | predicted | measured |
-|---|---|---|
-| RTT 0 ms | 20.0 Mbps | 20–30 Mbps |
-| RTT 20 ms | 6.5 Mbps | 10–15 Mbps |
+**This is a withdrawn claim, and it is the fourth such entry in this repo.** The
+pattern is the same every time — the flattering number was the one measuring
+something that did not yet work. Nothing about the crossover should be cited: not
+the boundary, not its RTT-dependence, not the "band, not a line" observation about
+the 20 Mbps cell, all of which described a comparison against free preprocessing.
 
-Right ballpark, right direction, right RTT-dependence. Falcon does consistently
-a little better than the linear prediction, and the reason is structural rather
-than noise: `NetworkProfile` charges per *round*, not per message, and Falcon's
-67 extra messages batch into fewer than 67 extra rounds — so the true RTT
-penalty is smaller than `67 × RTT`, which is exactly the direction of the
-residual, and it grows with RTT (as the 6.5-vs-12 row shows) precisely because
-that is the term being over-charged.
+**What would make the comparison fair, and it is real work.** Falcon accounts
+preprocessing offline, and so does every protocol in its class; the honest
+reproduction of its claim is an *online-only* measurement. This backend cannot
+produce one, because it has no offline/online split — `lt_falcon_batch` runs its
+offline phase inline, so every figure above is a total. Building that split is now
+the top item under "What remains", and until it exists the defensible statement is
+narrow:
+
+> With preprocessing charged, garbled circuits dominate Falcon's `wrap3` DReLU on
+> this workload across 10–1000 Mbps. Whether Falcon's *online* phase is cheaper —
+> its actual claim — is not something these measurements answer.
+
+### The `a2b` is probably avoidable — so this withdrawal is about the reproduction, not about Falcon
+
+The offline phase costs what it costs because δ is computed by bit-decomposing the
+sum of `x`'s three components. That is not the only way, and the alternative is
+much cheaper. Writing `w₀₁ = wrap2(x₀,x₁)` and `y = (x₀+x₁) mod L`:
+
+```
+x₀+x₁+x₂ = y + w₀₁·L + x₂,   and with  u = [y + x₂ ≥ L]:
+δ = wrap3_exact mod 2 = (w₀₁ + u) mod 2 = w₀₁ ⊕ u
+```
+
+Verified exhaustively over all `2^18` triples at ℓ = 6. What makes it interesting is
+**who knows what**: party 0 holds `left = x₀` and `right = x₁`, so it computes both
+`w₀₁` and `y` **locally, for free**. And `x₂` is held by parties 1 and 2. So δ needs
+only
+
+1. a sharing of the one bit `w₀₁`, which party 0 knows — a single input message; and
+2. one comparison `u = [x₂ ≥ L − y]` between a value known to party 0 and a value
+   known to parties 1 and 2.
+
+Step 2 is not circular. It is a comparison of two *cleartext-to-their-holder*
+integers, not of secret shares, so it is a millionaires' problem rather than
+another `Π_WA` — and Baru already has the cheap primitive for it. Its garbled
+comparator costs ~ℓ AND gates in **one round**, and it is cheap here for exactly
+the reason `NonlinMode::Gc` is: in the three-party honest-majority setting the input
+labels come from the co-garbler with **no oblivious transfer**. At ℓ = 21 that is
+roughly 700 bytes and one round per element, against the prefix adder's ~ℓ·log ℓ
+ring multiplications and ~9 rounds.
+
+There is an irony worth naming: the cheapest known way to make Falcon's
+preprocessing affordable, in this codebase, is a garbled circuit — the protocol it
+is being compared against. That is legitimate (preprocessing is preprocessing) and
+it is also a hint about why the online/offline boundary is where the real question
+lives.
+
+**Unmeasured.** The construction above is derived and checked arithmetically; it is
+not implemented, so no cost claim is made for it. What it establishes is narrower
+and enough: **one `a2b` per element is an artefact of this reproduction, not a lower
+bound on Falcon's offline phase.** The withdrawal in this section should therefore
+be read as "Baru's Falcon loses to Baru's garbled circuits once preprocessing is
+charged", and *not* as "Falcon's DReLU is not worth its preprocessing" — a claim
+these measurements do not support and which the construction above suggests is
+false.
+
+### Why the ratio widens instead of narrowing
+
+The earlier analysis had Falcon starting ~703 ms behind on compute and paying 112
+extra messages against a 1.5 MB byte saving, which predicted break-even at 17.1 and
+4.0 Mbps — and matched the measured 15–20 and 5–10. That model was right about the
+protocol it described. It no longer describes this one.
+
+Bit composition adds `ℓ` daBits **per element** plus one `a2b` over the batch. At
+ℓ = 21 and a conv layer's worth of activations that is ~170 000 daBits per
+comparison batch, so the offline phase now dominates both the compute term and the
+byte term it was supposed to be trading against. The gap grows with bandwidth
+because at 1 Gbit/s the byte saving buys almost nothing while the extra compute and
+rounds are paid in full: **552 vs 3363** at RTT 0, a 6.1× loss, against 1.85× at
+10 Mbps. A bandwidth-advantaged protocol should show the reverse.
 
 ### What this licenses saying
 
-> Given a deployment's RTT and bandwidth, **pick** the nonlinearity protocol
-> rather than fixing it — with the crossover measured, not modelled.
+The *architectural* claim survives and is worth separating from the withdrawn one:
 
-Falcon always uses `wrap3`. Baru has three interchangeable implementations of
-the same comparison and a cost model whose purpose is choosing between them, so
-this is a claim the reproduction makes possible and Falcon cannot make.
+> Baru has three interchangeable implementations of the same comparison, verified
+> bit-exact against each other, behind one interface — so which protocol backs
+> every ReLU, max-pool and argmax is a one-line choice rather than a rewrite.
 
-Two honest limits on it. The compute term is Rust-in-simulation against what
-optimised C++ would do, and it is the term that sets the RTT-0 intercept — a
-faster `Π_PC` moves the crossover right. And `a2b` is dominated everywhere here,
-so the practical choice is two-way, not three-way.
+That is what made this measurement possible at all, and it is what let the
+withdrawal be *detected* rather than shipped. What is no longer licensed is the
+"pick per deployment" claim, because on this workload there is currently nothing to
+pick: `gc` dominates both alternatives everywhere measured.
+
+Two limits that still apply, and now cut the other way. The compute term is
+Rust-in-simulation rather than optimised C++, and it sets the RTT-0 intercept where
+Falcon's loss is worst — so a faster `Π_PC` and a cheaper offline phase both move
+the boundary back toward Falcon. Neither is measured, so neither is claimed.
 
 ## What remains
 
+- **An offline/online split for the Falcon backend.** Now the top item: without it
+  every figure above is a total, and Falcon's actual claim — that its *online*
+  phase is cheap — cannot be measured at all. `lt_falcon_batch` runs preprocessing
+  inline because this backend has no phase structure to hang it on; giving it one
+  is what makes the comparison fair in both directions.
+- **Check whether the offline phase can be cheaper.** One `a2b` per element may be
+  an artefact of computing δ from `x`'s three components rather than the cheapest
+  correct construction. This is what decides whether the withdrawal is a statement
+  about Falcon or about this reproduction of it.
 - **An end-to-end LeNet run** rather than a per-op extrapolation. Everything it
   needs exists; what is missing is the convolution *packing* (expressing conv as
   a matmul over patches) and the harness, neither of which is new protocol.
-- **A real offline phase** for the Falcon backend (see the caveat above) — the
-  one thing between `NonlinMode::Falcon` and something deployable.
 
 ## Strategy from here (2026-08-01)
 

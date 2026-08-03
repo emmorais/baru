@@ -21,6 +21,7 @@
 //! |---|---|---|
 //! | **`MaliciousBackend`** (ABY3, checked) | **malicious** | with abort, ≤1 of 3 corrupt |
 //! | `TransportBackend` (ABY3 over transport) | semi-honest | superseded by `MaliciousBackend`; kept as the measurement baseline |
+//! | ↳ its `NonlinMode::Falcon` comparison | semi-honest | covered by the row above since `falcon_mpc::random_wrap_masks` landed; **it was below it before** — the `Π_WA` masks were dealt from a public seed, so all three parties could reconstruct them |
 //! | `Aby3Simulator` | semi-honest | in-process simulator; models values, not adversaries |
 //! | `gc_protocol` (garbled leg) | semi-honest | tables cross-checked; input labels and evaluator output are not — see `GC_MALICIOUS_GAPS` |
 //! | `Semi2kEngine` | semi-honest | no MACs; `mpcc::spdz2k` is the authenticated upgrade |
@@ -78,7 +79,10 @@ impl<T: crate::crypto::net::Transport> AttestedSecurity
     }
     fn attestation_note(&self) -> &'static str {
         "ABY3 resharing has no multiplication check: a corrupt party can add an \
-         arbitrary offset to its z_i and no honest party can recompute it"
+         arbitrary offset to its z_i and no honest party can recompute it. This \
+         covers all three NonlinMode comparisons: a2b, gc and falcon each leak \
+         nothing to a passive party, the last of them only since \
+         falcon_mpc::random_wrap_masks replaced its dealt preprocessing"
     }
 }
 

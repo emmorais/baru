@@ -247,9 +247,9 @@ pub fn reduce_expression(
                 match v {
                     Types::NativeApply => "NativeApply".cyan().to_string(),
                     Types::Error(e, _) => format!("Error({})", e.display()).red().to_string(),
-                    Types::Vector(v) => {
-                        format!("Vector(len={})", v.borrow().len()).cyan().to_string()
-                    }
+                    Types::Vector(v) => format!("Vector(len={})", v.borrow().len())
+                        .cyan()
+                        .to_string(),
                     Types::Num(n) => format!("{}", format!("Num({})", n).green()),
                     Types::Fixed(val) => {
                         use crate::interpreter::ast::FIXED_SCALE;
@@ -311,9 +311,7 @@ pub fn reduce_expression(
                     };
                     stack.push(Eval(
                         inner,
-                        Continuation::PopHandler {
-                            cont: Box::new(k),
-                        },
+                        Continuation::PopHandler { cont: Box::new(k) },
                         eenv.clone(),
                     ));
                 }
@@ -609,7 +607,10 @@ pub fn reduce_expression(
                             henv.borrow_mut()
                                 .insert(h.var.clone(), Rc::new(RefCell::new(caught)));
                             let body = if h.handler.len() == 1 {
-                                h.handler.into_iter().next().expect("one handler expression")
+                                h.handler
+                                    .into_iter()
+                                    .next()
+                                    .expect("one handler expression")
                             } else {
                                 Expr::Seq(h.handler)
                             };
@@ -796,7 +797,11 @@ pub fn reduce_expression(
                                                     }
                                                     super::parser::BinOp::DivExact => {
                                                         if b == 0 {
-                                                            stack.push(Apply(*cont, ErrObj::raise("division by zero"), env.clone()));
+                                                            stack.push(Apply(
+                                                                *cont,
+                                                                ErrObj::raise("division by zero"),
+                                                                env.clone(),
+                                                            ));
                                                             continue;
                                                         }
                                                         // (a << 16) / b
@@ -804,7 +809,11 @@ pub fn reduce_expression(
                                                     }
                                                     super::parser::BinOp::Mod => {
                                                         if b == 0 {
-                                                            stack.push(Apply(*cont, ErrObj::raise("modulo by zero"), env.clone()));
+                                                            stack.push(Apply(
+                                                                *cont,
+                                                                ErrObj::raise("modulo by zero"),
+                                                                env.clone(),
+                                                            ));
                                                             continue;
                                                         }
                                                         a % b
@@ -825,7 +834,11 @@ pub fn reduce_expression(
                                                     super::parser::BinOp::Mul => a.wrapping_mul(b),
                                                     super::parser::BinOp::DivExact => {
                                                         if b == 0 {
-                                                            stack.push(Apply(*cont, ErrObj::raise("division by zero"), env.clone()));
+                                                            stack.push(Apply(
+                                                                *cont,
+                                                                ErrObj::raise("division by zero"),
+                                                                env.clone(),
+                                                            ));
                                                             continue;
                                                         }
                                                         if a % b != 0 {
@@ -833,7 +846,10 @@ pub fn reduce_expression(
                                                                 *cont,
                                                                 ErrObj::raise_with(
                                                                     "non-exact division",
-                                                                    vec![Types::Num(a), Types::Num(b)],
+                                                                    vec![
+                                                                        Types::Num(a),
+                                                                        Types::Num(b),
+                                                                    ],
                                                                 ),
                                                                 env.clone(),
                                                             ));
@@ -843,7 +859,11 @@ pub fn reduce_expression(
                                                     }
                                                     super::parser::BinOp::Mod => {
                                                         if b == 0 {
-                                                            stack.push(Apply(*cont, ErrObj::raise("modulo by zero"), env.clone()));
+                                                            stack.push(Apply(
+                                                                *cont,
+                                                                ErrObj::raise("modulo by zero"),
+                                                                env.clone(),
+                                                            ));
                                                             continue;
                                                         }
                                                         a % b
@@ -1091,7 +1111,10 @@ pub fn reduce_expression(
                                 other => {
                                     stack.push(Apply(
                                         *cont,
-                                        ErrObj::raise_with("not expects a number or boolean", vec![other]),
+                                        ErrObj::raise_with(
+                                            "not expects a number or boolean",
+                                            vec![other],
+                                        ),
                                         env.clone(),
                                     ));
                                     continue;
@@ -1102,7 +1125,10 @@ pub fn reduce_expression(
                                 other => {
                                     stack.push(Apply(
                                         *cont,
-                                        ErrObj::raise_with("negation expects a number", vec![other]),
+                                        ErrObj::raise_with(
+                                            "negation expects a number",
+                                            vec![other],
+                                        ),
                                         env.clone(),
                                     ));
                                     continue;
@@ -1143,7 +1169,10 @@ pub fn reduce_expression(
                                 other => {
                                     stack.push(Apply(
                                         *cont,
-                                        ErrObj::raise_with("bitlen expects a number or share", vec![other]),
+                                        ErrObj::raise_with(
+                                            "bitlen expects a number or share",
+                                            vec![other],
+                                        ),
                                         env.clone(),
                                     ));
                                     continue;
@@ -1341,7 +1370,10 @@ pub fn reduce_expression(
                         other => {
                             stack.push(Apply(
                                 *cont,
-                                ErrObj::raise_with("cons expects a list as its second argument", vec![other]),
+                                ErrObj::raise_with(
+                                    "cons expects a list as its second argument",
+                                    vec![other],
+                                ),
                                 env.clone(),
                             ));
                             continue;
@@ -1391,12 +1423,15 @@ pub fn reduce_expression(
                                     stack.push(Apply(*cont, result, env.clone()));
                                 }
                                 other => {
-                            stack.push(Apply(
-                                *cont,
-                                ErrObj::raise_with("attempt to call a non-procedure", vec![other]),
-                                env.clone(),
-                            ));
-                        }
+                                    stack.push(Apply(
+                                        *cont,
+                                        ErrObj::raise_with(
+                                            "attempt to call a non-procedure",
+                                            vec![other],
+                                        ),
+                                        env.clone(),
+                                    ));
+                                }
                             }
                         } else {
                             let mut rem = args;
@@ -1523,7 +1558,9 @@ pub fn reduce_expression(
                                 Types::Share(_sref) => {
                                     stack.push(Apply(
                                         *cont,
-                                        ErrObj::raise("attempt to call a shared value as a procedure"),
+                                        ErrObj::raise(
+                                            "attempt to call a shared value as a procedure",
+                                        ),
                                         env.clone(),
                                     ));
                                     continue;
@@ -1613,13 +1650,16 @@ pub fn reduce_expression(
                                 }
                             }
                             other => {
-                            stack.push(Apply(
-                                *cont,
-                                ErrObj::raise_with("if condition must be a number or shared boolean", vec![other]),
-                                env.clone(),
-                            ));
-                            continue;
-                        }
+                                stack.push(Apply(
+                                    *cont,
+                                    ErrObj::raise_with(
+                                        "if condition must be a number or shared boolean",
+                                        vec![other],
+                                    ),
+                                    env.clone(),
+                                ));
+                                continue;
+                            }
                         }
                     }
 
@@ -1786,7 +1826,9 @@ impl Participant {
         let share_from_backend = backend.clone();
         let share_from_fn = Arc::new(move |args: Vec<Types>| -> Types {
             if args.len() != 3 {
-                return ErrObj::raise("share-from expects 3 args: (share-from owner-id value nbits)");
+                return ErrObj::raise(
+                    "share-from expects 3 args: (share-from owner-id value nbits)",
+                );
             }
             match (&args[0], &args[1], &args[2]) {
                 (Types::Num(owner_id), Types::Num(n), Types::Num(nb)) => {
@@ -1930,10 +1972,12 @@ impl Participant {
                 Err(e) => return ErrObj::raise(format!("nn-load-model: {e}")),
             };
             if net.scale_bits != 16 {
-                return ErrObj::raise(format!("nn-load-model: model was quantized at {} scale bits, but Baru's \
+                return ErrObj::raise(format!(
+                    "nn-load-model: model was quantized at {} scale bits, but Baru's \
                      Types::Fixed is always Q16.16 — re-run `baru quantize` with \
                      --scale-bits 16",
-                    net.scale_bits));
+                    net.scale_bits
+                ));
             }
             let layers: Vec<Types> = net
                 .layers
@@ -1984,8 +2028,12 @@ impl Participant {
             for layer in &layers {
                 let parts = match layer {
                     Types::List(parts) if parts.len() == 3 => parts,
-                    _ => return ErrObj::raise("nn-forward: each layer must be a 3-element list \
-                         (weights bias activation), as produced by nn-load-model"),
+                    _ => {
+                        return ErrObj::raise(
+                            "nn-forward: each layer must be a 3-element list \
+                         (weights bias activation), as produced by nn-load-model",
+                        )
+                    }
                 };
                 let weights = match &parts[0] {
                     Types::List(w) => w,
@@ -2107,12 +2155,18 @@ impl Participant {
         // Returns a JSON string representing the compiled Circuit.
         let zkp_compile_fn = Arc::new(move |args: Vec<Types>| -> Types {
             if args.len() != 2 {
-                return ErrObj::raise("zkp-compile expects 2 args: (zkp-compile 'expr '(\"x\" \"y\"))");
+                return ErrObj::raise(
+                    "zkp-compile expects 2 args: (zkp-compile 'expr '(\"x\" \"y\"))",
+                );
             }
             // First arg: quoted expression
             let expr = match &args[0] {
                 Types::Quoted(e) => *e.clone(),
-                _ => return ErrObj::raise("zkp-compile: first arg must be a quoted expression (use ')"),
+                _ => {
+                    return ErrObj::raise(
+                        "zkp-compile: first arg must be a quoted expression (use ')",
+                    )
+                }
             };
             // Second arg: list of private variable names
             // Accepts either Types::List (from evaluated list) or Types::Quoted
@@ -2162,14 +2216,18 @@ impl Participant {
             };
             let backend = crate::zkp::binius_real::Binius64Real::new();
             use crate::zkp::ZKPBackend;
-            let circuit = match backend
-                .compile_circuit(&expr, &private_vars) {
+            let circuit = match backend.compile_circuit(&expr, &private_vars) {
                 Ok(v) => v,
                 Err(e) => return ErrObj::raise(format!("zkp-compile failed: {}", e)),
             };
             let json = match serde_json::to_string(&circuit) {
                 Ok(v) => v,
-                Err(e) => return ErrObj::raise(format!("zkp-compile: failed to serialize circuit: {}", e)),
+                Err(e) => {
+                    return ErrObj::raise(format!(
+                        "zkp-compile: failed to serialize circuit: {}",
+                        e
+                    ))
+                }
             };
             Types::Str(json)
         });
@@ -2192,7 +2250,9 @@ impl Participant {
             let circuit_json = match &args[0] {
                 Types::Str(s) => s.clone(),
                 _ => {
-                    return ErrObj::raise("zkp-prove: first arg must be a circuit JSON string (from zkp-compile)")
+                    return ErrObj::raise(
+                        "zkp-prove: first arg must be a circuit JSON string (from zkp-compile)",
+                    )
                 }
             };
             let circuit: crate::zkp::Circuit = match serde_json::from_str(&circuit_json) {
@@ -2218,10 +2278,14 @@ impl Participant {
             };
 
             if private_keys.len() != private_nums.len() {
-                return ErrObj::raise("zkp-prove: private-keys and private-vals must have the same length");
+                return ErrObj::raise(
+                    "zkp-prove: private-keys and private-vals must have the same length",
+                );
             }
             if public_keys.len() != public_nums.len() {
-                return ErrObj::raise("zkp-prove: public-keys and public-vals must have the same length");
+                return ErrObj::raise(
+                    "zkp-prove: public-keys and public-vals must have the same length",
+                );
             }
 
             let private_vals: std::collections::HashMap<String, i64> =
@@ -2231,14 +2295,15 @@ impl Participant {
 
             let backend = crate::zkp::binius_real::Binius64Real::new();
             use crate::zkp::ZKPBackend;
-            let proof = match backend
-                .prove(&circuit, &private_vals, &public_vals) {
+            let proof = match backend.prove(&circuit, &private_vals, &public_vals) {
                 Ok(v) => v,
                 Err(e) => return ErrObj::raise(format!("zkp-prove failed: {}", e)),
             };
             let json = match serde_json::to_string(&proof) {
                 Ok(v) => v,
-                Err(e) => return ErrObj::raise(format!("zkp-prove: failed to serialize proof: {}", e)),
+                Err(e) => {
+                    return ErrObj::raise(format!("zkp-prove: failed to serialize proof: {}", e))
+                }
             };
             Types::Str(json)
         });
@@ -2280,7 +2345,9 @@ impl Participant {
             };
 
             if public_keys.len() != public_nums.len() {
-                return ErrObj::raise("zkp-verify: public-keys and public-vals must have the same length");
+                return ErrObj::raise(
+                    "zkp-verify: public-keys and public-vals must have the same length",
+                );
             }
             let public_vals: std::collections::HashMap<String, i64> =
                 public_keys.into_iter().zip(public_nums).collect();
@@ -2302,14 +2369,18 @@ impl Participant {
         // Saves a proof JSON string to a file using the serialization module.
         let proof_save_fn = Arc::new(move |args: Vec<Types>| -> Types {
             if args.len() != 2 {
-                return ErrObj::raise("proof-save expects 2 args: (proof-save proof-json filename)");
+                return ErrObj::raise(
+                    "proof-save expects 2 args: (proof-save proof-json filename)",
+                );
             }
             match (&args[0], &args[1]) {
                 (Types::Str(proof_json), Types::Str(filename)) => {
                     let proof: crate::zkp::ZKProof = match serde_json::from_str(proof_json) {
-                Ok(v) => v,
-                Err(e) => return ErrObj::raise(format!("proof-save: invalid proof JSON: {}", e)),
-            };
+                        Ok(v) => v,
+                        Err(e) => {
+                            return ErrObj::raise(format!("proof-save: invalid proof JSON: {}", e))
+                        }
+                    };
                     if let Err(e) = crate::zkp::serialization::save_proof(&proof, filename) {
                         return ErrObj::raise(format!("proof-save failed: {}", e));
                     }
@@ -2332,13 +2403,15 @@ impl Participant {
             match &args[0] {
                 Types::Str(filename) => {
                     let proof = match crate::zkp::serialization::load_proof(filename) {
-                Ok(v) => v,
-                Err(e) => return ErrObj::raise(format!("proof-load failed: {}", e)),
-            };
+                        Ok(v) => v,
+                        Err(e) => return ErrObj::raise(format!("proof-load failed: {}", e)),
+                    };
                     let json = match serde_json::to_string(&proof) {
-                Ok(v) => v,
-                Err(e) => return ErrObj::raise(format!("proof-load: failed to serialize: {}", e)),
-            };
+                        Ok(v) => v,
+                        Err(e) => {
+                            return ErrObj::raise(format!("proof-load: failed to serialize: {}", e))
+                        }
+                    };
                     Types::Str(json)
                 }
                 _ => ErrObj::raise("proof-load expects a filename string"),
@@ -2499,7 +2572,9 @@ impl Participant {
             };
             let json = match serde_json::to_string(&kp) {
                 Ok(v) => v,
-                Err(e) => return ErrObj::raise(format!("fhe-keygen-ckks-mock: serialise error: {}", e)),
+                Err(e) => {
+                    return ErrObj::raise(format!("fhe-keygen-ckks-mock: serialise error: {}", e))
+                }
             };
             Types::Str(json)
         });
@@ -2515,7 +2590,11 @@ impl Participant {
             }
             let keys_json = match &args[0] {
                 Types::Str(s) => s.clone(),
-                _ => return ErrObj::raise("fhe-enc: first arg must be a key-pair JSON string (from fhe-keygen)"),
+                _ => {
+                    return ErrObj::raise(
+                        "fhe-enc: first arg must be a key-pair JSON string (from fhe-keygen)",
+                    )
+                }
             };
             let kp: crate::fhe::backend::FheKeyPair = match serde_json::from_str(&keys_json) {
                 Ok(v) => v,
@@ -2682,7 +2761,9 @@ impl Participant {
         // fhe-compile
         let fhe_compile_fn = Arc::new(move |args: Vec<Types>| -> Types {
             if args.len() != 2 {
-                return ErrObj::raise("fhe-compile expects 2 args: (fhe-compile 'expr '(\"enc-var\"))");
+                return ErrObj::raise(
+                    "fhe-compile expects 2 args: (fhe-compile 'expr '(\"enc-var\"))",
+                );
             }
             let expr = match &args[0] {
                 Types::Quoted(e) => *e.clone(),
@@ -2690,20 +2771,20 @@ impl Participant {
             };
             let enc_vars: Vec<String> = match &args[1] {
                 Types::List(items) => {
-                        match items
-                            .iter()
-                            .map(|v| match v {
-                                Types::Str(s) => Ok(s.clone()),
-                                other => Err(ErrObj::raise(format!(
-                                    "fhe-compile: enc-vars must be a list of strings, got {other:?}"
-                                ))),
-                            })
-                            .collect::<Result<Vec<_>, Types>>()
-                        {
-                            Ok(v) => v,
-                            Err(e) => return e,
-                        }
+                    match items
+                        .iter()
+                        .map(|v| match v {
+                            Types::Str(s) => Ok(s.clone()),
+                            other => Err(ErrObj::raise(format!(
+                                "fhe-compile: enc-vars must be a list of strings, got {other:?}"
+                            ))),
+                        })
+                        .collect::<Result<Vec<_>, Types>>()
+                    {
+                        Ok(v) => v,
+                        Err(e) => return e,
                     }
+                }
                 Types::Quoted(inner) => match inner.as_ref() {
                     Expr::Str(s) => vec![s.clone()],
                     Expr::Seq(items) if items.is_empty() => vec![],
@@ -2719,13 +2800,16 @@ impl Participant {
                         }
                         vars
                     }
-                    _ => return ErrObj::raise("fhe-compile: enc-vars must be a quoted list of strings"),
+                    _ => {
+                        return ErrObj::raise(
+                            "fhe-compile: enc-vars must be a quoted list of strings",
+                        )
+                    }
                 },
                 _ => return ErrObj::raise("fhe-compile: second arg must be a list of strings"),
             };
             let mut cc = crate::zkp::circuit_compiler::CircuitCompiler::new();
-            let mut circuit = match cc
-                .compile_fhe(&expr) {
+            let mut circuit = match cc.compile_fhe(&expr) {
                 Ok(v) => v,
                 Err(e) => return ErrObj::raise(format!("fhe-compile failed: {}", e)),
             };
@@ -2748,15 +2832,19 @@ impl Participant {
         // are emitted.  Required for evaluation on CKKS backends.
         let fhe_compile_ckks_fn = Arc::new(move |args: Vec<Types>| -> Types {
             if args.len() != 2 {
-                return ErrObj::raise("fhe-compile-ckks expects 2 args: (fhe-compile-ckks 'expr '(\"enc-var\"))");
+                return ErrObj::raise(
+                    "fhe-compile-ckks expects 2 args: (fhe-compile-ckks 'expr '(\"enc-var\"))",
+                );
             }
             let expr = match &args[0] {
                 Types::Quoted(e) => *e.clone(),
-                _ => return ErrObj::raise("fhe-compile-ckks: first arg must be a quoted expression"),
+                _ => {
+                    return ErrObj::raise("fhe-compile-ckks: first arg must be a quoted expression")
+                }
             };
             let enc_vars: Vec<String> = match &args[1] {
                 Types::List(items) => {
-                        match items
+                    match items
                             .iter()
                             .map(|v| match v {
                                 Types::Str(s) => Ok(s.clone()),
@@ -2769,7 +2857,7 @@ impl Participant {
                             Ok(v) => v,
                             Err(e) => return e,
                         }
-                    }
+                }
                 Types::Quoted(inner) => match inner.as_ref() {
                     Expr::Str(s) => vec![s.clone()],
                     Expr::Seq(items) if items.is_empty() => vec![],
@@ -2785,13 +2873,18 @@ impl Participant {
                         }
                         vars
                     }
-                    _ => return ErrObj::raise("fhe-compile-ckks: enc-vars must be a quoted list of strings"),
+                    _ => {
+                        return ErrObj::raise(
+                            "fhe-compile-ckks: enc-vars must be a quoted list of strings",
+                        )
+                    }
                 },
-                _ => return ErrObj::raise("fhe-compile-ckks: second arg must be a list of strings"),
+                _ => {
+                    return ErrObj::raise("fhe-compile-ckks: second arg must be a list of strings")
+                }
             };
             let mut cc = crate::zkp::circuit_compiler::CircuitCompiler::new_real();
-            let mut circuit = match cc
-                .compile_fhe(&expr) {
+            let mut circuit = match cc.compile_fhe(&expr) {
                 Ok(v) => v,
                 Err(e) => return ErrObj::raise(format!("fhe-compile-ckks failed: {}", e)),
             };
@@ -2799,7 +2892,9 @@ impl Participant {
             circuit.public_inputs.retain(|v| !enc_vars.contains(v));
             let json = match serde_json::to_string(&circuit) {
                 Ok(v) => v,
-                Err(e) => return ErrObj::raise(format!("fhe-compile-ckks: serialise error: {}", e)),
+                Err(e) => {
+                    return ErrObj::raise(format!("fhe-compile-ckks: serialise error: {}", e))
+                }
             };
             Types::Str(json)
         });
@@ -2819,12 +2914,19 @@ impl Participant {
             }
             let circuit_json = match &args[0] {
                 Types::Str(s) => s.clone(),
-                _ => return ErrObj::raise("fhe-eval: first arg must be a circuit JSON string (from fhe-compile)"),
+                _ => {
+                    return ErrObj::raise(
+                        "fhe-eval: first arg must be a circuit JSON string (from fhe-compile)",
+                    )
+                }
             };
-            let mut circuit: crate::fhe::backend::FheCircuit = match serde_json::from_str(&circuit_json) {
-                Ok(v) => v,
-                Err(e) => return ErrObj::raise(format!("fhe-eval: invalid circuit JSON: {}", e)),
-            };
+            let mut circuit: crate::fhe::backend::FheCircuit =
+                match serde_json::from_str(&circuit_json) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        return ErrObj::raise(format!("fhe-eval: invalid circuit JSON: {}", e))
+                    }
+                };
             let keys_json = match &args[1] {
                 Types::Str(s) => s.clone(),
                 _ => return ErrObj::raise("fhe-eval: second arg must be a key-pair JSON string"),
@@ -3053,7 +3155,9 @@ impl Participant {
         let fhe_to_share_backend = backend.clone();
         let fhe_to_share_fn = Arc::new(move |args: Vec<Types>| -> Types {
             if args.len() != 3 {
-                return ErrObj::raise("fhe->share expects 3 args: (fhe->share keys ciphertext nbits)");
+                return ErrObj::raise(
+                    "fhe->share expects 3 args: (fhe->share keys ciphertext nbits)",
+                );
             }
             let keys_json = match &args[0] {
                 Types::Str(s) => s.clone(),
@@ -3125,9 +3229,10 @@ impl Participant {
         }
 
         let reg = |name: &str, f: Arc<dyn Fn(Vec<Types>) -> Types + Send + Sync>| {
-            self.store
-                .borrow_mut()
-                .insert(name.to_string(), Rc::new(RefCell::new(Types::NativeFunc(f))));
+            self.store.borrow_mut().insert(
+                name.to_string(),
+                Rc::new(RefCell::new(Types::NativeFunc(f))),
+            );
         };
 
         // ─── Conditions ─────────────────────────────────────────────────────
@@ -3488,9 +3593,7 @@ impl Participant {
                 };
                 let n = match usize::try_from(n) {
                     Ok(v) => v,
-                    Err(_) => {
-                        return ErrObj::raise(format!("make-vector: negative length {n}"))
-                    }
+                    Err(_) => return ErrObj::raise(format!("make-vector: negative length {n}")),
                 };
                 Types::Vector(Rc::new(RefCell::new(vec![fill; n])))
             }),
@@ -3513,16 +3616,19 @@ impl Participant {
                         let idx = match usize::try_from(*i) {
                             Ok(v) => v,
                             Err(_) => {
-                                return ErrObj::raise(format!(
-                                    "vector-ref: negative index {i}"
-                                ))
+                                return ErrObj::raise(format!("vector-ref: negative index {i}"))
                             }
                         };
                         b.get(idx).cloned().unwrap_or_else(|| {
-                            ErrObj::raise(format!("vector-ref: index {idx} past end (length {})", b.len()))
+                            ErrObj::raise(format!(
+                                "vector-ref: index {idx} past end (length {})",
+                                b.len()
+                            ))
                         })
                     }
-                    [Types::Vector(_), Types::Share(_)] => ErrObj::raise("vector-ref: index is secret; a secret index needs an explicit mux scan"),
+                    [Types::Vector(_), Types::Share(_)] => ErrObj::raise(
+                        "vector-ref: index is secret; a secret index needs an explicit mux scan",
+                    ),
                     _ => ErrObj::raise("vector-ref expects (vector-ref v index)"),
                 }
             }),
@@ -3536,21 +3642,23 @@ impl Participant {
                         let idx = match usize::try_from(*i) {
                             Ok(v) => v,
                             Err(_) => {
-                                return ErrObj::raise(format!(
-                                    "vector-set!: negative index {i}"
-                                ))
+                                return ErrObj::raise(format!("vector-set!: negative index {i}"))
                             }
                         };
                         let len = b.len();
                         match b.get_mut(idx) {
                             Some(slot) => *slot = val.clone(),
                             None => {
-                                return ErrObj::raise(format!("vector-set!: index {idx} past end (length {len})"))
+                                return ErrObj::raise(format!(
+                                    "vector-set!: index {idx} past end (length {len})"
+                                ))
                             }
                         }
                         val.clone()
                     }
-                    [Types::Vector(_), Types::Share(_), _] => ErrObj::raise("vector-set!: index is secret; a secret index needs an explicit mux scan"),
+                    [Types::Vector(_), Types::Share(_), _] => ErrObj::raise(
+                        "vector-set!: index is secret; a secret index needs an explicit mux scan",
+                    ),
                     _ => ErrObj::raise("vector-set! expects (vector-set! v index value)"),
                 }
             }),
@@ -3568,9 +3676,7 @@ impl Participant {
             "list->vector",
             Arc::new(move |args: Vec<Types>| -> Types {
                 match args.as_slice() {
-                    [Types::List(items)] => {
-                        Types::Vector(Rc::new(RefCell::new(items.clone())))
-                    }
+                    [Types::List(items)] => Types::Vector(Rc::new(RefCell::new(items.clone()))),
                     _ => ErrObj::raise("list->vector expects one list"),
                 }
             }),
@@ -3594,7 +3700,9 @@ impl Participant {
                 for a in args {
                     match a {
                         Types::List(v) => out.extend(v),
-                        other => return ErrObj::raise(format!("append expects lists, got {other:?}")),
+                        other => {
+                            return ErrObj::raise(format!("append expects lists, got {other:?}"))
+                        }
                     }
                 }
                 Types::List(out)
@@ -3629,13 +3737,13 @@ impl Participant {
                                 return ErrObj::raise(format!("list-ref: negative index {i}"))
                             }
                         };
-                        v.get(i)
-                            .cloned()
-                            .unwrap_or_else(|| ErrObj::raise(format!("list-ref: index {i} past end (len {})", v.len())))
+                        v.get(i).cloned().unwrap_or_else(|| {
+                            ErrObj::raise(format!("list-ref: index {i} past end (len {})", v.len()))
+                        })
                     }
-                    [Types::List(_), Types::Share(_)] => {
-                        ErrObj::raise("list-ref: index is secret; a secret index needs an explicit mux scan")
-                    }
+                    [Types::List(_), Types::Share(_)] => ErrObj::raise(
+                        "list-ref: index is secret; a secret index needs an explicit mux scan",
+                    ),
                     _ => ErrObj::raise("list-ref expects (list-ref lst index)"),
                 }
             }),
@@ -3968,9 +4076,7 @@ fn decode_quoted_str_list(v: &Types, label: &str) -> Result<Vec<String>, Types> 
                 let mut out = Vec::new();
                 match head.as_ref() {
                     Expr::Str(s) => out.push(s.clone()),
-                    other => {
-                        return bad(format!("expected string in quoted list, got {other:?}"))
-                    }
+                    other => return bad(format!("expected string in quoted list, got {other:?}")),
                 }
                 for e in rest {
                     match e {
@@ -4010,9 +4116,7 @@ fn decode_quoted_num_list(v: &Types, label: &str) -> Result<Vec<i64>, Types> {
                 let mut out = Vec::new();
                 match head.as_ref() {
                     Expr::Num(n) => out.push(*n),
-                    other => {
-                        return bad(format!("expected number in quoted list, got {other:?}"))
-                    }
+                    other => return bad(format!("expected number in quoted list, got {other:?}")),
                 }
                 for e in rest {
                     match e {
@@ -4205,11 +4309,7 @@ fn fixed_share_binop(
 /// Element-wise product for the vector builtins.  Handles Num, Fixed and
 /// Share operands (including Q16.16 shares) following the interpreter's
 /// scalar coercion rules.
-fn vec_mul(
-    backend: &Arc<Mutex<Box<dyn Backend>>>,
-    a: &Types,
-    b: &Types,
-) -> Result<Types, Types> {
+fn vec_mul(backend: &Arc<Mutex<Box<dyn Backend>>>, a: &Types, b: &Types) -> Result<Types, Types> {
     use crate::interpreter::ast::FIXED_SCALE;
     let to_fixed = |v: &Types| -> i64 {
         match v {
@@ -4238,11 +4338,7 @@ fn vec_mul(
 }
 
 /// Element-wise sum for the vector builtins.  Same operand rules as `vec_mul`.
-fn vec_add(
-    backend: &Arc<Mutex<Box<dyn Backend>>>,
-    a: &Types,
-    b: &Types,
-) -> Result<Types, Types> {
+fn vec_add(backend: &Arc<Mutex<Box<dyn Backend>>>, a: &Types, b: &Types) -> Result<Types, Types> {
     use crate::interpreter::ast::FIXED_SCALE;
     let to_fixed = |v: &Types| -> i64 {
         match v {

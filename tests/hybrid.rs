@@ -122,4 +122,3 @@ fn test_real_tfhe_share_conversion_and_reencrypt() {
     let fresh = mpc_reencrypt(&a, &ck, &ct, 3, nbits);
     assert_eq!((a.decrypt(&ck, &fresh) as u128) & 0xFFFF_FFFF, residue);
 }
-

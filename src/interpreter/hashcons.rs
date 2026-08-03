@@ -240,8 +240,7 @@ impl Store {
             // elements therefore share a handle even though `eq?` distinguishes
             // them — hash-consing is about structure, `eq?` about identity.
             Types::Vector(v) => {
-                let ids: Vec<NodeId> =
-                    v.borrow().iter().map(|x| self.intern_value(x)).collect();
+                let ids: Vec<NodeId> = v.borrow().iter().map(|x| self.intern_value(x)).collect();
                 self.list(&ids)
             }
             Types::Num(n) => self.num(*n),

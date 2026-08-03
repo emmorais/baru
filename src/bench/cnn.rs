@@ -155,8 +155,18 @@ impl ConvLayer {
 }
 
 pub struct CnnModel {
-    pub d: usize,               // input side length (1 channel)
-    pub kernels: Vec<Vec<i64>>, // first conv: [OC][K*K]
+    pub d: usize, // input side length
+    /// Input channels. `1` for a grayscale dataset, `3` for RGB.
+    ///
+    /// The conv packing has always been multi-channel — that is the whole point
+    /// of the reversed channel offset, and `fhe::conv_pack` has `in_c = 2` and
+    /// `in_c = 3` tests. What was single-channel was the *plumbing*: this field
+    /// used to be a hardcoded `1` at three `ConvShape` sites. An RGB 28×28 input
+    /// needs degree 3977 against `n = 4096`, so it fits without splitting
+    /// channels across ciphertexts; a wide *intermediate* layer is what does not
+    /// (16 channels at 13×13 needs 5266), and that constraint is unchanged.
+    pub in_c: usize,
+    pub kernels: Vec<Vec<i64>>, // first conv: [OC][in_c*K*K], row-major (in_c, ky, kx)
     pub cbias: Vec<i64>,        // [OC]
     /// Additional conv layers after the first (each followed by ReLU∘rescale
     /// and max-pool). Empty for the shallow model `bench-cnn` exercises; one
@@ -203,6 +213,7 @@ impl CnnModel {
 
         let mut model = CnnModel {
             d,
+            in_c: 1,
             kernels,
             cbias,
             extra_conv: Vec::new(),
@@ -273,6 +284,7 @@ impl CnnModel {
         let ph = oh / POOL;
         let mut model = CnnModel {
             d,
+            in_c: 1,
             kernels,
             cbias,
             extra_conv,
@@ -342,11 +354,19 @@ impl CnnModel {
         s + &format!(" → dense(→{}) → argmax", self.nclasses())
     }
 
+    /// Plaintext first convolution at one output position, summed over input
+    /// channels. The channel-major kernel layout and the `in_c · d · d` input
+    /// layout match what `conv_pack` expects, so this stays the reference the
+    /// encrypted path is checked against.
     fn conv_dot(&self, input: &[i64], oc: usize, oy: usize, ox: usize) -> i64 {
         let mut acc = 0i64;
-        for ky in 0..K {
-            for kx in 0..K {
-                acc += self.kernels[oc][ky * K + kx] * input[(oy + ky) * self.d + (ox + kx)];
+        let hw = self.d * self.d;
+        for ic in 0..self.in_c {
+            for ky in 0..K {
+                for kx in 0..K {
+                    acc += self.kernels[oc][(ic * K + ky) * K + kx]
+                        * input[ic * hw + (oy + ky) * self.d + (ox + kx)];
+                }
             }
         }
         acc
@@ -487,7 +507,7 @@ fn weight_polys(s: &Bfv, model: &CnnModel) -> Vec<Vec<u64>> {
     let mut out: Vec<Vec<u64>> = Vec::new();
 
     let conv1 = ConvShape {
-        in_c: 1,
+        in_c: model.in_c,
         h: model.d,
         w: model.d,
         kh: K,
@@ -1488,7 +1508,7 @@ pub fn run_cnn_hybrid_in_session(
     // channel appears at once. See `fhe::conv_pack`.
     let t0 = Instant::now();
     let conv1_shape = ConvShape {
-        in_c: 1,
+        in_c: model.in_c,
         h: model.d,
         w: model.d,
         kh: K,
@@ -1750,7 +1770,7 @@ pub fn run_cnn_hybrid_in_session(
             + model.extra_conv.iter().map(|c| c.out_c()).sum::<usize>(),
         conv_mults_toeplitz: conv_pack::toeplitz_multiplications(
             ConvShape {
-                in_c: 1,
+                in_c: model.in_c,
                 h: model.d,
                 w: model.d,
                 kh: K,
@@ -2439,6 +2459,80 @@ mod tests {
             r.conv_mults,
             OC + c2,
             "conv mults should count both conv layers' output channels"
+        );
+    }
+
+    /// Rebuild a grayscale random model as an **RGB** one: `in_c = 3`, with the
+    /// first conv's kernels widened to `[OC][3·K·K]` and the input to `3·d·d`.
+    fn rgb_model(d: usize, seed: u64) -> (CnnModel, Vec<i64>) {
+        let (mut model, _) = CnnModel::random(d, seed);
+        let mut rng = StdRng::seed_from_u64(seed ^ 0x5247_4200);
+        model.in_c = 3;
+        model.kernels = (0..model.out_channels())
+            .map(|_| (0..3 * K * K).map(|_| rng.gen_range(-2i64..=2)).collect())
+            .collect();
+        let input: Vec<i64> = (0..3 * d * d).map(|_| rng.gen_range(0i64..64)).collect();
+        (model, input)
+    }
+
+    /// **Three-channel input through the encrypted pipeline, bit-exact.**
+    ///
+    /// The claim this settles: `fhe::conv_pack`'s reversed channel offset was
+    /// always multi-channel (it has `in_c = 2` and `in_c = 3` unit tests), but
+    /// `CnnModel` hardcoded `in_c = 1` at three `ConvShape` sites, so no RGB
+    /// image had ever reached the *hybrid*. Now one does.
+    ///
+    /// Degree check, which is why this needs no channel splitting: an RGB 28×28
+    /// input with a 3×3 kernel touches coefficient 3977, under `n = 4096`. The
+    /// packing constraint that does still bite is a wide *intermediate* layer —
+    /// 16 channels at 13×13 needs 5266 — and that is unchanged by this test.
+    #[test]
+    #[ignore] // real 3-party transport
+    fn rgb_input_classifies_exactly_under_encryption() {
+        let (model, input) = rgb_model(16, 11);
+        let r = run_cnn_hybrid(&model, &input, NetworkProfile::INSTANT);
+        assert!(
+            r.correct,
+            "RGB: encrypted class {} != plaintext {}",
+            r.class, r.expected
+        );
+        assert_eq!(r.bootstraps, 0, "RGB must not need a bootstrap either");
+        // Still one ciphertext multiplication per output channel: channels sum
+        // inside the single packed product rather than costing one each.
+        assert_eq!(
+            r.conv_mults,
+            model.out_channels(),
+            "three input channels must not cost three times the multiplications"
+        );
+    }
+
+    /// The degree bound, asserted rather than assumed — an RGB 28×28 conv must
+    /// fit `n = 4096`, and a 16-channel 13×13 one must not. If the first ever
+    /// stops holding, `rgb_input_classifies_exactly_under_encryption` would fail
+    /// with a packing panic instead of a wrong answer, and this says why.
+    #[test]
+    fn rgb_fits_the_ring_but_a_wide_intermediate_layer_does_not() {
+        let rgb = ConvShape {
+            in_c: 3,
+            h: 28,
+            w: 28,
+            kh: K,
+            kw: K,
+        };
+        assert_eq!(rgb.required_degree(), 3977);
+        assert!(rgb.required_degree() < BfvParams::DEFAULT.n);
+
+        let wide = ConvShape {
+            in_c: 16,
+            h: 13,
+            w: 13,
+            kh: K,
+            kw: K,
+        };
+        assert_eq!(wide.required_degree(), 5266);
+        assert!(
+            wide.required_degree() > BfvParams::DEFAULT.n,
+            "this is the constraint that still needs channel splitting or n = 8192"
         );
     }
 

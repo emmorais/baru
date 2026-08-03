@@ -61,7 +61,7 @@ Jung~Hee Cheon, Andrey Kim, Miran Kim, and Yongsoo Song.
 \bibitem{TFHE}
 Ilaria Chillotti, Nicolas Gama, Mariya Georgieva, and Malika Izabach{\`e}ne.
 \newblock {TFHE}: Fast fully homomorphic encryption over the torus.
-\newblock volume~33, pages 34--91, 2020.
+\newblock {\em Journal of Cryptology}, 33(1):34--91, 2020.
 
 \bibitem{DamgardNielsen}
 Ivan Damg{\aa}rd and Jesper~Buus Nielsen.
@@ -82,8 +82,8 @@ L{\'e}o Ducas and Wessel P.~J. van Woerden.
 \bibitem{FV}
 Junfeng Fan and Frederik Vercauteren.
 \newblock Somewhat practical fully homomorphic encryption.
-\newblock 2012.
-\newblock 2012/144.
+\newblock Cryptology ePrint Archive, Paper 2012/144, 2012.
+\newblock \url{https://eprint.iacr.org/2012/144}.
 
 \bibitem{Gentry}
 Craig Gentry.
@@ -160,6 +160,14 @@ Deevashwer Rathee, Mayank Rathee, Nishant Kumar, Nishanth Chandran, Divya
   Gupta, Aseem Rastogi, and Rahul Sharma.
 \newblock {CrypTFlow2}: Practical 2-party secure inference.
 \newblock In {\em ACM CCS}, pages 325--342, 2020.
+
+\bibitem{Falcon}
+Sameer Wagh, Shruti Tople, Fabrice Benhamouda, Eyal Kushilevitz, Prateek
+  Mittal, and Tal Rabin.
+\newblock {FALCON}: Honest-majority maliciously secure framework for private
+  deep learning.
+\newblock {\em Proceedings on Privacy Enhancing Technologies},
+  2021(1):188--208, 2021.
 
 \bibitem{MedMNIST}
 Jiancheng Yang, Rui Shi, Donglai Wei, Zequan Liu, Lin Zhao, Bilian Ke,

@@ -843,7 +843,6 @@ pub enum Strategy {
 }
 
 impl Strategy {
-
     fn parse(s: &str) -> Result<Strategy, String> {
         match s {
             "mpc" => Ok(Strategy::Mpc),
@@ -859,11 +858,7 @@ impl Strategy {
     }
 }
 
-pub fn run_strategy(
-    s: Strategy,
-    data: &LayerData,
-    profile: NetworkProfile,
-) -> StrategyReport {
+pub fn run_strategy(s: Strategy, data: &LayerData, profile: NetworkProfile) -> StrategyReport {
     match s {
         Strategy::Mpc => run_mpc_only(data, profile),
         Strategy::Tfhe => run_tfhe_only(data, profile),

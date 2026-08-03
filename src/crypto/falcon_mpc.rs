@@ -904,11 +904,806 @@ pub fn private_compare_elements(l: usize) -> usize {
     l + (l - 1) + 1 + 1
 }
 
+// ─── The offline phase ───────────────────────────────────────────────────────
+//
+// Everything `Π_WA` and `Π_SS` consume is query-independent, which is why Falcon
+// accounts for it offline. It must still be *generated*, and generating it is
+// where a stand-in is easy and wrong: a value derived from a seed every party can
+// compute is not a secret, and preprocessing whose secrecy fails takes the online
+// protocol's secrecy with it.
+//
+// # The one free primitive, and the one that costs a round
+//
+// A replicated sharing of a uniformly random value is **free**. Party `i` holds
+// the pair `(vᵢ, vᵢ₊₁)`, and component `vᵢ` is derived from the PRF key shared by
+// exactly the two parties that hold it. Nobody predicts a component they do not
+// hold, and nobody holds all three, so the value is secret with no communication
+// (`PrfKeys::random_share_mod`). At modulus 2 that is a uniformly random *bit*
+// shared over `Z₂`, since addition mod 2 is XOR.
+//
+// What is *not* free is the **same** bit shared in a second structure — a daBit.
+// `Π_PC` needs its blinding bit over `Z_p`, `Π_SS` needs its selector over the
+// ring, and both need it to be the bit they already hold over `Z₂`.
+//
+// The replicated layout makes this cheap, for a reason worth stating precisely:
+// **each additive component `bᵢ` is already known to exactly the two parties that
+// must hold it** in a replicated sharing of `bᵢ` — party `i` holds it as `left`,
+// party `i−1` as `right`. So each `bᵢ` crosses into `Z_p` (or the ring) with *no
+// communication at all*, via `share_component`. Only the XOR needs a protocol:
+//
+// ```text
+// b = b₀ ⊕ b₁ ⊕ b₂
+//   = c ⊕ b₂           where c = b₀ ⊕ b₁ = b₀ + b₁ − 2·b₀·b₁
+//   = c + b₂ − 2·c·b₂
+// ```
+//
+// Two multiplications, both batched across the whole request, and no input
+// sharing. **No party learns `b`**: each holds two of the three components and
+// never the third, and the multiplication protocol reveals nothing.
+//
+// The tempting shortcut — "party 0 holds `(b₀,b₁)` so let it input `c` directly"
+// — does not work, and failing at it is instructive. A *replicated* sharing of
+// `c` needs `c` at two parties; party 2 holds `(b₂,b₀)` and cannot compute it.
+// Sharing a one-party value takes a real input protocol and a message; sharing
+// each `bᵢ` takes neither.
+
+/// A batch of random bits, shared over `Z₂` **and** over `Z_p`, consistently.
+///
+/// The `Z₂` sharing is free; the `Z_p` sharing costs one batched multiplication
+/// for the whole batch. See the module note above for why the party roles are
+/// fixed rather than symmetric.
+pub fn random_dabits_fp<T: Transport>(
+    n: usize,
+    base_op_id: u64,
+    me: PartyId,
+    mbx: &Mailbox<T>,
+) -> (Vec<[u64; 2]>, Vec<FpShare>) {
+    if n == 0 {
+        return (Vec::new(), Vec::new());
+    }
+    let z2 = random_bits_z2(n, base_op_id, me, mbx);
+    let fp = fp_image_of(
+        &z2,
+        base_op_id.wrapping_add(n as u64),
+        base_op_id.wrapping_add(n as u64 + 1),
+        me,
+        mbx,
+    );
+    (z2, fp)
+}
+
+/// Operation ids one [`random_dabits_fp`] or [`random_dabits_ring`] call
+/// consumes, starting at its `base_op_id`.
+///
+/// `n` of them go to the `Z₂` draw — one PRF counter per bit, since
+/// [`crate::crypto::net::PrfKeys::random_share_mod`] takes a scalar counter —
+/// and one to each of the two XOR multiplications, which need only a single id
+/// apiece however wide the batch (`mul_batch` tags the whole batch with one id
+/// and derives per-element randomness inside its own `2^40` slot).
+///
+/// Callers **must** reserve this much. The earlier code hard-coded the offline
+/// phase at `base + 1_000`, `base + 2_000`, `base + 3_000`, which silently
+/// overlapped once a batch passed ~333 elements — and a CNN ReLU layer is far
+/// larger than that. Overlap means two protocols deriving masks from the same
+/// PRF counter, so it is a privacy bug, not just a mixed-up tag.
+pub fn dabit_id_span(n: usize) -> u64 {
+    n as u64 + 2
+}
+
+/// The free half of every daBit: one replicated `Z₂` bit per element, straight
+/// from the pairwise PRFs. No communication — each party derives both of its
+/// components locally.
+fn random_bits_z2<T: Transport>(
+    n: usize,
+    base_op_id: u64,
+    me: PartyId,
+    mbx: &Mailbox<T>,
+) -> Vec<[u64; 2]> {
+    let keys = mbx.prf_keys(me);
+    (0..n)
+        .map(|i| {
+            let (l, r) = keys.random_share_mod(base_op_id.wrapping_add(i as u64), 2);
+            [l & 1, r & 1]
+        })
+        .collect()
+}
+
+/// Carry `Z₂` bits into `Z_p` by XORing their three components there.
+///
+/// Each component crosses for free: component `j` is this party's `left` when
+/// `me == j` and its `right` when `me == j−1`, which is exactly who
+/// `share_component` expects to supply it. Only the two XORs cost a round each.
+fn fp_image_of<T: Transport>(
+    z2: &[[u64; 2]],
+    mul_id_a: u64,
+    mul_id_b: u64,
+    me: PartyId,
+    mbx: &Mailbox<T>,
+) -> Vec<FpShare> {
+    let comp = |b: &[u64; 2], j: usize| -> FpShare {
+        let v = if me == j {
+            b[0]
+        } else if me == (j + 2) % 3 {
+            b[1]
+        } else {
+            0
+        };
+        share_component(Fp::new(v), j, me)
+    };
+    let b0: Vec<FpShare> = z2.iter().map(|b| comp(b, 0)).collect();
+    let b1: Vec<FpShare> = z2.iter().map(|b| comp(b, 1)).collect();
+    let b2: Vec<FpShare> = z2.iter().map(|b| comp(b, 2)).collect();
+
+    let two = Fp::new(2);
+    // c = b₀ ⊕ b₁
+    let p01: Vec<(FpShare, FpShare)> = b0.iter().copied().zip(b1.iter().copied()).collect();
+    let prod01 = mul_batch(&p01, mul_id_a, me, mbx);
+    let cs: Vec<FpShare> = b0
+        .iter()
+        .zip(&b1)
+        .zip(&prod01)
+        .map(|((x, y), xy)| *x + *y - xy.scalar_mul(two))
+        .collect();
+    // b = c ⊕ b₂
+    let p2: Vec<(FpShare, FpShare)> = cs.iter().copied().zip(b2.iter().copied()).collect();
+    let prod2 = mul_batch(&p2, mul_id_b, me, mbx);
+    cs.iter()
+        .zip(&b2)
+        .zip(&prod2)
+        .map(|((c, y), cy)| *c + *y - cy.scalar_mul(two))
+        .collect()
+}
+
+/// [`fp_image_of`] for the ring: same free component crossing, same two XORs.
+fn ring_image_of<T: Transport>(
+    z2: &[[u64; 2]],
+    nbits: usize,
+    mul_id_a: u64,
+    mul_id_b: u64,
+    me: PartyId,
+    mbx: &Mailbox<T>,
+) -> Vec<PartyShare> {
+    use crate::crypto::aby3_protocol::{mul_batch_party_at, share_component as ring_component};
+    let mask: Fr = if nbits >= 128 {
+        Fr::MAX
+    } else {
+        (1u128 << nbits) - 1
+    };
+    let comp = |b: &[u64; 2], j: usize| -> PartyShare {
+        let v = if me == j {
+            b[0]
+        } else if me == (j + 2) % 3 {
+            b[1]
+        } else {
+            0
+        };
+        ring_component(Fr::from(v), j, me)
+    };
+    let xor = |x: &PartyShare, y: &PartyShare, xy: &PartyShare| PartyShare {
+        left: x
+            .left
+            .wrapping_add(y.left)
+            .wrapping_sub(xy.left.wrapping_mul(2))
+            & mask,
+        right: x
+            .right
+            .wrapping_add(y.right)
+            .wrapping_sub(xy.right.wrapping_mul(2))
+            & mask,
+    };
+    let b0: Vec<PartyShare> = z2.iter().map(|b| comp(b, 0)).collect();
+    let b1: Vec<PartyShare> = z2.iter().map(|b| comp(b, 1)).collect();
+    let b2: Vec<PartyShare> = z2.iter().map(|b| comp(b, 2)).collect();
+
+    let p01: Vec<(PartyShare, PartyShare)> = b0.iter().cloned().zip(b1.iter().cloned()).collect();
+    let prod01 = mul_batch_party_at(&p01, nbits as u32, mul_id_a, me, mbx);
+    let cs: Vec<PartyShare> = b0
+        .iter()
+        .zip(&b1)
+        .zip(&prod01)
+        .map(|((x, y), xy)| xor(x, y, xy))
+        .collect();
+
+    let p2: Vec<(PartyShare, PartyShare)> = cs.iter().cloned().zip(b2.iter().cloned()).collect();
+    let prod2 = mul_batch_party_at(&p2, nbits as u32, mul_id_b, me, mbx);
+    cs.iter()
+        .zip(&b2)
+        .zip(&prod2)
+        .map(|((c, y), cy)| xor(c, y, cy))
+        .collect()
+}
+
+/// A batch of random bits shared over **all three** structures at once — `Z₂`,
+/// `Z_p` and the ring `Z_{2^nbits}` — every one of them the same bit.
+///
+/// The `Z₂` half is drawn once and carried into both other structures, which is
+/// the whole point: calling [`random_dabits_fp`] and [`random_dabits_ring`]
+/// separately gives two *unrelated* bits, and code that assumed otherwise would
+/// be wrong in a way no single-structure test can see.
+///
+/// [`random_wrap_masks`] needs exactly this. Its `Z_p` image is the bit of the
+/// mask that `Π_PC` compares against, its ring image is what composes the mask,
+/// and the two must agree or the comparison is against a different number than
+/// the one being masked.
+pub fn random_dabits_triple<T: Transport>(
+    n: usize,
+    nbits: usize,
+    base_op_id: u64,
+    me: PartyId,
+    mbx: &Mailbox<T>,
+) -> (Vec<[u64; 2]>, Vec<FpShare>, Vec<PartyShare>) {
+    if n == 0 {
+        return (Vec::new(), Vec::new(), Vec::new());
+    }
+    let z2 = random_bits_z2(n, base_op_id, me, mbx);
+    let m = base_op_id.wrapping_add(n as u64);
+    let fp = fp_image_of(&z2, m, m.wrapping_add(1), me, mbx);
+    let ring = ring_image_of(&z2, nbits, m.wrapping_add(2), m.wrapping_add(3), me, mbx);
+    (z2, fp, ring)
+}
+
+/// Operation ids one [`random_dabits_triple`] call consumes.
+pub fn dabit_triple_id_span(n: usize) -> u64 {
+    n as u64 + 4
+}
+
+/// `Π_WA`'s masks, generated by **bit composition** — the offline phase of
+/// Falcon's Fig. 6, and the piece that used to be dealt from a public seed.
+///
+/// Returns one `(x, bits, δ)` per element: a ring sharing of a uniform mask
+/// `x ∈ [0, 2^l_bits)`, the `Z_p` shares of its bits (least significant first),
+/// and `δ = wrap3(x₀,x₁,x₂,L)` as a replicated `Z₂` bit. **No party learns `x`.**
+///
+/// # Why this is the hard part of `Π_WA`
+///
+/// `δ` is a function of all three additive components of `x`, so no party can
+/// compute it from its own view — each is missing a summand. Computing it *from
+/// shares* is what `Π_WA` itself does, which is the circularity Falcon has to
+/// break. Sampling `x` and dealing `δ` alongside it, as this code used to,
+/// escapes the circularity by giving up the secret: a seed every party can
+/// evaluate is not a secret, so all three could reconstruct the mask.
+///
+/// # The construction
+///
+/// Build `x` **out of** shared bits rather than decomposing a sampled `x`:
+///
+/// 1. Draw `l_bits` daBits per element ([`random_dabits_triple`]). Their `Z_p`
+///    images *are* `bits` — free, no conversion. Their ring images compose `x`.
+/// 2. `x = Σ 2^k b_k`, a local weighted sum of the ring images. `x` is uniform
+///    because the bits are uniform and independent.
+/// 3. `δ` is **bit `l_bits` of the integer sum `x₀+x₁+x₂`**. That is the one
+///    identity that makes this cheap: writing `s = x₀+x₁+x₂` we have
+///    `s = wrap3_exact·L + x` with `wrap3_exact ∈ {0,1,2}`, so
+///    `δ = wrap3_exact mod 2 = ⌊s/L⌋ mod 2`, which is exactly bit `l_bits` of
+///    `s`. One `a2b` at width `l_bits + 1` therefore yields it — the wrap
+///    genuinely falls out of the carry chain, and the low bits it also computes
+///    are simply discarded because step 1 already produced them for free.
+/// 4. Move `δ` from the ring into `Z₂`, where `Π_WA` consumes it, by opening
+///    `δ ⊕ r` against a fresh ring/`Z₂` daBit. `r` is a uniform secret bit, so
+///    the opened value is uniform and independent of `δ`.
+///
+/// # Cost, stated honestly
+///
+/// One `a2b` per element — the very protocol Falcon's online phase exists to
+/// avoid. So Falcon is *not* cheaper than [`NonlinMode::A2b`] when offline and
+/// online are added together; it is cheaper online, which is the claim its
+/// tables make and the one `docs/falcon-reproduction.md` measures. Preprocessing
+/// is input-independent and can be generated ahead of any query, which is what
+/// makes the split meaningful rather than an accounting trick.
+///
+/// [`NonlinMode::A2b`]: crate::interpreter::transport_backend::NonlinMode::A2b
+pub fn random_wrap_masks<T: Transport>(
+    count: usize,
+    l_bits: u32,
+    base_op_id: u64,
+    me: PartyId,
+    mbx: &Mailbox<T>,
+) -> Vec<(PartyShare, Vec<FpShare>, [u64; 2])> {
+    use crate::crypto::aby3_protocol::{
+        a2b_batch_party, mul_batch_party, reveal_batch_party, A2B_ID_BLOCK,
+    };
+    if count == 0 {
+        return Vec::new();
+    }
+    // `1u128 << l_bits` must not overflow, and the XOR encoding `a+b−2ab` needs
+    // at least two bits of headroom.
+    assert!(
+        (2..128).contains(&l_bits),
+        "random_wrap_masks: l_bits = {l_bits} outside 2..128"
+    );
+    let l = l_bits as usize;
+    let mask: Fr = (1u128 << l_bits) - 1;
+    let total = count * l;
+
+    // ── 1. `l_bits` daBits per element ──
+    // The Z_p images are the mask's bits; the ring images compose the mask.
+    let (_, fp, ring) = random_dabits_triple(total, l, base_op_id, me, mbx);
+    let mut next = base_op_id.wrapping_add(dabit_triple_id_span(total));
+
+    // ── 2. x = Σ 2^k b_k, local ──
+    // Reducing each component mod L is safe: it changes the component by a
+    // multiple of L, so the reconstructed value is unchanged mod L, and it is
+    // what puts the summands in the range `wrap3` is defined over.
+    let xs: Vec<PartyShare> = (0..count)
+        .map(|e| {
+            let mut acc = PartyShare { left: 0, right: 0 };
+            for k in 0..l {
+                let b = &ring[e * l + k];
+                acc.left = acc.left.wrapping_add(b.left << k) & mask;
+                acc.right = acc.right.wrapping_add(b.right << k) & mask;
+            }
+            acc
+        })
+        .collect();
+
+    // ── 3. δ = bit `l_bits` of x₀+x₁+x₂ ──
+    // At width `l_bits + 1` the sum is exact in the bits that matter: three
+    // summands below `2^l_bits` total below `3·2^l_bits < 2^(l_bits+2)`, and
+    // reducing mod `2^(l_bits+1)` leaves bits `0..=l_bits` untouched.
+    let decomp = a2b_batch_party(&xs, l + 1, next, me, mbx);
+    next = next.wrapping_add(A2B_ID_BLOCK);
+    let delta_ring: Vec<PartyShare> = decomp.iter().map(|bits| bits[l].clone()).collect();
+
+    // ── 4. δ from the ring into Z₂ ──
+    let (r_z2, r_ring) = random_dabits_ring(count, 128, next, me, mbx);
+    next = next.wrapping_add(dabit_id_span(count));
+    let pairs: Vec<(PartyShare, PartyShare)> = delta_ring
+        .iter()
+        .cloned()
+        .zip(r_ring.iter().cloned())
+        .collect();
+    let prod = mul_batch_party(&pairs, next, me, mbx);
+    next = next.wrapping_add(1);
+    let xored: Vec<PartyShare> = delta_ring
+        .iter()
+        .zip(&r_ring)
+        .zip(&prod)
+        .map(|((d, r), dr)| PartyShare {
+            left: d.left.wrapping_add(r.left).wrapping_sub(dr.left.wrapping_mul(2)),
+            right: d
+                .right
+                .wrapping_add(r.right)
+                .wrapping_sub(dr.right.wrapping_mul(2)),
+        })
+        .collect();
+    let opened = reveal_batch_party(&xored, next, me, mbx);
+
+    // Public XOR lands in component 0 only — party 0's `left` and party 2's
+    // `right` — so it is counted exactly once in the reconstruction.
+    (0..count)
+        .map(|e| {
+            let c = opened[e];
+            assert!(
+                c <= 1,
+                "random_wrap_masks: δ ⊕ r opened to {c}, which is not a bit — \
+                 the mask sharing and its bit decomposition disagree"
+            );
+            let c = c as u64;
+            let delta = [
+                r_z2[e][0] ^ if me == 0 { c } else { 0 },
+                r_z2[e][1] ^ if me == 2 { c } else { 0 },
+            ];
+            (xs[e].clone(), fp[e * l..(e + 1) * l].to_vec(), delta)
+        })
+        .collect()
+}
+
+/// Operation ids one [`random_nonzero_masks`] call consumes.
+///
+/// Loose on purpose. Each resampling round spends one id on its opening plus one
+/// per slot it redraws, and how many slots are redrawn is data-dependent — a slot
+/// is resampled when its draw came up zero. This reserves the worst case (every
+/// slot zero in every one of the eight rounds), which cannot actually happen but
+/// costs nothing to reserve: operation ids are positions in a `u64` counter, not
+/// a resource that runs out.
+pub fn nonzero_mask_id_span(n: usize) -> u64 {
+    n as u64 + 8 * (n as u64 + 2)
+}
+
+/// Operation ids one [`random_wrap_masks`] call consumes.
+pub fn wrap_mask_id_span(count: usize, l_bits: u32) -> u64 {
+    use crate::crypto::aby3_protocol::A2B_ID_BLOCK;
+    dabit_triple_id_span(count * l_bits as usize)
+        + A2B_ID_BLOCK
+        + dabit_id_span(count)
+        + 2 // the δ-conversion multiplication and its opening
+}
+
+/// A batch of random bits, shared over `Z₂` **and** over the ring `Z_{2^k}`.
+///
+/// The ring counterpart of [`random_dabits_fp`] and the same construction —
+/// except that `−2·c·b₂` is a wrapping ring operation, and the ring
+/// multiplication protocol is the ABY3 one rather than the field one.
+pub fn random_dabits_ring<T: Transport>(
+    n: usize,
+    nbits: usize,
+    base_op_id: u64,
+    me: PartyId,
+    mbx: &Mailbox<T>,
+) -> (Vec<[u64; 2]>, Vec<PartyShare>) {
+    if n == 0 {
+        return (Vec::new(), Vec::new());
+    }
+    let z2 = random_bits_z2(n, base_op_id, me, mbx);
+    let m = base_op_id.wrapping_add(n as u64);
+    let ring = ring_image_of(&z2, nbits, m, m.wrapping_add(1), me, mbx);
+    (z2, ring)
+}
+
+/// Random **non-zero** `Z_p` masks for `Π_PC`'s final opening.
+///
+/// `Π_PC` reveals `m · Π c[i]` and reads only its zero-ness. `m` must therefore
+/// be a uniformly random *unit*: with `m = 1` the product itself is revealed,
+/// which says more than the predicate, and with `m = 0` the opening reads zero
+/// whatever the product was — at `p = 37` that is a **1-in-37 wrong answer**, not
+/// a negligible event.
+///
+/// So the zero ones are found and resampled. Opening *whether a mask is zero*
+/// leaks nothing: `m` is drawn independently of any input, and this runs offline.
+/// Resampling is one extra round per attempt and terminates with probability
+/// `1 − p^{-attempts}`.
+pub fn random_nonzero_masks<T: Transport>(
+    n: usize,
+    base_op_id: u64,
+    me: PartyId,
+    mbx: &Mailbox<T>,
+) -> Vec<FpShare> {
+    use crate::crypto::fp_protocol::random_share;
+    if n == 0 {
+        return Vec::new();
+    }
+    let mut out: Vec<FpShare> = (0..n)
+        .map(|i| random_share(base_op_id.wrapping_add(i as u64), me, mbx))
+        .collect();
+    let mut op = base_op_id.wrapping_add(n as u64);
+    // Each round resamples only the slots that came up zero, so the expected
+    // number of rounds is 1 + p^{-1} + p^{-2} + … ≈ 1.03 at p = 37.
+    for _ in 0..8 {
+        let opened = reveal_batch(&out, op, me, mbx);
+        op = op.wrapping_add(1);
+        let bad: Vec<usize> = opened
+            .iter()
+            .enumerate()
+            .filter(|(_, v)| v.is_zero())
+            .map(|(i, _)| i)
+            .collect();
+        if bad.is_empty() {
+            return out;
+        }
+        for (k, &i) in bad.iter().enumerate() {
+            out[i] = random_share(op.wrapping_add(k as u64), me, mbx);
+        }
+        op = op.wrapping_add(bad.len() as u64 + 1);
+    }
+    // 8 independent rounds all producing a zero has probability p^-8 ≈ 2^-41.
+    // Continuing with a possibly-zero mask would silently invert a comparison,
+    // so this stops instead.
+    panic!("random_nonzero_masks: 8 consecutive zero draws — PRF or modulus is wrong");
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::crypto::net::InprocHandle;
     use std::thread;
+
+    /// **The daBit's defining property**: the bit shared over `Z₂` and the bit
+    /// shared over `Z_p` must be the *same* bit. If they drift, `Π_PC`'s blinding
+    /// stops cancelling and every comparison built on it silently inverts for
+    /// half its inputs.
+    #[test]
+    #[ignore] // real 3-party transport
+    fn dabits_agree_across_z2_and_zp() {
+        const N: usize = 24;
+        let out = run3(|me, mbx| random_dabits_fp(N, 500, me, mbx));
+        for i in 0..N {
+            // Z₂: XOR of the three additive components.
+            let z2 = (out[0].0[i][0] ^ out[1].0[i][0] ^ out[2].0[i][0]) & 1;
+            // Z_p: sum of the three additive components.
+            let zp = out[0].1[i].left + out[1].1[i].left + out[2].1[i].left;
+            assert!(
+                zp.value() == 0 || zp.value() == 1,
+                "bit {i} reconstructed to {} over Z_p — not a bit",
+                zp.value()
+            );
+            assert_eq!(z2, zp.value(), "bit {i} disagrees between Z₂ and Z_p");
+        }
+        // Both values must actually vary; a constant would satisfy the above.
+        let bits: Vec<u64> = (0..N)
+            .map(|i| (out[0].0[i][0] ^ out[1].0[i][0] ^ out[2].0[i][0]) & 1)
+            .collect();
+        assert!(
+            bits.contains(&0) && bits.contains(&1),
+            "24 draws were all the same bit — this is not randomness"
+        );
+    }
+
+    /// The replicated sharing must be *consistent*: each party's `right`
+    /// component is its successor's `left`. A daBit that broke this would be
+    /// malformed in a way the online protocol cannot detect.
+    #[test]
+    #[ignore] // real 3-party transport
+    fn dabit_sharings_are_well_formed() {
+        const N: usize = 8;
+        let out = run3(|me, mbx| random_dabits_fp(N, 600, me, mbx));
+        for i in 0..N {
+            for p in 0..3 {
+                assert_eq!(
+                    out[p].0[i][1],
+                    out[(p + 1) % 3].0[i][0],
+                    "Z₂ bit {i}: party {p}'s right is not party {}'s left",
+                    (p + 1) % 3
+                );
+                assert_eq!(
+                    out[p].1[i].right,
+                    out[(p + 1) % 3].1[i].left,
+                    "Z_p bit {i}: replication broken between {p} and {}",
+                    (p + 1) % 3
+                );
+            }
+        }
+    }
+
+    /// **No party may learn the bit.** The construction gives party 0 the value
+    /// `c = b₀ ⊕ b₁` and party 1 the value `b₂`, and its security rests on
+    /// neither holding both. This checks the consequence directly: over many
+    /// draws, no single party's view predicts the bit better than chance.
+    ///
+    /// A weak test statistically, but it is the property that the *previous*
+    /// implementation violated outright — it derived every component from a seed
+    /// all three parties could compute — so a regression would be gross, not
+    /// subtle.
+    #[test]
+    #[ignore] // real 3-party transport
+    fn no_party_view_determines_the_bit() {
+        const N: usize = 64;
+        let out = run3(|me, mbx| random_dabits_fp(N, 700, me, mbx));
+        for p in 0..3 {
+            // The party's whole view of the Z₂ sharing is its own two components.
+            let mut agree_with_left = 0;
+            for i in 0..N {
+                let b = (out[0].0[i][0] ^ out[1].0[i][0] ^ out[2].0[i][0]) & 1;
+                if out[p].0[i][0] == b {
+                    agree_with_left += 1;
+                }
+            }
+            assert!(
+                (8..=56).contains(&agree_with_left),
+                "party {p}'s own component matched the secret bit {agree_with_left}/64 times — \
+                 it is not independent of the secret"
+            );
+        }
+    }
+
+    /// The ring daBit, same properties. `Π_SS` consumes this one.
+    #[test]
+    #[ignore] // real 3-party transport
+    fn ring_dabits_agree_across_z2_and_the_ring() {
+        const N: usize = 24;
+        const NBITS: usize = 20;
+        let out = run3(|me, mbx| random_dabits_ring(N, NBITS, 800, me, mbx));
+        let mask: Fr = (1u128 << NBITS) - 1;
+        for i in 0..N {
+            let z2 = (out[0].0[i][0] ^ out[1].0[i][0] ^ out[2].0[i][0]) & 1;
+            let ring = out[0].1[i]
+                .left
+                .wrapping_add(out[1].1[i].left)
+                .wrapping_add(out[2].1[i].left)
+                & mask;
+            assert!(ring <= 1, "bit {i} reconstructed to {ring} in the ring");
+            assert_eq!(z2 as u128, ring, "bit {i} disagrees between Z₂ and the ring");
+        }
+    }
+
+    /// **The property `Π_WA` cannot check for itself.** The mask `x`, its bits
+    /// over `Z_p`, and its wrap `δ` are three separate objects, and the protocol
+    /// silently returns the wrong sign if any pair of them disagrees. Nothing
+    /// downstream detects it — a DReLU that is wrong for half its inputs still
+    /// looks like a bit.
+    ///
+    /// So this reconstructs all three from the parties' shares and checks them
+    /// against each other: the bits must be the binary expansion of the very `x`
+    /// the ring shares reconstruct to, and `δ` must be the `wrap3` of that `x`'s
+    /// own three summands.
+    #[test]
+    #[ignore] // real 3-party transport
+    fn composed_wrap_masks_are_mutually_consistent() {
+        const COUNT: usize = 16;
+        const LB: u32 = 8;
+        let out = run3(|me, mbx| random_wrap_masks(COUNT, LB, 1_000, me, mbx));
+        let mask: Fr = (1u128 << LB) - 1;
+
+        // Indexed on purpose: every check reads the *same* position across all
+        // three parties' vectors, which an iterator over any one cannot express.
+        #[allow(clippy::needless_range_loop)]
+        for e in 0..COUNT {
+            // Replication: each party's `right` is its successor's `left`.
+            for p in 0..3 {
+                assert_eq!(
+                    out[p][e].0.right,
+                    out[(p + 1) % 3][e].0.left,
+                    "mask {e}: ring replication broken between {p} and {}",
+                    (p + 1) % 3
+                );
+            }
+            // The three additive summands, and the mask they reconstruct to.
+            let c = [out[0][e].0.left, out[1][e].0.left, out[2][e].0.left];
+            for (j, cj) in c.iter().enumerate() {
+                assert!(*cj <= mask, "mask {e}: summand {j} is not reduced mod L");
+            }
+            let x = (c[0].wrapping_add(c[1]).wrapping_add(c[2])) & mask;
+
+            // The Z_p bits must be the binary expansion of that same x.
+            for k in 0..LB as usize {
+                let b = out[0][e].1[k].left + out[1][e].1[k].left + out[2][e].1[k].left;
+                assert_eq!(
+                    u128::from(b.value()),
+                    (x >> k) & 1,
+                    "mask {e}: Z_p bit {k} disagrees with the ring value {x}"
+                );
+            }
+
+            // And δ must be that x's own wrap3 — the piece no party can compute.
+            let delta = (out[0][e].2[0] ^ out[1][e].2[0] ^ out[2][e].2[0]) & 1;
+            let want = crate::crypto::falcon::wrap3(c[0] as u64, c[1] as u64, c[2] as u64, LB);
+            assert_eq!(
+                delta, want,
+                "mask {e}: δ = {delta} but wrap3({}, {}, {}) = {want}",
+                c[0], c[1], c[2]
+            );
+        }
+
+        // The masks must actually be masks. A construction that produced a
+        // constant, or only even values, would satisfy every check above.
+        let values: Vec<u128> = (0..COUNT)
+            .map(|e| {
+                (out[0][e].0.left.wrapping_add(out[1][e].0.left).wrapping_add(out[2][e].0.left))
+                    & mask
+            })
+            .collect();
+        assert!(
+            values.iter().collect::<std::collections::HashSet<_>>().len() > COUNT / 2,
+            "16 masks took {} distinct values — this is not randomness",
+            values.iter().collect::<std::collections::HashSet<_>>().len()
+        );
+        assert!(
+            values.iter().any(|v| v & 1 == 1),
+            "every mask was even — the low daBit is not being composed in"
+        );
+    }
+
+    /// **No party may learn the mask** — the property whose absence made this
+    /// protocol undeployable before bit composition landed.
+    ///
+    /// The regression being guarded is gross rather than subtle: the previous
+    /// implementation derived all three summands from `op_id` by a public
+    /// formula, so *every* party could reconstruct `x` exactly. This checks the
+    /// consequence directly — a party's own two summands must not determine the
+    /// mask — and would have failed outright against that version.
+    #[test]
+    #[ignore] // real 3-party transport
+    fn no_party_view_determines_the_composed_mask() {
+        const COUNT: usize = 32;
+        const LB: u32 = 8;
+        let out = run3(|me, mbx| random_wrap_masks(COUNT, LB, 2_000, me, mbx));
+        let mask: Fr = (1u128 << LB) - 1;
+        for p in 0..3 {
+            let mut matched = 0;
+            // Indexed for the same reason: the mask is reconstructed from all
+            // three parties' entries at position `e`.
+            #[allow(clippy::needless_range_loop)]
+            for e in 0..COUNT {
+                let x = (out[0][e].0.left.wrapping_add(out[1][e].0.left).wrapping_add(out[2][e].0.left))
+                    & mask;
+                // The party's whole view is its two summands; the best it can do
+                // is guess from their sum.
+                let guess = out[p][e].0.left.wrapping_add(out[p][e].0.right) & mask;
+                if guess == x {
+                    matched += 1;
+                }
+            }
+            assert!(
+                matched <= COUNT / 4,
+                "party {p}'s own summands predicted the mask {matched}/{COUNT} times — \
+                 it is not independent of the secret"
+            );
+        }
+    }
+
+    /// End to end: `Π_DReLU` on masks that came from the real offline phase.
+    ///
+    /// [`composed_wrap_masks_are_mutually_consistent`] checks the masks against
+    /// each other; this checks them against the protocol that consumes them, over
+    /// every value in the ring including both boundaries. The two together are
+    /// what let the offline phase be believed — internal consistency alone would
+    /// pass for a mask whose `δ` convention was off by one from `Π_WA`'s.
+    #[test]
+    #[ignore] // real 3-party transport
+    fn drelu_over_composed_masks_matches_the_signed_value() {
+        const LB: u32 = 8;
+        let l = 1u64 << LB;
+        let vals: Vec<u64> = (0..l).collect();
+        let splits: Vec<[u64; 3]> = vals
+            .iter()
+            .map(|&v| {
+                let s0 = v.wrapping_mul(37) % l;
+                let s1 = v.wrapping_mul(91).wrapping_add(11) % l;
+                [s0, s1, (v + 2 * l - s0 - s1) % l]
+            })
+            .collect();
+        let expected: Vec<u64> = vals
+            .iter()
+            .map(|&v| u64::from(crate::crypto::falcon::signed(v, LB) >= 0))
+            .collect();
+        let n = vals.len();
+
+        let out = run3(move |me, mbx| {
+            let a: Vec<PartyShare> = splits
+                .iter()
+                .map(|s| PartyShare {
+                    left: s[me % 3] as u128,
+                    right: s[(me + 1) % 3] as u128,
+                })
+                .collect();
+            // The whole offline phase, batched across all 256 comparisons.
+            let off = 100_000;
+            let wm = random_wrap_masks(n, LB, off, me, mbx);
+            let off = off + wrap_mask_id_span(n, LB);
+            let (beta_z2, beta_fp) = random_dabits_fp(n, off, me, mbx);
+            let off = off + dabit_id_span(n);
+            let m = random_nonzero_masks(n, off, me, mbx);
+            let pre: Vec<WrapPreproc> = wm
+                .into_iter()
+                .enumerate()
+                .map(|(i, (x, bits, delta))| WrapPreproc {
+                    x,
+                    bits,
+                    delta,
+                    beta_fp: beta_fp[i],
+                    beta_bit: beta_z2[i],
+                    m: m[i],
+                })
+                .collect();
+            drelu_batch(&a, &pre, LB, PC_ID_BLOCK, me, mbx)
+        });
+
+        for (i, want) in expected.iter().enumerate() {
+            let got = (out[0][i][0] ^ out[1][i][0] ^ out[2][i][0]) & 1;
+            assert_eq!(
+                got,
+                *want,
+                "DReLU at value {i} (signed {}) over a composed mask",
+                crate::crypto::falcon::signed(i as u64, LB)
+            );
+        }
+    }
+
+    /// A `Π_PC` mask must never be zero: the opening reads only zero-ness, so a
+    /// zero mask reports "product is zero" whatever the product was. At `p = 37`
+    /// an unchecked draw is wrong 1 time in 37, which is not a tail event.
+    #[test]
+    #[ignore] // real 3-party transport
+    fn pc_masks_are_never_zero() {
+        const N: usize = 200;
+        let out = run3(|me, mbx| random_nonzero_masks(N, 900, me, mbx));
+        // Indexed on purpose: each step reads the *same* position across all
+        // three parties' vectors, which an iterator over any one cannot express.
+        #[allow(clippy::needless_range_loop)]
+        for i in 0..N {
+            let m = out[0][i].left + out[1][i].left + out[2][i].left;
+            assert!(!m.is_zero(), "mask {i} is zero — a comparison using it inverts");
+        }
+        // And they must be *masks*, i.e. varied — a constant 1 would pass the
+        // above while revealing the raw product, which is the leak this fixes.
+        let vals: std::collections::HashSet<u64> = (0..N)
+            .map(|i| (out[0][i].left + out[1][i].left + out[2][i].left).value())
+            .collect();
+        assert!(
+            vals.len() > 10,
+            "only {} distinct masks in {N} draws — not uniform over Z_p",
+            vals.len()
+        );
+    }
 
     fn run3<F, R>(f: F) -> Vec<R>
     where

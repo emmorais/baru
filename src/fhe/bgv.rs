@@ -105,8 +105,8 @@
 
 use rand::Rng;
 
-use crate::fhe::ntt::I256;
 use crate::fhe::ntt;
+use crate::fhe::ntt::I256;
 
 // ─── Parameters ───────────────────────────────────────────────────────────────
 

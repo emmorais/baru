@@ -392,4 +392,3 @@ fn diff_ckks_rejects_fixed_to_int() {
     let mut cc = CircuitCompiler::new_real();
     assert!(cc.compile_fhe(&expr).is_err());
 }
-

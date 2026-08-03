@@ -601,6 +601,10 @@ mod tests {
     /// FHE packing bound changed, and E25's boundary needs restating again.
     #[test]
     fn the_crossover_depends_on_which_preprocessing_mpc_is_priced_with() {
+        on_a_deep_stack(crossover_preprocessing_body);
+    }
+
+    fn crossover_preprocessing_body() {
         let mut dep = Deployment::wan(2);
         dep.allow_dealer = true;
         let r = run(&[64, 1024], &dep, 32).unwrap();
@@ -651,8 +655,32 @@ mod tests {
         );
     }
 
+    /// Run a wide-layer test body on a stack sized for the workload.
+    ///
+    /// A width-`w` layer is a `w`-term expression, and both the parser and the
+    /// circuit compiler recurse once per term. A debug build gives every block in
+    /// a function its own stack slots, so one level of that recursion costs a few
+    /// KiB however tightly the code is written — 1024 of them do not fit in the
+    /// 2 MiB a libtest thread gets, while the 8 MiB main thread the CLI runs on is
+    /// comfortable (`bench-layer --widths 8,1024` succeeds).
+    ///
+    /// Narrowing the widths instead would delete the measurement these tests exist
+    /// to make: the crossover only appears once the layer is wide.
+    fn on_a_deep_stack(body: fn()) {
+        std::thread::Builder::new()
+            .stack_size(32 << 20)
+            .spawn(body)
+            .expect("spawn a deep-recursion thread")
+            .join()
+            .expect("test body panicked");
+    }
+
     #[test]
     fn the_hybrid_overtakes_semi2k_as_the_layer_widens() {
+        on_a_deep_stack(hybrid_overtakes_body);
+    }
+
+    fn hybrid_overtakes_body() {
         let mut dep = Deployment::wan(2);
         dep.allow_dealer = true;
         let r = run(&[8, 1024], &dep, 32).unwrap();

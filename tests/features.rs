@@ -1300,7 +1300,10 @@ fn test_define_function_sugar() {
 #[test]
 fn test_set_assigns_an_existing_binding() {
     assert_eq!(eval("(begin (define x 1) (set! x 42) x)"), 42);
-    assert_eq!(eval("(let ((c 0)) (begin (set! c (+ c 10)) (set! c (+ c 5)) c))"), 15);
+    assert_eq!(
+        eval("(let ((c 0)) (begin (set! c (+ c 10)) (set! c (+ c 5)) c))"),
+        15
+    );
 }
 
 /// Scheme requires the variable to exist. Catching it *before* the operand runs
@@ -1329,7 +1332,10 @@ fn test_set_is_visible_through_a_closure() {
 #[test]
 fn test_apply_spreads_a_list() {
     assert_eq!(eval("(apply + (list 3 4))"), 7);
-    assert_eq!(eval("(apply (lambda (a b c) (+ a (* b c))) (list 1 2 3))"), 7);
+    assert_eq!(
+        eval("(apply (lambda (a b c) (+ a (* b c))) (list 1 2 3))"),
+        7
+    );
     assert_eq!(eval("(begin (define (f) 9) (apply f (list)))"), 9);
 }
 
@@ -1382,7 +1388,10 @@ fn test_variadic_operators_keep_fixed_point() {
 /// two-operand form itself still runs the protocol.
 #[test]
 fn test_operator_procedures_refuse_secrets() {
-    assert_eq!(eval_shared("(let ((z :sint32 5)) (reconstruct (+ z 1)))"), 6);
+    assert_eq!(
+        eval_shared("(let ((z :sint32 5)) (reconstruct (+ z 1)))"),
+        6
+    );
     let secret_via_apply =
         std::panic::catch_unwind(|| eval_shared("(let ((z :sint32 5)) (apply + (list z 1)))"));
     assert!(
@@ -1625,10 +1634,7 @@ fn test_unwinding_discards_the_rest_of_the_guarded_expression() {
 #[test]
 fn test_raise_wraps_a_non_condition() {
     assert_eq!(eval("(guard (e (error? e)) (raise 5))"), 1);
-    assert_eq!(
-        eval("(guard (e (car (error-irritants e))) (raise 5))"),
-        5
-    );
+    assert_eq!(eval("(guard (e (car (error-irritants e))) (raise 5))"), 5);
 }
 
 /// **The point of the whole exercise**: an uncaught condition is the *value* of
@@ -1646,9 +1652,9 @@ fn test_an_uncaught_condition_is_a_value_not_a_panic() {
 #[test]
 fn test_malformed_guard_is_rejected() {
     for src in [
-        "(guard (e) (error \"x\"))",   // no handler body
-        "(guard (e 1))",              // nothing to protect
-        "(guard e 1)",                // missing clause parens
+        "(guard (e) (error \"x\"))", // no handler body
+        "(guard (e 1))",             // nothing to protect
+        "(guard e 1)",               // missing clause parens
     ] {
         assert!(
             baru::interpreter::parser::parse(src).is_err(),
@@ -1697,10 +1703,7 @@ fn test_machine_type_errors_are_catchable() {
         "car of empty list"
     );
     // The irritant is the value that provoked it.
-    assert_eq!(
-        eval("(guard (e (car (error-irritants e))) (car 42))"),
-        42
-    );
+    assert_eq!(eval("(guard (e (car (error-irritants e))) (car 42))"), 42);
 }
 
 /// Normal list operations are untouched by the above.
@@ -1718,15 +1721,17 @@ fn test_list_operations_still_work_after_raising_their_errors() {
 #[test]
 fn test_vector_builtin_failures_are_catchable() {
     for src in [
-        "(guard (e 1) (dot (list 1 2) (list 1)))",   // length mismatch
+        "(guard (e 1) (dot (list 1 2) (list 1)))", // length mismatch
         "(guard (e 1) (dot (list \"x\") (list 1)))", // bad element type
         "(guard (e 1) (vsum (list \"x\" 1)))",
-        "(guard (e 1) (matvec (list 5) (list 1)))",  // row is not a list
+        "(guard (e 1) (matvec (list 5) (list 1)))", // row is not a list
     ] {
         assert_eq!(eval(src), 1, "{src}");
     }
-    assert!(eval_plain_string("(guard (e (error-message e)) (dot (list 1 2) (list 1)))")
-        .contains("length mismatch"));
+    assert!(
+        eval_plain_string("(guard (e (error-message e)) (dot (list 1 2) (list 1)))")
+            .contains("length mismatch")
+    );
 }
 
 /// And they still compute the right answers.

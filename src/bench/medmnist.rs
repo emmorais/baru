@@ -10,9 +10,25 @@
 //! datasets at 28×28 — *exactly* MNIST's shape — so the existing 784-pixel
 //! pipeline runs on them unchanged and the artifact stops being about digits.
 //!
-//! Two datasets are embedded, chosen because they are grayscale (the conv
-//! packing assumes one input channel) and because they stress different ends
-//! of the classifier:
+//! Two datasets are embedded, chosen because they stress different ends of the
+//! classifier:
+//!
+//! Both happen to be grayscale, and this module used to say that was *required*
+//! because "the conv packing assumes one input channel". **That was wrong.** The
+//! reversed channel offset in [`crate::fhe::conv_pack`] has always been
+//! multi-channel — channels summing on a shared coefficient is the point of it,
+//! and it carries `in_c = 2` and `in_c = 3` unit tests. What was single-channel
+//! was the plumbing: `CnnModel` hardcoded `in_c = 1` at three `ConvShape` sites,
+//! so no RGB image ever reached the hybrid. It does now
+//! (`cnn::tests::rgb_input_classifies_exactly_under_encryption`), at one
+//! ciphertext multiplication per output channel, because an RGB 28×28 conv needs
+//! degree 3977 against `n = 4096`.
+//!
+//! So an RGB MedMNIST set (PathMNIST, DermaMNIST) is a *training and embedding*
+//! task now, not a packing one. The packing limit that does still bite is a wide
+//! **intermediate** layer: 16 channels at 13×13 needs degree 5266, which is what
+//! caps the first conv at 12 channels and would need channel splitting or
+//! `n = 8192`.
 //!
 //! | dataset | task | classes | test set |
 //! |---|---|---|---|

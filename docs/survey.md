@@ -38,12 +38,12 @@ We report what falls out. Several widely-repeated intuitions survive; several do
 not. Among the results that only a single-harness study can produce: the
 FHE-versus-MPC crossover is a property of *the baseline's preprocessing*, not of
 either cryptosystem, and it disappears entirely once MPC is given SHE-based
-preprocessing; active security on the nonlinear surface of private inference
-costs 2.63× bytes but only 1.06× rounds; and the choice between a garbled and a
-`wrap3`-style comparison protocol has a *measured* crossover in bandwidth that
-moves with RTT. We also report our own withdrawn claims, including a ZKP backend
-that proved nothing and an MPC bit-decomposition that leaked its inputs, because
-a survey that reports only what worked is not reporting.
+preprocessing; and active security on the nonlinear surface of private inference
+costs 2.63× bytes but only 1.06× rounds. We also report our own withdrawn claims —
+a ZKP backend that proved nothing, an MPC bit-decomposition that leaked its inputs,
+and a comparison-protocol crossover that turned out to charge one side for
+preprocessing and not the other — because a survey that reports only what worked is
+not reporting.
 
 ---
 
@@ -92,12 +92,13 @@ comparison as weaker evidence than our internal ones.
   they actually cost, with the cost dimensions (rounds, bytes, compute,
   preprocessing) separated rather than collapsed into a single "performance"
   number.
-- A **single-artifact measurement study**: ~72,000 lines of Rust in which one
+- A **single-artifact measurement study**: ~70,000 lines of Rust in which one
   program runs on every paradigm, with a validated network model and uniform
   accounting.
 - **Cross-paradigm findings** that are not visible from any single paradigm's
-  literature (§7), including two crossovers whose *location* turns out to depend
-  on a parameter the original claims left implicit.
+  literature (§7), including a crossover whose *location* turns out to depend on a
+  parameter the original claims left implicit — and a second one we withdrew when
+  the same scrutiny was applied to it (§7.3).
 - A **methodology for honest benchmarking** (§6) — bit-exactness gating,
   machine-checked security attestations, and a discipline of recording
   withdrawn results — together with the record of what it caught in our own
@@ -542,36 +543,59 @@ the **maximum** over its instructions, not their sum; and conversions **batch
 per level**, so a crossing's cost depends on whether another crossing already
 happens there.
 
-### 7.3 The nonlinearity crossover is in bandwidth, and moves with RTT
+### 7.3 A withdrawn result: the nonlinearity crossover
 
 Baru implements three interchangeable comparison protocols — batched bit
 decomposition, garbled circuits, and Falcon's `wrap3`-based DReLU — behind one
-interface, verified to compute the same function bit-exactly. This makes the
-Yao-vs-GMW trade of §3 directly measurable on a real workload rather than
-argued. Latency per encrypted MedMNIST diagnosis (2026-08-01):
+interface, verified to compute the same function bit-exactly. This section reported
+a **measured bandwidth crossover** between the last two: garbled circuits above
+~15 Mbps, Falcon below, with the boundary moving down as RTT rose.
 
-| RTT | 1000 | 100 | 40 | 30 | 20 | 15 | 10 | 5 Mbps |
+**That result is withdrawn.** It was measured while Falcon's `Π_WA` preprocessing
+was dealt from a shared seed — free precisely because it was not secret. With the
+offline phase real (bit composition, §7.2), re-measured 2026-08-03:
+
+| RTT | 1000 | 100 | 60 | 40 | 30 | 20 | 15 | 10 Mbps |
 |---|---|---|---|---|---|---|---|---|
-| **0 ms** gc | **638** | **3227** | **6554** | **8511** | 12357 | 16215 | 23915 | 46869 |
-| **0 ms** falcon | 1279 | 3528 | 6750 | 8583 | **12167** | **15740** | **22828** | **43794** |
-| **20 ms** gc | **2411** | **4839** | **8395** | **10292** | **14174** | **18046** | 25594 | 48659 |
-| **20 ms** falcon | 3873 | 6276 | 9585 | 11393 | 14998 | 18431 | **25543** | **46850** |
+| **0 ms** gc | **552** | **2801** | **4349** | **6260** | **9075** | **12075** | **15906** | **24292** |
+| **0 ms** falcon | 3363 | 7306 | 10028 | 13512 | 18643 | 25659 | 31411 | 44964 |
+| **20 ms** gc | **2296** | **4739** | **6234** | **8050** | **9828** | **14068** | **17775** | **25280** |
+| **20 ms** falcon | 8000 | 11872 | 14762 | 18025 | 21701 | 28962 | 35589 | 49253 |
 
-Falcon — the lowest-bandwidth route — wins below **~20 Mbps at RTT 0** and below
-**~10 Mbps at RTT 20 ms**. Higher RTT shifts the crossover *down*, shrinking the
-region where it wins, because it sends more messages. The mechanism checks out
-quantitatively: Falcon starts ~641 ms behind on compute and pays 67 extra
-messages, against which it saves 1.6 MB; break-even is predicted at 20.0 and 6.5
-Mbps against 20–30 and 10–15 measured.
+Garbled circuits win at every point, at both RTTs, by 1.85–6.1×. The ratio *widens*
+with bandwidth, which is the signature of a protocol whose problem is not
+bandwidth: preprocessing now costs an `a2b` per element, and Falcon's online phase
+exists to avoid exactly that protocol.
 
-**The boundary is a band, not a line.** Around 20–30 Mbps the winner flips
-between repeat runs (0.1–0.3% spread). No ordering inside that band should be
-quoted; the finding is that the protocols are *indistinguishable* there, which
-is what a crossover is.
+The methodological point is the one worth keeping, and it is why this section stays
+in rather than being deleted: **the earlier crossover compared Falcon's online cost
+against garbled circuits' total cost.** Charging one side for preprocessing and not
+the other is an easy mistake to make and a hard one to see, because the resulting
+number is plausible, mechanistically explicable — the cost model predicted
+break-even at 17.1 Mbps against 15–20 measured — and flattering. It reproduced
+faithfully. It was still comparing two different things.
 
-The generalizable claim: given a deployment's RTT and bandwidth, one should
-**pick** the nonlinearity protocol rather than fixing it. Systems that hardwire
-one choice are optimal only in part of the deployment space.
+What the architecture still supports is narrower and survives:
+
+> Three implementations of one comparison, bit-exact against each other behind a
+> single interface, so which protocol backs every ReLU, max-pool and argmax is a
+> one-line choice.
+
+That interchangeability is what made the error *detectable*. What is not supported
+is "pick the protocol per deployment", because on this workload there is currently
+nothing to pick. And Falcon's own claim — that its **online** phase is cheap — is
+untested here: `lt_falcon_batch` runs preprocessing inline, so every figure above
+is a total, and building a genuine offline/online split is the open work.
+
+**The withdrawal's scope.** One `a2b` per element is an artefact of our
+construction, not a lower bound: δ also equals `w₀₁ ⊕ [y + x₂ ≥ L]` with
+`w₀₁ = wrap2(x₀,x₁)` and `y = (x₀+x₁) mod L` (verified exhaustively at ℓ = 6), and
+party 0 computes both `w₀₁` and `y` locally — leaving one comparison between values
+each side already holds in the clear, which no-OT three-party garbling settles in
+one round. Unimplemented, so no cost is claimed. But it fixes the scope: the honest
+reading is *"Baru's Falcon loses to Baru's garbled circuits once preprocessing is
+charged"*, not *"Falcon's DReLU does not repay its preprocessing"* — a claim these
+measurements do not support.
 
 ---
 
@@ -652,6 +676,22 @@ bit, so the run aborts when `y=1` and completes when `y=0`. **Deferring the
 abort does not close this** — batching hides *when* an abort happens, not
 *whether* it happens. We had asserted the opposite before building it.
 
+**A crossover that charged one side for preprocessing and not the other.** The
+comparison-protocol crossover reported in §7.3 (garbled circuits above ~15 Mbps,
+Falcon below, boundary moving with RTT) was measured while Falcon's `Π_WA`
+preprocessing was dealt from a shared seed — free because it was not secret. With a
+real offline phase the crossover vanishes: garbled circuits win at every bandwidth
+from 10 to 1000 Mbps, by 1.85–6.1×. **The crossover and everything derived from it
+are withdrawn.**
+
+This one is worth dwelling on because it was the hardest to see. The number was not
+noisy, not irreproducible, and not unexplained — the cost model predicted break-even
+at 17.1 Mbps against 15–20 measured, the RTT-dependence went the right way, and the
+mechanism was articulable. All of that was true of a comparison between Falcon's
+*online* cost and garbled circuits' *total* cost. A plausible mechanism is not
+evidence that the two sides are commensurable, and here it actively concealed that
+they were not.
+
 **Comparison errors of framing.** Pricing FHE's *linear* part against MPC's
 *whole layer* (omitting the ReLU that FHE cannot do at all); computing a
 crossover against a trusted-dealer baseline (asking whether FHE beats free
@@ -680,11 +720,21 @@ are modelled.
 still `rounds × RTT + bytes / bandwidth`, not a real WAN with congestion, jitter
 or packet loss.
 
-**Two disclosed cryptographic gaps.** The Falcon backend's preprocessing is
-currently **dealt from a common seed and is not secure** — all three parties can
-reconstruct the mask; its online protocol and measured costs are real, its
-offline phase is not. FHE threshold *key generation* is dealer-based. Both are
-recorded on the code and in the attestation table rather than only in prose.
+**One disclosed cryptographic gap.** FHE threshold *key generation* is
+dealer-based. It is recorded on the code and in the attestation table rather than
+only in prose.
+
+The Falcon backend's preprocessing used to be the second such gap — dealt from a
+common seed, so all three parties could reconstruct the mask. It is now generated
+by bit composition (`random_wrap_masks`), which closed the gap and cost the §7.3
+crossover its validity: preprocessing turned out to cost an `a2b` per element, the
+protocol Falcon's online phase exists to avoid.
+
+**No offline/online split.** Related, and the limit that now matters most for §7.3:
+`lt_falcon_batch` runs preprocessing inline, so every latency we report is a
+*total*. Protocols whose design puts work offline — Falcon among them — are
+therefore charged for it here in a way their own papers do not, and we cannot
+currently produce the online-only figure that would make the comparison fair.
 
 **Workload breadth.** Findings are anchored on feed-forward CNN inference at
 28×28. Transformers, larger images, and non-inference workloads are not covered.
@@ -768,7 +818,7 @@ hand-entered.
 |---|---|
 | Deep inference, zero bootstraps | `bench-deep-nn --depths 2,4,8,16,32` |
 | Private diagnosis | `bench-medmnist --dataset pneumonia` |
-| Nonlinearity crossover | `bench-medmnist --sweep` |
+| Nonlinearity comparison (withdrawn crossover, §7.3) | `bench-medmnist --sweep` |
 | Cost of active security | `bench-malicious --n 32 --bits 32` |
 | Triples: SHE vs OT | `bench-triples` |
 | FHE↔MPC crossover | `bench-layer` |

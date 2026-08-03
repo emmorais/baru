@@ -809,9 +809,14 @@ Ordered by value per unit of work, with the dependency structure respected.
 1. ~~**MedMNIST swap** (§3)~~ — **done 2026-07-28.** The artifact is now a
    healthcare artifact: private pneumonia and organ diagnosis, plaintext-exact
    under encryption, no new crypto. Next dataset in this direction would be a
-   *multi-channel* one (PathMNIST, DermaMNIST), which needs the conv packing to
-   split RGB channels across ciphertexts — a packing question, not a
-   construction one.
+   *multi-channel* one (PathMNIST, DermaMNIST). **Corrected 2026-08-03: this does
+   not need channel splitting.** The claim that it did was wrong — `conv_pack` was
+   always multi-channel, and an RGB 28×28 conv needs degree 3977 against
+   `n = 4096`. The blocker was three hardcoded `in_c = 1` sites in `CnnModel`,
+   now a real field, with an RGB image classifying exactly under encryption at one
+   ciphertext multiplication per output channel
+   (`cnn::tests::rgb_input_classifies_exactly_under_encryption`). What remains is
+   ordinary: train on an RGB set and embed the weights.
 2. ~~**Backend-aware optimizer** (§4)~~ — **done 2026-07-28**: reassociation-for-
    depth added (the sharpest form of the claim — it moves *only* depth), plus
    **per-site search**, which replaced the whole-circuit bundling that had been
@@ -927,9 +932,28 @@ everything is "planned" cannot express priority.
 * **A LAN/WAN measurement harness** so `mpcc`'s latency and bandwidth terms are
   calibrated against a real network rather than a profile (roadmap P1).
 
-* **Multi-channel MedMNIST** (PathMNIST, DermaMNIST). Needs the conv packing to
-  split RGB channels across ciphertexts — a packing question, not a construction
-  one.
+* **An offline/online split for the MPC backend.** Newly the highest-value item,
+  because its absence just cost a headline result. `lt_falcon_batch` runs its
+  preprocessing inline — the backend has no phase structure to hang it on — so
+  every latency Baru reports for it is a *total*. That is fine when protocols have
+  the same phase structure and silently unfair when they do not: the withdrawn
+  nonlinearity crossover (`falcon-reproduction.md`) compared Falcon's online cost
+  against garbled circuits' total cost, and nothing in the harness could have
+  flagged it. A split makes both the fair comparison and Falcon's own claim
+  measurable, and it generalises — every preprocessing-based protocol in the repo
+  has the same exposure.
+
+* **Multi-channel MedMNIST** (PathMNIST, DermaMNIST). No longer blocked on
+  packing — see §6.1's correction. The crypto path takes RGB today; what is left
+  is training on an RGB set and embedding the weights, plus teaching
+  `tools/train_medmnist.py` not to call `to_grayscale`.
+
+* **Channel splitting for wide intermediate layers.** This is the packing problem
+  that *is* real: 16 channels at 13×13 needs degree 5266 against `n = 4096`, which
+  is what caps the first conv at 12 channels. Splitting `in_c` into groups and
+  summing the partial products is free (homomorphic addition), so this is the
+  cheapest route to a wider model — and the prerequisite for CIFAR scale that does
+  *not* forfeit the no-evaluation-keys property the way SIMD packing would.
 
 ## 8. What to cut, or at least defer
 
