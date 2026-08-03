@@ -788,6 +788,11 @@ impl CircuitCompiler {
             // `apply` needs an argument count that only exists at run time.
             // Silently mis-lowering any of them would produce a circuit that is
             // perfectly sound about the wrong function.
+            Expr::Guard(..) => Err(
+                "cannot compile `guard` to a circuit: a circuit has no control flow \
+                 to unwind, so there is nothing for a handler to intercept"
+                    .to_string(),
+            ),
             Expr::Define(name, _) => Err(format!(
                 "cannot compile `(define {name} ...)` to a circuit: a circuit has \
                  no environment to extend. Use `let` instead."
@@ -833,7 +838,9 @@ impl CircuitCompiler {
                 for (name, rhs) in bindings {
                     // If the RHS is a lambda, store it for later inlining
                     // instead of collapsing it to a sentinel wire.
-                    if let Expr::Lambda(params, lam_body) = rhs {
+                    // Only fixed-arity lambdas can be inlined; a variadic one is
+                    // left to `flatten`, which refuses it with a reason.
+                    if let Expr::Lambda(params, None, lam_body) = rhs {
                         child_lam.insert(name.clone(), (params.clone(), *lam_body.clone()));
                     } else {
                         let val = self.flatten(rhs, &mut child_env, &mut child_lam, flat)?;
@@ -1004,14 +1011,20 @@ impl CircuitCompiler {
             }
 
             // ── Lambda / Call ─────────────────────────────────
-            Expr::Lambda(params, body) => {
+            Expr::Lambda(params, rest, body) => {
+                if rest.is_some() {
+                    return Err("cannot compile a variadic `(lambda (a . rest) ...)` to a \
+                                circuit: the argument count must be fixed when the circuit \
+                                is built"
+                        .to_string());
+                }
                 // Bare lambda — emit sentinel; meaningful only inside Call.
                 let dst = self.fresh("lam");
                 flat.push(FlatOp::Const {
                     dst: dst.clone(),
                     value: 0,
                 });
-                let _ = (params, body);
+                let _ = (params, rest, body);
                 Ok(CVal::Wire(dst))
             }
             Expr::Call(func, args) => self.flatten_call(func, args, env, lambdas, flat),
@@ -1299,7 +1312,13 @@ impl CircuitCompiler {
     ) -> Result<CVal, String> {
         match func {
             // Direct lambda application — beta-reduce immediately.
-            Expr::Lambda(params, body) => {
+            Expr::Lambda(params, rest, body) => {
+                if rest.is_some() {
+                    return Err("cannot compile a variadic `(lambda (a . rest) ...)` to a \
+                                circuit: the argument count must be fixed when the circuit \
+                                is built"
+                        .to_string());
+                }
                 if params.len() != args.len() {
                     return Err(format!(
                         "arity mismatch: lambda expects {}, got {}",
@@ -1772,6 +1791,11 @@ impl CircuitCompiler {
             // These cannot reach a circuit (`flatten` refuses them), but variable
             // extraction runs before flattening, so they are walked rather than
             // ignored — otherwise a diagnostic could omit the very name at fault.
+            Expr::Guard(_, handler, body) => {
+                for e in handler.iter().chain(body) {
+                    self.extract_vars_helper(e, vars);
+                }
+            }
             Expr::Define(name, value) | Expr::Set(name, value) => {
                 vars.push(name.clone());
                 self.extract_vars_helper(value, vars);
@@ -1817,7 +1841,7 @@ impl CircuitCompiler {
             | Expr::Str(_)
             | Expr::Char(_)
             | Expr::Bool(_)
-            | Expr::Lambda(_, _) => {}
+            | Expr::Lambda(_, _, _) => {}
         }
     }
 }
@@ -2133,6 +2157,7 @@ mod tests {
         // ((lambda (x) (* x x)) 5)  — constant folds to Const(25)
         let lam = Expr::Lambda(
             vec!["x".to_string()],
+            None,
             Box::new(mul_expr(Expr::Var("x".into()), Expr::Var("x".into()))),
         );
         let expr = Expr::Call(Box::new(lam), vec![Expr::Num(5)]);
@@ -2161,6 +2186,7 @@ mod tests {
         // After inlining and constant folding: Const(14)
         let lam = Expr::Lambda(
             vec!["x".to_string()],
+            None,
             Box::new(add_expr(Expr::Var("x".into()), Expr::Var("x".into()))),
         );
         let call = Expr::Call(Box::new(Expr::Var("double".into())), vec![Expr::Num(7)]);

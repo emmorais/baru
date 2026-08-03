@@ -1390,3 +1390,325 @@ fn test_operator_procedures_refuse_secrets() {
         "`+` as a procedure must refuse a share instead of guessing"
     );
 }
+
+// ---------------------------------------------------------------------------
+// `do` loops and vectors (Tier 1)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_do_accumulates() {
+    assert_eq!(
+        eval("(do ((i 0 (+ i 1)) (acc 0 (+ acc i))) ((== i 5) acc))"),
+        10
+    );
+}
+
+#[test]
+fn test_do_result_and_body() {
+    assert_eq!(eval("(do ((i 0 (+ i 1))) ((== i 3) 99))"), 99);
+    // A body that mutates an outer binding, i.e. `do` used for effect.
+    assert_eq!(
+        eval("(let ((n 0)) (do ((i 0 (+ i 1))) ((== i 4) n) (set! n (+ n i))))"),
+        6
+    );
+}
+
+/// A spec without a step carries its variable through unchanged, and an empty
+/// result clause yields 0 (this language's "no value").
+#[test]
+fn test_do_optional_step_and_empty_result() {
+    assert_eq!(eval("(do ((i 0 (+ i 1)) (k 7)) ((== i 2) k))"), 7);
+    assert_eq!(eval("(do ((i 0 (+ i 1))) ((== i 2)))"), 0);
+}
+
+#[test]
+fn test_vector_basics() {
+    assert_eq!(eval("(vector-length (vector 1 2 3))"), 3);
+    assert_eq!(eval("(vector-ref (vector 10 20 30) 1)"), 20);
+    assert_eq!(eval("(vector? (vector 1))"), 1);
+    assert_eq!(eval("(vector? (list 1))"), 0);
+    assert_eq!(eval("(vector-length (make-vector 4))"), 4);
+    assert_eq!(eval("(vector-ref (make-vector 3 7) 2)"), 7);
+    assert_eq!(eval("(length (vector->list (vector 1 2)))"), 2);
+    assert_eq!(eval("(vector-length (list->vector (list 1 2 3)))"), 3);
+}
+
+#[test]
+fn test_vector_set_mutates() {
+    assert_eq!(
+        eval("(let ((v (vector 1 2 3))) (begin (vector-set! v 0 99) (vector-ref v 0)))"),
+        99
+    );
+}
+
+/// **The property that distinguishes a vector from a list here.** Vectors have
+/// reference semantics: cloning a `Types::Vector` shares its storage, so a
+/// mutation is visible through every alias and through a function that received
+/// it as an argument. Without this a vector would just be a list with O(1)
+/// indexing, which `list-ref` already gives.
+#[test]
+fn test_vectors_have_reference_semantics() {
+    assert_eq!(
+        eval("(let ((v (vector 1 2))) (let ((w v)) (begin (vector-set! w 0 9) (vector-ref v 0))))"),
+        9
+    );
+    assert_eq!(
+        eval(
+            "(let ((v (vector 1 2)))
+               (let ((f (lambda (x) (vector-set! x 1 77))))
+                 (begin (f v) (vector-ref v 1))))"
+        ),
+        77
+    );
+    // Distinct vectors with equal contents are not `eq?`.
+    assert_eq!(eval("(eq? (vector 1) (vector 1))"), 0);
+}
+
+#[test]
+#[should_panic(expected = "past end")]
+fn test_vector_ref_bounds_checked() {
+    eval("(vector-ref (vector 1 2) 5)");
+}
+
+/// A secret index is refused rather than silently scanned, matching `list-ref`.
+#[test]
+fn test_vector_index_must_be_public() {
+    let r = std::panic::catch_unwind(|| {
+        eval_shared("(let ((z :sint32 1)) (vector-ref (vector 10 20) z))")
+    });
+    assert!(r.is_err(), "a secret vector index must be refused");
+}
+
+// ---------------------------------------------------------------------------
+// Rest parameters (Tier 1)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_rest_parameter_collects_remaining_arguments() {
+    assert_eq!(eval("((lambda (a . rest) (length rest)) 1 2 3)"), 2);
+    assert_eq!(eval("((lambda (a . rest) a) 1 2 3)"), 1);
+    // The rest list is empty, not absent, when only the fixed args are given.
+    assert_eq!(eval("((lambda (a . rest) (length rest)) 1)"), 0);
+}
+
+/// `(lambda (. args) ...)` takes everything. Scheme spells this `(lambda args ...)`,
+/// but a bare identifier there already means "one required parameter" in this
+/// language, and changing that would break existing programs — so the dotted
+/// spelling is the supported one. Recorded in LANGUAGE.md §13.
+#[test]
+fn test_all_arguments_as_a_rest_list() {
+    assert_eq!(eval("((lambda (. args) (length args)) 1 2 3 4)"), 4);
+    assert_eq!(eval("((lambda (. args) (length args)))"), 0);
+}
+
+#[test]
+fn test_rest_parameter_works_through_apply() {
+    assert_eq!(
+        eval("(apply (lambda (a . rest) (+ a (length rest))) (list 10 1 2))"),
+        12
+    );
+}
+
+/// With a rest parameter the fixed parameters are a *minimum*; without one the
+/// arity stays exact.
+#[test]
+#[should_panic(expected = "expected at least 2")]
+fn test_rest_parameter_still_requires_the_fixed_arguments() {
+    eval("((lambda (a b . r) a) 1)");
+}
+
+#[test]
+fn test_fixed_arity_is_unchanged() {
+    assert_eq!(eval("((lambda (a b) (+ a b)) 1 2)"), 3);
+}
+
+/// `Display` must round-trip the dot, or a variadic lambda would print as a
+/// fixed-arity one — which matters because quoted expressions are shown to users
+/// and fed to `eval` and the compilers.
+#[test]
+fn test_variadic_lambda_displays_its_dot() {
+    let e = baru::interpreter::parser::parse("(lambda (a . rest) a)").unwrap();
+    assert_eq!(format!("{e}"), "(lambda (a . rest) a)");
+    let e = baru::interpreter::parser::parse("(lambda (. args) args)").unwrap();
+    assert_eq!(format!("{e}"), "(lambda (. args) args)");
+}
+
+#[test]
+fn test_malformed_rest_parameter_is_rejected() {
+    assert!(baru::interpreter::parser::parse("(lambda (a . b c) a)").is_err());
+    assert!(baru::interpreter::parser::parse("(lambda (a .) a)").is_err());
+}
+
+// ---------------------------------------------------------------------------
+// The error continuation (Tier 1)
+//
+// A raised condition does not reach the continuation it was handed to. The
+// machine truncates the task stack back to the height recorded when the
+// innermost `guard` was installed and runs that handler instead — so unwinding
+// is one `truncate`, not a walk over pending frames.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_guard_catches_an_explicit_error() {
+    assert_eq!(eval("(guard (e 42) (error \"boom\"))"), 42);
+}
+
+#[test]
+fn test_guard_passes_a_normal_value_through() {
+    assert_eq!(eval("(guard (e 99) (+ 1 2))"), 3);
+}
+
+/// The condition is bound **inert**, so the handler can mention it without
+/// re-raising. Getting this wrong makes a caught error impossible to inspect.
+#[test]
+fn test_a_caught_condition_can_be_inspected() {
+    assert_eq!(eval("(guard (e (error? e)) (error \"x\"))"), 1);
+    assert_eq!(
+        eval_plain_string("(guard (e (error-message e)) (error \"boom\"))"),
+        "boom"
+    );
+    assert_eq!(
+        eval("(guard (e (length (error-irritants e))) (error \"m\" 1 2 3))"),
+        3
+    );
+}
+
+/// Failures the *evaluator* raises, not just explicit `error` calls. These were
+/// process-killing panics before the error continuation existed.
+#[test]
+fn test_evaluator_failures_are_catchable() {
+    assert_eq!(eval("(guard (e 99) definitely-unbound)"), 99);
+    assert_eq!(eval("(guard (e 7) ((lambda (a) a)))"), 7); // arity
+    assert_eq!(eval("(guard (e 5) (/ 1 0))"), 5);
+    assert_eq!(eval("(guard (e 5) (mod 1 0))"), 5);
+    assert_eq!(eval("(guard (e 5) (vector-ref (vector 1) 9))"), 5);
+    assert_eq!(eval("(guard (e 5) (list-ref (list 1) 9))"), 5);
+    assert_eq!(eval("(guard (e 5) (1 2))"), 5); // calling a non-procedure
+}
+
+#[test]
+fn test_innermost_guard_wins() {
+    assert_eq!(eval("(guard (e 1) (guard (f 2) (error \"inner\")))"), 2);
+}
+
+/// A handler may itself raise; the condition then propagates to the *enclosing*
+/// guard. This is what proves the handler runs with its own frame already
+/// popped, rather than still installed and catching itself forever.
+#[test]
+fn test_a_handler_can_reraise_to_the_enclosing_guard() {
+    assert_eq!(
+        eval("(guard (e 1) (car (guard (f (error \"re\")) (error \"x\"))))"),
+        1
+    );
+    assert_eq!(eval("(guard (e 8) (guard (f (raise f)) (error \"x\")))"), 8);
+}
+
+/// A handler goes out of scope at the normal exit of its body, or it would keep
+/// catching conditions raised long afterwards.
+#[test]
+fn test_handler_is_uninstalled_on_normal_exit() {
+    // The inner guard completes normally; the later raise must reach the outer.
+    assert_eq!(
+        eval("(guard (e 111) (begin (guard (f 0) 1) (error \"after\")))"),
+        111
+    );
+}
+
+#[test]
+fn test_unwinding_discards_the_rest_of_the_guarded_expression() {
+    // The `+ 1` around the raise never runs; the handler's value is the result.
+    assert_eq!(eval("(guard (e 0) (+ 1 (error \"x\")))"), 0);
+    // A guard used as a subexpression yields its handler's value in place.
+    assert_eq!(eval("(+ 1 (guard (e 10) (error \"x\")))"), 11);
+}
+
+#[test]
+fn test_raise_wraps_a_non_condition() {
+    assert_eq!(eval("(guard (e (error? e)) (raise 5))"), 1);
+    assert_eq!(
+        eval("(guard (e (car (error-irritants e))) (raise 5))"),
+        5
+    );
+}
+
+/// **The point of the whole exercise**: an uncaught condition is the *value* of
+/// the evaluation rather than a panic, so a REPL session survives a bad
+/// expression instead of taking the process down.
+#[test]
+fn test_an_uncaught_condition_is_a_value_not_a_panic() {
+    let out = eval_plain_string("(guard (e (error-message e)) (error \"survivable\"))");
+    assert_eq!(out, "survivable");
+    // Directly: no panic, and the message is preserved.
+    let r = std::panic::catch_unwind(|| eval_plain_string("(+ 1 1)"));
+    assert!(r.is_ok(), "a following expression must still evaluate");
+}
+
+#[test]
+fn test_malformed_guard_is_rejected() {
+    for src in [
+        "(guard (e) (error \"x\"))",   // no handler body
+        "(guard (e 1))",              // nothing to protect
+        "(guard e 1)",                // missing clause parens
+    ] {
+        assert!(
+            baru::interpreter::parser::parse(src).is_err(),
+            "should be a parse error: {src}"
+        );
+    }
+}
+
+/// The error continuation reaches the *crypto* builtins too, not just the
+/// interpreter core. Each of these was a process-killing panic before.
+#[test]
+fn test_crypto_builtin_failures_are_catchable() {
+    for src in [
+        "(guard (e 1) (nn-load-model \"definitely-not-a-file.json\"))",
+        "(guard (e 1) (zkp-compile 5 '(\"x\")))",
+        "(guard (e 1) (zkp-verify \"bad\" \"bad\" '() '()))",
+        "(guard (e 1) (fhe-compile 5 '()))",
+        "(guard (e 1) (fhe-dec \"not-json\" 5))",
+        "(guard (e 1) (proof-load \"definitely-not-a-file\"))",
+        "(guard (e 1) (b2a 5 8))",
+        "(guard (e 1) (a2b 5 8))",
+    ] {
+        assert_eq!(eval(src), 1, "{src}");
+    }
+}
+
+/// Type errors in the machine itself — `car`/`cdr`/`cons`/`if` and the unary
+/// operators — raise rather than abort, and carry the offending value as an
+/// irritant so a handler can report what was wrong.
+#[test]
+fn test_machine_type_errors_are_catchable() {
+    for src in [
+        "(guard (e 1) (car (list)))",
+        "(guard (e 1) (car 5))",
+        "(guard (e 1) (cdr (list)))",
+        "(guard (e 1) (cdr \"x\"))",
+        "(guard (e 1) (cons 1 2))",
+        "(guard (e 1) (not \"x\"))",
+        "(guard (e 1) (null? 5))",
+        "(guard (e 1) (if \"x\" 1 2))",
+    ] {
+        assert_eq!(eval(src), 1, "{src}");
+    }
+    assert_eq!(
+        eval_plain_string("(guard (e (error-message e)) (car (list)))"),
+        "car of empty list"
+    );
+    // The irritant is the value that provoked it.
+    assert_eq!(
+        eval("(guard (e (car (error-irritants e))) (car 42))"),
+        42
+    );
+}
+
+/// Normal list operations are untouched by the above.
+#[test]
+fn test_list_operations_still_work_after_raising_their_errors() {
+    assert_eq!(eval("(car (list 1 2))"), 1);
+    assert_eq!(eval("(car (cdr (list 1 2)))"), 2);
+    assert_eq!(eval("(length (cdr (cons 1 (cons 2 ()))))"), 1);
+    assert_eq!(eval("(null? (list))"), 1);
+    assert_eq!(eval("(not 0)"), 1);
+}

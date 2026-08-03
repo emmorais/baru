@@ -93,7 +93,16 @@ Fixed values print with 4 decimal digits (`3.5000`). Conversions are explicit vi
 (define x 5)                             ; bind in the current environment
 (define (sq n) (* n n))                  ; sugar for (define sq (lambda (n) ...))
 (set! x 42)                              ; assign to an EXISTING binding
+
+(lambda (a . rest) (length rest))        ; variadic: rest collects the remainder
+(lambda (. args) (length args))          ; every argument in one list
 ```
+
+With a rest parameter the fixed parameters become a **minimum** rather than an
+exact arity, and the rest list is empty (not absent) when only the fixed
+arguments are supplied. Scheme spells the take-everything form `(lambda args …)`;
+here a bare identifier in that position already means *one required parameter*,
+so the dotted `(lambda (. args) …)` is the supported spelling — see §13.
 
 `define` introduces a binding; `set!` assigns to one that already exists and
 errors if it does not. Both return the value (this language has no "unspecified").
@@ -151,17 +160,86 @@ Inside a `let` binding, the annotation `:sintN` wraps the bound expression in
 (case key ((1 2) body...)                ; key evaluated once, compared with ==
           ((3)   body...)
           (else  body...))
+(do ((i 0 (+ i 1))                       ; iteration: (var init [step])
+     (acc 0 (+ acc i)))
+    ((== i 5) acc)                       ; (test result...) — result may be empty
+  body...)                               ; body runs each pass, for effect
 ```
 
 Any nonzero number / `#t` is truthy. When `cond` is a **shared** value the
 condition bit is revealed first — see §6.3.
 
+### Conditions and `guard`
+
+```lisp
+(guard (e handler...)                    ; e is bound to the condition
+  body...)                               ; if body raises, handler runs instead
+(error "message" irritant...)            ; signal a condition
+(raise obj)                              ; raise any object
+```
+
+```lisp
+(guard (e (error-message e)) (error "boom"))   ; => "boom"
+(guard (e 0) (/ 1 0))                          ; => 0
+(guard (e 99) some-unbound-name)               ; => 99
+```
+
+**Errors propagate through an error continuation.** A raised condition never
+reaches the continuation it was handed to: the machine truncates its task stack
+back to the height recorded when the innermost `guard` was installed, then runs
+that handler. Unwinding is therefore a single truncate, not a walk over pending
+frames, and everything the guarded expression had left to do is discarded.
+
+Three consequences worth knowing:
+
+- **An uncaught condition is the value of the evaluation**, not a crash. A REPL
+  session survives a bad expression and carries on to the next one.
+- **The condition is bound inert** inside the handler, so `e` can be inspected
+  and passed around. A handler may `raise` it again, and it then propagates to
+  the *enclosing* guard.
+- **A handler is uninstalled when its body exits normally**, so it cannot catch
+  something raised later in the program.
+
+| Builtin | Description |
+|---|---|
+| `error` | `(error "msg" irritant...)` — build and signal a condition. |
+| `raise` | Re-raise a caught condition, or wrap any other object. |
+| `error?` | Is this value a condition? |
+| `error-message` / `error-irritants` | Accessors on a caught condition. |
+
+**Coverage, stated precisely.** Catchable by `guard`:
+
+- explicit `error` / `raise`;
+- unbound variables, and `set!` on an unbound name;
+- arity mismatches (including the zero-argument case), and calling a
+  non-procedure or a share as one;
+- division and modulo by zero, non-exact division;
+- type errors in `car`, `cdr`, `cons`, `if`, `not`, `null?`, `bitlen`,
+  negation and the arithmetic shifts — each carrying the offending value as an
+  irritant;
+- every failure in the procedures of §5.2–§5.2b;
+- **every MPC, FHE and ZKP builtin failure** — bad arguments, malformed JSON, a
+  missing model or proof file, a wrong quantisation scale.
+
+Still a panic, so **not** catchable:
+
+- the `MAX_FRAMES` step budget, and two internal invariants that indicate a bug
+  in the evaluator rather than in the program;
+- type errors inside the vector helpers (`dot`, `vsum`, `matvec`, `nn-forward`)
+  — these share fallible helpers whose signatures need to change together, a
+  contained follow-up rather than a hazard;
+- the `eval_plain` / `eval_shared` / `eval_fhe` test harness, where a panic is
+  the point: a test should fail loudly.
+
+`guard` cannot be compiled to a circuit: a circuit has no control flow to unwind,
+so there is nothing for a handler to intercept.
+
 A `cond` or `case` with no matching clause and no `else` evaluates to `0`, the
 same "no value" an untaken `when` produces.
 
-> **These are derived forms.** `begin`, `when`, `unless`, `cond`, `case`, `let*`
-> and named `let` are desugared **in the parser** into `if` / `let` / `letrec` /
-> sequences. Nothing in the evaluator or the FHE/ZKP circuit compilers knows they
+> **These are derived forms.** `begin`, `when`, `unless`, `cond`, `case`, `do`,
+> `let*` and named `let` are desugared **in the parser** into `if` / `let` /
+> `letrec` / sequences. Nothing in the evaluator or the FHE/ZKP circuit compilers knows they
 > exist, which is why they work on every backend the core forms work on — a ReLU
 > written `(cond ((> x 0) x) (else 0))` compiles, proves and verifies under
 > Binius64 exactly like the `if` it lowers to
@@ -273,11 +351,37 @@ through the backend):
 | `reverse` | `(reverse lst)` | Reversed copy. |
 | `list-ref` | `(list-ref lst i)` | Element at **public** index `i`. A *secret* index is refused with an error rather than silently scanned — see the note below. |
 
+### 5.2a Vectors
+
+Fixed-length, mutable, with **reference semantics** — the counterpart to this
+language's immutable lists. Indices are public, as for `list-ref`.
+
+| Builtin | Description |
+|---|---|
+| `vector` | `(vector v1 v2 …)` — build from arguments. |
+| `make-vector` | `(make-vector n [fill])` — `n` slots, `fill` defaults to `0`. |
+| `vector-length` | Number of slots. |
+| `vector-ref` | `(vector-ref v i)` at a **public** index; bounds-checked. |
+| `vector-set!` | `(vector-set! v i x)` — mutates in place, returns `x`. |
+| `vector->list` / `list->vector` | Convert between the two. |
+| `vector?` | Type test. |
+
+`vector-set!` is the reason vectors exist: without mutation a vector would be a
+list with O(1) indexing, which `list-ref` already provides. Because the storage
+is shared, a mutation is visible through every alias and through any procedure
+the vector was passed to:
+
+```lisp
+(let ((v (vector 1 2)))
+  (let ((f (lambda (x) (vector-set! x 1 77))))
+    (begin (f v) (vector-ref v 1))))     ; => 77
+```
+
 ### 5.2b Predicates and equivalence
 
 | Builtin | Description |
 |---|---|
-| `number?` `integer?` `boolean?` `string?` `char?` | Type tests on public values. |
+| `number?` `integer?` `boolean?` `string?` `char?` `vector?` `error?` | Type tests on public values. |
 | `list?` `pair?` | `pair?` is a *non-empty* list; there are no improper pairs (§13). |
 | `procedure?` | True for closures and builtins. |
 | `share?` `ciphertext?` | Is this value a secret share / an FHE ciphertext? |
@@ -767,11 +871,15 @@ third_party/sealy/       vendored, patched SEAL bindings (see BARU_PATCHES.md)
 Baru is Scheme-*like*, not a Scheme. The gaps are of three different kinds, and
 the distinction matters because only the first is a matter of effort:
 
-**Simply not implemented yet** (ordinary interpreter work): `do`, variadic/rest
-parameters (`(lambda args …)`), vectors, `values`/`call-with-values`,
-`delay`/`force`, `call/cc`, hygienic macros (`define-syntax`/`syntax-rules`), the
-numeric tower (only `i64` and Q16.16 exist), and catchable errors — an unbound
-variable currently panics rather than raising.
+**Simply not implemented yet** (ordinary interpreter work):
+`values`/`call-with-values`, `delay`/`force`, `call/cc`, hygienic macros
+(`define-syntax`/`syntax-rules`), string and char procedures beyond equality, and
+the numeric tower (only `i64` and Q16.16 exist).
+
+Errors *are* now catchable via `guard` (§3), across the evaluator, the Scheme
+procedures and the MPC/FHE/ZKP builtins. Four small areas still panic — the
+`MAX_FRAMES` budget, two evaluator invariants, the vector helpers, and the test
+harness. The exact list is in §3.
 
 Also: `define` binds in the *current* environment rather than being hoisted like
 Scheme's internal `define` (which behaves as `letrec*` at the head of a body), so
@@ -791,6 +899,10 @@ mutual recursion between two internal `define`s needs `letrec`.
 - **`and` / `or` are two-argument and bitwise**, not variadic and
   short-circuiting: `(and 6 3)` is `2`. Short-circuiting on a *secret* condition
   would leak, so this is not purely an oversight.
+- **Take-everything lambdas are written `(lambda (. args) …)`**, not Scheme's
+  `(lambda args …)`. A bare identifier in that position already means one
+  required parameter here, and changing it would silently alter existing
+  programs.
 
 **In conflict with the cryptography**, and so unlikely ever to close:
 

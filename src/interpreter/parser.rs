@@ -317,6 +317,31 @@ fn gensym(stem: &str) -> String {
     format!("{stem} {}", N.fetch_add(1, Ordering::Relaxed))
 }
 
+/// Split a trailing `. rest` out of a parsed parameter-name list.
+///
+/// `(lambda (a b . rest) ...)` reaches the parser as the names
+/// `["a", "b", ".", "rest"]`, because the tokenizer treats `.` as an ordinary
+/// symbol. Scheme's `(lambda args ...)` — every argument in one list — is
+/// deliberately *not* supported: this language already reads a bare identifier
+/// there as a single required parameter, and silently changing that would break
+/// existing programs. Use `(lambda (. args) ...)` instead.
+fn split_rest_param(names: Vec<String>) -> Result<(Vec<String>, Option<String>), String> {
+    match names.iter().position(|n| n == ".") {
+        None => Ok((names, None)),
+        Some(i) => {
+            if i + 2 != names.len() {
+                return Err(
+                    "lambda: `.` must be followed by exactly one rest parameter".to_string(),
+                );
+            }
+            let mut fixed = names;
+            let rest = fixed.pop().expect("checked above");
+            fixed.pop(); // the "." marker
+            Ok((fixed, Some(rest)))
+        }
+    }
+}
+
 /// Parse expressions up to (and consuming) the closing paren.
 fn parse_body(tokens: &[String], pos: &mut usize, form: &str) -> Result<Vec<Expr>, String> {
     let mut out = Vec::new();
@@ -478,6 +503,31 @@ pub fn parse_tokens(tokens: &[String], pos: &mut usize) -> Result<Expr, String> 
             *pos += 1;
             return Ok(Expr::Eval(Box::new(inner)));
         }
+        if next_tok == "guard" {
+            // (guard (var handler...) body...)
+            *pos += 1;
+            if *pos >= tokens.len() || tokens[*pos] != "(" {
+                return Err("guard expects a (var handler...) clause".to_string());
+            }
+            *pos += 1;
+            if *pos >= tokens.len() {
+                return Err("guard: empty handler clause".to_string());
+            }
+            let var = tokens[*pos].clone();
+            if var == "(" || var == ")" {
+                return Err("guard needs a variable to bind the condition to".to_string());
+            }
+            *pos += 1;
+            let handler = parse_body(tokens, pos, "guard handler")?;
+            if handler.is_empty() {
+                return Err("guard handler needs at least one expression".to_string());
+            }
+            let body = parse_body(tokens, pos, "guard")?;
+            if body.is_empty() {
+                return Err("guard needs a body to protect".to_string());
+            }
+            return Ok(Expr::Guard(var, handler, body));
+        }
         // ─── Mutation and application (real AST variants) ───────────────────
         if next_tok == "define" || next_tok == "set!" {
             let is_define = next_tok == "define";
@@ -506,7 +556,7 @@ pub fn parse_tokens(tokens: &[String], pos: &mut usize) -> Result<Expr, String> 
                 let body = body_expr(parse_body(tokens, pos, "define")?, "define")?;
                 return Ok(Expr::Define(
                     fname,
-                    Box::new(Expr::Lambda(params, Box::new(body))),
+                    Box::new(Expr::Lambda(params, None, Box::new(body))),
                 ));
             }
             let name = tokens[*pos].clone();
@@ -600,6 +650,84 @@ pub fn parse_tokens(tokens: &[String], pos: &mut usize) -> Result<Expr, String> 
             let inner = clauses_to_if(clauses, "case")?;
             return Ok(Expr::Let(vec![(tmp, key)], vec![inner]));
         }
+        if next_tok == "do" {
+            // (do ((var init step) ...) (test result...) body...)
+            //   => (letrec ((loop (lambda (var ...)
+            //                       (if test (begin result...)
+            //                                (begin body... (loop step ...))))))
+            //        (loop init ...))
+            // `step` is optional; a spec without one carries its variable
+            // through unchanged, as Scheme specifies.
+            *pos += 1;
+            if *pos >= tokens.len() || tokens[*pos] != "(" {
+                return Err("do expects a variable-spec list".to_string());
+            }
+            *pos += 1;
+            let mut vars: Vec<String> = Vec::new();
+            let mut inits: Vec<Expr> = Vec::new();
+            let mut steps: Vec<Expr> = Vec::new();
+            while *pos < tokens.len() && tokens[*pos] == "(" {
+                *pos += 1;
+                if *pos >= tokens.len() {
+                    return Err("unterminated do spec".to_string());
+                }
+                let name = tokens[*pos].clone();
+                if name == "(" || name == ")" {
+                    return Err("do spec needs a variable name".to_string());
+                }
+                *pos += 1;
+                let init = parse_tokens(tokens, pos)?;
+                // Optional step; absent means "unchanged".
+                let step = if *pos < tokens.len() && tokens[*pos] != ")" {
+                    parse_tokens(tokens, pos)?
+                } else {
+                    Expr::Var(name.clone())
+                };
+                if *pos >= tokens.len() || tokens[*pos] != ")" {
+                    return Err("expected ')' after do spec".to_string());
+                }
+                *pos += 1;
+                vars.push(name);
+                inits.push(init);
+                steps.push(step);
+            }
+            if *pos >= tokens.len() || tokens[*pos] != ")" {
+                return Err("expected ')' to close do spec list".to_string());
+            }
+            *pos += 1;
+            // Termination clause: (test result...)
+            if *pos >= tokens.len() || tokens[*pos] != "(" {
+                return Err("do expects a (test result...) clause".to_string());
+            }
+            *pos += 1;
+            let test = parse_tokens(tokens, pos)?;
+            let results = parse_body(tokens, pos, "do result clause")?;
+            let done = if results.is_empty() {
+                Expr::Num(0)
+            } else {
+                body_expr(results, "do result clause")?
+            };
+            // Loop body, then the recursive step call.
+            let body = parse_body(tokens, pos, "do")?;
+            let loop_name = gensym("do-loop");
+            let recur = Expr::Call(Box::new(Expr::Var(loop_name.clone())), steps);
+            let mut next: Vec<Expr> = body;
+            next.push(recur);
+            let step_branch = body_expr(next, "do")?;
+            let lam = Expr::Lambda(
+                vars,
+                None,
+                Box::new(Expr::If(
+                    Box::new(test),
+                    Box::new(done),
+                    Box::new(step_branch),
+                )),
+            );
+            return Ok(Expr::LetRec(
+                vec![(loop_name.clone(), lam)],
+                vec![Expr::Call(Box::new(Expr::Var(loop_name)), inits)],
+            ));
+        }
         if next_tok == "let*" {
             // (let* ((a x) (b y)) body...) => (let ((a x)) (let ((b y)) body...))
             *pos += 1;
@@ -628,7 +756,7 @@ pub fn parse_tokens(tokens: &[String], pos: &mut usize) -> Result<Expr, String> 
             let bindings = parse_bindings(tokens, pos, "named let")?;
             let body = body_expr(parse_body(tokens, pos, "named let")?, "named let")?;
             let (params, inits): (Vec<String>, Vec<Expr>) = bindings.into_iter().unzip();
-            let lam = Expr::Lambda(params, Box::new(body));
+            let lam = Expr::Lambda(params, None, Box::new(body));
             return Ok(Expr::LetRec(
                 vec![(name.clone(), lam)],
                 vec![Expr::Call(Box::new(Expr::Var(name)), inits)],
@@ -710,15 +838,39 @@ pub fn parse_tokens(tokens: &[String], pos: &mut usize) -> Result<Expr, String> 
             // backend. Any other arity becomes a call to the same operator's
             // *procedure* binding, which is variadic but public-values-only —
             // so `(+ 1 2 3)` and `(- 5)` work, and the fast path is untouched.
-            let operands = parse_body(tokens, pos, &format!("`{op_tok}` expression"))?;
-            if operands.len() == 2 {
-                let mut it = operands.into_iter();
-                let left = it.next().expect("2 operands");
-                let right = it.next().expect("2 operands");
-                Ok(Expr::BinOp(op, Box::new(left), Box::new(right)))
-            } else {
-                Ok(Expr::Call(Box::new(Expr::Var(op_tok)), operands))
+            // Parsed operand-at-a-time rather than into a `Vec` first, because
+            // this is the deepest recursion in the parser: `bench-layer` builds
+            // one nested `(+ …)` per multiplication, and an extra allocation per
+            // frame here is enough to overflow the stack on a wide layer.
+            if *pos < tokens.len() && tokens[*pos] == ")" {
+                // No operands: `(+)` is 0, `(*)` is 1. The identities live in
+                // the procedure binding, so route there.
+                *pos += 1;
+                return Ok(Expr::Call(Box::new(Expr::Var(op_tok)), Vec::new()));
             }
+            let left = parse_tokens(tokens, pos)?;
+            if *pos < tokens.len() && tokens[*pos] == ")" {
+                // One operand: `(- 5)`. Route to the procedure binding.
+                *pos += 1;
+                return Ok(Expr::Call(Box::new(Expr::Var(op_tok)), vec![left]));
+            }
+            let right = parse_tokens(tokens, pos)?;
+            if *pos < tokens.len() && tokens[*pos] == ")" {
+                // The overwhelmingly common case, and the only one that
+                // dispatches secret shares — kept on the original code path.
+                *pos += 1;
+                return Ok(Expr::BinOp(op, Box::new(left), Box::new(right)));
+            }
+            // Three or more: variadic, via the procedure binding.
+            let mut operands = vec![left, right];
+            while *pos < tokens.len() && tokens[*pos] != ")" {
+                operands.push(parse_tokens(tokens, pos)?);
+            }
+            if *pos >= tokens.len() {
+                return Err(format!("expected ')' to close `{op_tok}` expression"));
+            }
+            *pos += 1;
+            Ok(Expr::Call(Box::new(Expr::Var(op_tok)), operands))
         } else if next_tok == "let" || next_tok == "letrec" {
             let is_letrec = next_tok == "letrec";
             *pos += 1;
@@ -948,7 +1100,10 @@ pub fn parse_tokens(tokens: &[String], pos: &mut usize) -> Result<Expr, String> 
                         } else {
                             Expr::Seq(items.into_iter().skip(2).collect())
                         };
-                        return Ok(Expr::Lambda(params, Box::new(body)));
+                        // `(lambda (a b . rest) ...)`: the parameter list parsed
+                        // as ordinary names, so the dot is still sitting in it.
+                        let (params, rest) = split_rest_param(params)?;
+                        return Ok(Expr::Lambda(params, rest, Box::new(body)));
                     }
                 }
             }
