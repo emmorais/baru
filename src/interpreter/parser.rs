@@ -295,6 +295,149 @@ pub fn tokenize(src: &str) -> Vec<String> {
 // We keep parse_tokens and parse in parser.rs for now, but they refer to Ast types in ast.rs
 use crate::interpreter::ast::Expr;
 
+// ─── Derived forms ───────────────────────────────────────────────────────────
+//
+// `cond`, `case`, `when`, `unless`, `let*`, named `let` and `begin` are all
+// *desugared here* into the core AST rather than given evaluator support.
+//
+// That is a deliberate choice, and the reason is the circuit backends. The ZKP
+// and FHE compilers (`zkp::circuit_compiler`, `mpcc`) flatten a fixed set of
+// `Expr` variants; anything new would have to be taught to each of them, and
+// `CVal`-based flattening resolves `if` statically to terminate its unrolling.
+// A form that lowers to `If`/`Let`/`LetRec`/`Seq` needs no compiler change and
+// cannot desynchronise the interpreter from the compilers, because after
+// parsing there is nothing left to disagree about.
+
+/// Unique suffix for parser-generated temporaries, so a desugared binding can
+/// never capture a user variable or a temporary from an enclosing form.
+fn gensym(stem: &str) -> String {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static N: AtomicUsize = AtomicUsize::new(0);
+    // A space keeps the name unwritable in source: the tokenizer splits on it.
+    format!("{stem} {}", N.fetch_add(1, Ordering::Relaxed))
+}
+
+/// Parse expressions up to (and consuming) the closing paren.
+fn parse_body(tokens: &[String], pos: &mut usize, form: &str) -> Result<Vec<Expr>, String> {
+    let mut out = Vec::new();
+    while *pos < tokens.len() && tokens[*pos] != ")" {
+        out.push(parse_tokens(tokens, pos)?);
+    }
+    if *pos >= tokens.len() {
+        return Err(format!("expected ')' to close {form}"));
+    }
+    *pos += 1;
+    Ok(out)
+}
+
+/// Collapse a body into one expression, `Seq` when there is more than one.
+fn body_expr(mut body: Vec<Expr>, form: &str) -> Result<Expr, String> {
+    match body.len() {
+        0 => Err(format!("{form} needs at least one body expression")),
+        1 => Ok(body.pop().unwrap()),
+        _ => Ok(Expr::Seq(body)),
+    }
+}
+
+/// `((name init) ...)` — the binding list shared by `let`, `let*` and `letrec`.
+/// Assumes `*pos` is at the opening paren of the whole list.
+fn parse_bindings(
+    tokens: &[String],
+    pos: &mut usize,
+    form: &str,
+) -> Result<Vec<(String, Expr)>, String> {
+    if *pos >= tokens.len() || tokens[*pos] != "(" {
+        return Err(format!("{form} expects a binding list"));
+    }
+    *pos += 1;
+    let mut out = Vec::new();
+    while *pos < tokens.len() && tokens[*pos] == "(" {
+        *pos += 1;
+        if *pos >= tokens.len() {
+            return Err(format!("unterminated binding in {form}"));
+        }
+        let name = tokens[*pos].clone();
+        if name == "(" || name == ")" {
+            return Err(format!("{form} binding needs a name"));
+        }
+        *pos += 1;
+        // `:sintN` / `:sintN-from-P` sugar is handled by the core `let`, so a
+        // derived form that wants it should lower to `let` rather than reparse
+        // the annotation here.
+        if *pos < tokens.len() && tokens[*pos].starts_with(':') {
+            return Err(format!(
+                "{form} does not support the `{}` share annotation; use `let`",
+                tokens[*pos]
+            ));
+        }
+        let init = parse_tokens(tokens, pos)?;
+        if *pos >= tokens.len() || tokens[*pos] != ")" {
+            return Err(format!("expected ')' after binding in {form}"));
+        }
+        *pos += 1;
+        out.push((name, init));
+    }
+    if *pos >= tokens.len() || tokens[*pos] != ")" {
+        return Err(format!("expected ')' to close {form} bindings"));
+    }
+    *pos += 1;
+    Ok(out)
+}
+
+/// One `cond` / `case` clause: `None` test means `else`.
+struct Clause {
+    test: Option<Expr>,
+    body: Vec<Expr>,
+}
+
+/// Fold clauses right-to-left into nested `If`. A `cond` that falls off the end
+/// yields `0`, matching how this language already spells "no value" (`when`
+/// without a taken branch, and the `1`/`0` comparisons).
+fn clauses_to_if(clauses: Vec<Clause>, form: &str) -> Result<Expr, String> {
+    let mut out: Option<Expr> = None;
+    for c in clauses.into_iter().rev() {
+        let body = body_expr(c.body, form)?;
+        out = Some(match c.test {
+            None => {
+                if out.is_some() {
+                    return Err(format!("{form}: `else` must be the last clause"));
+                }
+                body
+            }
+            Some(t) => Expr::If(
+                Box::new(t),
+                Box::new(body),
+                Box::new(out.unwrap_or(Expr::Num(0))),
+            ),
+        });
+    }
+    out.ok_or_else(|| format!("{form} needs at least one clause"))
+}
+
+/// Parse `(test body...)` clauses until the closing paren of the whole form.
+fn parse_clauses(tokens: &[String], pos: &mut usize, form: &str) -> Result<Vec<Clause>, String> {
+    let mut clauses = Vec::new();
+    while *pos < tokens.len() && tokens[*pos] == "(" {
+        *pos += 1;
+        if *pos >= tokens.len() {
+            return Err(format!("unterminated clause in {form}"));
+        }
+        let test = if tokens[*pos] == "else" {
+            *pos += 1;
+            None
+        } else {
+            Some(parse_tokens(tokens, pos)?)
+        };
+        let body = parse_body(tokens, pos, &format!("{form} clause"))?;
+        clauses.push(Clause { test, body });
+    }
+    if *pos >= tokens.len() || tokens[*pos] != ")" {
+        return Err(format!("expected ')' to close {form}"));
+    }
+    *pos += 1;
+    Ok(clauses)
+}
+
 pub fn parse_tokens(tokens: &[String], pos: &mut usize) -> Result<Expr, String> {
     if *pos >= tokens.len() {
         return Err("unexpected end of tokens".to_string());
@@ -334,6 +477,162 @@ pub fn parse_tokens(tokens: &[String], pos: &mut usize) -> Result<Expr, String> 
             }
             *pos += 1;
             return Ok(Expr::Eval(Box::new(inner)));
+        }
+        // ─── Mutation and application (real AST variants) ───────────────────
+        if next_tok == "define" || next_tok == "set!" {
+            let is_define = next_tok == "define";
+            let form = if is_define { "define" } else { "set!" };
+            *pos += 1;
+            if *pos >= tokens.len() {
+                return Err(format!("{form} needs a name"));
+            }
+            // `(define (f a b) body...)` is sugar for `(define f (lambda (a b) body...))`.
+            if is_define && tokens[*pos] == "(" {
+                *pos += 1;
+                if *pos >= tokens.len() {
+                    return Err("define: empty function signature".to_string());
+                }
+                let fname = tokens[*pos].clone();
+                *pos += 1;
+                let mut params = Vec::new();
+                while *pos < tokens.len() && tokens[*pos] != ")" {
+                    params.push(tokens[*pos].clone());
+                    *pos += 1;
+                }
+                if *pos >= tokens.len() {
+                    return Err("define: unterminated parameter list".to_string());
+                }
+                *pos += 1; // consume ')' of the signature
+                let body = body_expr(parse_body(tokens, pos, "define")?, "define")?;
+                return Ok(Expr::Define(
+                    fname,
+                    Box::new(Expr::Lambda(params, Box::new(body))),
+                ));
+            }
+            let name = tokens[*pos].clone();
+            if name == ")" {
+                return Err(format!("{form} needs a name"));
+            }
+            *pos += 1;
+            let value = parse_tokens(tokens, pos)?;
+            if *pos >= tokens.len() || tokens[*pos] != ")" {
+                return Err(format!("expected ')' after {form}"));
+            }
+            *pos += 1;
+            return Ok(if is_define {
+                Expr::Define(name, Box::new(value))
+            } else {
+                Expr::Set(name, Box::new(value))
+            });
+        }
+        // ─── Derived forms (desugared; see the note above `gensym`) ─────────
+        if next_tok == "begin" {
+            *pos += 1;
+            let body = parse_body(tokens, pos, "begin")?;
+            return body_expr(body, "begin");
+        }
+        if next_tok == "when" || next_tok == "unless" {
+            let is_when = next_tok == "when";
+            let form = if is_when { "when" } else { "unless" };
+            *pos += 1;
+            let cond = parse_tokens(tokens, pos)?;
+            let body = body_expr(parse_body(tokens, pos, form)?, form)?;
+            let zero = Expr::Num(0);
+            return Ok(if is_when {
+                Expr::If(Box::new(cond), Box::new(body), Box::new(zero))
+            } else {
+                Expr::If(Box::new(cond), Box::new(zero), Box::new(body))
+            });
+        }
+        if next_tok == "cond" {
+            *pos += 1;
+            let clauses = parse_clauses(tokens, pos, "cond")?;
+            return clauses_to_if(clauses, "cond");
+        }
+        if next_tok == "case" {
+            // (case key ((d ...) body...) ... (else body...))
+            //   => (let ((tmp key)) (if (or (== tmp d) ...) body ... ))
+            // The key is bound once so it is evaluated once, as Scheme requires.
+            *pos += 1;
+            let key = parse_tokens(tokens, pos)?;
+            let raw = parse_clauses(tokens, pos, "case")?;
+            let tmp = gensym("case-key");
+            let mut clauses = Vec::with_capacity(raw.len());
+            for c in raw {
+                let test = match c.test {
+                    None => None,
+                    Some(datums) => {
+                        // The clause head parsed as an expression; recover the
+                        // datum list from whatever shape it took.
+                        let items: Vec<Expr> = match datums {
+                            Expr::Call(head, rest) => {
+                                let mut v = vec![*head];
+                                v.extend(rest);
+                                v
+                            }
+                            Expr::Seq(v) => v,
+                            single => vec![single],
+                        };
+                        if items.is_empty() {
+                            return Err("case clause needs at least one datum".to_string());
+                        }
+                        // `==` yields 1/0 and `or` is bitwise, so a chain of
+                        // `or`s over them is a correct logical disjunction.
+                        let mut acc: Option<Expr> = None;
+                        for d in items {
+                            let eq = Expr::BinOp(
+                                BinOp::Eq,
+                                Box::new(Expr::Var(tmp.clone())),
+                                Box::new(d),
+                            );
+                            acc = Some(match acc {
+                                None => eq,
+                                Some(a) => {
+                                    Expr::BinOp(BinOp::Or, Box::new(a), Box::new(eq))
+                                }
+                            });
+                        }
+                        acc
+                    }
+                };
+                clauses.push(Clause { test, body: c.body });
+            }
+            let inner = clauses_to_if(clauses, "case")?;
+            return Ok(Expr::Let(vec![(tmp, key)], vec![inner]));
+        }
+        if next_tok == "let*" {
+            // (let* ((a x) (b y)) body...) => (let ((a x)) (let ((b y)) body...))
+            *pos += 1;
+            let bindings = parse_bindings(tokens, pos, "let*")?;
+            let body = parse_body(tokens, pos, "let*")?;
+            if bindings.is_empty() {
+                return body_expr(body, "let*");
+            }
+            let mut out = body;
+            for b in bindings.into_iter().rev() {
+                out = vec![Expr::Let(vec![b], out)];
+            }
+            return body_expr(out, "let*");
+        }
+        // Named `let`: (let loop ((i 0)) body...). Detected by a name where the
+        // core `let` expects its binding list. Lowers to `letrec` + a call, so
+        // the loop variable is in scope inside the body exactly as in Scheme.
+        if next_tok == "let"
+            && *pos + 1 < tokens.len()
+            && tokens[*pos + 1] != "("
+            && tokens[*pos + 1] != ")"
+        {
+            *pos += 1;
+            let name = tokens[*pos].clone();
+            *pos += 1;
+            let bindings = parse_bindings(tokens, pos, "named let")?;
+            let body = body_expr(parse_body(tokens, pos, "named let")?, "named let")?;
+            let (params, inits): (Vec<String>, Vec<Expr>) = bindings.into_iter().unzip();
+            let lam = Expr::Lambda(params, Box::new(body));
+            return Ok(Expr::LetRec(
+                vec![(name.clone(), lam)],
+                vec![Expr::Call(Box::new(Expr::Var(name)), inits)],
+            ));
         }
         // unary operators: atom, not, bitlen
         if next_tok == "atom" {
@@ -406,13 +705,20 @@ pub fn parse_tokens(tokens: &[String], pos: &mut usize) -> Result<Expr, String> 
                 "ash-right" => BinOp::AshRight,
                 _ => unreachable!(),
             };
-            let left = parse_tokens(tokens, pos)?;
-            let right = parse_tokens(tokens, pos)?;
-            if *pos >= tokens.len() || tokens[*pos] != ")" {
-                return Err("expected ')' after binary expression".to_string());
+            // Two operands take the core `BinOp` path, which is the only one
+            // that dispatches MPC shares and FHE ciphertexts through the
+            // backend. Any other arity becomes a call to the same operator's
+            // *procedure* binding, which is variadic but public-values-only —
+            // so `(+ 1 2 3)` and `(- 5)` work, and the fast path is untouched.
+            let operands = parse_body(tokens, pos, &format!("`{op_tok}` expression"))?;
+            if operands.len() == 2 {
+                let mut it = operands.into_iter();
+                let left = it.next().expect("2 operands");
+                let right = it.next().expect("2 operands");
+                Ok(Expr::BinOp(op, Box::new(left), Box::new(right)))
+            } else {
+                Ok(Expr::Call(Box::new(Expr::Var(op_tok)), operands))
             }
-            *pos += 1;
-            Ok(Expr::BinOp(op, Box::new(left), Box::new(right)))
         } else if next_tok == "let" || next_tok == "letrec" {
             let is_letrec = next_tok == "letrec";
             *pos += 1;

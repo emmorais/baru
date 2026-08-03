@@ -21,6 +21,7 @@ input encrypted, and only the class index ever revealed.
 | **Language reference** | [`LANGUAGE.md`](LANGUAGE.md) — syntax, types, every builtin, the REPL, worked examples |
 | **All measured results** | [`docs/experiments.md`](docs/experiments.md) — the full experimental record, including the negative results |
 | **Where to pick up performance work** | [`docs/private-inference-performance.md`](docs/private-inference-performance.md) — written to be read cold |
+| **Cross-paradigm survey (SoK)** | [`docs/survey.md`](docs/survey.md) — MPC, FHE, ZKP and hybrids measured in one harness; the methodology, and what it caught. LaTeX in [`paper-survey/`](paper-survey/) |
 | **Publication framing** | [`docs/paper-outline.md`](docs/paper-outline.md), [`docs/paper-circuit-optimization.md`](docs/paper-circuit-optimization.md) |
 
 ---
@@ -125,7 +126,7 @@ the corrections behind each row are in [`docs/experiments.md`](docs/experiments.
 | Private *training* (SGD under MPC, backprop through ReLU) | trained model **bit-identical** to plaintext integer SGD, in **3 643** wire messages | `bench-train --hidden 8` |
 | Convolution packing | 1352 ct×ct multiplications → **8** | `bench-cnn --img 28` |
 | Our NTT vs NTL+GMP | **1.8× faster** at every size (after the Shoup butterfly rewrite) | `bench-polymul` |
-| Triples from SHE vs from OT | **192 B/triple** vs 3074, and ~28× faster | `bench-triples` |
+| Triples from SHE vs from OT | **384 B/triple** vs 3074 at equal 64-bit width (**8.0×**), and ~28× faster | `bench-triples` |
 | Compiler vs expert hand-written network | **0.38×** the interactive calls, **0.49×** the messages | `bench-compiled-nn` |
 | **Cost of active security** (malicious ABY3, with abort) | comparisons: **2.63×** bytes but only **1.06×** rounds, **1.23×** wall clock on a WAN | `bench-malicious` |
 | **Proving** a Q16.16 quantized neuron (784 inputs) | **32 ms** prove, **4.8 ms** verify, 112 KB proof; constraints linear in width, proof size far sublinear | `bench-zkp-layer` |

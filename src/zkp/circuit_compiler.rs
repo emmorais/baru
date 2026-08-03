@@ -781,6 +781,21 @@ impl CircuitCompiler {
         flat: &mut Vec<FlatOp>,
     ) -> Result<CVal, String> {
         match expr {
+            // ── Forms a circuit cannot host ───────────────────
+            // Refused explicitly rather than approximated. A circuit is a fixed
+            // set of gates with no environment and no runtime control flow, so
+            // `define` has nothing to extend, `set!` has nothing to mutate, and
+            // `apply` needs an argument count that only exists at run time.
+            // Silently mis-lowering any of them would produce a circuit that is
+            // perfectly sound about the wrong function.
+            Expr::Define(name, _) => Err(format!(
+                "cannot compile `(define {name} ...)` to a circuit: a circuit has \
+                 no environment to extend. Use `let` instead."
+            )),
+            Expr::Set(name, _) => Err(format!(
+                "cannot compile `(set! {name} ...)` to a circuit: circuits are \
+                 single-assignment. Thread the value through `let` instead."
+            )),
             // ── Literals ─────────────────────────────────────
             Expr::Num(n) => Ok(CVal::Wire(self.emit_const(*n, flat))),
             // Fixed-point literal: the circuit works on the scaled integer
@@ -1754,6 +1769,13 @@ impl CircuitCompiler {
     fn extract_vars_helper(&self, expr: &Expr, vars: &mut Vec<String>) {
         match expr {
             Expr::Var(name) => vars.push(name.clone()),
+            // These cannot reach a circuit (`flatten` refuses them), but variable
+            // extraction runs before flattening, so they are walked rather than
+            // ignored — otherwise a diagnostic could omit the very name at fault.
+            Expr::Define(name, value) | Expr::Set(name, value) => {
+                vars.push(name.clone());
+                self.extract_vars_helper(value, vars);
+            }
             Expr::Let(bindings, body) | Expr::LetRec(bindings, body) => {
                 for (name, e) in bindings {
                     vars.push(name.clone());

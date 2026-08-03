@@ -85,9 +85,48 @@ Fixed values print with 4 decimal digits (`3.5000`). Conversions are explicit vi
 ((lambda (x) (* x x)) 7)                  ; direct call => 49
 ```
 
+```lisp
+(let* ((x 2) (y (* x 3))) (+ x y))       ; => 8; each init sees the previous
+(let loop ((i 0) (acc 0))                ; named let — the standard Scheme loop
+  (if (== i 5) acc (loop (+ i 1) (+ acc i))))   ; => 10
+
+(define x 5)                             ; bind in the current environment
+(define (sq n) (* n n))                  ; sugar for (define sq (lambda (n) ...))
+(set! x 42)                              ; assign to an EXISTING binding
+```
+
+`define` introduces a binding; `set!` assigns to one that already exists and
+errors if it does not. Both return the value (this language has no "unspecified").
+
+**`set!` writes through a shared cell**, so a closure sees assignments made after
+it was created — the usual counter works:
+
+```lisp
+(let ((n 0))
+  (let ((bump (lambda () (set! n (+ n 1)))))
+    (begin (bump) (bump) (bump) n)))     ; => 3
+```
+
+Neither form can be compiled to a circuit: an FHE or ZKP circuit has no
+environment to extend and is single-assignment. Both are refused with an error
+naming the reason rather than mis-compiled.
+
 Currying, higher-order functions, closures capturing their environment, and
 mutual recursion (`even?`/`odd?` style) all work; the evaluator is trampolined so
 deep recursion (Ackermann, Collatz, …) does not overflow the Rust stack.
+
+**Tail calls are proper.** A closure body is evaluated with the *caller's*
+continuation rather than a new frame, so a named-`let` loop runs in constant
+continuation space. The practical ceiling is `MAX_FRAMES` (a step budget on the
+trampoline, currently 1 000 000 ≈ 50 000 loop iterations), not the recursion
+depth.
+
+> **`let` is sequential, unlike Scheme's.** In Baru, `(let ((a 1) (b (+ a 10))) b)`
+> is `11`: a later init sees an earlier binding. Scheme's `let` evaluates inits in
+> the *outer* scope and would reject that (or see an outer `a`); the sequential
+> behaviour is Scheme's `let*`. **`let*` is therefore semantically redundant
+> here** and is provided so Scheme source ports unchanged and so intent is
+> explicit. See §13.
 
 ### `:sintN` sugar — auto-sharing in `let` bindings
 
@@ -103,16 +142,37 @@ Inside a `let` binding, the annotation `:sintN` wraps the bound expression in
 
 ```lisp
 (if cond then else)
+(begin e1 e2 ... en)                     ; evaluate in order, return the last
+(when   cond body...)                    ; body if truthy, else 0
+(unless cond body...)                    ; body if falsy,  else 0
+(cond (test1 body...)                    ; first matching clause wins
+      (test2 body...)
+      (else  body...))                   ; optional; must come last
+(case key ((1 2) body...)                ; key evaluated once, compared with ==
+          ((3)   body...)
+          (else  body...))
 ```
 
 Any nonzero number / `#t` is truthy. When `cond` is a **shared** value the
 condition bit is revealed first — see §6.3.
+
+A `cond` or `case` with no matching clause and no `else` evaluates to `0`, the
+same "no value" an untaken `when` produces.
+
+> **These are derived forms.** `begin`, `when`, `unless`, `cond`, `case`, `let*`
+> and named `let` are desugared **in the parser** into `if` / `let` / `letrec` /
+> sequences. Nothing in the evaluator or the FHE/ZKP circuit compilers knows they
+> exist, which is why they work on every backend the core forms work on — a ReLU
+> written `(cond ((> x 0) x) (else 0))` compiles, proves and verifies under
+> Binius64 exactly like the `if` it lowers to
+> (`tests/zkp_real.rs::derived_forms_compile_prove_and_verify`).
 
 ### Operators
 
 | Form | Meaning |
 |---|---|
 | `(+ a b)` `(- a b)` `(* a b)` | arithmetic (wrapping on i64; works on `Num`, `Fixed`, and shares) |
+| `(+ a b c …)` `(* a b c …)` `(- a)` `(- a b c)` `(/ a b c)` | **non-binary arities** route to the operator's *procedure* binding: variadic, but **public values only** |
 | `(/ a b)` | exact integer division |
 | `(mod a b)` | modulo |
 | `(- a)` | unary negation |
@@ -123,6 +183,26 @@ condition bit is revealed first — see §6.3.
 | `(bitlen x)` | number of significant bits |
 | `(atom x)` | 1 if `x` is an atom |
 | `(null? lst)` | 1 if the list is empty |
+
+**Operators are also values.** `+`, `-`, `*`, `/`, `mod` and the comparisons are
+bound as ordinary procedures, so they can be applied or passed around:
+
+```lisp
+(- 5)                     ; => -5   (unary negation)
+(+ 1 2 3)                 ; => 6
+(+)                       ; => 0    (Scheme's additive identity)
+(apply * (list 2 3 4))    ; => 24
+```
+
+Two operands take the **special-form** path, which is the only one that
+dispatches secret shares and FHE ciphertexts through the backend. Any other
+arity — and any use of an operator as a *value* — takes the procedure path,
+which handles `Num` and `Fixed` but **refuses secrets** with an error naming the
+two-operand form. Duplicating the MPC dispatch into a second code path is the
+kind of drift this repository is built to measure, so it is not done.
+
+`apply` is likewise a **binding, not syntax**, so `(let ((apply …)) …)` shadows
+it exactly as in Scheme.
 
 ### Lists
 
@@ -188,6 +268,41 @@ through the backend):
 | `dot` | `(dot vec-a vec-b)` | Inner product. |
 | `vsum` | `(vsum vec)` | Sum of the elements. |
 | `matvec` | `(matvec matrix vec)` | Matrix (list of row lists) × vector. |
+| `length` | `(length lst)` | Number of elements. |
+| `append` | `(append lst …)` | Concatenate lists. |
+| `reverse` | `(reverse lst)` | Reversed copy. |
+| `list-ref` | `(list-ref lst i)` | Element at **public** index `i`. A *secret* index is refused with an error rather than silently scanned — see the note below. |
+
+### 5.2b Predicates and equivalence
+
+| Builtin | Description |
+|---|---|
+| `number?` `integer?` `boolean?` `string?` `char?` | Type tests on public values. |
+| `list?` `pair?` | `pair?` is a *non-empty* list; there are no improper pairs (§13). |
+| `procedure?` | True for closures and builtins. |
+| `share?` `ciphertext?` | Is this value a secret share / an FHE ciphertext? |
+| `zero?` | `(zero? x)` on a `Num` or `Fixed`. |
+| `eq?` `eqv?` | Identity/atom equality. Returns `1`/`0`. |
+| `equal?` | Structural equality, recursing into lists. |
+
+All predicates return `1`/`0` rather than `#t`/`#f`, so they compose with the
+existing numeric comparisons and with `and`/`or`'s bitwise behaviour.
+
+Three deliberate boundaries, because each is a place where a convenience could
+have quietly cost privacy:
+
+- **`share?` is safe and `eq?` on shares is cheap.** A value's *type* is public —
+  only its contents are secret — so asking whether something is a share leaks
+  nothing. `eq?` on two shares compares **handle identity**, never contents:
+  comparing secrets by value needs a protocol round, and spending one inside a
+  predicate would hide a real cost. Use `(== a b)`, which is visibly a protocol
+  operation.
+- **`list-ref` requires a public index.** A secret index needs a linear scan of
+  muxes over the whole list (or ORAM). That is a protocol decision with a cost,
+  not something an accessor should pick silently, so it is an error.
+- **These builtins do not exist on the circuit backends.** They are
+  `NativeFunc`s, which have no gate-level meaning; a program compiled to FHE or
+  ZKP has already resolved its public structure.
 
 ### 5.3 Fixed-point conversions
 
@@ -549,9 +664,14 @@ integer-share × fixed-constant products are exact at any width.
 
 ```lisp
 (let ((c (zkp-compile '(* x (+ x 1)) '("x"))))
-  (let ((p (zkp-prove c '("x") '(3) '() '())))
-    (zkp-verify c p '() '())))            ; => 1
+  (let ((p (zkp-prove c '("x") '(3) '("__out") '(12))))
+    (zkp-verify c p '("__out") '(12))))   ; => 1
 ```
+
+The claimed output must be supplied as the public input `__out`. Without it the
+statement would be "some circuit was evaluated", which proves nothing useful, so
+the prover refuses. (This example passed `'() '()` before 2026-08-03 and had not
+been updated when the real Binius64 backend replaced the placeholder.)
 
 ### FHE: encrypted input, public weight
 
@@ -641,3 +761,48 @@ third_party/sealy/       vendored, patched SEAL bindings (see BARU_PATCHES.md)
 - **Single-evaluator model**: all parties evaluate the same expression text.
 - **`nn-forward` activations**: only `relu` and `identity`. Richer
   nonlinearities need a polynomial approximation to stay oblivious.
+
+### Deviations from Scheme
+
+Baru is Scheme-*like*, not a Scheme. The gaps are of three different kinds, and
+the distinction matters because only the first is a matter of effort:
+
+**Simply not implemented yet** (ordinary interpreter work): `do`, variadic/rest
+parameters (`(lambda args …)`), vectors, `values`/`call-with-values`,
+`delay`/`force`, `call/cc`, hygienic macros (`define-syntax`/`syntax-rules`), the
+numeric tower (only `i64` and Q16.16 exist), and catchable errors — an unbound
+variable currently panics rather than raising.
+
+Also: `define` binds in the *current* environment rather than being hoisted like
+Scheme's internal `define` (which behaves as `letrec*` at the head of a body), so
+mutual recursion between two internal `define`s needs `letrec`.
+
+**Representational differences** that would need a refactor:
+
+- **`let` is sequential** (Scheme's `let*`); see §3. `let*` is provided but
+  redundant.
+- **No improper pairs.** A list is `List(Vec<Types>)`, not cons cells, so
+  `(cons 1 2)` is an error rather than a dotted pair, and `set-car!` has nothing
+  to mutate.
+- **`quote` yields an AST wrapper, not data.** `'sym` evaluates to a quoted
+  *expression*, and `(car '(a b))` fails, because quoted forms are inputs to
+  `eval` / `zkp-compile` rather than list-and-symbol data. Scheme's code-is-data
+  property is therefore absent.
+- **`and` / `or` are two-argument and bitwise**, not variadic and
+  short-circuiting: `(and 6 3)` is `2`. Short-circuiting on a *secret* condition
+  would leak, so this is not purely an oversight.
+
+**In conflict with the cryptography**, and so unlikely ever to close:
+
+- **Secret-dependent recursion is not expressible obliviously.** A loop whose
+  trip count depends on a secret cannot reveal the condition (a leak) and cannot
+  evaluate both branches (it diverges). Any oblivious language must bound loops
+  publicly. The same argument applies to `call/cc` under a secret, which makes
+  the *round count* data-dependent.
+- **The circuit backends are static by construction.** `zkp::circuit_compiler`
+  resolves lists at compile time and unrolls recursion, terminating via static
+  `if` resolution; a circuit has no runtime control flow at all. Runtime-shaped
+  data and dynamic dispatch are unrepresentable there, not merely unimplemented.
+
+A fuller treatment, including why the public/secret split is the natural stopping
+point, is in [`docs/survey.md`](docs/survey.md) §3.

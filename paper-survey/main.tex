@@ -1,0 +1,923 @@
+\documentclass[11pt]{article}
+
+% ---- Packages (all standard in a full TeX Live / MiKTeX install) ----
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{lmodern}
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{multirow}
+\usepackage{microtype}
+\usepackage{xcolor}
+\usepackage{listings}
+\usepackage{siunitx}
+\usepackage[hidelinks]{hyperref}
+\usepackage[capitalize,noabbrev]{cleveref}
+
+\sisetup{group-separator={,},group-minimum-digits=4,detect-weight=true}
+
+% ---- Macros ----
+\newcommand{\bt}[1]{\texttt{#1}}
+\newcommand{\Z}{\mathbb{Z}}
+\newcommand{\Fabb}{\mathcal{F}_{\mathsf{ABB}}}
+\newcommand{\ReLU}{\ensuremath{\mathrm{ReLU}}}
+\newcommand{\Baru}{\textsc{Baru}}
+% A finding worth pulling out of the prose.
+\newcommand{\finding}[1]{\medskip\noindent\fbox{\parbox{0.97\linewidth}{\textbf{Finding.} #1}}\medskip}
+
+\lstset{basicstyle=\ttfamily\small,columns=fullflexible,keepspaces=true,
+        breaklines=true,frame=none,xleftmargin=1em}
+
+\title{\bfseries Measuring Privacy-Preserving Computation in One Place:\\
+MPC, FHE, ZKP and Their Hybrids}
+
+\author{(author names elided for review)}
+\date{}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+Privacy-preserving computation is not one field but four---secure multi-party
+computation (MPC), fully homomorphic encryption (FHE), garbled circuits, and
+zero-knowledge proofs (ZKP)---each with its own literature, benchmarks and
+accounting conventions. A practitioner choosing between them, or a reviewer
+assessing a claim that one beats another, must assemble numbers from different
+papers, measured on different hardware, over different networks, counting
+different things. Cross-paradigm comparison is therefore largely \emph{citation
+assembly} rather than measurement.
+
+We take a different route. We survey the paradigms through a single artifact,
+\Baru{}, in which one source program runs on all of them---a plain interpreter,
+three-party replicated-secret-sharing MPC, garbled circuits, BFV/BGV/CKKS/TFHE
+homomorphic encryption, a Binius64 SNARK, and \emph{combinations} in which
+values cross between representations mid-computation without being exposed.
+Every backend is driven through the same transport, charged by the same byte and
+round accounting, and checked bit-exactly against the same plaintext reference.
+A network cost model is validated against a real socket to within \SI{13.6}{\percent}
+worst case, so a claim about a wide-area deployment is computed from measured
+counts rather than asserted.
+
+Several widely repeated intuitions survive re-measurement; several do not. Among
+the results that only a single-harness study can produce: the FHE-versus-MPC
+crossover is a property of \emph{the baseline's preprocessing} rather than of
+either cryptosystem, and disappears once MPC is given somewhat-homomorphic
+preprocessing; active security on the nonlinear surface of private inference
+costs $2.63\times$ bytes but only $1.06\times$ rounds; and the choice between a
+garbled and a \bt{wrap3}-style comparison protocol has a measured crossover in
+bandwidth that moves with round-trip time. We also report our own withdrawn
+claims, including a ZKP backend that proved nothing and a bit-decomposition that
+leaked its inputs, because a study that reports only what worked is not
+reporting.
+\end{abstract}
+
+%==============================================================================
+\section{The comparability problem}
+\label{sec:intro}
+
+Ask how fast private inference is and the literature answers in incompatible
+units. Gazelle~\cite{Gazelle}, Delphi~\cite{Delphi} and Cheetah~\cite{Cheetah}
+report two-party hybrid systems in which the server holds the model in
+plaintext. Falcon~\cite{Falcon} reports three-party replicated sharing on a LAN.
+CKKS~\cite{CKKS} papers report amortized throughput over batched slots. SNARK
+papers report prover time for a circuit that a different paper would express
+with a different constraint count. Each is internally rigorous. Together they do
+not compose.
+
+Four obstacles recur.
+
+\begin{enumerate}
+  \item \textbf{Different hardware.} A $5\times$ difference between two systems
+    is unfalsifiable when one ran on a server-class Xeon and the other on a
+    laptop.
+  \item \textbf{Different accounting.} ``Communication'' may mean payload bytes,
+    serialized bytes, or bytes per party. ``Rounds'' may mean protocol rounds,
+    messages, or interactive calls. These differ by more than the effects being
+    measured.
+  \item \textbf{Different security models.} Semi-honest and malicious figures
+    appear in adjacent columns of secondary literature without the distinction
+    surviving the citation.
+  \item \textbf{Different functions.} Two \ReLU{} costs may be for different bit
+    widths, different fixed-point scales, or---in the worst case we found in our
+    own work---subtly different functions that nobody checked against a common
+    reference.
+\end{enumerate}
+
+A survey assembled from such numbers inherits all four. The alternative we
+pursue is to re-measure the paradigms in one harness where the obstacles are
+controlled by construction: the same machine, the same accounting code,
+machine-checked security levels, and a bit-exactness assertion against a shared
+plaintext reference before any cost is quoted.
+
+The cost of this approach is equally clear and we state it up front. Our
+implementations are research-quality Rust, not the tuned C++ of the systems we
+discuss. \textbf{Absolute figures here are not competitive with optimized
+implementations and should not be read as such.} What the single harness buys is
+\emph{internally valid ratios}: comparisons in which the confounds above are held
+fixed. Where we compare against published numbers we say so, and treat the
+comparison as weaker evidence than our internal ones.
+
+\paragraph{Contributions.}
+\begin{itemize}
+  \item A \textbf{systematization} of four paradigms organized by what they
+    actually cost, with the cost dimensions (rounds, bytes, compute,
+    preprocessing) separated rather than collapsed into one ``performance''
+    number (\cref{sec:background}).
+  \item A \textbf{single-artifact measurement study}: roughly \num{72000} lines
+    of Rust in which one program runs on every paradigm, with a validated
+    network model and uniform accounting (\cref{sec:artifact,sec:method}).
+  \item \textbf{Cross-paradigm findings} not visible from any single paradigm's
+    literature (\cref{sec:cross}), including two crossovers whose location
+    depends on a parameter the original claims left implicit.
+  \item A \textbf{methodology for honest benchmarking} (\cref{sec:method}), with
+    the record of what it caught in our own work (\cref{sec:withdrawn}).
+\end{itemize}
+
+%==============================================================================
+\section{Scope}
+\label{sec:scope}
+
+\paragraph{In scope.} Semi-honest and malicious three-party MPC over rings;
+garbled circuits in the honest-majority setting; RLWE-based FHE (BFV~\cite{FV},
+BGV~\cite{BGV}, CKKS~\cite{CKKS}) and TFHE~\cite{TFHE}; FHE$\leftrightarrow$MPC
+scheme switching; SNARKs over 64-bit words (Binius64~\cite{Binius}); and the
+supporting primitives these need---oblivious transfer, private set intersection,
+private information retrieval, and Beaver-triple~\cite{Beaver} preprocessing from
+both OT and somewhat-homomorphic encryption (SHE).
+
+\paragraph{Out of scope.} Differential privacy and federated learning (a
+different threat model: they protect an \emph{aggregate}, not a computation);
+trusted execution environments (hardware trust assumption); ORAM (surveyed but
+not implemented, see \cref{sec:open}); and transformer nonlinearities such as
+softmax and LayerNorm, which need exponential, reciprocal and inverse-square-root
+subprotocols we do not have.
+
+\paragraph{Application focus.} We use private neural-network inference as the
+running workload, because it is the one application that exercises every
+paradigm: dense linear algebra (where FHE packing shines), comparisons (where
+MPC and garbled circuits compete), and verifiable computation (where SNARKs
+apply). Where a result is specific to this workload we say so.
+
+%==============================================================================
+\section{Four paradigms, four cost structures}
+\label{sec:background}
+
+The paradigms are usually taxonomized by security property. For a practitioner
+choosing among them, the more useful axis is \emph{what each is expensive in}
+(\cref{tab:paradigms}).
+
+\begin{table}[t]
+\centering
+\small
+\begin{tabular}{@{}lllll@{}}
+\toprule
+Paradigm & Secret from & Expensive in & Cheap in & Rounds \\
+\midrule
+Secret-sharing MPC & computing parties & \textbf{rounds}, bandwidth & local arithmetic & $O(\text{depth})$ \\
+Garbled circuits   & computing parties & \textbf{bandwidth} & rounds & $O(1)$ \\
+FHE                & computing server  & \textbf{compute}, ct.\ size & rounds (none) & none \\
+ZK proofs          & the verifier      & \textbf{prover compute} & verifier, proof size & none \\
+\bottomrule
+\end{tabular}
+\caption{The paradigms organized by cost structure rather than security
+property. Three trade-offs follow directly, and drive most of this paper.}
+\label{tab:paradigms}
+\end{table}
+
+\paragraph{MPC and garbled circuits trade rounds against bytes.}
+This is the classic Yao~\cite{Yao}-versus-GMW trade. Neither dominates: the
+winner depends on round-trip time and bandwidth, and the boundary is an
+empirical question. \Cref{sec:crossover-nonlin} measures it.
+
+\paragraph{FHE and MPC trade compute against communication.}
+FHE sends a lot once and computes hard; MPC sends little, many times. On a fast
+LAN, MPC usually wins; on a thin pipe, the balance shifts. This framing omits
+\emph{preprocessing}, and \cref{sec:crossover-fhe} shows the omission is what
+makes most published FHE-versus-MPC crossovers fragile.
+
+\paragraph{ZK is orthogonal; conflating it with the others is a category error.}
+MPC and FHE keep data secret \emph{from the parties computing on it}. A SNARK
+proves a computation was performed correctly while hiding the witness \emph{from
+a verifier}---the prover holds everything in the clear. A deployment needing both
+confidentiality and integrity pays for both. We keep them in separate tables for
+this reason, and our benchmark prints the caveat alongside its numbers so they
+cannot travel without it.
+
+\subsection{The hybrid, and why it exists}
+
+Neural-network inference alternates linear layers with nonlinearities. FHE is
+good at the former and bad at the latter---comparison is not a low-degree
+polynomial. MPC is the reverse: comparison costs a bit decomposition, but a
+linear layer costs one round regardless of width.
+
+Linear layers under FHE, nonlinearities under MPC, with a \emph{scheme switch}
+between them, is therefore the natural design, and is what
+Gazelle~\cite{Gazelle}, Delphi~\cite{Delphi} and Cheetah~\cite{Cheetah} all
+instantiate. \Baru{} implements it and adds two things (\cref{sec:hybrid}): the
+weights are encrypted too, and the switch is used as a \emph{noise refresh},
+which removes bootstrapping from deep networks entirely.
+
+%==============================================================================
+\section{The \texorpdfstring{\protect\normalfont\scshape Baru}{Baru} artifact}
+\label{sec:artifact}
+
+\subsection{One program, many backends}
+
+\Baru{} is a Lisp-like language whose interpreter manipulates secret values only
+through opaque handles and a fixed set of primitive operations. This is the
+Arithmetic Black Box abstraction of the SPDZ line~\cite{DamgardNielsen,SPDZ}: an
+ideal functionality $\Fabb$ storing values by handle and exposing
+\bt{add}/\bt{mul}/\bt{lt}/\bt{share\_public}/\bt{reveal}. A backend implements
+those primitives; the evaluator never inspects a representation.
+
+\begin{lstlisting}
+; private ReLU on one neuron -- every value is secret-shared
+(let ((w :sint8 -1) (x :sint8 3) (b :sint8 0))
+  (let ((z (+ (* w x) b)))
+    (reconstruct (* z (> z 0)))))          ; => 0
+
+; a value computed under MPC crosses into FHE without being revealed
+(let ((keys (fhe-keygen)) (x (share 6 32)) (y (share -7 32)))
+  (fhe-dec keys (share->fhe keys (* x y))))   ; => -42
+\end{lstlisting}
+
+The consequence for a survey is direct: \emph{the same source text} is the
+workload for every paradigm, so a cross-paradigm comparison cannot be confounded
+by two implementations computing subtly different things. This is not
+hypothetical; \cref{sec:withdrawn} records a case where it caught exactly that.
+
+\subsection{Composability}
+
+Because every gadget (\bt{relu}, \bt{max2}, \bt{maxpool2d}, \bt{argmax},
+\bt{dense}, \bt{conv2d}) is a pure composition of $\Fabb$ primitives, universal
+composability~\cite{Canetti} gives security of any network built from them for
+free, given the primitives. Architecture search therefore needs no new security
+argument per architecture, and the research question becomes ``which
+architecture is \emph{fastest} under the cost model?'' rather than ``is this one
+secure?''
+
+\subsection{What is implemented}
+
+\begin{table}[t]
+\centering
+\small
+\begin{tabular}{@{}p{0.16\linewidth}p{0.78\linewidth}@{}}
+\toprule
+Layer & Contents \\
+\midrule
+MPC & ABY3~\cite{ABY3} replicated shares over $\Z_{2^{128}}$; \textbf{triple-free} multiplication from pairwise PRFs; bit decomposition (carry-save $3\to2$ plus Kogge--Stone~\cite{KoggeStone}); batched primitives; \textbf{malicious security with abort} ($\le 1$ of 3 corrupt), following Chida et al.~\cite{Chida} in the ring adaptation of Eerikson et al.~\cite{Eerikson}; in-process and TCP transports \\
+Garbled & Half-gates~\cite{HalfGates}, free-XOR~\cite{FreeXOR}, fixed-key AES; comparator and fused $\ReLU\circ\text{rescale}$ circuits; OT-free label delivery in the three-party honest-majority setting \\
+Falcon & $\Pi_{\mathrm{PC}}$ private compare over $\Z_p$, $\Pi_{\mathrm{WA}}$ \bt{wrap3}, $\Pi_{\mathrm{DReLU}}$, $\Pi_{\mathrm{SS}}$, $\Pi_{\mathrm{Maxpool}}$, exact truncation---a reproduction of Falcon~\cite{Falcon} inside the same harness \\
+FHE & BFV~\cite{FV} and BGV~\cite{BGV} (depth-one, no evaluation keys), SEAL CKKS~\cite{SEAL,CKKS}, TFHE-rs~\cite{TFHErs,TFHE}; multi-modular NTT with Shoup butterflies; CRT slot packing; Cheetah-style~\cite{Cheetah} convolution packing \\
+Hybrid & MPC$\leftrightarrow$FHE switching both directions; re-encryption as a bootstrapping alternative; replicated threshold-key switch~\cite{AsharovMHE} \\
+ZKP & Expression-to-circuit compiler; real Binius64~\cite{Binius} prover and verifier \\
+Compiler & Backend-aware circuit IR, rewrite rules, cost models, protocol registry (dealer / Shamir / Semi2k~\cite{MPSPDZ} / LowGear~\cite{Overdrive}), per-operation protocol assignment \\
+Primitives & Chou--Orlandi~\cite{ChouOrlandi} and IKNP~\cite{IKNP} OT, DH-PSI, single-server BFV PIR \\
+\bottomrule
+\end{tabular}
+\caption{What the artifact implements. Every row is exercised by at least one
+benchmark, and every engine attests its security level (\cref{sec:attest}).}
+\label{tab:implemented}
+\end{table}
+
+\Cref{tab:implemented} summarizes. All figures below are from the maintainer's
+machine (Apple M1 Pro, 8 cores), release build, unless noted.
+
+%==============================================================================
+\section{The paradigms, surveyed and measured}
+\label{sec:paradigms}
+
+\subsection{Secret-sharing MPC}
+\label{sec:mpc}
+
+\Baru{}'s MPC layer is ABY3-style~\cite{ABY3}: $x = s_0+s_1+s_2 \bmod 2^{128}$,
+with party $i$ holding the replicated pair $(s_i, s_{i+1})$. Addition and scalar
+multiplication are local. Multiplication is \textbf{triple-free}---each party
+sends one ring element to one neighbour, with correlated randomness regenerated
+locally from a one-time pairwise PRF key exchange. There is no dealer and no
+preprocessing phase.
+
+The engineering lesson this layer taught, four separate times, generalizes
+beyond the artifact.
+
+\finding{The arithmetic was never the bottleneck; the round structure was. Each
+time a segment-level measurement said ``MPC is slow'', a per-phase breakdown
+said ``one unbatched loop inside it is slow''.}
+
+Batched forms cost \emph{the same number of rounds for any batch width}.
+Adopting them moved the CNN's MPC segment from \SI{40.8}{\second} to
+\SI{6.1}{\second} ($6.7\times$), with messages falling from \num{29211} to
+\num{5591}. A reader should take from this that published MPC costs are highly
+sensitive to batching discipline, and that comparing two systems' round counts
+without checking whether both batch is comparing implementations, not protocols.
+
+\paragraph{Cost of active security.}
+Verified 2026-08-01 (\cref{tab:malicious}).
+
+\begin{table}[t]
+\centering
+\small
+\begin{tabular}{@{}lccc@{}}
+\toprule
+Workload & bytes & interactive calls & wall clock (WAN, \SI{25}{\milli\second}) \\
+\midrule
+\textbf{Comparisons}, $n{=}32$, 32-bit & $\mathbf{2.63\times}$ & $\mathbf{1.06\times}$ & $\mathbf{1.26\times}$ \\
+Dot product, $n{=}32$, 32-bit & $2.47\times$ & $1.75\times$ & $2.80\times$ \\
+\bottomrule
+\end{tabular}
+\caption{Semi-honest ABY3 versus malicious-with-abort, same workload, same
+transport. Active security costs bytes, not rounds.}
+\label{tab:malicious}
+\end{table}
+
+The comparison row is the one that matters for inference, since every \ReLU{},
+max-pool and argmax reduces to a comparison.
+
+\finding{Active security costs bytes, not rounds: the MAC doubles what is sent
+but batches into the same round.}
+
+The dot-product row is a small-workload artifact---the semi-honest leg needs only
+four interactive calls, so a fixed pair-pool cost amortizes against nothing---and
+we report it rather than hide it.
+
+A second result generalizes. The statistical slack that ring-based verification
+normally charges as a widening to $\Z_{2^{k+s}}$~\cite{SPDZ2k} is \emph{already
+paid for} when the implementation shares over a ring much wider than its values.
+Q16.16 values in a 128-bit ring leave \textbf{59 bits} of statistical security at
+no widening cost.
+
+\subsection{Garbled circuits}
+\label{sec:gc}
+
+In the \emph{three-party honest-majority} setting, garbled-circuit input labels
+are delivered by the co-garbler with no oblivious transfer. Since OT is the
+expensive part of two-party garbling, this changes the economics substantially,
+and is why garbling is competitive here at all.
+
+Measured head-to-head against bit decomposition through the identical transport
+(\num{1352} comparisons, 20-bit): \bt{a2b} needs 9 rounds and \SI{5.94}{\mega\byte};
+the garbled circuit needs 1 round and \SI{1.69}{\mega\byte}. Wall clock favours
+garbling $4.2\times$ on a LAN and $4.9\times$ on a \SI{20}{\milli\second} WAN.
+
+\paragraph{A correction to our own earlier claim.} That $4.2$--$4.9\times$ is the
+\emph{garbling primitive in isolation}. The deployable three-party protocol,
+including the $Y2A$ return leg that converts the boolean output back to an
+arithmetic share, is $1.4$--$1.7\times$, worth $1.9\times$ on the CNN's MPC
+segment. We record both, because the gap between them is exactly what gets lost
+in citation.
+
+\subsection{Fully homomorphic encryption}
+\label{sec:fhe}
+
+\Baru{} uses the cheapest FHE primitive that exists: one
+ciphertext$\times$ciphertext multiplication, \emph{no relinearization keys, no
+bootstrapping, no evaluation keys}, decrypting the degree-2 product directly
+under $s^2$. Parameters are $n=4096$, $q=2^{100}$, $t=2^{20}$ for BFV---inside
+the ${\approx}109$-bit $\log q$ ceiling for 128-bit security at that
+dimension~\cite{HEStandard}.
+
+Two packing results are worth surveying.
+
+\begin{itemize}
+  \item \textbf{Reversed-coefficient packing} makes a whole matrix--vector
+    product one multiplication. We find this is \emph{already optimal for dense
+    layers}: a degree-$n$ product admits at most $n/\mathrm{in}$ separable
+    outputs, so $\lceil \mathrm{out}\cdot\mathrm{in}/n\rceil$ multiplications is
+    the limit. Gazelle's SIMD packing~\cite{Gazelle} matches the throughput but
+    requires rotations and Galois keys, forfeiting the no-evaluation-keys
+    property.
+  \item \textbf{Cheetah-style convolution packing}~\cite{Cheetah} makes a whole
+    output channel one multiplication, independent of image size. Measured A/B at
+    $28\times28$: \num{1352} multiplications become \textbf{2}, and FHE time falls
+    from \SI{77.5}{\second} to \SI{264}{\milli\second}.
+\end{itemize}
+
+\finding{BGV is indistinguishable from BFV at identical parameters (repeated runs
+put the gap at $+0.5\%$, $+0.5\%$, $-0.1\%$). Where the message sits in the
+ciphertext, high bits or low, is not where the cost is.}
+
+On arithmetic, our multi-modular NTT---NTT-friendly primes used as a
+computational device and CRT-reconstructed, because a power-of-two $q$ admits no
+direct NTT---is $1.8\times$ faster than NTL+GMP~\cite{NTL} at every size after
+moving its butterfly to Shoup-preconditioned multiplication. NTL is retained as a
+\emph{differential oracle} rather than a dependency, which is what made rewriting
+the hottest code in the repository safe.
+
+\subsection{The hybrid and the no-bootstrap result}
+\label{sec:hybrid}
+
+The construction's central observation is that the scheme switch performed for a
+\ReLU{} \emph{also refreshes the ciphertext}. After switching back, each party
+freshly encrypts its share component and the evaluator sums; the sum of fresh
+encryptions is a fresh encryption. The FHE noise budget therefore resets at every
+layer boundary, and a network of arbitrary depth runs with \textbf{zero FHE
+bootstraps} at cost linear in depth, on an engine supporting only a
+\emph{single} multiplication (\cref{tab:deep}).
+
+\begin{table}[t]
+\centering
+\small
+\begin{tabular}{@{}rccrrrcc@{}}
+\toprule
+depth & exact? & total & fhe & switch & mpc & our boots. & CKKS-competitor boots. \\
+\midrule
+2  & \checkmark & \SI{145}{\milli\second}  & 20  & 59  & 54  & \textbf{0} & 0 \\
+8  & \checkmark & \SI{539}{\milli\second}  & 81  & 239 & 210 & \textbf{0} & 3 \\
+32 & \checkmark & \SI{2119}{\milli\second} & 333 & 958 & 820 & \textbf{0} & 15 \\
+\bottomrule
+\end{tabular}
+\caption{Deep private inference, width 16, weights \emph{and} activations
+encrypted, real ABY3 protocol, BFV at $n=4096,\ q=2^{100}$. Linear in depth and
+bit-exact at every depth; the exactness is the evidence for the noise claim,
+since accumulated noise would make deep outputs diverge.}
+\label{tab:deep}
+\end{table}
+
+This construction also encrypts the \textbf{weights}. That is a stronger privacy
+model than Gazelle, Delphi and Cheetah, whose server holds the model in
+plaintext.
+
+\subsection{Zero-knowledge proofs}
+\label{sec:zkp}
+
+Proving a Q16.16 quantized neuron, $\ReLU((\sum_i w_i x_i) \gg 16 + b)$, with
+public weights and private inputs, on a real Binius64 prover
+(\cref{tab:zkp}).
+
+\begin{table}[t]
+\centering
+\small
+\begin{tabular}{@{}rrrrr@{}}
+\toprule
+width & constraints & prove & verify & proof bytes \\
+\midrule
+1   & 14    & \SI{6.3}{\milli\second}  & \SI{1.0}{\milli\second} & \num{18544} \\
+64  & 589   & \SI{8.0}{\milli\second}  & \SI{1.3}{\milli\second} & \num{47808} \\
+\textbf{784} & \textbf{\num{7159}} & \textbf{\SI{32.3}{\milli\second}} & \textbf{\SI{4.8}{\milli\second}} & \textbf{\num{111712}} \\
+\bottomrule
+\end{tabular}
+\caption{Constraints grow linearly ($\approx 9$ per input); proof size does
+not---a $286\times$ larger circuit yields a $6\times$ larger proof. Width 784 is
+the MNIST input dimension.}
+\label{tab:zkp}
+\end{table}
+
+Two implementation findings generalize to anyone building arithmetic circuits
+over 64-bit words. First, comparison gates are \textbf{unsigned}, so signed
+comparison must flip sign bits first; without it $\ReLU(-1)$ returns $-1$---a
+circuit perfectly sound about the wrong function. Second, and sharper:
+
+\finding{Division cannot be checked the obvious way. A circuit cannot divide, so
+the prover supplies quotient and remainder as witnesses; but checking $a = bq+r$
+with $|r|<|b|$ is \emph{unsound}, because circuit multiplication wraps mod
+$2^{64}$. For $a=1, b=3$ a cheating prover sets $r=0$ and $q=3^{-1} \bmod 2^{64}$
+and both checks pass. Requiring the 128-bit product's high word to be the sign
+extension of the low word closes it.}
+
+We drive that forgery through the real prover as a test.
+
+\subsection{Preprocessing: OT versus SHE}
+\label{sec:triples}
+
+Beaver-triple preprocessing is where the FHE-versus-MPC comparison is usually
+decided, and it is usually decided implicitly (\cref{tab:triples}).
+
+\begin{table}[t]
+\centering
+\small
+\begin{tabular}{@{}llrrr@{}}
+\toprule
+route & domain & B/triple & triples/s & rounds \\
+\midrule
+LowGear (SHE)~\cite{Overdrive} & $\mathbb{F}_p$, 60-bit prime & \textbf{192} & \num{97304} & 2 \\
+Semi2k (OT)~\cite{MPSPDZ}      & $\Z_{2^{64}}$ & \num{3074} & \num{2681} & 3 \\
+\bottomrule
+\end{tabular}
+\caption{Two parties, semi-honest. \textbf{The two rows are over different
+domains}; see the caveat below for the apples-to-apples figure.}
+\label{tab:triples}
+\end{table}
+
+\paragraph{A comparability caveat the literature routinely drops---and which we
+dropped ourselves.} A ${\approx}60$-bit prime field does \emph{not} represent
+every 64-bit value, so \cref{tab:triples} compares a 61-bit field triple against
+a 64-bit ring triple. At \textbf{equal 64-bit width} LowGear needs two CRT limbs,
+giving \SI{384}{\byte}/triple against OT's \num{3074}---an $\mathbf{8.0\times}$
+communication advantage, not the $16\times$ a naive reading suggests. Our own
+experimental record quoted $16.3\times$; we correct it here. This is precisely
+the error class a single-harness study is positioned to catch, and it is the
+reason \cref{sec:method} exists.
+
+The measured OT cost also validates the analytic model: \num{3074} measured
+against \num{3136} predicted, a \SI{2}{\percent} error.
+
+%==============================================================================
+\section{Methodology}
+\label{sec:method}
+
+This is the section we would most like other artifacts to adopt.
+
+\subsection{Identical transport, uniform accounting}
+
+Every protocol---arithmetic MPC, garbled, Falcon, hybrid---runs over the same
+transport stack, wrapped in counting and latency decorators that observe traffic
+without touching protocol code. Both legs of any comparison pay real
+serialization, real message passing and real byte counting. There is no
+measurement asymmetry in which one side is simulated and the other is not.
+
+This matters more than it sounds. The in-process simulator \emph{is not the
+protocol}: its share multiplication reconstructs and reshares locally, which is
+free and insecure, and it understated the pure-MPC baseline by ${\approx}2.7\times$
+(\SI{6.7}{\milli\second} simulated against \SI{18}{\milli\second} real). Every
+MPC number in this study is the real wire protocol, with three party threads
+exchanging serialized messages.
+
+\subsection{A validated network model}
+\label{sec:netmodel}
+
+The cost model charges $\text{rounds} \times \text{RTT} + \text{bytes} /
+\text{bandwidth}$, letting a benchmark ``move'' parties between continents
+without deploying anything. It is \textbf{validated against a real loopback TCP
+socket}: worst error \SI{13.6}{\percent}, under \SI{1}{\percent} through the
+middle of both sweeps, with the link's constants measured rather than assumed.
+Cost really is linear in rounds and linear in bytes with no missing cross-term,
+which is what licenses computing wall-clock from measured counts.
+
+Building this validation found two harness bugs that had been silently distorting
+results: per-message latency timers could \emph{reorder} back-to-back messages,
+and the bandwidth model did not serialize bulk transfers cumulatively,
+\emph{undercharging exactly the byte-heavy phases} the crossover experiments are
+about. Both now have regression tests. We mention this because a cost model never
+checked against a socket should be assumed to have bugs of this kind.
+
+The honest limitation: the constants are loopback's (RTT \SI{23}{\micro\second}),
+not a WAN's, so a wide-area deployment needs its own two constants.
+
+\subsection{Bit-exactness as a gate on quoting cost}
+
+\finding{A cost comparison between routes computing different things is
+meaningless.}
+
+Every backend is therefore checked against a common plaintext reference before
+any number is reported, and the benchmarks refuse to present a clean table when a
+cell disagrees. The encrypted CNN reproduces the plaintext prediction on 600 of
+600 embedded medical images, run twice---before and after two optimizations---with
+both passes agreeing on all 600. That is what makes those optimizations
+\emph{exact} rather than merely close.
+
+\subsection{Machine-checked security attestations}
+\label{sec:attest}
+
+Every engine attests the security level it actually implements, in one auditable
+table, and asking a session for more than an engine attests is an \emph{error
+rather than a silent downgrade}. Exactly one engine attests malicious security.
+The editing rule is that an attestation records what the code \emph{does}, never
+what the roadmap intends: raising one is the last step of an upgrade, after the
+cheating-detection tests pass.
+
+We consider this the most transferable idea in the artifact. Security level is
+the dimension most often lost when numbers move between papers, and making it a
+machine-checked property of running code---rather than prose in a limitations
+section---is cheap to implement and hard to get wrong by accident.
+
+\subsection{Recording withdrawn results}
+
+Negative, superseded and withdrawn results are kept in the experimental record
+alongside the wins, with the reasoning that produced them.
+\Cref{sec:withdrawn} summarizes what this caught.
+
+%==============================================================================
+\section{Cross-paradigm findings}
+\label{sec:cross}
+
+These are the results that motivated the single-harness approach, in the sense
+that no single paradigm's literature could produce them.
+
+\subsection{The FHE-versus-MPC crossover belongs to the baseline's preprocessing}
+\label{sec:crossover-fhe}
+
+The standard claim is that FHE overtakes MPC past some layer width, because MPC
+preprocessing grows linearly while a packed ciphertext is flat. \Baru{}'s cost
+model predicts it, and measurement confirms it---\emph{against an OT-preprocessed
+baseline} (\cref{tab:layer}).
+
+\begin{table}[t]
+\centering
+\small
+\begin{tabular}{@{}rrrrr@{}}
+\toprule
+width & dealer (lower bound) & Semi2k (OT) & \textbf{LowGear (SHE)} & hybrid/BFV \\
+\midrule
+64   & \SI{600.6}{\milli\second} & \SI{694.5}{\milli\second} & \textbf{\SI{606.2}{\milli\second}} & \SI{692.1}{\milli\second} \\
+1024 & \SI{603.0}{\milli\second} & \SI{942.8}{\milli\second} & \textbf{\SI{623.4}{\milli\second}} & \SI{692.1}{\milli\second} \\
+4096 & \SI{610.9}{\milli\second} & \SI{1.74}{\second}        & \textbf{\SI{678.4}{\milli\second}} & \SI{733.7}{\milli\second} \\
+\bottomrule
+\end{tabular}
+\caption{One private layer with both operands secret plus a \ReLU{}; WAN, two
+parties, preprocessing charged per triple \emph{consumed}.}
+\label{tab:layer}
+\end{table}
+
+Against \textbf{SHE-preprocessed} MPC the crossover is gone in this range
+entirely. LowGear tracks the trusted-dealer lower bound within
+\SI{5}{\milli\second} at width 64.
+
+\finding{The honest statement is not ``the hybrid beats dishonest-majority MPC
+past width 64'' but ``the hybrid beats \emph{OT-preprocessed} dishonest-majority
+MPC past width 64, and loses to SHE-preprocessed MPC at every width measured.''
+The mechanism survives---preprocessing volume decides it---but the boundary is a
+property of the baseline, not of either cryptosystem.}
+
+A second boundary moves with the \textbf{threat model}. Under an honest majority
+(ABY3, multiplication from correlated randomness, zero preprocessing) the layer
+stays on MPC at \emph{every} width. Under a dishonest majority with OT
+preprocessing, FHE takes it past ${\approx}256$ multiplications. This explains a
+structural fact about the literature that is otherwise puzzling: \emph{every
+hybrid FHE+MPC inference system is two-party}. Gazelle, Delphi and Cheetah sit
+precisely in the regime where the model says the hybrid pays.
+
+\subsection{Protocol assignment can be derived, not annotated}
+
+Given measured costs for each backend, a search over per-operation-kind
+assignments returns $\bt{mul}\to\text{fhe}$, $\bt{cmp-lt}\to\text{binary}$ for a
+256-wide encrypted layer with a comparison---that is, it \emph{derives} the
+Gazelle/Delphi/Cheetah architecture rather than having it annotated. The prior
+work on protocol assignment (HyCC~\cite{HyCC} $\to$ Silph~\cite{Silph} $\to$
+SING~\cite{SING}) is \textbf{MPC-only}; extending the cost model to span MPC
+\emph{and} FHE is what makes the hybrid architecture an output of the search
+rather than an input.
+
+Two structural non-linearities make this objective non-separable, which is worth
+noting for anyone tempted to formulate it as an integer linear program: a
+dependence level costs the \emph{maximum} over its instructions, not their sum;
+and conversions \emph{batch per level}, so a crossing's cost depends on whether
+another crossing already happens there.
+
+\subsection{The nonlinearity crossover is in bandwidth, and moves with RTT}
+\label{sec:crossover-nonlin}
+
+\Baru{} implements three interchangeable comparison protocols---batched bit
+decomposition, garbled circuits, and Falcon's \bt{wrap3}-based
+$\Pi_{\mathrm{DReLU}}$~\cite{Falcon}---behind one interface, verified to compute
+the same function bit-exactly. This makes the trade of \cref{sec:background}
+directly measurable on a real workload rather than argued (\cref{tab:crossover}).
+
+\begin{table}[t]
+\centering
+\small
+\begin{tabular}{@{}llrrrrrrr@{}}
+\toprule
+RTT & protocol & 1000 & 100 & 40 & 30 & 20 & 10 & 5 \si{\mega\bit\per\second} \\
+\midrule
+\multirow{2}{*}{\SI{0}{\milli\second}}
+ & gc     & \textbf{638}  & \textbf{3227} & \textbf{6554} & \textbf{8511}  & \num{12357} & \num{23915} & \num{46869} \\
+ & falcon & \num{1279} & \num{3528} & \num{6750} & \num{8583} & \textbf{12167} & \textbf{22828} & \textbf{43794} \\
+\midrule
+\multirow{2}{*}{\SI{20}{\milli\second}}
+ & gc     & \textbf{2411} & \textbf{4839} & \textbf{8395} & \textbf{10292} & \textbf{14174} & \num{25594} & \num{48659} \\
+ & falcon & \num{3873} & \num{6276} & \num{9585} & \num{11393} & \num{14998} & \textbf{25543} & \textbf{46850} \\
+\bottomrule
+\end{tabular}
+\caption{Milliseconds per encrypted MedMNIST diagnosis; winner in bold. Both
+routes compute the same diagnosis bit-exactly, from one shared session, so only
+the protocol and the network vary.}
+\label{tab:crossover}
+\end{table}
+
+Falcon---the lowest-bandwidth route---wins below ${\approx}\SI{20}{\mega\bit\per\second}$
+at RTT 0 and below ${\approx}\SI{10}{\mega\bit\per\second}$ at RTT
+\SI{20}{\milli\second}. Higher RTT shifts the crossover \emph{down}, shrinking
+the region where it wins, because it sends more messages. The mechanism checks
+out quantitatively: Falcon starts ${\approx}\SI{641}{\milli\second}$ behind on
+compute and pays 67 extra messages, against which it saves
+\SI{1.6}{\mega\byte}; break-even is predicted at \num{20.0} and
+\SI{6.5}{\mega\bit\per\second} against $20$--$30$ and $10$--$15$ measured.
+
+\paragraph{The boundary is a band, not a line.} Around
+$20$--$30$\,\si{\mega\bit\per\second} the winner flips between repeat runs
+($0.1$--$0.3\%$ spread). No ordering inside that band should be quoted; the
+finding is that the protocols are \emph{indistinguishable} there, which is what a
+crossover is.
+
+\finding{Given a deployment's RTT and bandwidth, one should \emph{pick} the
+nonlinearity protocol rather than fixing it. Systems that hardwire one choice are
+optimal only in part of the deployment space.}
+
+%==============================================================================
+\section{Case study: private medical image diagnosis}
+\label{sec:medmnist}
+
+MedMNIST v2~\cite{MedMNIST} distributes twelve biomedical datasets at
+$28\times28$---exactly MNIST's~\cite{MNIST} shape---so a private-inference
+pipeline runs on them unchanged, and the artifact stops being about handwritten
+digits (\cref{tab:medmnist}).
+
+\begin{table}[t]
+\centering
+\small
+\begin{tabular}{@{}lrr@{}}
+\toprule
+ & PneumoniaMNIST & OrganAMNIST \\
+\midrule
+task & chest X-ray, 2 classes & abdominal CT, 11 organs \\
+integer accuracy, full test set & \SI{84.78}{\percent} (624) & \SI{81.18}{\percent} (\num{17778}) \\
+\SI{95}{\percent} Wilson CI~\cite{Wilson} & $[81.7, 87.4]$ & $[80.6, 81.8]$ \\
+balanced accuracy / AUC & \SI{80.64}{\percent} / \textbf{0.9314} & \SI{80.49}{\percent} / \textbf{0.9590} \\
+sensitivity / specificity & \SI{97.18}{\percent} / \textbf{\SI{64.10}{\percent}} & --- \\
+published ResNet-18 ($28\times28$) & 0.854 / 0.944 & 0.935 / 0.997 \\
+majority-class baseline & \SI{62.50}{\percent} & \SI{18.48}{\percent} \\
+\textbf{encrypted $=$ plaintext} & \textbf{300/300} & \textbf{300/300} \\
+FHE bootstraps & 0 & 0 \\
+online latency / diagnosis & \textbf{\SI{268}{\milli\second}} & \SI{291}{\milli\second} \\
+\bottomrule
+\end{tabular}
+\caption{Private diagnosis on real biomedical images, image \emph{and} weights
+encrypted, only the class index revealed.}
+\label{tab:medmnist}
+\end{table}
+
+Three points a privacy venue should care about.
+
+\paragraph{Privacy costs nothing in accuracy, and this is shown rather than
+asserted.} The integer model matches its float parent to within 0.2 points, and
+the encrypted pipeline reproduces the plaintext diagnosis bit-exactly on every
+one of 600 images.
+
+\paragraph{Accuracy alone misreads a medical classifier.} PneumoniaMNIST's test
+set is ${\approx}60\%$ positive, and this model earns its \SI{84.78}{\percent}
+largely by \emph{over-calling disease}: \SI{97.2}{\percent} sensitivity against
+\SI{64.1}{\percent} specificity. Balanced accuracy is \SI{80.64}{\percent}. None
+of this is visible while only accuracy is reported, and none of it is a
+cryptographic result---but a paper claiming private diagnosis has to report it.
+
+\paragraph{The accuracy ceiling is the packing, not the crypto.} We initially
+attributed the model's size to the FHE noise budget. That was wrong. Three limits
+bind and noise is the third: spatially, $3\times3$ valid convolution plus pooling
+takes $28 \to 13 \to 5 \to 1$, admitting at most three convolutions; by
+\emph{packing}, $2\cdot \mathrm{in}_c \cdot H \cdot W \lesssim n$ caps the first
+convolution at 12 channels before the second's input passes $n=4096$. That is a
+packing constraint that relaxes at $n=8192$, not a limit of the construction.
+Depth, meanwhile, really is free.
+
+%==============================================================================
+\section{What the methodology caught in our own work}
+\label{sec:withdrawn}
+
+A study's credibility rests partly on what its authors were willing to withdraw.
+Each item below was found by the discipline of \cref{sec:method} and is recorded
+in the artifact rather than quietly fixed.
+
+\paragraph{A ZKP backend that proved nothing.} Until 2026-07-31 the shipped
+backend's \bt{verify} never checked that a witness satisfied any constraint---
+anyone holding the public circuit could forge an accepting proof. It is retained,
+unused, so a soundness test can keep demonstrating precisely what it failed to
+do. \textbf{Every ZKP number predating that date is withdrawn.}
+
+\paragraph{A privacy break in bit decomposition.} The previous \bt{a2b} masked
+its input with a value derived from a \emph{public} lockstep counter, so the input
+was recoverable from the transcript by any observer. Everything built on it---
+\ReLU{}, max-pool, argmax---leaked its activations. The advertised ``no extra
+communication per bit'' was a \emph{symptom}: the carry chain was free because
+every operand was already public. Fixing it cost $4.4\times$ MPC time and
+${\approx}130\times$ bandwidth, later recovered by triple-free multiplication and
+batching.
+
+\paragraph{An insecure FHE scheme, removed rather than caveated.} The fast engine
+was a scale-invariant NTRU~\cite{LTV,YASHE} port. Analysis showed it insecure at
+the parameters the construction needs even at depth
+one~\cite{ABDucas,KirchnerFouque,DucasvanWoerden}: the large LTV secret raises
+the fatigue point to ${\approx}2^{59}$, but a single multiply with usable $t$
+forces $q \gtrsim 2^{84}$. It was deleted, not kept as a ``fast reference'';
+every result transferred bit-exact and the FHE column got slower.
+
+\paragraph{A selective-failure channel that passes every functional test.}
+Attaching MACs to bit-decomposition leaves by multiplication is unsound: a
+corrupt party injects $\delta$, the first downstream gate carries MAC error
+$\delta y$ with $y$ a secret bit, so the run aborts when $y=1$ and completes when
+$y=0$.
+
+\finding{Deferring the abort does not close this. Batching hides \emph{when} an
+abort happens, not \emph{whether} it happens; those are different channels and
+only the first is closed by batching. We had asserted the opposite before
+building it.}
+
+\paragraph{Comparison errors of framing.} Pricing FHE's \emph{linear} part
+against MPC's \emph{whole layer} (omitting the \ReLU{} that FHE cannot do at
+all); computing a crossover against a trusted-dealer baseline (asking whether FHE
+beats free preprocessing); and the cross-domain triple comparison corrected in
+\cref{sec:triples}.
+
+\paragraph{Honest negatives retained.} PIR loses to downloading the database by
+${\approx}13\times$ with no crossover in $N$. Hybrid-TFHE does not pay. Faster
+ring arithmetic does \emph{not} bring FHE close to MPC. Per-layer bit-width
+tuning was measured at ${\approx}10\%$ and not built. A fused garbled max-of-four
+was measured as a $1.68\times$ \emph{loss} and not built.
+
+%==============================================================================
+\section{Threats to validity}
+\label{sec:threats}
+
+\paragraph{Implementation quality.} Research Rust, not tuned C++. Absolute
+figures are not competitive; ratios measured within the harness are the
+defensible output. Where we compare against published numbers---for example our
+sign extraction at ${\approx}\SI{0.043}{\milli\second}$ against Falcon's
+optimized C++---the gap is implementation, not protocol, and we say so.
+
+\paragraph{Single machine.} All figures from one Apple M1 Pro. Cross-machine
+variance is uncharacterized. The network model is validated on loopback, so WAN
+constants are modelled.
+
+\paragraph{The simulated network is a model.} Validated to \SI{13.6}{\percent}
+worst case, but it is still $\text{rounds}\times\text{RTT} +
+\text{bytes}/\text{bandwidth}$, not a real WAN with congestion, jitter or packet
+loss.
+
+\paragraph{Two disclosed cryptographic gaps.} The Falcon backend's preprocessing
+is currently \emph{dealt from a common seed and is not secure}---all three parties
+can reconstruct the mask. Its online protocol and measured costs are real; its
+offline phase is not. FHE threshold \emph{key generation} is dealer-based. Both
+are recorded on the code and in the attestation table rather than only in prose.
+
+\paragraph{Workload breadth.} Findings are anchored on feed-forward CNN inference
+at $28\times28$. Transformers, larger images, and non-inference workloads are not
+covered.
+
+\paragraph{Not an adversarial evaluation.} Cheating-detection tests drive real
+attacks over the transport for the malicious ABY3 layer, but this is not a
+security audit, and no formal proofs are machine-checked.
+
+%==============================================================================
+\section{Open problems}
+\label{sec:open}
+
+\begin{enumerate}
+  \item \textbf{A CIFAR-scale private CNN} needs SIMD-slot packing; coefficient
+    packing bounds image size. The composition and security story is independent
+    of it.
+  \item \textbf{Transformer nonlinearities} (softmax, LayerNorm) need
+    exponential, reciprocal and inverse-square-root subprotocols.
+  \item \textbf{Malicious security at the FHE boundary.} Replication cannot catch
+    a \emph{malformed input ciphertext}---both honest co-holders compute on it
+    faithfully and agree. This sharpens the positioning: \emph{ZK is needed only
+    at the input boundary, never for the evaluation}, where single-server
+    verifiable FHE needs it over the whole computation. The boundary proof is not
+    implemented.
+  \item \textbf{Secret-index array access}, priced by the cost model, before
+    ORAM. CirC~\cite{CirC} implements exactly the two cases either side of that
+    line and does not implement ORAM at all.
+  \item \textbf{Per-instruction protocol assignment}, versus the current
+    per-operation-kind granularity.
+  \item \textbf{Cross-machine and real-WAN validation} of the cost model's
+    constants.
+\end{enumerate}
+
+%==============================================================================
+\section{Conclusion}
+
+Cross-paradigm performance claims in privacy-preserving computation are not
+currently falsifiable, because the numbers come from incommensurable sources. We
+have described a harness in which they are, and reported what changes when the
+paradigms are re-measured under uniform accounting: an FHE-versus-MPC crossover
+that belongs to the baseline's preprocessing rather than to either cryptosystem;
+active security that costs bytes but not rounds; and a nonlinearity choice that
+should be made per deployment rather than fixed by the system designer. Three
+claims did not survive the re-measurement, two of them our own.
+
+The transferable part is not the artifact but the discipline: identical
+transports for both legs of any comparison, a cost model checked against a real
+socket, bit-exactness as a precondition for quoting cost, and security level as a
+machine-checked property of running code rather than prose. Each is cheap to
+adopt, and each caught something here that would otherwise have been published.
+
+%==============================================================================
+\section*{Reproducibility}
+
+Single Rust crate, no GPU. \bt{cargo test} covers correctness; every
+\bt{bench-*} subcommand emits \bt{--json}. All numbers are produced by these
+commands; none are hand-entered.
+
+\begin{center}
+\small
+\begin{tabular}{@{}ll@{}}
+\toprule
+Result & Command \\
+\midrule
+Deep inference, zero bootstraps & \bt{bench-deep-nn --depths 2,4,8,16,32} \\
+Private diagnosis (\cref{tab:medmnist}) & \bt{bench-medmnist --dataset pneumonia} \\
+Nonlinearity crossover (\cref{tab:crossover}) & \bt{bench-medmnist --sweep} \\
+Cost of active security (\cref{tab:malicious}) & \bt{bench-malicious --n 32 --bits 32} \\
+Triples: SHE vs OT (\cref{tab:triples}) & \bt{bench-triples} \\
+FHE$\leftrightarrow$MPC crossover (\cref{tab:layer}) & \bt{bench-layer} \\
+Cost model vs real socket (\cref{sec:netmodel}) & \bt{bench-net} \\
+Proving a quantized neuron (\cref{tab:zkp}) & \bt{bench-zkp-layer --widths 1,...,784} \\
+Falcon vs \bt{a2b} vs garbled & \bt{bench-falcon} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\bibliographystyle{plain}
+\bibliography{references}
+
+\end{document}

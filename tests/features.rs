@@ -1053,3 +1053,340 @@ fn test_fhe_tfhe_relu() {
     // ReLU(5) + ReLU(-4) = 5 + 0 = 5
     assert_eq!(eval_fhe(src), 5);
 }
+
+// ---------------------------------------------------------------------------
+// Scheme derived forms (Tier 1)
+//
+// Every form below is *desugared in the parser* into the core AST, so these
+// tests double as a check that the desugaring is semantics-preserving: there is
+// no evaluator support to test independently. The circuit backends see only the
+// lowered shapes, which is why `test_derived_forms_reach_the_zkp_compiler`
+// exists further down.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_begin_returns_last() {
+    assert_eq!(eval("(begin 1 2 3)"), 3);
+}
+
+#[test]
+fn test_begin_single() {
+    assert_eq!(eval("(begin 7)"), 7);
+}
+
+#[test]
+fn test_when_taken_and_not() {
+    assert_eq!(eval("(when (> 3 1) 42)"), 42);
+    assert_eq!(eval("(when (> 1 3) 42)"), 0);
+}
+
+#[test]
+fn test_unless_is_when_inverted() {
+    assert_eq!(eval("(unless (> 1 3) 42)"), 42);
+    assert_eq!(eval("(unless (> 3 1) 42)"), 0);
+}
+
+#[test]
+fn test_when_body_is_a_sequence() {
+    assert_eq!(eval("(when #t 1 2 99)"), 99);
+}
+
+#[test]
+fn test_cond_picks_first_true_clause() {
+    assert_eq!(eval("(cond ((> 1 3) 10) ((> 3 1) 20) (else 30))"), 20);
+}
+
+#[test]
+fn test_cond_falls_through_to_else() {
+    assert_eq!(eval("(cond ((> 1 3) 10) ((> 2 5) 20) (else 30))"), 30);
+}
+
+/// A `cond` with no matching clause and no `else` yields 0 — the same "no
+/// value" this language already uses for an untaken `when`.
+#[test]
+fn test_cond_without_else_yields_zero() {
+    assert_eq!(eval("(cond ((> 1 3) 10))"), 0);
+}
+
+#[test]
+fn test_cond_clause_body_is_a_sequence() {
+    assert_eq!(eval("(cond (#t 1 2 3) (else 9))"), 3);
+}
+
+/// `else` must come last; a clause after it is unreachable and is a bug in the
+/// program, not something to silently accept.
+#[test]
+fn test_cond_rejects_else_before_other_clauses() {
+    let e = baru::interpreter::parser::parse("(cond (else 1) (#t 2))");
+    assert!(e.is_err(), "else before another clause must be an error");
+}
+
+#[test]
+fn test_let_star_sees_earlier_bindings() {
+    assert_eq!(eval("(let* ((x 2) (y (* x 3))) (+ x y))"), 8);
+}
+
+/// **A deviation from Scheme, pinned here rather than left as folklore.**
+///
+/// Baru's plain `let` is *sequential*: a later init sees an earlier binding, so
+/// `(let ((a 1) (b (+ a 10))) b)` is 11. In Scheme that is `let*` behaviour and
+/// plain `let` would either reject `a` as unbound or see an outer `a`.
+///
+/// The consequence is that `let*` is semantically **redundant** here — it is
+/// provided so Scheme source ports unchanged and so intent is explicit, not
+/// because it does something `let` cannot. Making `let` parallel would be a
+/// breaking change to a core form (~46 multi-binding `let`s in-tree), so it is
+/// a deliberate decision recorded in LANGUAGE.md §13, not an oversight.
+#[test]
+fn test_let_is_sequential_like_let_star() {
+    assert_eq!(eval("(let ((a 1) (b (+ a 10))) b)"), 11);
+    // Both forms therefore agree where Scheme would distinguish them.
+    assert_eq!(eval("(let ((x 1)) (let* ((x 2) (y x)) y))"), 2);
+    assert_eq!(eval("(let ((x 1)) (let ((x 2) (y x)) y))"), 2);
+}
+
+#[test]
+fn test_let_star_empty_bindings() {
+    assert_eq!(eval("(let* () 5)"), 5);
+}
+
+#[test]
+fn test_named_let_loops() {
+    assert_eq!(
+        eval("(let loop ((i 0) (acc 0)) (if (== i 5) acc (loop (+ i 1) (+ acc i))))"),
+        10
+    );
+}
+
+#[test]
+fn test_named_let_is_tail_recursive() {
+    // 20k iterations: proper tail calls reuse the caller's continuation, so
+    // this must not grow the machine's continuation chain.
+    assert_eq!(
+        eval("(let loop ((i 0)) (if (== i 20000) 123 (loop (+ i 1))))"),
+        123
+    );
+}
+
+#[test]
+fn test_case_matches_one_of_several_datums() {
+    assert_eq!(eval("(case 2 ((1) 100) ((2 3) 200) (else 300))"), 200);
+    assert_eq!(eval("(case 3 ((1) 100) ((2 3) 200) (else 300))"), 200);
+    assert_eq!(eval("(case 9 ((1) 100) ((2 3) 200) (else 300))"), 300);
+}
+
+#[test]
+fn test_case_single_datum_clause() {
+    assert_eq!(eval("(case 1 ((1) 100) (else 300))"), 100);
+}
+
+/// The key expression must be evaluated exactly once, which is why the
+/// desugaring binds it to a temporary rather than substituting it per datum.
+#[test]
+fn test_case_evaluates_its_key_once() {
+    // If the key were substituted per datum, the inner `let` would run twice
+    // and this would still return 200 — so instead assert the shape directly.
+    let e = baru::interpreter::parser::parse("(case (+ 1 1) ((2) 200) (else 0))").unwrap();
+    let rendered = format!("{e:?}");
+    assert_eq!(
+        rendered.matches("BinOp(Add").count(),
+        1,
+        "case must bind its key once, not inline it per datum: {rendered}"
+    );
+}
+
+/// The temporary a `case` introduces must not be capturable, or a user variable
+/// of the same name would shadow it. Nested `case` is the case that would break.
+#[test]
+fn test_nested_case_temporaries_do_not_collide() {
+    assert_eq!(
+        eval("(case 1 ((1) (case 2 ((2) 42) (else 0))) (else 0))"),
+        42
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Scheme predicates, equivalence and list procedures (Tier 1)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_type_predicates() {
+    for (src, want) in [
+        ("(number? 3)", 1),
+        ("(number? \"x\")", 0),
+        ("(integer? 3)", 1),
+        ("(string? \"x\")", 1),
+        ("(string? 3)", 0),
+        ("(char? 'a')", 1),
+        ("(boolean? #t)", 1),
+        ("(boolean? 1)", 0),
+        ("(list? (list 1 2))", 1),
+        ("(list? 3)", 0),
+        ("(procedure? (lambda (x) x))", 1),
+        ("(procedure? 3)", 0),
+        ("(zero? 0)", 1),
+        ("(zero? 1)", 0),
+    ] {
+        assert_eq!(eval(src), want, "{src}");
+    }
+}
+
+/// `pair?` is false on the empty list and true on a non-empty one. This
+/// language has no improper pairs, so that is all it can mean here.
+#[test]
+fn test_pair_predicate() {
+    assert_eq!(eval("(pair? (list 1 2))"), 1);
+    assert_eq!(eval("(pair? (list))"), 0);
+}
+
+#[test]
+fn test_eqv_on_atoms() {
+    assert_eq!(eval("(eq? 3 3)"), 1);
+    assert_eq!(eval("(eq? 3 4)"), 0);
+    assert_eq!(eval("(eqv? 'a' 'a')"), 1);
+    assert_eq!(eval("(eq? \"ab\" \"ab\")"), 1);
+}
+
+/// The `eq?` / `equal?` split: `equal?` recurses into lists, `eq?` does not.
+#[test]
+fn test_equal_recurses_where_eq_does_not() {
+    assert_eq!(eval("(equal? (list 1 2) (list 1 2))"), 1);
+    assert_eq!(eval("(eq? (list 1 2) (list 1 2))"), 0);
+    assert_eq!(eval("(equal? (list 1 2) (list 1 3))"), 0);
+    assert_eq!(eval("(equal? (list) (list))"), 1);
+}
+
+#[test]
+fn test_list_procedures() {
+    assert_eq!(eval("(length (list 1 2 3))"), 3);
+    assert_eq!(eval("(length (list))"), 0);
+    assert_eq!(eval("(car (reverse (list 1 2 3)))"), 3);
+    assert_eq!(eval("(length (append (list 1) (list 2 3)))"), 3);
+    assert_eq!(eval("(car (append (list 1) (list 2)))"), 1);
+    assert_eq!(eval("(list-ref (list 10 20 30) 1)"), 20);
+    assert_eq!(eval("(list-ref (list 10 20 30) 0)"), 10);
+}
+
+#[test]
+fn test_derived_forms_compose_with_each_other() {
+    // cond inside a named let inside let*, all desugared.
+    assert_eq!(
+        eval(
+            "(let* ((n 4))
+               (let loop ((i 0) (acc 0))
+                 (cond ((== i n) acc)
+                       (else (loop (+ i 1) (+ acc i))))))"
+        ),
+        6
+    );
+}
+
+// ---------------------------------------------------------------------------
+// define, set!, apply, and operators as values (Tier 1)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_define_binds_a_value() {
+    assert_eq!(eval("(begin (define x 5) x)"), 5);
+}
+
+#[test]
+fn test_define_function_sugar() {
+    assert_eq!(eval("(begin (define (sq n) (* n n)) (sq 7))"), 49);
+    assert_eq!(eval("(begin (define (add a b) (+ a b)) (add 3 4))"), 7);
+    assert_eq!(eval("(begin (define (nine) 9) (nine))"), 9);
+}
+
+#[test]
+fn test_set_assigns_an_existing_binding() {
+    assert_eq!(eval("(begin (define x 1) (set! x 42) x)"), 42);
+    assert_eq!(eval("(let ((c 0)) (begin (set! c (+ c 10)) (set! c (+ c 5)) c))"), 15);
+}
+
+/// Scheme requires the variable to exist. Catching it *before* the operand runs
+/// means a typo cannot first perform whatever side effects the operand had.
+#[test]
+#[should_panic(expected = "set!: unbound variable")]
+fn test_set_rejects_an_unbound_variable() {
+    eval("(set! definitely-not-bound 1)");
+}
+
+/// The property that makes `set!` worth having rather than simulating with
+/// rebinding: bindings are shared cells, so a closure observes assignments made
+/// after it was created. This is the classic counter.
+#[test]
+fn test_set_is_visible_through_a_closure() {
+    assert_eq!(
+        eval(
+            "(let ((n 0))
+               (let ((bump (lambda () (set! n (+ n 1)))))
+                 (begin (bump) (bump) (bump) n)))"
+        ),
+        3
+    );
+}
+
+#[test]
+fn test_apply_spreads_a_list() {
+    assert_eq!(eval("(apply + (list 3 4))"), 7);
+    assert_eq!(eval("(apply (lambda (a b c) (+ a (* b c))) (list 1 2 3))"), 7);
+    assert_eq!(eval("(begin (define (f) 9) (apply f (list)))"), 9);
+}
+
+/// `apply` is a **value**, not syntax — so it can be passed to itself, and more
+/// importantly a user binding of the same name shadows it. An earlier version of
+/// this change made `apply` a parser special form, which silently broke
+/// `test_higher_order_apply` below; this pins the correct behaviour.
+#[test]
+fn test_apply_is_a_first_class_shadowable_value() {
+    assert_eq!(eval("(procedure? apply)"), 1);
+    assert_eq!(eval("(apply apply (list + (list 1 2)))"), 3);
+    assert_eq!(
+        eval("(let ((apply (lambda (f x) (f x)))) (apply (lambda (n) (* n n)) 7))"),
+        49
+    );
+}
+
+#[test]
+#[should_panic(expected = "must be a list")]
+fn test_apply_requires_a_list() {
+    eval("(apply + 5)");
+}
+
+/// Operators are usable as values, and non-binary arities route to those
+/// bindings. Two operands keep the core `BinOp` path, which is the only one that
+/// dispatches secret shares.
+#[test]
+fn test_operators_are_first_class_and_variadic() {
+    assert_eq!(eval("(- 5)"), -5); // documented since forever; a parse error until now
+    assert_eq!(eval("(+ 1 2 3)"), 6);
+    assert_eq!(eval("(* 2 3 4)"), 24);
+    assert_eq!(eval("(+)"), 0); // Scheme's additive identity
+    assert_eq!(eval("(- 10 3 2)"), 5); // left fold
+    assert_eq!(eval("(/ 100 5 2)"), 10);
+    assert_eq!(eval("(apply * (list 2 3 4))"), 24);
+    // The two-operand fast path is unchanged.
+    assert_eq!(eval("(+ 1 2)"), 3);
+}
+
+/// Q16.16 must survive the variadic path, including the rescale per multiply.
+#[test]
+fn test_variadic_operators_keep_fixed_point() {
+    assert_eq!(eval_plain_string("(+ 1.5 2)"), "3.5000");
+    assert_eq!(eval_plain_string("(* 2.0 3.0)"), "6.0000");
+    assert_eq!(eval_plain_string("(- 1.5)"), "-1.5000");
+}
+
+/// A secret operand reaching the *procedure* form gets an error naming the
+/// two-operand form, rather than a silently wrong public answer. The
+/// two-operand form itself still runs the protocol.
+#[test]
+fn test_operator_procedures_refuse_secrets() {
+    assert_eq!(eval_shared("(let ((z :sint32 5)) (reconstruct (+ z 1)))"), 6);
+    let secret_via_apply =
+        std::panic::catch_unwind(|| eval_shared("(let ((z :sint32 5)) (apply + (list z 1)))"));
+    assert!(
+        secret_via_apply.is_err(),
+        "`+` as a procedure must refuse a share instead of guessing"
+    );
+}

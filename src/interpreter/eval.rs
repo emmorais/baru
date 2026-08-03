@@ -16,6 +16,22 @@ use colored::*;
 #[derive(Debug, Clone)]
 pub enum Continuation {
     Halt,
+
+    /// Bind `name` in `env` once its value is known (`define`).
+    Define {
+        name: String,
+        cont: Box<Continuation>,
+        env: Env,
+    },
+
+    /// Assign to the existing binding `name` (`set!`). Writes *through* the
+    /// shared `Ptr`, so closures over the same variable observe the change.
+    Set {
+        name: String,
+        cont: Box<Continuation>,
+        env: Env,
+    },
+
     BinOpLeft {
         op: super::parser::BinOp,
         right: Box<Expr>,
@@ -167,6 +183,8 @@ pub fn reduce_expression(
 
             fn colored_expr(e: &Expr) -> String {
                 match e {
+                    Expr::Define(n, _) => format!("Define({n})").yellow().to_string(),
+                    Expr::Set(n, _) => format!("Set({n})").yellow().to_string(),
                     Expr::Num(n) => format!("{}", format!("Num({})", n).green()),
                     Expr::Fixed(v) => {
                         use crate::interpreter::ast::FIXED_SCALE;
@@ -203,6 +221,7 @@ pub fn reduce_expression(
 
             fn colored_value(v: &Types) -> String {
                 match v {
+                    Types::NativeApply => "NativeApply".cyan().to_string(),
                     Types::Num(n) => format!("{}", format!("Num({})", n).green()),
                     Types::Fixed(val) => {
                         use crate::interpreter::ast::FIXED_SCALE;
@@ -247,6 +266,34 @@ pub fn reduce_expression(
 
         match task {
             Eval(e, k, eenv) => match e {
+                Expr::Define(name, value) => {
+                    stack.push(Eval(
+                        *value,
+                        Continuation::Define {
+                            name,
+                            cont: Box::new(k),
+                            env: eenv.clone(),
+                        },
+                        eenv.clone(),
+                    ));
+                }
+                Expr::Set(name, value) => {
+                    // Scheme requires the variable to exist; catching it here
+                    // rather than after evaluating the operand means a typo does
+                    // not first run whatever side effects the operand had.
+                    if !eenv.borrow().contains_key(&name) {
+                        panic!("set!: unbound variable: {name}");
+                    }
+                    stack.push(Eval(
+                        *value,
+                        Continuation::Set {
+                            name,
+                            cont: Box::new(k),
+                            env: eenv.clone(),
+                        },
+                        eenv.clone(),
+                    ));
+                }
                 Expr::Num(n) => {
                     stack.push(Apply(k, Types::Num(n), eenv.clone()));
                 }
@@ -471,6 +518,24 @@ pub fn reduce_expression(
             },
             Apply(k, val, _env) => {
                 match k {
+                    Continuation::Define { name, cont, env } => {
+                        // A fresh cell: `define` introduces a binding rather
+                        // than assigning to one, so it must not write through an
+                        // existing `Ptr` that closures may already share.
+                        env.borrow_mut()
+                            .insert(name, Rc::new(RefCell::new(val.clone())));
+                        stack.push(Apply(*cont, val, env.clone()));
+                    }
+                    Continuation::Set { name, cont, env } => {
+                        // Write *through* the existing cell so every closure
+                        // over this variable sees the new value.
+                        let ptr = env.borrow().get(&name).cloned();
+                        match ptr {
+                            Some(p) => *p.borrow_mut() = val.clone(),
+                            None => panic!("set!: unbound variable: {name}"),
+                        }
+                        stack.push(Apply(*cont, val, env.clone()));
+                    }
                     Continuation::Halt => {
                         if stack.is_empty() {
                             if trace_enabled && !trace.is_empty() {
@@ -1088,6 +1153,10 @@ pub fn reduce_expression(
                     Continuation::CallEvalOperator { args, cont, env } => {
                         if args.is_empty() {
                             match val {
+                                // `(apply)` with no arguments at all.
+                                Types::NativeApply => {
+                                    panic!("apply expects (apply f arg-list), got 0 arguments")
+                                }
                                 Types::Closure(params, body, closure_env) => {
                                     if !params.is_empty() {
                                         panic!(
@@ -1128,6 +1197,50 @@ pub fn reduce_expression(
                         mut_collected.push(val);
                         if remaining.is_empty() {
                             match operator {
+                                // `(apply f lst)` — spread `lst` and re-enter
+                                // this same dispatch, so arity checks, closures,
+                                // builtins and tail-call behaviour are shared
+                                // with an ordinary call rather than duplicated.
+                                Types::NativeApply => {
+                                    if mut_collected.len() != 2 {
+                                        panic!(
+                                            "apply expects (apply f arg-list), got {} arguments",
+                                            mut_collected.len()
+                                        );
+                                    }
+                                    let spread = mut_collected.pop().expect("2 args");
+                                    let func = mut_collected.pop().expect("2 args");
+                                    let mut items = match spread {
+                                        Types::List(v) => v,
+                                        other => panic!(
+                                            "apply: last argument must be a list, got {other:?}"
+                                        ),
+                                    };
+                                    match items.pop() {
+                                        // Zero arguments: hand the operator to the
+                                        // no-argument call path.
+                                        None => stack.push(Apply(
+                                            Continuation::CallEvalOperator {
+                                                args: Vec::new(),
+                                                cont,
+                                                env: env.clone(),
+                                            },
+                                            func,
+                                            env.clone(),
+                                        )),
+                                        Some(last) => stack.push(Apply(
+                                            Continuation::CallEvalArgs {
+                                                operator: func,
+                                                remaining: Vec::new(),
+                                                mut_collected: items,
+                                                cont,
+                                                env: env.clone(),
+                                            },
+                                            last,
+                                            env.clone(),
+                                        )),
+                                    }
+                                }
                                 Types::Closure(params, body, closure_env) => {
                                     if params.len() != mut_collected.len() {
                                         panic!(
@@ -1666,6 +1779,8 @@ impl Participant {
             "list".to_string(),
             Rc::new(RefCell::new(Types::NativeFunc(list_fn))),
         );
+
+        self.register_scheme_builtins();
 
         // zkp-compile builtin: (zkp-compile 'expr '("x" "y"))
         // Compiles a quoted expression to a Binius64 circuit.
@@ -2606,6 +2721,369 @@ impl Participant {
         );
     }
 
+    /// Scheme's type predicates, equivalences and list procedures.
+    ///
+    /// These are ordinary builtins rather than special forms, which keeps them
+    /// out of the parser and therefore out of the circuit compilers — a program
+    /// that reaches a circuit backend cannot call one, because `NativeFunc` has
+    /// no gate-level meaning. That is the honest boundary: these operate on
+    /// *public* structure, and public structure is exactly what a circuit has
+    /// already resolved by the time it is a circuit.
+    ///
+    /// **`share?` is the one to read twice.** It answers "is this value a
+    /// secret handle", which is public information (the *type* is public; only
+    /// the value is secret), so it leaks nothing. A predicate over a secret's
+    /// *contents* would, and none is provided.
+    fn register_scheme_builtins(&self) {
+        // Scheme truth: only #f is false. This language also treats 0 as false
+        // (`(if 0 ...)`), so predicates return 1/0 to compose with the existing
+        // numeric comparisons rather than introducing a second boolean scheme.
+        fn truth(b: bool) -> Types {
+            Types::Num(i64::from(b))
+        }
+
+        let reg = |name: &str, f: Arc<dyn Fn(Vec<Types>) -> Types + Send + Sync>| {
+            self.store
+                .borrow_mut()
+                .insert(name.to_string(), Rc::new(RefCell::new(Types::NativeFunc(f))));
+        };
+
+        // ─── Type predicates ────────────────────────────────────────────────
+        macro_rules! pred {
+            ($name:literal, $pat:pat) => {
+                reg(
+                    $name,
+                    Arc::new(move |args: Vec<Types>| -> Types {
+                        if args.len() != 1 {
+                            panic!(concat!($name, " expects 1 argument"));
+                        }
+                        truth(matches!(&args[0], $pat))
+                    }),
+                );
+            };
+            ($name:literal, $pat:pat if $guard:expr) => {
+                reg(
+                    $name,
+                    Arc::new(move |args: Vec<Types>| -> Types {
+                        if args.len() != 1 {
+                            panic!(concat!($name, " expects 1 argument"));
+                        }
+                        truth(matches!(&args[0], $pat if $guard))
+                    }),
+                );
+            };
+        }
+        pred!("number?", Types::Num(_) | Types::Fixed(_));
+        pred!("integer?", Types::Num(_));
+        pred!("boolean?", Types::Bool(_));
+        pred!("string?", Types::Str(_));
+        pred!("char?", Types::Char(_));
+        pred!(
+            "procedure?",
+            Types::Closure(..) | Types::NativeFunc(_) | Types::NativeApply
+        );
+        pred!("share?", Types::Share(_));
+        pred!("ciphertext?", Types::FheCiphertext(..));
+
+        // `pair?` is true of a non-empty list. This language has no improper
+        // pairs — `List(Vec<..>)`, not cons cells — so `(cons 1 2)` is an error
+        // rather than a dotted pair, and `pair?` cannot distinguish the two.
+        // Documented as a deviation rather than papered over.
+        pred!("pair?", Types::List(v) if !v.is_empty());
+        pred!("list?", Types::List(_));
+
+        reg(
+            "zero?",
+            Arc::new(move |args: Vec<Types>| -> Types {
+                if args.len() != 1 {
+                    panic!("zero? expects 1 argument");
+                }
+                match &args[0] {
+                    Types::Num(n) => truth(*n == 0),
+                    Types::Fixed(v) => truth(*v == 0),
+                    other => panic!("zero? expects a number, got {other:?}"),
+                }
+            }),
+        );
+
+        // ─── Equivalence ────────────────────────────────────────────────────
+        // `eq?`/`eqv?`/`equal?` agree on the atoms this language has; they
+        // differ only on aggregates, where `equal?` recurses. A `Share` compares
+        // by *handle identity*, never by value: comparing two secrets by content
+        // would need a protocol round, and silently spending one inside a
+        // predicate is exactly the kind of hidden cost this repo measures. Use
+        // `(== a b)` for a secret comparison, which is visibly a protocol op.
+        fn eqv(a: &Types, b: &Types) -> bool {
+            match (a, b) {
+                (Types::Num(x), Types::Num(y)) => x == y,
+                (Types::Fixed(x), Types::Fixed(y)) => x == y,
+                (Types::Bool(x), Types::Bool(y)) => x == y,
+                (Types::Char(x), Types::Char(y)) => x == y,
+                (Types::Str(x), Types::Str(y)) => x == y,
+                (Types::List(x), Types::List(y)) => x.is_empty() && y.is_empty(),
+                (Types::Share(x), Types::Share(y)) => x.id == y.id,
+                _ => false,
+            }
+        }
+        fn deep_equal(a: &Types, b: &Types) -> bool {
+            match (a, b) {
+                (Types::List(x), Types::List(y)) => {
+                    x.len() == y.len() && x.iter().zip(y).all(|(p, q)| deep_equal(p, q))
+                }
+                _ => eqv(a, b),
+            }
+        }
+        for name in ["eq?", "eqv?"] {
+            reg(
+                name,
+                Arc::new(move |args: Vec<Types>| -> Types {
+                    if args.len() != 2 {
+                        panic!("eq?/eqv? expect 2 arguments");
+                    }
+                    truth(eqv(&args[0], &args[1]))
+                }),
+            );
+        }
+        reg(
+            "equal?",
+            Arc::new(move |args: Vec<Types>| -> Types {
+                if args.len() != 2 {
+                    panic!("equal? expects 2 arguments");
+                }
+                truth(deep_equal(&args[0], &args[1]))
+            }),
+        );
+
+        // `apply` is a *binding*, not syntax, so `(let ((apply ...)) ...)`
+        // shadows it exactly as in Scheme. The evaluator implements it because a
+        // `NativeFunc` cannot call a closure.
+        self.store.borrow_mut().insert(
+            "apply".to_string(),
+            Rc::new(RefCell::new(Types::NativeApply)),
+        );
+
+        // ─── Operators as first-class procedures ────────────────────────────
+        //
+        // `(+ a b)` is a *special form* that the parser lowers to `BinOp`, which
+        // is the path that dispatches shares and ciphertexts through the
+        // backend. These bindings exist so the same operators can also be used
+        // as *values* — `(apply + lst)`, or passed to a higher-order function —
+        // and so non-binary arities work: the parser routes any arity other than
+        // two here.
+        //
+        // **They are public-values-only, deliberately.** Reproducing the share
+        // and ciphertext dispatch would mean duplicating the `BinOp` logic, and
+        // two copies of an MPC arithmetic path is exactly the kind of drift this
+        // repository measures. A secret operand therefore gets an error naming
+        // the two-operand form, which does dispatch correctly.
+        use crate::interpreter::ast::FIXED_SCALE;
+
+        /// View a public numeric argument as `(scaled_value, is_fixed)`.
+        fn num_arg(v: &Types, op: &str) -> (i64, bool) {
+            match v {
+                Types::Num(n) => (*n, false),
+                Types::Fixed(f) => (*f, true),
+                Types::Bool(b) => (i64::from(*b), false),
+                Types::Share(_) => panic!(
+                    "`{op}` as a procedure does not accept secret shares; \
+                     use the two-operand form `({op} a b)`, which runs the protocol"
+                ),
+                Types::FheCiphertext(..) => panic!(
+                    "`{op}` as a procedure does not accept ciphertexts; \
+                     use the two-operand form `({op} a b)`"
+                ),
+                other => panic!("`{op}` expects numbers, got {other:?}"),
+            }
+        }
+        /// Rebuild a result in the wider of the argument representations.
+        fn num_out(raw: i64, fixed: bool) -> Types {
+            if fixed {
+                Types::Fixed(raw)
+            } else {
+                Types::Num(raw)
+            }
+        }
+
+        // Variadic sum / product, with Scheme's identities for zero arguments.
+        for (name, is_add) in [("+", true), ("*", false)] {
+            reg(
+                name,
+                Arc::new(move |args: Vec<Types>| -> Types {
+                    let any_fixed = args.iter().any(|a| matches!(a, Types::Fixed(_)));
+                    let mut acc: i64 = if is_add {
+                        0
+                    } else if any_fixed {
+                        FIXED_SCALE
+                    } else {
+                        1
+                    };
+                    for a in &args {
+                        let (raw, was_fixed) = num_arg(a, if is_add { "+" } else { "*" });
+                        // Promote an integer to Q16.16 when mixed with a fixed.
+                        let v = if any_fixed && !was_fixed {
+                            raw.wrapping_mul(FIXED_SCALE)
+                        } else {
+                            raw
+                        };
+                        acc = if is_add {
+                            acc.wrapping_add(v)
+                        } else if any_fixed {
+                            // Q16.16 product needs one rescale per multiply.
+                            acc.wrapping_mul(v) >> 16
+                        } else {
+                            acc.wrapping_mul(v)
+                        };
+                    }
+                    num_out(acc, any_fixed)
+                }),
+            );
+        }
+
+        // `-` negates one argument and left-folds two or more; `/` left-folds.
+        for name in ["-", "/"] {
+            let is_sub = name == "-";
+            reg(
+                name,
+                Arc::new(move |args: Vec<Types>| -> Types {
+                    let op = if is_sub { "-" } else { "/" };
+                    if args.is_empty() {
+                        panic!("`{op}` needs at least one argument");
+                    }
+                    let any_fixed = args.iter().any(|a| matches!(a, Types::Fixed(_)));
+                    let promote = |v: &Types| -> i64 {
+                        let (raw, was_fixed) = num_arg(v, op);
+                        if any_fixed && !was_fixed {
+                            raw.wrapping_mul(FIXED_SCALE)
+                        } else {
+                            raw
+                        }
+                    };
+                    let first = promote(&args[0]);
+                    if args.len() == 1 {
+                        if is_sub {
+                            return num_out(first.wrapping_neg(), any_fixed);
+                        }
+                        panic!("`/` needs at least two arguments");
+                    }
+                    let mut acc = first;
+                    for a in &args[1..] {
+                        let v = promote(a);
+                        acc = if is_sub {
+                            acc.wrapping_sub(v)
+                        } else {
+                            if v == 0 {
+                                panic!("`/` division by zero");
+                            }
+                            if any_fixed {
+                                // Q16.16 quotient: pre-scale to keep the point.
+                                acc.wrapping_mul(FIXED_SCALE) / v
+                            } else {
+                                acc / v
+                            }
+                        };
+                    }
+                    num_out(acc, any_fixed)
+                }),
+            );
+        }
+
+        // Comparisons and `mod`: strictly two public operands.
+        for name in ["==", "<", ">", "<=", ">=", "mod"] {
+            reg(
+                name,
+                Arc::new(move |args: Vec<Types>| -> Types {
+                    if args.len() != 2 {
+                        panic!("`{name}` expects exactly 2 arguments");
+                    }
+                    let any_fixed = args.iter().any(|a| matches!(a, Types::Fixed(_)));
+                    let promote = |v: &Types| -> i64 {
+                        let (raw, was_fixed) = num_arg(v, name);
+                        if any_fixed && !was_fixed {
+                            raw.wrapping_mul(FIXED_SCALE)
+                        } else {
+                            raw
+                        }
+                    };
+                    let (a, b) = (promote(&args[0]), promote(&args[1]));
+                    match name {
+                        "==" => truth(a == b),
+                        "<" => truth(a < b),
+                        ">" => truth(a > b),
+                        "<=" => truth(a <= b),
+                        ">=" => truth(a >= b),
+                        _ => {
+                            if b == 0 {
+                                panic!("`mod` by zero");
+                            }
+                            num_out(a % b, any_fixed)
+                        }
+                    }
+                }),
+            );
+        }
+
+        // ─── List procedures ────────────────────────────────────────────────
+        reg(
+            "length",
+            Arc::new(move |args: Vec<Types>| -> Types {
+                match args.as_slice() {
+                    [Types::List(v)] => Types::Num(v.len() as i64),
+                    [other] => panic!("length expects a list, got {other:?}"),
+                    _ => panic!("length expects 1 argument"),
+                }
+            }),
+        );
+        reg(
+            "append",
+            Arc::new(move |args: Vec<Types>| -> Types {
+                let mut out = Vec::new();
+                for a in args {
+                    match a {
+                        Types::List(v) => out.extend(v),
+                        other => panic!("append expects lists, got {other:?}"),
+                    }
+                }
+                Types::List(out)
+            }),
+        );
+        reg(
+            "reverse",
+            Arc::new(move |args: Vec<Types>| -> Types {
+                match args.as_slice() {
+                    [Types::List(v)] => {
+                        let mut v = v.clone();
+                        v.reverse();
+                        Types::List(v)
+                    }
+                    [other] => panic!("reverse expects a list, got {other:?}"),
+                    _ => panic!("reverse expects 1 argument"),
+                }
+            }),
+        );
+        reg(
+            "list-ref",
+            Arc::new(move |args: Vec<Types>| -> Types {
+                match args.as_slice() {
+                    // The index must be public: a secret index would need a
+                    // linear scan of muxes over the whole list (or ORAM), which
+                    // is a protocol decision, not something a list accessor
+                    // should make silently. See docs/survey.md §3.
+                    [Types::List(v), Types::Num(i)] => {
+                        let i = usize::try_from(*i)
+                            .unwrap_or_else(|_| panic!("list-ref: negative index {i}"));
+                        v.get(i)
+                            .cloned()
+                            .unwrap_or_else(|| panic!("list-ref: index {i} past end (len {})", v.len()))
+                    }
+                    [Types::List(_), Types::Share(_)] => {
+                        panic!("list-ref: index is secret; a secret index needs an explicit mux scan")
+                    }
+                    _ => panic!("list-ref expects (list-ref lst index)"),
+                }
+            }),
+        );
+    }
+
     /// Reveal a shared value to the caller (simulated reveal via backend).
     pub fn reveal(&self, sref: &crate::interpreter::backend::ShareRef) -> crate::crypto::types::Fr {
         let mut be = self.backend.lock().unwrap_or_else(|e| e.into_inner());
@@ -2819,6 +3297,8 @@ fn from_persist_value(p: PersistValue) -> Option<Types> {
 
 fn expr_short(e: &Expr) -> String {
     match e {
+        Expr::Define(n, _) => format!("Define({n})"),
+        Expr::Set(n, _) => format!("Set({n})"),
         Expr::Quote(_) => "Quote".to_string(),
         Expr::Eval(_) => "Eval".to_string(),
         Expr::UnOp(_, _) => "UnOp".to_string(),
@@ -2850,6 +3330,8 @@ fn expr_short(e: &Expr) -> String {
 fn cont_short(c: &Continuation) -> String {
     match c {
         Continuation::Halt => "Halt".to_string(),
+        Continuation::Define { name, .. } => format!("DefineCont({name})"),
+        Continuation::Set { name, .. } => format!("SetCont({name})"),
         Continuation::BinOpLeft { .. } => "BinOpLeft".to_string(),
         Continuation::BinOpRight { .. } => "BinOpRight".to_string(),
         Continuation::UnOp { .. } => "UnOp".to_string(),
@@ -3322,6 +3804,17 @@ pub fn eval_plain_string(src: &str) -> String {
             println!("eval_plain: quoted value: {:?}", v);
             // Return the string representation of the quoted value as string
             v.to_string()
+        }
+        // Q16.16, rendered the way the REPL renders it. Previously this
+        // panicked, so a fixed-point result could not be asserted at all
+        // without first pushing it through `fixed->int`.
+        Types::Fixed(raw) => {
+            use crate::interpreter::ast::FIXED_SCALE;
+            let whole = raw / FIXED_SCALE;
+            let frac = (raw % FIXED_SCALE).abs();
+            let frac_digits = (frac * 10_000) / FIXED_SCALE;
+            let sign = if raw < 0 && whole == 0 { "-" } else { "" };
+            format!("{sign}{whole}.{frac_digits:04}")
         }
         other => panic!("expected Num, got: {:?}", other),
     }

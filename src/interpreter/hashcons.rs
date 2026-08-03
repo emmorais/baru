@@ -88,6 +88,10 @@ pub enum Tag {
     VFheCiphertext,
     /// Q16.16 fixed-point literal (`Expr::Fixed`).
     EFixed,
+    /// `(define name value)` (`Expr::Define`).
+    EDefine,
+    /// `(set! name value)` (`Expr::Set`).
+    ESet,
 }
 
 /// An interned node: a tag, an inline byte payload for leaves, and links to
@@ -228,6 +232,8 @@ impl Store {
     /// Intern a runtime [`Types`] value, returning its handle.
     pub fn intern_value(&mut self, v: &Types) -> NodeId {
         match v {
+            // Interned like any other opaque builtin: it has no structure.
+            Types::NativeApply => self.intern(Tag::VNative, vec![], vec![]),
             Types::Num(n) => self.num(*n),
             Types::Fixed(v) => self.intern(Tag::VFixed, v.to_le_bytes().to_vec(), vec![]),
             Types::Bool(b) => self.boolean(*b),
@@ -352,6 +358,16 @@ impl Store {
             Expr::Cons(a, b) => {
                 let (ah, bh) = (self.intern_expr(a), self.intern_expr(b));
                 self.tuple(Tag::ECons, &[ah, bh])
+            }
+            Expr::Define(name, value) => {
+                let n = self.intern(Tag::EVar, name.as_bytes().to_vec(), vec![]);
+                let v = self.intern_expr(value);
+                self.tuple(Tag::EDefine, &[n, v])
+            }
+            Expr::Set(name, value) => {
+                let n = self.intern(Tag::EVar, name.as_bytes().to_vec(), vec![]);
+                let v = self.intern_expr(value);
+                self.tuple(Tag::ESet, &[n, v])
             }
             Expr::Lambda(params, body) => {
                 let p = self.sym_list(params);

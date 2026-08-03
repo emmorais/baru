@@ -1622,9 +1622,21 @@ Measured, two parties, semi-honest, 4096 triples:
 | **lowgear (SHE)** | `F_941356466589171713` | **192** | 73 400 | 2 | ✓ |
 | semi2k (OT) | `Z_2^64` | 3074 | 2 620 | 3 | ✓ |
 
-LowGear's ~61-bit field covers Semi2k's 64-bit values without CRT limbs, so the
-comparison is direct: **192 B/triple against OT's 3074 — a 16.3× communication
-advantage**, and 2× better than the literature's 384 B estimate.
+**⚠️ CORRECTED 2026-08-01 — the two rows are over different domains.** This
+section previously read "LowGear's ~61-bit field covers Semi2k's 64-bit values
+without CRT limbs, so the comparison is direct: 192 against 3074 — a 16.3×
+communication advantage". That is wrong: a ~61-bit prime field does **not**
+represent every 64-bit value, so the raw table compares a 61-bit field triple
+against a 64-bit ring triple.
+
+At **equal 64-bit width** LowGear needs two CRT limbs, giving **384 B/triple
+against OT's 3074 — an 8.0× communication advantage**, which is the figure to
+quote. `bench-triples` now prints the equal-width line itself so the
+apples-to-apples number cannot be read off the raw table by mistake. The 192 B
+figure remains correct *for a 60-bit prime field*, and is still 2× better than
+the literature's 384 B estimate at that width.
+
+The direction of the finding is unchanged; only its magnitude was overstated.
 
 **The surprise, and a correction to our own model.** `mpcc::cost` asserted that
 *"LowGear trades bandwidth for CPU: its preprocessing is compute-bound."* That
@@ -1652,8 +1664,9 @@ behaviour. ZKPoPK is the bulk of the Overdrive paper and is deliberately absent
 
 **The hybrid never beats SHE-preprocessed MPC at any width measured**, and
 LowGear tracks the trusted-dealer *lower bound* within 5 ms at width 64 —
-because its preprocessing is **192 B/triple against OT's 3136, 16.3× cheaper**,
-and ~28× faster. An earlier composed estimate said the crossover moved from
+because its preprocessing is **384 B/triple against OT's 3074 at equal 64-bit
+width — 8.0× cheaper** (see the correction in VI.4; the raw 192 B figure is for
+a narrower field), and ~28× faster. An earlier composed estimate said the crossover moved from
 width 64 to 4096; measuring it properly says it is gone in this range entirely.
 
 That is a real qualification to the paper outline's E25, whose conclusion — *"the

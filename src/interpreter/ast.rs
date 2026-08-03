@@ -30,6 +30,20 @@ pub enum Expr {
     Char(char),
     Bool(bool),
     Private(Box<Expr>), // NEW: (private expr) for ZKP witness marking
+    /// `(define name value)` — bind in the current environment.
+    ///
+    /// Unlike the derived forms in the parser, this needs its own variant
+    /// because it *mutates* an environment, which no combination of
+    /// `let`/`if`/`lambda` expresses. The circuit backends reject it: a circuit
+    /// has no environment to extend at proving time.
+    Define(String, Box<Expr>),
+    /// `(set! name value)` — assign to an existing binding.
+    ///
+    /// Bindings are `Rc<RefCell<Types>>` shared between an environment and the
+    /// closures that captured it, so assignment is visible through every
+    /// closure over the same variable — Scheme's semantics, and the reason
+    /// `set!` is worth having rather than simulating with rebinding.
+    Set(String, Box<Expr>),
 }
 
 // Implement to_string for Expr
@@ -46,6 +60,8 @@ impl std::fmt::Display for Expr {
                 write!(f, "{}.{:04}", whole, frac_digits)
             }
             Expr::Var(v) => write!(f, "{}", v),
+            Expr::Define(n, v) => write!(f, "(define {} {})", n, v),
+            Expr::Set(n, v) => write!(f, "(set! {} {})", n, v),
             Expr::Quote(e) => write!(f, "'{}", e),
             Expr::Eval(e) => write!(f, "(eval {})", e),
             Expr::BinOp(op, lhs, rhs) => match op {
@@ -165,11 +181,25 @@ pub enum Types {
     NativeFunc(Arc<dyn Fn(Vec<Types>) -> Types + Send + Sync>),
     /// An FHE ciphertext handle (serialised as JSON for REPL round-trips).
     FheCiphertext(crate::fhe::backend::FheCiphertextHandle),
+    /// `apply` — a procedure the *evaluator* must implement, not a
+    /// [`Types::NativeFunc`].
+    ///
+    /// A `NativeFunc` receives values and returns a value; it has no way to
+    /// *call* a closure, which is precisely what `apply` must do. So `apply` is
+    /// a distinguished value that the call dispatcher recognises and expands.
+    ///
+    /// It is a value rather than a special form on purpose: in Scheme `apply` is
+    /// an ordinary procedure, so `(let ((apply ...)) ...)` must shadow it. A
+    /// parser-level special form would silently capture that name — which it did
+    /// in the first version of this change, breaking a higher-order test that
+    /// used `apply` as a user variable.
+    NativeApply,
 }
 
 impl Clone for Types {
     fn clone(&self) -> Self {
         match self {
+            Types::NativeApply => Types::NativeApply,
             Types::Num(n) => Types::Num(*n),
             Types::Fixed(v) => Types::Fixed(*v),
             Types::List(vs) => Types::List(vs.clone()),
@@ -188,6 +218,7 @@ impl Clone for Types {
 impl fmt::Debug for Types {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Types::NativeApply => write!(f, "NativeApply"),
             Types::Num(n) => write!(f, "Num({})", n),
             Types::Fixed(v) => {
                 let whole = v / FIXED_SCALE;
