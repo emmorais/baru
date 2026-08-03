@@ -173,7 +173,11 @@ pub struct Report {
     pub routes: Vec<RoutePoint>,
 }
 
-fn measure<F>(profile: NetworkProfile, body: F) -> (i64, CommStats, f64, Option<usize>)
+fn measure<F>(
+    profile: NetworkProfile,
+    nbits: usize,
+    body: F,
+) -> (i64, CommStats, f64, Option<usize>)
 where
     F: Fn(&mut TransportBackend<MpcTransport>, usize) -> (ShareRef, Option<usize>)
         + Send
@@ -185,6 +189,12 @@ where
     let (outs, comm) = run_parties(profile, move |me| {
         let body = body.clone();
         move |be: &mut TransportBackend<MpcTransport>| {
+            // Same wire width as the CNN and comparison benchmarks, so the byte
+            // figures this route reports are comparable with theirs rather than
+            // inflated by `u128` padding. `correct` below is the oracle.
+            if let Some(w) = crate::bench::cnn::wire_bits_for(nbits) {
+                be.set_wire_bits(w);
+            }
             let (r, rounds) = body(be, me);
             (be.reveal(&r, None), rounds)
         }
@@ -318,7 +328,7 @@ where
     let mut rounds = None;
     for &rtt in rtts {
         let profile = NetworkProfile::fixed_latency(Duration::from_micros(rtt * 500));
-        let (got, c, ms, r) = measure(profile, body.clone());
+        let (got, c, ms, r) = measure(profile, nbits, body.clone());
         correct &= to_signed(got as u128, nbits) == want;
         comm = c;
         rounds = r;

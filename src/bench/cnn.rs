@@ -124,28 +124,67 @@ const K: usize = 3; // conv kernel size
 const POOL: usize = 2; // max-pool window / stride
 const NCLASSES: usize = 10;
 
-/// Ring-share serialisation width for the MPC segment, from `BARU_WIRE_BITS`:
-/// `auto` for the safe `nbits + 1`, or an explicit width to experiment with.
+/// Ring-share serialisation width for this pipeline's MPC segment.
 ///
-/// Off by default: the wire has always carried 128-bit shares and every byte figure
-/// in the docs was measured that way, so changing it silently would invalidate them
-/// without saying so.
+/// **Narrowed by default since 2026-08-03**: the width is the model's own `nbits + 1`
+/// rather than the 128 the wire used to carry. `BARU_WIRE_BITS` overrides it —
+/// `auto` for the same derived width, an explicit number to experiment, and `128`
+/// to reproduce any figure measured before the change.
 ///
-/// **The precondition is real.** Every value *and intermediate product* in the MPC
-/// segment must fit in the chosen width — see
-/// [`TransportBackend::wire_bits`](crate::interpreter::transport_backend::TransportBackend::wire_bits).
-/// For this pipeline the widest intermediate is `bit × (a−b)` inside max-pool and
-/// argmax, so `nbits + 1` is the floor; below it results go *wrong* rather than slow,
-/// and wrong on some inputs and not others. A two-image spot check passed at 21 bits
-/// while the full scan failed, because the two embedded datasets have different
-/// moduli — which is why `auto` exists and why the encrypted-versus-plaintext check
-/// over every image, not a sample, is the thing that must be green before any figure
-/// measured at a narrowed width is quoted.
+/// # Why the default moved, and what it invalidates
 ///
-/// Worth measuring because ring shares are 84% padding at `nbits = 20` and `a2b` is
-/// almost nothing but ring shares; `docs/falcon-reproduction.md` has the table.
+/// A ring share was serialised as a `u128` whatever its width, so at `nbits = 20`
+/// four fifths of every ring message was zero padding. It is worth **5.6x** on the
+/// bit-decomposition route (29.9 → 5.3 MB per diagnosis) and 2.9x on Falcon, and
+/// because the three comparison protocols use ring traffic in very different
+/// proportions the overhead did not cancel between them — it made batched bit
+/// decomposition look like the byte-heaviest route when it is the cheapest, and it
+/// suppressed Falcon's crossover against garbled circuits by 15x.
+///
+/// **Every byte figure measured before this date is at 128 and is not comparable.**
+/// The affected documents say so where they quote one.
+///
+/// # The precondition
+///
+/// Every value *and intermediate product* must fit in the chosen width. The measured
+/// floor is `nbits` itself — pneumonia is exact at 20 and wrong at 19, organa exact
+/// at 22 and wrong at 21 — and one bit of margin is kept because the failure is
+/// **value-dependent and silent**: at 19 bits pneumonia still classified 2 of 3
+/// images correctly. A spot check therefore cannot establish a floor, which is why
+/// the oracle is `encrypted_matches_plaintext_on_real_scans` over every embedded
+/// image of both datasets rather than a sample.
+///
+/// A single width per *program* is what makes this sound at all;
+/// `TransportBackend::wire_bits` explains why a per-share width derived from `nbits`
+/// is not, and why two attempts at it produced silently wrong results.
+///
+/// # Which benchmarks narrow, and one that must not
+///
+/// | benchmark | width | byte effect |
+/// |---|---|---|
+/// | `bench-medmnist` / `bench-cnn` | `nbits + 1` | `a2b` 29.9 → 5.3 MB (5.6x) |
+/// | `bench-gc-compare` | `b + 1` | `a2b` 5.94 → 1.29 MB (4.6x) |
+/// | `bench-compiled-nn` | `nbits + 1` | 55.5 → 18.1 kB (3.1x) |
+/// | `bench-nn` | `NBITS + 1` | **none** — its traffic is input sharing and reveals, not ring resharing, so the width never reaches the wire |
+/// | `bench-malicious` | **128, deliberately** | must not narrow |
+///
+/// The malicious row is not an oversight. [`crate::crypto::aby3_verify::headroom_bits`]
+/// is `128 − used_bits`: the statistical security of the MAC check **is** the slack
+/// between the values' width and the full ring. Narrowing the wire to the value width
+/// would leave zero headroom and the check would prove nothing — the packing that the
+/// semi-honest paths just gained is unavailable to the actively-secure one *by
+/// construction*.
+///
+/// That has a consequence the repo has not yet measured and should: the 2.63x byte
+/// cost of active security is measured with both sides at 128, and it is a fair ratio
+/// at equal width. Against a *packed* semi-honest baseline the true cost is larger,
+/// because only one side can pack. Quantifying it needs a run, not an argument, so no
+/// figure is claimed here.
 pub fn wire_bits_for(nbits: usize) -> Option<u32> {
-    match std::env::var("BARU_WIRE_BITS").ok()?.as_str() {
+    let Ok(spec) = std::env::var("BARU_WIRE_BITS") else {
+        return Some(nbits as u32 + 1);
+    };
+    match spec.as_str() {
         // The safe choice, and the reason it is spelled rather than numeric: the
         // floor is `nbits + 1`, which is a property of the *model*. Pneumonia runs
         // at `2^20` and needs 21; organa runs at `2^22` and needs 23. A global 21

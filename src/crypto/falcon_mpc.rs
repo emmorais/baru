@@ -1200,14 +1200,30 @@ const DELTA_WIRE_BITS: u32 = 4;
 ///    `δ ⊕ r` against a fresh ring/`Z₂` daBit. `r` is a uniform secret bit, so
 ///    the opened value is uniform and independent of `δ`.
 ///
-/// # Cost, stated honestly
+/// # Cost, measured
 ///
-/// One `a2b` per element — the very protocol Falcon's online phase exists to
-/// avoid. So Falcon is *not* cheaper than [`NonlinMode::A2b`] when offline and
-/// online are added together; it is cheaper online, which is the claim its
-/// tables make and the one `docs/falcon-reproduction.md` measures. Preprocessing
-/// is input-independent and can be generated ahead of any query, which is what
-/// makes the split meaningful rather than an accounting trick.
+/// One `a2b` per element — the very protocol Falcon's online phase exists to avoid.
+/// Measured at ℓ = 20 by `falcons_cost_is_mostly_offline`, per comparison and per
+/// party: **289 B offline against 34 B online**, so preprocessing is **89% of the
+/// bytes** and 71% of the messages, and 8.9× of the wall time.
+///
+/// Two things follow, and an earlier version of this comment got the first wrong.
+///
+/// It claimed Falcon is "not cheaper than [`NonlinMode::A2b`] once offline and online
+/// are added together". **That is false at the current encoding**: 289 + 34 = 323 B
+/// per comparison against `a2b`'s measured 954 B (1.29 MB over 1352 comparisons,
+/// `bench-gc-compare`), so Falcon is ~3× cheaper in *total* bytes, not merely online.
+/// The claim was written when ring shares still went on the wire as `u128`, which
+/// inflated this protocol far more than `a2b` because it is the more
+/// preprocessing-heavy of the two.
+///
+/// Second, and this one holds: because the split is 89/11, **any comparison that
+/// charges totals charges Falcon roughly nine times its online cost.** That is the
+/// right way to read the crossover in `docs/falcon-reproduction.md` — it is a
+/// total-cost boundary, and an online-only boundary would sit far above it.
+/// Preprocessing is input-independent and can be generated before any query arrives,
+/// which is what makes the distinction a real deployment property rather than an
+/// accounting trick.
 ///
 /// [`NonlinMode::A2b`]: crate::interpreter::transport_backend::NonlinMode::A2b
 pub fn random_wrap_masks<T: Transport>(
@@ -2073,6 +2089,149 @@ mod tests {
     }
 
     /// One party's traffic for a batched `Π_DReLU` of `n` elements at ℓ = 32.
+    /// One phase's cost: wall time, messages and bytes for party 0.
+    #[derive(Debug, Clone, Copy)]
+    struct Phase {
+        ms: f64,
+        messages: u64,
+        bytes: u64,
+    }
+
+    /// **`Π_DReLU`'s offline and online costs, measured apart.**
+    ///
+    /// This is the measurement `docs/falcon-reproduction.md` needed and could not
+    /// make: `TransportBackend` runs Falcon's preprocessing inline, so every latency
+    /// it reports is a *total*, and Falcon's own claim is about the **online** phase.
+    /// Charging one protocol for a phase its competitor does not have is what
+    /// invalidated the crossover in the first place — and reporting only totals is
+    /// what let that go unnoticed.
+    ///
+    /// Nothing here needs a backend refactor, because [`drelu_batch`] already takes
+    /// its preprocessing as a parameter: generate it, stop the clock, then run the
+    /// online protocol against it.
+    /// **Where Falcon's cost actually sits, offline against online.**
+    ///
+    /// The crossover in `docs/falcon-reproduction.md` was withdrawn three times, and
+    /// the first withdrawal was because Falcon's preprocessing had been free (dealt
+    /// from a public seed) while garbled circuits paid for everything. Once it was
+    /// generated for real, every reported figure became a *total* — which is the
+    /// opposite accounting error, because Falcon is designed to put work offline and
+    /// its published numbers are online-only.
+    ///
+    /// This test measures the two phases apart so both claims can be stated without
+    /// either bias. It asserts only what it can: that the split is lopsided in the
+    /// direction Falcon's design implies. The printed figures are what the docs
+    /// should quote when comparing against a protocol with no offline phase.
+    #[test]
+    #[ignore] // real 3-party transport
+    fn falcons_cost_is_mostly_offline() {
+        const LB: u32 = 20;
+        const N: usize = 256;
+        let (off, on) = measure_drelu_phases(N, LB);
+        let per = |p: Phase| (p.bytes as f64 / N as f64, p.messages);
+
+        println!(
+            "\n  Π_DReLU at ℓ={LB}, n={N} — party 0, phases apart\n    \
+             offline : {:>8.1} ms  {:>4} messages  {:>9.2} MB  ({:.0} B/op)\n    \
+             online  : {:>8.1} ms  {:>4} messages  {:>9.2} MB  ({:.0} B/op)\n    \
+             offline share: {:.0}% of bytes, {:.0}% of messages\n",
+            off.ms,
+            off.messages,
+            off.bytes as f64 / 1e6,
+            per(off).0,
+            on.ms,
+            on.messages,
+            on.bytes as f64 / 1e6,
+            per(on).0,
+            100.0 * off.bytes as f64 / (off.bytes + on.bytes) as f64,
+            100.0 * off.messages as f64 / (off.messages + on.messages) as f64,
+        );
+
+        assert!(
+            off.bytes > 0 && on.bytes > 0,
+            "both phases must actually communicate — a zero means the split is \
+             measuring nothing"
+        );
+        // The design claim: preprocessing is the expensive half. If this ever
+        // inverts, Falcon's online-only figures stop being the flattering ones and
+        // the comparison against garbled circuits needs revisiting in the other
+        // direction.
+        assert!(
+            off.bytes > on.bytes,
+            "expected preprocessing to dominate bytes, got offline {} vs online {}",
+            off.bytes,
+            on.bytes
+        );
+    }
+
+    fn measure_drelu_phases(n: usize, l_bits: u32) -> (Phase, Phase) {
+        use crate::bench::comm::CountingTransport;
+        use std::time::Instant;
+        let l = 1u64 << l_bits;
+        let handles = InprocHandle::create(3);
+        let mut joins = Vec::new();
+        for h in handles {
+            let counted = CountingTransport::new(h, 3);
+            let handle = counted.handle();
+            joins.push(thread::spawn(move || {
+                let mbx = Mailbox::new(counted);
+                let me = mbx.id();
+                let a: Vec<PartyShare> = (0..n)
+                    .map(|i| {
+                        let v = (i as u64).wrapping_mul(0x9E37) % l;
+                        let s = [v / 3, v / 3, v - 2 * (v / 3)];
+                        PartyShare {
+                            left: s[me % 3] as u128,
+                            right: s[(me + 1) % 3] as u128,
+                        }
+                    })
+                    .collect();
+
+                // ── Offline: everything query-independent ──
+                let t0 = Instant::now();
+                let off = 1_000_000;
+                let wm = random_wrap_masks(n, l_bits, off, me, &mbx);
+                let off2 = off + wrap_mask_id_span(n, l_bits);
+                let (beta_z2, beta_fp) = random_dabits_fp(n, off2, me, &mbx);
+                let off3 = off2 + dabit_id_span(n);
+                let masks = random_nonzero_masks(n, off3, me, &mbx);
+                let pre: Vec<WrapPreproc> = wm
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, (x, bits, delta))| WrapPreproc {
+                        x,
+                        bits,
+                        delta,
+                        beta_fp: beta_fp[i],
+                        beta_bit: beta_z2[i],
+                        m: masks[i],
+                    })
+                    .collect();
+                let offline = Phase {
+                    ms: t0.elapsed().as_secs_f64() * 1e3,
+                    messages: handle.stats().messages,
+                    bytes: handle.stats().bytes,
+                };
+
+                // ── Online: the comparison itself ──
+                let t1 = Instant::now();
+                let _bits = drelu_batch(&a, &pre, l_bits, PC_ID_BLOCK, me, &mbx);
+                let after = handle.stats();
+                let online = Phase {
+                    ms: t1.elapsed().as_secs_f64() * 1e3,
+                    messages: after.messages - offline.messages,
+                    bytes: after.bytes - offline.bytes,
+                };
+                (offline, online)
+            }));
+        }
+        let mut out: Vec<(Phase, Phase)> = joins
+            .into_iter()
+            .map(|j| j.join().expect("party panicked"))
+            .collect();
+        out.remove(0)
+    }
+
     fn measure_drelu(n: usize, l_bits: u32) -> (u64, u64) {
         use crate::bench::comm::CountingTransport;
         let l = 1u64 << l_bits;

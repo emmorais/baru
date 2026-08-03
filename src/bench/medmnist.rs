@@ -87,6 +87,15 @@
 //! worth 2.0× on the MPC segment at that latency — a constant-round protocol
 //! pays where rounds cost.
 //!
+//! **The 10.1 MB is unchanged by the 2026-08-03 encoding change and the other byte
+//! figures are not.** Ring shares used to go on the wire as `u128` whatever their
+//! width; they now carry the model's own width
+//! ([`crate::bench::cnn::wire_bits_for`]). That leaves this configuration alone
+//! because it is garbled-dominated — ring traffic is 5% of it — but `a2b` fell
+//! **29.9 → 5.3 MB** and Falcon **10.1 → 3.5 MB**, both of which were mostly
+//! padding. Any byte figure elsewhere in the repo dated before that change is at the
+//! old encoding; `BARU_WIRE_BITS=128` reproduces it.
+//!
 //! The threading lives in the multi-modular NTT (independent primes, plus a
 //! pure-map CRT reconstruction), is bit-identical to the serial path, and is
 //! switchable — so the core-count-independent figure stays quotable.

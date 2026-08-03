@@ -468,6 +468,24 @@ The measurement was worth making precisely because the conclusion flipped: the
 effect is real, and it lands almost entirely on a configuration the headline
 does not use.
 
+##### Resolved 2026-08-03 — prediction confirmed, and consequence 2 was wrong
+
+The encoding is now fixed rather than annotated: ring shares are serialised at the
+model's own width by default (`bench::cnn::wire_bits_for`). **The estimate above was
+accurate.** It predicted `a2b`'s true content at ≈5.1 MB against a reported 29.9;
+measured at the derived width it is **5.3 MB**, the difference being the one bit of
+margin the default keeps (`29.5 × 21/128 + 0.5 = 5.34`). Bit-exact over every
+embedded image of both datasets.
+
+Consequence 1 stands and is discharged. **Consequence 2 was wrong**, and its error is
+instructive: it reasoned that only the `--gc` path mattered, where ring traffic is
+5%. But the comparison this document was built to make is *Falcon against garbled
+circuits*, and Falcon is **90% ring traffic** — so the padding fell almost entirely
+on one side of the very comparison the stage exists for. It suppressed Falcon's
+crossover against `gc` by **15×**: from below 30–100 Mbps to below 2–4. Deciding that
+an encoding issue is not a blocker requires knowing which comparison will land on it,
+and this one guessed.
+
 10. **Batched ring reveal.** ✅ **Done 2026-08-01**
     (`aby3_protocol::reveal_batch_party`). `Π_WA` opens one masked value per
     DReLU, and the only reveal the semi-honest path had was per-share — `N−1`
@@ -837,16 +855,28 @@ interchangeable before any cost is quoted.
 
 ### Measured on MedMNIST, one encrypted diagnosis
 
-| mode | messages | traffic | latency | matches plaintext |
-|---|---|---|---|---|
-| `a2b` | 114 | 29.9 MB | 2367 ms | ✅ |
-| `--gc` | 61 | 10.1 MB | 489 ms | ✅ |
-| `--falcon` | 128 | **8.5 MB** | 1112 ms | ✅ |
+Re-measured 2026-08-03 with a real offline phase for Falcon and the ring encoding
+narrowed to the model's width (both changes are described below; the earlier row for
+`--falcon` was 128 messages and 8.5 MB against *dealt* preprocessing, and every
+figure here was previously inflated by `u128` padding):
 
-**Falcon is the lowest-bandwidth route and `gc` the lowest-latency one** — 1.2×
-fewer bytes against 2.3× more time. Neither dominates, which is exactly the
+| mode | messages | traffic | of which ring | latency | matches plaintext |
+|---|---|---|---|---|---|
+| `a2b` | 114 | 5.3 MB | 4.8 MB | 1412 ms | ✅ |
+| `--gc` | 61 | 10.1 MB | 0.5 MB | **327 ms** | ✅ |
+| `--falcon` | 292 | **3.5 MB** | 2.6 MB | 1901 ms | ✅ |
+
+**Falcon is the lowest-bandwidth route and `gc` the lowest-latency one** — 2.9×
+fewer bytes against 5.8× more time. Neither dominates, which is exactly the
 crossover the cost model exists to decide, now backed by three interchangeable
 implementations rather than an argument.
+
+Two things changed in this table that are easy to misread. Falcon's message count
+rose from 128 to 292 because its preprocessing is now generated rather than dealt —
+that is the price of it being secure at all. And `a2b` fell from 29.9 MB to 5.3,
+which makes it the *middle* route on bytes rather than the worst by 3×; its old
+figure was 99% ring traffic at 84% padding and said more about this crate's
+serialisation than about bit decomposition.
 
 ### Two things it needed, both worth naming
 
@@ -942,97 +972,93 @@ protocol and the network vary; every cell is checked against the plaintext
 argmax and the table refuses to print clean if any disagreed. Latency per
 encrypted diagnosis, ms, `--precompute` on (so these are *online* figures):
 
-### ⚠️ The crossover is withdrawn (2026-08-03)
+### The crossover, measured properly (2026-08-03)
 
-Re-measured with **all four** offline pieces interactive, i.e. with bit composition
-in place. The crossover does not survive it:
+The boundary this document reported at **15–20 Mbps** is withdrawn: it was measured
+while `Π_WA`'s masks were dealt from a shared seed — free precisely because they were
+not secret — so it compared Falcon's *online* cost against garbled circuits' *total*
+cost. With a real offline phase (bit composition, above) and the ring encoding
+narrowed to the model's own width:
 
 | RTT | 1000 | 100 | 60 | 40 | 30 | 20 | 15 | 10 Mbps |
 |---|---|---|---|---|---|---|---|---|
-| **0 ms** gc | **595** | **2851** | **5166** | **6752** | **8281** | **12378** | **16153** | **23851** |
-| **0 ms** falcon | 2284 | 5301 | 7500 | 8583 | 10030 | 14207 | 17695 | 25172 |
-| **20 ms** gc | **2388** | **4526** | **6060** | **8192** | **10102** | **13984** | **17799** | **25335** |
-| **20 ms** falcon | 6841 | 8950 | 10595 | 12655 | 14558 | 18356 | 22065 | 29471 |
+| **0 ms** gc | **566** | **2928** | **5405** | **6672** | 8228 | 12294 | 15978 | 23525 |
+| **0 ms** falcon | 1950 | 5459 | 5805 | 6824 | **7898** | **10714** | **13533** | **19297** |
+| **20 ms** gc | **2273** | **4450** | **5931** | **7811** | **9713** | **13515** | **17364** | 24996 |
+| **20 ms** falcon | 6865 | 8087 | 9339 | 10645 | 12153 | 15029 | 17822 | **23386** |
 
-**Garbled circuits win at every point in that grid** — so the crossover this
-document previously reported at 15–20 Mbps is withdrawn. It was measured while
-`Π_WA`'s masks were dealt from a shared seed, free precisely because they were not
-secret, which made it a comparison between Falcon's *online* cost and garbled
-circuits' *total* cost.
+> **Crossover between 30 and 40 Mbps at RTT 0, and between 10 and 15 Mbps at
+> RTT 20 ms.** Garbled circuits win above, Falcon below, and higher RTT moves the
+> boundary *down* — it shrinks Falcon's region, because Falcon sends 4.7× the
+> messages.
 
-**But the boundary exists; it is below the grid.** Extending the sweep downward
-(2026-08-03, RTT 0):
-
-| Mbps | 8 | 4 | 2 | 1 | 0.5 |
-|---|---|---|---|---|---|
-| gc | **29780** | **58390** | 115916 | 230617 | 460647 |
-| falcon | 31337 | 59061 | **115138** | **226764** | **447365** |
-
-**Crossover between 2 and 4 Mbps**, with Falcon winning below it. That is a real
-deployment region — rural links, satellite backhaul, congested mobile — so the
-finding is not that the trade vanished but that it moved by an order of magnitude
-once both protocols were charged for their preprocessing.
-
-The traffic counts say why the boundary is so low:
+The mechanism, from the same run:
 
 | protocol | messages | MB wire | of which ring |
 |---|---|---|---|
 | gc | 61 | 10.1 | 0.5 |
-| falcon | 290 | 10.1 | 9.1 |
+| falcon | 288 | **3.5** | 2.6 |
 
-The two send **the same bytes**, so Falcon's 4.8× message disadvantage has almost
-nothing to trade against; only at very low bandwidth does the byte term dominate
-enough for its small edge to tell.
+Falcon is 2.88× cheaper in bytes and 4.7× dearer in messages, so the two terms
+genuinely trade and the boundary is where the trade balances. That is the claim the
+cost model exists to make, and it is now measured with **both** protocols charged for
+their preprocessing and **neither** paying for `u128` padding.
 
-#### The encoding is holding Falcon back, and fixing it moves the boundary 15×
+#### Read it as a *total-cost* boundary, because 89% of Falcon's cost is offline
 
-Nine of Falcon's 10.1 MB is ring resharing, and ring shares are serialised at
-whatever width the backend declares — 128 by default, for values 20 bits wide.
-`BARU_WIRE_BITS=auto` narrows that to the model's own width (see
-`bench::cnn::wire_bits_for`), and it is **bit-exact over every embedded image of both
-datasets** (`encrypted_matches_plaintext_on_real_scans`, 462 s). At that setting:
+Measured per comparison and per party at ℓ = 20 (`falcons_cost_is_mostly_offline`):
 
-| | messages | MB wire | crossover, RTT 0 | crossover, RTT 20 ms |
-|---|---|---|---|---|
-| gc | 61 | 10.1 | — | — |
-| falcon | 291 | **3.5** | **30–100 Mbps** | **10–30 Mbps** |
+| phase | ms | messages | bytes/op |
+|---|---|---|---|
+| offline | 1048 | 22 | **289** |
+| online | 118 | 9 | **34** |
 
-Falcon's traffic falls 2.9× and its winning region widens from *below 2–4 Mbps* to
-*below 30–100 Mbps*. `a2b` gains even more — 29.9 MB → **5.3 MB**, 5.6× — because it
-is almost nothing but ring traffic, which makes it the byte-cheapest of the three
-routes and directly contradicts this document's standing claim that it never wins.
+**Preprocessing is 89% of the bytes, 71% of the messages and 8.9× the time.** So a
+comparison that charges totals — which the sweep above does, because
+`lt_falcon_batch` runs preprocessing inline — charges Falcon roughly **nine times its
+online cost**. An online-only boundary would sit far above 30–40 Mbps.
 
-The default is left at 128 so no committed figure moves silently; every number in
-the tables above is at the default unless the row says otherwise.
+That is not a reason to quote the online figure instead. Falcon's preprocessing is
+query-independent and can be generated before a query arrives, so both numbers
+describe real deployments — a cold one pays the total, a warm one pays the online
+cost. The error to avoid is quoting one protocol's online cost against another's
+total, which is precisely how this document's first crossover went wrong. Both
+figures, labelled, or neither.
 
-#### Getting here took two corrections, and the second one is the interesting one
+It also corrects a claim made earlier on this page: that Falcon is not cheaper than
+`a2b` once both phases are counted. At the current encoding it is — 289 + 34 = 323 B
+per comparison against `a2b`'s 954 B — because the padding that used to hide this
+fell hardest on the preprocessing-heavy protocol.
 
-The first re-measurement put Falcon at **32.5 MB against garbled circuits' 10.1 MB**
-and concluded it was dearer in both terms, hence that no crossover could exist
-anywhere. That was wrong in a way worth recording: **82% of those bytes were
-padding.** Ring shares are packed at whatever width the caller declares, and
-`random_wrap_masks` was calling the general `a2b` path, which declares **128** — so
-20-bit values travelled in 128 bits.
+**The withdrawn number was wrong in two directions at once.** It put the boundary at
+15–20 Mbps by comparing Falcon's online cost against gc's total — which flattered
+Falcon — while simultaneously inflating Falcon's bytes 2.9× with padding, which
+penalised it. Correcting both moves the boundary *up*, to 30–40: Falcon wins over a
+**wider** region than the original claim, for entirely different reasons. Two errors
+had partly cancelled.
 
-Narrowing it to 4 bits took Falcon from 32.5 MB to **10.1 MB** with no protocol
-change at all. The precondition is the one `a2b_batch_party_at` states and
-`truncate_batch` already relies on: every consumer must work at that width or below,
-and here δ's only products are bit×bit before it is opened. `DELTA_WIRE_BITS`
-documents it at the call site.
+#### The three answers before this one
 
-So there were briefly three different answers — a crossover at 15–20 Mbps, no
-crossover possible, and a tie — and only the last is measured on a protocol that is
-both secure and not paying 6.4× for its encoding. Two of the three were produced by
-this harness in good faith, one after the other.
+Each was reproducible, computed the correct diagnosis, and agreed with the cost
+model — the first even matched a break-even prediction of 17.1 Mbps against 15–20
+measured. None of that detected the problem.
 
-Three claims, three statuses, and they must not be conflated:
-
-| | status |
+| reported | why it was wrong |
 |---|---|
-| "the crossover is at 15–20 Mbps" | **withdrawn** — Falcon's online cost against gc's total |
-| "Falcon is dearer in bytes, so no crossover exists" | **withdrawn** — 82% of the gap was padding |
-| "the two send the same bytes; gc wins on messages" | **current**, and reproducible from the table |
-| "Falcon's DReLU cannot repay its bandwidth" | **unsupported** — it has not been measured on a bit-packed wire |
+| 15–20 Mbps | Falcon's *online* cost against gc's *total* |
+| no crossover at any bandwidth | Falcon inflated 3.2× by serialisation padding |
+| a tie, no boundary worth quoting | the grid stopped above the boundary |
+
+What caught them was decomposing each total into the terms the cost model charges —
+phases, messages, bytes, and the padded share of bytes — and asking whether both
+protocols were being charged for the same things. The sweep now prints those terms
+next to every table for that reason.
+
+A methodological rule that came out of it: **a two-image spot check is not evidence
+about a wire format.** Narrowing to a fixed 21 bits was bit-exact for the `2^20`
+dataset and returned the wrong diagnosis for *every* image of the `2^22` one; only
+`encrypted_matches_plaintext_on_real_scans`, over every embedded image of both
+datasets, caught it.
 
 ### The `a2b` is probably avoidable — so this withdrawal is about the reproduction, not about Falcon
 

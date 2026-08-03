@@ -277,6 +277,15 @@ fn mpc_party_run(
 ) -> (Vec<i64>, Vec<Phase>) {
     const OWNER: usize = 0;
     let mut be = TransportBackend::new(me, transport);
+    // Ring shares carry `NBITS` on the wire rather than 128, matching the CNN path
+    // so byte figures from the two benchmarks are comparable. Values here are
+    // interpreted modulo `2^NBITS` (`fr_to_signed`), so arithmetic modulo the same is
+    // the semantics rather than a truncation of it. The plaintext reference above is
+    // the oracle: a width that is too narrow shows up as a wrong result, not a slow
+    // one. See `TransportBackend::wire_bits`.
+    if let Some(w) = crate::bench::cnn::wire_bits_for(NBITS) {
+        be.set_wire_bits(w);
+    }
     let mut t = Timer::new();
 
     let share_vec = |be: &mut TransportBackend<MpcTransport>, vals: &[i64]| -> Vec<ShareRef> {

@@ -39,11 +39,12 @@ not. Among the results that only a single-harness study can produce: the
 FHE-versus-MPC crossover is a property of *the baseline's preprocessing*, not of
 either cryptosystem, and it disappears entirely once MPC is given SHE-based
 preprocessing; and active security on the nonlinear surface of private inference
-costs 2.63× bytes but only 1.06× rounds. We also report our own withdrawn claims —
-a ZKP backend that proved nothing, an MPC bit-decomposition that leaked its inputs,
-and a comparison-protocol crossover that turned out to charge one side for
-preprocessing and not the other — because a survey that reports only what worked is
-not reporting.
+costs 2.63× bytes but only 1.06× rounds; and the choice between a garbled and a
+`wrap3`-style comparison protocol has a boundary at 30–40 Mbps that moves with RTT.
+We also report our own withdrawn claims — a ZKP backend that proved nothing, an MPC
+bit-decomposition that leaked its inputs, and that last boundary, whose location we
+published wrongly three times before measuring it — because a survey that reports
+only what worked is not reporting.
 
 ---
 
@@ -96,9 +97,9 @@ comparison as weaker evidence than our internal ones.
   program runs on every paradigm, with a validated network model and uniform
   accounting.
 - **Cross-paradigm findings** that are not visible from any single paradigm's
-  literature (§7), including a crossover whose *location* turns out to depend on a
-  parameter the original claims left implicit — and a second one we withdrew when
-  the same scrutiny was applied to it (§7.3).
+  literature (§7), including two crossovers whose *location* turns out to depend on
+  parameters the original claims left implicit — one of which we mislocated three
+  times ourselves before measuring it (§7.3).
 - A **methodology for honest benchmarking** (§6) — bit-exactness gating,
   machine-checked security attestations, and a discipline of recording
   withdrawn results — together with the record of what it caught in our own
@@ -272,10 +273,25 @@ dot-product row is a small-workload artifact — the semi-honest leg needs only 
 interactive calls, so a fixed pair-pool cost is amortized against nothing — and
 we report it rather than hide it.
 
-A second result generalizes: the statistical slack that ring-based verification
-normally charges as a widening to `Z_{2^{k+s}}` is **already paid for** when the
-implementation shares over a ring much wider than its values. Q16.16 values in a
-128-bit ring leave **59 bits** of statistical security at no widening cost.
+A second result generalizes, **with a correction we owe to §7.3's encoding fix.**
+The statistical slack that ring-based verification normally charges as a widening to
+`Z_{2^{k+s}}` is already present when the implementation shares over a ring much
+wider than its values: Q16.16 values in a 128-bit ring leave **59 bits** of
+statistical security. That much stands and is what `headroom_bits` computes.
+
+What we previously added — that this comes **at no widening cost** — is false, and
+the re-baseline is what exposed it. The 128-bit ring was not free; it was costing
+3.1–5.6× in bytes on every semi-honest path, which is precisely what packing those
+paths to their values' own width recovered (§7.3). The verified path *cannot* recover
+it: its security is `128 − used_bits`, so narrowing the wire to the value width sets
+λ to zero. The slack was never free — it was invisible, because nothing in the repo
+was packed and so nothing revealed its price.
+
+The consequence for the row above: **2.63× is a fair ratio at equal width and
+understates the cost of active security against a packed baseline**, because only the
+semi-honest side can pack. The multiplier is bounded by the packing factor we measured
+on comparable paths (3.1–5.6×), but we have not run the combination and so claim no
+number for it. It is on the agenda.
 
 ### 5.2 Garbled circuits
 
@@ -285,15 +301,40 @@ expensive part of 2-party garbling, this changes the economics substantially,
 and it is the reason garbling is competitive here at all.
 
 Measured head-to-head against bit decomposition through the identical transport
-(1352 comparisons, 20-bit): `a2b` needs 9 rounds and 5.94 MB; the garbled
-circuit needs 1 round and 1.69 MB. Wall clock favours garbling 4.2× on a LAN and
-4.9× on a 20 ms WAN.
+(1352 comparisons, 20-bit): `a2b` needs 9 rounds and **1.29 MB**; the garbled circuit
+needs 1 round and 1.69 MB. So **bit decomposition is the byte-cheaper of the two**,
+by 1.3×, and garbling's advantage is entirely in rounds — wall clock favours it
+18.8× on a LAN and 4.0× on an 80 ms / 100 Mbps WAN, the ratio shrinking as bandwidth
+rather than latency starts to bind.
 
-**An important correction to our own earlier claim.** That 4.2–4.9× is the
-*garbling primitive in isolation*. The deployable 3-party protocol, including
-the Y2A return leg that converts the boolean output back to an arithmetic share,
-is **1.4–1.7×**, worth 1.9× on the CNN's MPC segment. We record both because the
-gap between them is exactly the kind of thing that gets lost in citation.
+**This reverses a figure we published.** The same experiment previously reported
+`a2b` at 5.94 MB, making garbling look 3.5× cheaper in bytes *as well as* faster.
+That 4.6× difference was `u128` serialisation padding: a 20-bit ring share travelled
+in 128 bits, and `a2b` is almost entirely ring traffic while garbled tables are
+already compact — so the overhead fell on one side of the comparison only. With the
+encoding fixed (§7.3), the byte ordering flips and only the round advantage survives.
+Both routes remain bit-exact against the plaintext reference.
+
+**An important correction to our own earlier claim.** The 18.8–4.0× above is the
+*garbling primitive in isolation*. The deployable 3-party protocol, including the Y2A
+return leg that converts the boolean output back to an arithmetic share, is smaller:
+**7.7× on a LAN falling to 1.8× at 80 ms / 100 Mbps** for the comparison, and 3.9× to
+2.4× for the fused ReLU∘rescale. We record both because the gap between them is
+exactly the kind of thing that gets lost in citation.
+
+**A second correction, to a number this paragraph used to quote.** It gave
+**1.4–1.7×** for the deployable path, taken not from this experiment but from the
+CNN's *MPC segment* — a different benchmark on a different workload, presented as if
+it corrected this one. Measured today that segment is **6.1×** (a2b 1102 ms against
+gc 180 ms). The old figure was right when it was written and is stale for a reason
+recorded in §9: at that time an unbatched scheme-switch import was **94% of the MPC
+segment**, so it loaded both routes equally and compressed the ratio toward 1. Import
+is now 23 ms of 1102, and the ratio reflects the protocols instead of the plumbing.
+
+Both corrections illustrate the same rule, and it is the one worth taking away:
+**quote the deployable protocol, on the workload you are claiming about, and say
+which benchmark produced the number.** A ratio is only meaningful together with what
+was in the denominator.
 
 ### 5.3 Fully homomorphic encryption
 
@@ -543,82 +584,64 @@ the **maximum** over its instructions, not their sum; and conversions **batch
 per level**, so a crossing's cost depends on whether another crossing already
 happens there.
 
-### 7.3 A withdrawn result: the nonlinearity crossover
+### 7.3 The nonlinearity crossover, and three wrong answers on the way to it
 
 Baru implements three interchangeable comparison protocols — batched bit
 decomposition, garbled circuits, and Falcon's `wrap3`-based DReLU — behind one
-interface, verified to compute the same function bit-exactly. This section reported
-a **measured bandwidth crossover** between the last two: garbled circuits above
-~15 Mbps, Falcon below, with the boundary moving down as RTT rose.
-
-**That result is withdrawn.** It was measured while Falcon's `Π_WA` preprocessing
-was dealt from a shared seed — free precisely because it was not secret — so it
-compared Falcon's *online* cost against garbled circuits' *total* cost. With the
-offline phase generated by bit composition (§7.2), re-measured 2026-08-03:
+interface, verified to compute the same function bit-exactly. Latency per encrypted
+MedMNIST diagnosis, with **both** protocols charged for their preprocessing and
+neither paying for serialisation padding (2026-08-03):
 
 | RTT | 1000 | 100 | 60 | 40 | 30 | 20 | 15 | 10 Mbps |
 |---|---|---|---|---|---|---|---|---|
-| **0 ms** gc | **595** | **2851** | **5166** | **6752** | **8281** | **12378** | **16153** | **23851** |
-| **0 ms** falcon | 2284 | 5301 | 7500 | 8583 | 10030 | 14207 | 17695 | 25172 |
-| **20 ms** gc | **2388** | **4526** | **6060** | **8192** | **10102** | **13984** | **17799** | **25335** |
-| **20 ms** falcon | 6841 | 8950 | 10595 | 12655 | 14558 | 18356 | 22065 | 29471 |
+| **0 ms** gc | **566** | **2928** | **5405** | **6672** | 8228 | 12294 | 15978 | 23525 |
+| **0 ms** falcon | 1950 | 5459 | 5805 | 6824 | **7898** | **10714** | **13533** | **19297** |
+| **20 ms** gc | **2273** | **4450** | **5931** | **7811** | **9713** | **13515** | **17364** | 24996 |
+| **20 ms** falcon | 6865 | 8087 | 9339 | 10645 | 12153 | 15029 | 17822 | **23386** |
 
-Garbled circuits win at every point *in that grid* — so the ~15 Mbps boundary is
-withdrawn. **But the boundary exists below it.** Extending the sweep (RTT 0):
+**Crossover between 30 and 40 Mbps at RTT 0, and between 10 and 15 Mbps at RTT
+20 ms.** Garbled circuits win above, Falcon below; higher RTT moves the boundary
+*down*, shrinking Falcon's region. The mechanism is visible in the same run: Falcon
+sends 3.5 MB against gc's 10.1 (2.88× cheaper) in 288 messages against 61 (4.7×
+dearer), so the two cost terms trade and the boundary is where the trade balances.
 
-| Mbps | 8 | 4 | 2 | 1 | 0.5 |
-|---|---|---|---|---|---|
-| gc | **29780** | **58390** | 115916 | 230617 | 460647 |
-| falcon | 31337 | 59061 | **115138** | **226764** | **447365** |
+**This section previously reported three other answers, and the sequence is the more
+useful result.** Each was reproducible, computed the correct diagnosis, and agreed
+with our cost model; the first even matched a break-even prediction of 17.1 Mbps
+against 15–20 measured.
 
-**Crossover between 2 and 4 Mbps.** The trade did not vanish; charging both
-protocols for preprocessing moved it by an order of magnitude. 2–4 Mbps is still a
-real deployment region — rural links, satellite backhaul, congested mobile — so the
-qualitative claim survives at a very different location.
+| reported | why it was wrong |
+|---|---|
+| 15–20 Mbps | Falcon's preprocessing was dealt from a shared seed, free because it was not secret — so this compared Falcon's *online* cost against garbled circuits' *total* |
+| no crossover at any bandwidth | with a real offline phase Falcon measured 32.5 MB against 10.1 and looked dearer in both terms; **82% of those bytes were padding** |
+| a tie, no boundary worth quoting | the grid stopped at 10 Mbps, above the boundary |
 
-**A second artifact was suppressing it further.** Nine of Falcon's 10.1 MB is ring
-resharing, serialised at whatever width the backend declares: 128 bits by default,
-for values 20 bits wide. Narrowing to the model's own width (`BARU_WIRE_BITS=auto`,
-bit-exact over every embedded image of both datasets) gives:
+Two things are worth extracting. First, **the first answer was wrong in two
+directions at once**: dealt preprocessing flattered Falcon while `u128` padding
+penalised it, and correcting both moves the boundary *up* to 30–40 Mbps — Falcon wins
+a **wider** region than the original claim, for entirely different reasons. The
+errors had partly cancelled, which is why the number looked plausible.
 
-| | messages | MB wire | crossover, RTT 0 | crossover, RTT 20 ms |
-|---|---|---|---|---|
-| gc | 61 | 10.1 | — | — |
-| falcon | 291 | **3.5** | **30–100 Mbps** | **10–30 Mbps** |
+Second, and this is the methodological point: **neither bit-exactness gating nor
+cost-model agreement detects any of the three.** Both mechanisms confirm that a
+computation is correct and that its cost is explicable. Neither asks whether two
+measurements are *commensurable*. What caught these was decomposing each total into
+the terms the model charges — phases, messages, bytes, and the padded share of bytes
+— and checking that both protocols were charged for the same things. The sweep now
+prints those terms beside every table.
 
-Falcon's winning region widens 15×, from below 2–4 Mbps to below 30–100. And `a2b`
-— the route §7 has been dismissing as never winning — drops from 29.9 MB to
-**5.3 MB**, making it the byte-cheapest of the three. The three-way ranking was
-partly a ranking of which protocol used the padded encoding most.
+A consequence we now apply generally: **a spot check is not evidence about an
+encoding.** Narrowing the ring wire to a fixed 21 bits was bit-exact for the `2^20`
+dataset and returned the wrong diagnosis for *every* image of the `2^22` one — the
+floor is a property of the model, not a constant. Only the full-scan check over every
+embedded image of both datasets caught it.
 
-**So this section reported three wrong answers before the current one**, each
-internally consistent: a crossover at 15–20 Mbps (Falcon's online cost against
-garbled circuits' total), no crossover at any bandwidth (Falcon inflated 3.2× by
-padding), and a tie with no boundary worth quoting (the grid simply stopped above
-it). The current answer is a boundary at 2–4 Mbps by default, 30–100 with the
-encoding fixed.
-
-The transferable lesson is sharper than "be careful", and it is why we report the
-sequence rather than only the endpoint: **every one of those wrong answers passed
-bit-exactness gating and agreed with our own cost model.** The first even matched a
-break-even prediction of 17.1 Mbps against 15–20 measured. What caught them was
-decomposing each total into the terms the model charges — phases, messages, bytes,
-and the padded share of bytes — and asking whether both protocols were being charged
-for the same things. A harness can be self-consistent, reproducible, and
-mechanistically explicable while comparing two different quantities.
-
-What the architecture still supports is narrower and survives:
-
-> Three implementations of one comparison, bit-exact against each other behind a
-> single interface, so which protocol backs every ReLU, max-pool and argmax is a
-> one-line choice.
-
-That interchangeability is what made both errors detectable. What is not supported
-is "pick the protocol per deployment" — on this workload there is currently nothing
-to pick. And Falcon's own claim, that its *online* phase is cheap, remains untested
-here: `lt_falcon_batch` runs preprocessing inline, so every figure above is a total.
-Nor has either route been measured on a bit-packed wire, which §10 argues could
-reorder all three.
+**What this cost, and what it bought.** Fixing the encoding took `a2b` from 29.9 MB
+to 5.3 and Falcon from 10.1 to 3.5, leaving the garbled route untouched at 10.1
+because it is garbled-dominated. So the headline configuration's figures are
+unchanged, while the *ranking* of the three routes on bytes reversed: `a2b`, which
+§7 previously dismissed as never winning, is now the middle route rather than the
+worst by 3×.
 
 ---
 
@@ -699,33 +722,43 @@ bit, so the run aborts when `y=1` and completes when `y=0`. **Deferring the
 abort does not close this** — batching hides *when* an abort happens, not
 *whether* it happens. We had asserted the opposite before building it.
 
-**A crossover withdrawn three times, for three different reasons.** The location
-reported in §7.3 has been wrong three ways, and the sequence is the finding:
+**A crossover reported wrong three times, for three different reasons.** The
+boundary in §7.3 was published at ~15 Mbps (Falcon's *online* cost against garbled
+circuits' *total*, because Falcon's preprocessing was dealt from a shared seed), then
+as no boundary at all (Falcon inflated 3.2× by `u128` serialisation padding), then as
+a tie (the grid stopped above it). It is at **30–40 Mbps** at RTT 0.
 
-1. **~15 Mbps.** Measured while Falcon's `Π_WA` preprocessing was dealt from a shared
-   seed — free because it was not secret — so it compared one protocol's *online*
-   cost against the other's *total*.
-2. **No crossover at any bandwidth.** With a real offline phase Falcon measured
-   32.5 MB against 10.1, apparently dearer in both terms. **82% of those bytes were
-   serialisation padding**; declaring the wire width the protocol actually needs
-   brought it to 10.1 MB.
-3. **A tie, no boundary worth quoting.** The grid stopped at 10 Mbps. Extending it
-   found the crossover at **2–4 Mbps**, which is where it now sits — 30–100 Mbps once
-   the padded encoding is fixed everywhere.
+**All three passed our bit-exactness gate and agreed with our cost model**, and the
+first matched a break-even prediction of 17.1 Mbps against 15–20 measured. That is
+the uncomfortable finding: those two mechanisms establish that a computation is
+correct and that its cost is explicable, and neither asks whether two measurements
+are commensurable.
 
-**Every one of those three passed our bit-exactness gate and agreed with our cost
-model**, and the first even matched a break-even prediction of 17.1 Mbps against
-15–20 measured. That is the uncomfortable part: neither mechanism detects a
-comparison between two different quantities. What caught them was decomposing each
-total into the terms the model charges — phases, messages, bytes, padded share of
-bytes — and asking whether both protocols were charged for the same things. A
-plausible mechanism is not evidence of commensurability; in all three cases it
-concealed the absence of it.
+The first answer was also wrong in *both* directions at once — dealt preprocessing
+flattered Falcon, padding penalised it — so the errors partly cancelled and the
+result looked mechanistically sound. Correcting both moved the boundary up rather
+than down.
 
-One methodological consequence we now apply: a two-image spot check is not evidence
-about a wire format. Narrowing the encoding to 21 bits was exact for the `2^20`
-dataset and returned the wrong diagnosis for **every** image of the `2^22` one, and
-only a full-scan run over both datasets caught it.
+One rule came out of it that we now apply generally: a spot check is not evidence
+about an encoding. Narrowing the ring wire to a fixed 21 bits was exact for the
+`2^20` dataset and wrong for **every** image of the `2^22` one, because the safe
+width is a property of the model rather than a constant.
+
+**A byte comparison that was measuring our serialisation.** For a year the
+comparison-primitive experiment reported `a2b` at 5.94 MB against garbled circuits'
+1.69 MB, i.e. garbling 3.5× cheaper in bytes as well as faster. Ring shares were
+serialised as `u128` whatever their width, so a 20-bit value travelled in 128 bits;
+`a2b` is ~99% ring traffic and garbled tables are already compact, so the overhead
+fell on one side only. Re-measured with the encoding fixed, `a2b` is **1.29 MB** and
+is the byte-*cheaper* route. **Garbling's byte advantage is withdrawn; its round
+advantage stands and is larger than we reported** (18.8× on a LAN).
+
+A control run at the old width reproduces 5 938 236 B exactly, so the benchmark was
+never unstable — it was faithfully measuring a quantity nobody meant to compare. The
+same encoding suppressed the §7.3 crossover by 15×, and its cost had been estimated
+in advance at 5.9× and dismissed as not worth fixing because "the headline path is
+garbled-dominated". That reasoning was sound for the headline path and wrong for every
+comparison the padding was actually load-bearing in.
 
 **Comparison errors of framing.** Pricing FHE's *linear* part against MPC's
 *whole layer* (omitting the ReLU that FHE cannot do at all); computing a
@@ -853,7 +886,7 @@ hand-entered.
 |---|---|
 | Deep inference, zero bootstraps | `bench-deep-nn --depths 2,4,8,16,32` |
 | Private diagnosis | `bench-medmnist --dataset pneumonia` |
-| Nonlinearity comparison (withdrawn crossover, §7.3) | `bench-medmnist --sweep` |
+| Nonlinearity crossover (§7.3) | `bench-medmnist --sweep` |
 | Cost of active security | `bench-malicious --n 32 --bits 32` |
 | Triples: SHE vs OT | `bench-triples` |
 | FHE↔MPC crossover | `bench-layer` |
