@@ -1042,6 +1042,107 @@ pub fn run_cli(args: &[String]) -> Result<(), String> {
 mod tests {
     use super::*;
 
+    /// **The wire width can be narrowed program-wide, and this is the case that
+    /// proves it is not the narrowing that broke before.**
+    ///
+    /// `max2(a,b) = b + (a−b)·(a>b)` is the exact shape of both earlier failures:
+    /// a *one-bit* value multiplied by a 20-bit operand. Deriving the wire width
+    /// from the bit's own `nbits` made `max2(9,6)` return 22 020 105
+    /// (`TransportBackend::store` records it). A single program-wide width does not
+    /// have that failure mode, because every sharing is valid modulo the same
+    /// `2^wire_bits` and arithmetic there is closed — the only precondition is that
+    /// values and intermediates fit, which at `nbits = 20` means `a−b` needs 21 bits.
+    ///
+    /// So this sweeps down to 21 and asserts exactness at each step. It is the test
+    /// that has to pass before any byte figure measured at a narrowed width can be
+    /// believed, and it is why `wire_bits` is a backend setting rather than an
+    /// inference from `ShareRef`.
+    #[test]
+    fn the_wire_width_narrows_program_wide_without_breaking_the_bit_times_wide_product() {
+        const NBITS: usize = 20;
+        wire_width_cases(NBITS, &[128, 64, 32, 24, 21]);
+    }
+
+    /// **The safe wire width tracks the model's own width**, which is the mistake a
+    /// two-image spot check missed: a global 21 bits is exact for a `2^20` model and
+    /// returns the wrong diagnosis for *every* input of a `2^22` one. Only a
+    /// five-minute full-scan run caught it, and only on one of the two datasets.
+    ///
+    /// Measured floor is `nbits` itself — pneumonia is exact at 20 and wrong at 19,
+    /// organa exact at 22 and wrong at 21. `BARU_WIRE_BITS=auto` asks for `nbits + 1`
+    /// anyway, keeping one bit of margin for ~5% of the traffic, because the failure
+    /// is **value-dependent**: at 19 bits pneumonia got 2 of 3 images right, so a
+    /// narrow spot check cannot establish a floor and the margin is cheap insurance
+    /// against a workload whose intermediates run wider than these.
+    #[test]
+    fn the_safe_wire_width_tracks_the_models_own_width() {
+        for nbits in [16usize, 20, 22, 24] {
+            wire_width_cases(nbits, &[nbits as u32 + 1, nbits as u32]);
+        }
+    }
+
+    /// The `max2` cases for a model of width `nbits`, and their expected results.
+    ///
+    /// Derived from `nbits` rather than fixed, because values are signed two's
+    /// complement: at `nbits = 16` the largest positive is `2^15 − 1`, and a literal
+    /// that overflows it is a bug in the test rather than in the protocol. Getting
+    /// this wrong is how the first version of this test "failed" at 16 bits.
+    fn max2_cases(nbits: usize) -> (Vec<(u128, u128)>, Vec<u128>) {
+        let max_pos = (1u128 << (nbits - 1)) - 1;
+        let mid = 1u128 << (nbits - 3);
+        // Deliberately **not** including opposite-extreme pairs such as
+        // `(max_pos, −2^(n-1))`. Their difference is `2^n − 1`, which does not fit
+        // in signed `nbits` — and comparison here is `MSB(a − b)`, so it returns the
+        // wrong answer for them at *any* wire width, including the 128-bit default.
+        // That is a precondition of the comparison protocol, not of the encoding,
+        // and putting it in this test would conflate two unrelated limits.
+        let cases = vec![(9, 6), (6, 9), (mid, 4), (0, 0), (7, 7), (max_pos, 1)];
+        let want = vec![9, 9, mid, 0, 7, max_pos];
+        (cases, want)
+    }
+
+    /// `max2 = b + (a−b)·(a>b)` over [`max2_cases`], at one model width and one wire
+    /// width. The `bit × wide` product in the middle is the whole point.
+    fn max2_under_wire(nbits: usize, wire: u32) -> Vec<u128> {
+        let (cases, _) = max2_cases(nbits);
+        let (out, _) = run_parties(NetworkProfile::INSTANT, move |_me| {
+            let cases = cases.clone();
+            move |be: &mut TransportBackend<MpcTransport>| {
+                be.set_wire_bits(wire);
+                let mut got = Vec::new();
+                for (a, b) in cases.iter().copied() {
+                    let sa = be.share_public(a, nbits);
+                    let sb = be.share_public(b, nbits);
+                    let bit = be.lt_batch(&[(sb.clone(), sa.clone())])[0].clone();
+                    let diff = be.sub(&sa, &sb);
+                    let sel = be.mul_batch(&[(bit, diff)])[0].clone();
+                    let max = be.add(&sb, &sel);
+                    got.push(be.reveal(&max, None));
+                }
+                got
+            }
+        });
+        let mask: u128 = if wire >= 128 {
+            u128::MAX
+        } else {
+            (1u128 << wire) - 1
+        };
+        out[0].iter().map(|v| v & mask).collect()
+    }
+
+    /// [`max2_under_wire`] asserted exact at every width in `wires`.
+    fn wire_width_cases(nbits: usize, wires: &[u32]) {
+        let (_, want) = max2_cases(nbits);
+        for &wire in wires {
+            let got = max2_under_wire(nbits, wire);
+            assert_eq!(
+                got, want,
+                "nbits = {nbits}, wire_bits = {wire}: max2 came back wrong"
+            );
+        }
+    }
+
+
     #[test]
     fn mpc_only_matches_plaintext_on_real_protocol() {
         let data = make_layer(6, 3);

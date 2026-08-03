@@ -455,6 +455,12 @@ pub struct SweepCell {
     pub ms: f64,
     pub messages: f64,
     pub bytes: f64,
+    /// Of `bytes`, the ABY3 ring resharing — 16 B per element whatever the ring
+    /// width is. Carried because it decides whether the byte comparison between
+    /// two protocols means anything: a route whose traffic is mostly padding is
+    /// being charged for this crate's serialisation, not for its protocol, and
+    /// this repo has already drawn one wrong conclusion that way.
+    pub ring_bytes: f64,
     /// Every cell recomputes the same diagnosis; if one disagrees with the
     /// plaintext argmax the whole row is meaningless, so it is carried here
     /// rather than assumed.
@@ -511,6 +517,7 @@ pub fn sweep_crossover(
                     ms: per.total_ms,
                     messages: per.messages,
                     bytes: per.bytes,
+                    ring_bytes: per.ring_bytes,
                     matches_plaintext: ok,
                 });
             }
@@ -521,6 +528,18 @@ pub fn sweep_crossover(
 
 /// Print the sweep as a latency grid, then name the bandwidth at which the
 /// winner changes for each RTT — the number the whole experiment is for.
+/// Bandwidth label that survives sub-1 Mbps.
+///
+/// `{:.0}` printed the 0.5 Mbps row as `0`, which matters because that is exactly
+/// where the crossover turned out to be at the default wire encoding.
+fn fmt_bw(mbps: f64) -> String {
+    if mbps.fract() == 0.0 {
+        format!("{mbps:.0}")
+    } else {
+        format!("{mbps:.2}")
+    }
+}
+
 fn print_sweep(cells: &[SweepCell], rtts: &[u64], bws: &[f64], protocols: &[Nonlin]) {
     println!("crossover sweep — ms per encrypted diagnosis, * marks the winner\n");
     let mismatched = cells.iter().filter(|c| !c.matches_plaintext).count();
@@ -541,7 +560,7 @@ fn print_sweep(cells: &[SweepCell], rtts: &[u64], bws: &[f64], protocols: &[Nonl
         }
         println!();
         for &bw in bws {
-            print!("    {bw:<10.0}");
+            print!("    {:<10}", fmt_bw(bw));
             let best = protocols
                 .iter()
                 .filter_map(|&p| at(rtt, bw, p))
@@ -570,9 +589,9 @@ fn print_sweep(cells: &[SweepCell], rtts: &[u64], bws: &[f64], protocols: &[Nonl
                 .find(|w| winner(w[0]) != winner(w[1]) && winner(w[1]).is_some());
             match flip {
                 Some(w) => println!(
-                    "    → crossover between {:.0} and {:.0} Mbps: {} wins above, {} below\n",
-                    w[1],
-                    w[0],
+                    "    → crossover between {} and {} Mbps: {} wins above, {} below\n",
+                    fmt_bw(w[1]),
+                    fmt_bw(w[0]),
                     winner(w[0]).map(|p| p.short()).unwrap_or("?"),
                     winner(w[1]).map(|p| p.short()).unwrap_or("?"),
                 ),
@@ -585,6 +604,88 @@ fn print_sweep(cells: &[SweepCell], rtts: &[u64], bws: &[f64], protocols: &[Nonl
             println!();
         }
     }
+
+    // ── The two terms behind every cell above ────────────────────────────────
+    //
+    // Printed because a crossover is a claim about *trading* one term against the
+    // other, and the latencies alone do not show whether a trade is even on offer.
+    // A protocol can only win somewhere if it is cheaper in one term and dearer in
+    // the other; when one route is cheaper in **both**, no (rtt, bandwidth) pair
+    // favours the other and extending the grid cannot find one. That is the check
+    // the withdrawn crossover needed and did not have.
+    //
+    // These are counts, not the latency model's inputs: `ms` is measured wall-clock
+    // under a simulator with concurrent links, so a byte ratio does *not* predict
+    // the low-bandwidth limit of the columns — messages spread over links overlap.
+    // Read them as the two terms' relative size, not as a formula for the table.
+    //
+    // Query-independent for a given protocol, so one row each rather than per cell.
+    println!("  traffic per diagnosis (identical across the grid — only the link varies)");
+    println!(
+        "    {:<10}{:>10}{:>10}{:>15}",
+        "protocol", "messages", "MB wire", "of which ring"
+    );
+    for &p in protocols {
+        if let Some(c) = cells.iter().find(|c| c.nonlin == p) {
+            println!(
+                "    {:<10}{:>10.0}{:>10.1}{:>15.1}",
+                p.short(),
+                c.messages,
+                c.bytes / 1e6,
+                c.ring_bytes / 1e6,
+            );
+        }
+    }
+    if protocols.len() == 2 {
+        let get = |p: Nonlin| cells.iter().find(|c| c.nonlin == p);
+        if let (Some(x), Some(y)) = (get(protocols[0]), get(protocols[1])) {
+            let (a, b) = (protocols[0], protocols[1]);
+            // The ring term is broken out because it is where a protocol
+            // comparison can quietly stop being about protocols. Ring shares are
+            // packed at whatever width the caller declares, so a route that asks
+            // for 128 bits to carry 20-bit values pays 6.4x for nothing — and
+            // since the two comparison protocols differ in how much of their
+            // traffic is ring shares, that overhead does not cancel between them.
+            // It once made this very comparison read 3.2x the wrong way; see
+            // `docs/falcon-reproduction.md`. A large `of which ring` next to a
+            // large total is the signal to go and check the declared widths.
+            let cheaper_bytes = if x.bytes <= y.bytes { a } else { b };
+            let cheaper_msgs = if x.messages <= y.messages { a } else { b };
+            let bratio = x.bytes.max(y.bytes) / x.bytes.min(y.bytes).max(1.0);
+            let mratio = x.messages.max(y.messages) / x.messages.min(y.messages).max(1.0);
+            // A 1.01x byte ratio is a tie, not an advantage, and calling it a
+            // trade would license predicting a crossover from what is really
+            // noise. Below this margin the byte axis carries no signal and the
+            // boundary — if there is one — is set by the compute intercept
+            // instead, which is far outside any bandwidth worth quoting.
+            const TIE: f64 = 1.05;
+            if bratio < TIE {
+                println!(
+                    "    → the two routes send the SAME bytes to within {:.0}% ({bratio:.2}x), so \n\
+                     \x20     the byte axis cannot decide between them; {} wins on messages \n\
+                     \x20     ({mratio:.1}x) and any boundary is set by the compute intercept",
+                    (TIE - 1.0) * 100.0,
+                    cheaper_msgs.short(),
+                );
+            } else if cheaper_bytes == cheaper_msgs {
+                println!(
+                    "    → {} is cheaper in BOTH terms ({mratio:.1}x messages, {bratio:.2}x \n\
+                     \x20     bytes) — no (rtt, bandwidth) pair favours the other, so no crossover \n\
+                     \x20     exists however far the grid is widened",
+                    cheaper_bytes.short(),
+                );
+            } else {
+                println!(
+                    "    → the terms trade: {} is cheaper in bytes ({bratio:.2}x) and {} in \n\
+                     \x20     messages ({mratio:.1}x), so a crossover exists — low bandwidth \n\
+                     \x20     favours the byte-cheaper route, high RTT the message-cheaper one",
+                    cheaper_bytes.short(),
+                    cheaper_msgs.short(),
+                );
+            }
+        }
+    }
+    println!();
 }
 
 /// Running totals over the encrypted runs, so the report can quote a mean
@@ -854,14 +955,20 @@ fn print_report(r: &MedMnistReport) {
         r.per_image_bytes / 1e6
     );
     // The split matters because the two halves are encoded very differently:
-    // ring shares go out as `Vec<u128>` (16 B per element regardless of
-    // `nbits`), garbled material as packed bytes. A traffic figure that does not
-    // separate them cannot be compared against a bit-packed system.
+    // ring shares are packed at whatever width the backend declares, garbled
+    // material as compact bytes. A traffic figure that does not separate them
+    // cannot be compared against a bit-packed system — and the padding line below
+    // is why: at the 128-bit default a 20-bit value travels in 128 bits, so 84% of
+    // the ring half is nothing. `BARU_WIRE_BITS` narrows it (see `cnn`), which is
+    // worth 5.6x on this route, so the figure is computed from the width actually
+    // in force rather than hardcoded.
+    let wire = crate::bench::cnn::wire_bits_for(r.log2_t as usize).unwrap_or(128);
     println!(
-        "      of which : ring(ABY3) {:.1} MB [16 B/elem, ~{:.0}% padding], \
+        "      of which : ring(ABY3) {:.1} MB [{} b/elem on the wire, ~{:.0}% padding], \
          garbled {:.1} MB, other {:.1} MB",
         r.per_image_ring_bytes / 1e6,
-        100.0 * (1.0 - r.log2_t as f64 / 128.0),
+        wire,
+        100.0 * (1.0 - (r.log2_t as f64 / wire as f64)).max(0.0),
         r.per_image_gc_bytes / 1e6,
         (r.per_image_bytes - r.per_image_ring_bytes - r.per_image_gc_bytes) / 1e6
     );

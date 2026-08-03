@@ -46,6 +46,29 @@ pub struct TransportBackend<T: Transport> {
     /// through the same primitives, so this counts *how often each route had
     /// to synchronise*, independently of how it was written.
     interactive_calls: std::sync::atomic::AtomicUsize,
+    /// Width at which ring shares are **serialised**, distinct from any value's
+    /// `nbits`. Default 128, which is what the wire has always used.
+    ///
+    /// # Why this is a backend-wide setting and not per-share
+    ///
+    /// [`Self::store`] explains why narrowing a share to *its own* value width is
+    /// wrong: `lt` produces a one-bit value whose sharing is then multiplied by a
+    /// 20-bit operand, so its components must be valid modulo `2^20`, not `2^1`.
+    /// The required modulus is a property of the share's *future consumers*, which
+    /// is not known when it is created — which is why two attempts to derive it
+    /// from `nbits` produced silently wrong results.
+    ///
+    /// A single program-wide width sidesteps that entirely. Every sharing is valid
+    /// modulo `2^wire_bits`, arithmetic modulo `2^wire_bits` is closed, so any
+    /// consumer is satisfied provided **every value and intermediate product in the
+    /// program fits in `wire_bits`**. That is one global precondition instead of a
+    /// per-share inference, and it is checkable: the bit-exactness tests fail loudly
+    /// when it is violated, because a product that overflows comes back wrong.
+    ///
+    /// It is left at 128 so nothing changes unless a caller opts in. What it is
+    /// worth: ring traffic is 84% padding at the CNN's `nbits = 20`, and `a2b` is
+    /// almost entirely ring traffic — see `docs/falcon-reproduction.md`.
+    wire_bits: u32,
 }
 
 /// Id space one `lt_falcon_batch` reserves: the inner `Π_WA`, its `Π_PC` tree
@@ -109,7 +132,26 @@ impl<T: Transport> TransportBackend<T> {
             next_id: 1,
             nonlin: NonlinMode::A2b,
             interactive_calls: std::sync::atomic::AtomicUsize::new(0),
+            wire_bits: 128,
         }
+    }
+
+    /// Set the ring-share serialisation width. See the [`wire_bits`] field for the
+    /// precondition — every value **and intermediate product** must fit, or results
+    /// go silently wrong. All parties must agree, since it changes the encoding.
+    ///
+    /// [`wire_bits`]: Self::wire_bits
+    pub fn set_wire_bits(&mut self, bits: u32) {
+        assert!(
+            (2..=128).contains(&bits),
+            "wire_bits = {bits} outside 2..=128"
+        );
+        self.wire_bits = bits;
+    }
+
+    /// The current serialisation width.
+    pub fn wire_bits(&self) -> u32 {
+        self.wire_bits
     }
 
     /// Batched interactive protocol invocations so far — see the field docs.
@@ -542,8 +584,9 @@ impl<T: Transport + 'static> Backend for TransportBackend<T> {
             .iter()
             .map(|(a, b)| (self.get_cloned(a), self.get_cloned(b)))
             .collect();
-        let results = crate::crypto::aby3_protocol::mul_batch_party(
+        let results = crate::crypto::aby3_protocol::mul_batch_party_at(
             &party_pairs,
+            self.wire_bits,
             base_op_id,
             self.me,
             &self.mailbox,
@@ -708,9 +751,10 @@ impl<T: Transport + 'static> Backend for TransportBackend<T> {
         // One id block for the whole batch: `a2b_batch_party` runs the same
         // ~9 rounds as a single decomposition, just wider.
         let op_id = self.alloc_block(crate::crypto::aby3_protocol::A2B_ID_BLOCK);
-        let bit_sets = crate::crypto::aby3_protocol::a2b_batch_party(
+        let bit_sets = crate::crypto::aby3_protocol::a2b_batch_party_at(
             &party_vals,
             nbits,
+            self.wire_bits,
             op_id,
             self.me,
             &self.mailbox,

@@ -124,6 +124,39 @@ const K: usize = 3; // conv kernel size
 const POOL: usize = 2; // max-pool window / stride
 const NCLASSES: usize = 10;
 
+/// Ring-share serialisation width for the MPC segment, from `BARU_WIRE_BITS`:
+/// `auto` for the safe `nbits + 1`, or an explicit width to experiment with.
+///
+/// Off by default: the wire has always carried 128-bit shares and every byte figure
+/// in the docs was measured that way, so changing it silently would invalidate them
+/// without saying so.
+///
+/// **The precondition is real.** Every value *and intermediate product* in the MPC
+/// segment must fit in the chosen width — see
+/// [`TransportBackend::wire_bits`](crate::interpreter::transport_backend::TransportBackend::wire_bits).
+/// For this pipeline the widest intermediate is `bit × (a−b)` inside max-pool and
+/// argmax, so `nbits + 1` is the floor; below it results go *wrong* rather than slow,
+/// and wrong on some inputs and not others. A two-image spot check passed at 21 bits
+/// while the full scan failed, because the two embedded datasets have different
+/// moduli — which is why `auto` exists and why the encrypted-versus-plaintext check
+/// over every image, not a sample, is the thing that must be green before any figure
+/// measured at a narrowed width is quoted.
+///
+/// Worth measuring because ring shares are 84% padding at `nbits = 20` and `a2b` is
+/// almost nothing but ring shares; `docs/falcon-reproduction.md` has the table.
+pub fn wire_bits_for(nbits: usize) -> Option<u32> {
+    match std::env::var("BARU_WIRE_BITS").ok()?.as_str() {
+        // The safe choice, and the reason it is spelled rather than numeric: the
+        // floor is `nbits + 1`, which is a property of the *model*. Pneumonia runs
+        // at `2^20` and needs 21; organa runs at `2^22` and needs 23. A global 21
+        // silently returned the wrong diagnosis for **every** organa image (0/2)
+        // while pneumonia stayed exact — so a single number chosen by hand is a
+        // footgun, and this option exists so nobody has to choose one.
+        "auto" => Some(nbits as u32 + 1),
+        v => v.parse::<u32>().ok(),
+    }
+}
+
 fn residue(v: i64, nbits: usize) -> u128 {
     (v as i128).rem_euclid(1i128 << nbits) as u128
 }
@@ -998,6 +1031,9 @@ fn mpc_conv_relu_pool(
         let cbias = cbias.clone();
         move |be: &mut TransportBackend<MpcTransport>| {
             be.set_nonlin(nonlin.mode());
+            if let Some(w) = wire_bits_for(nbits) {
+                be.set_wire_bits(w);
+            }
             // Reconstruct + bias every conv output locally (share_secret / add
             // are communication-free), then run the whole ReLU layer as one
             // batched a2b + one batched multiply, then max-pool.
@@ -1642,6 +1678,9 @@ pub fn run_cnn_hybrid_in_session(
             let hidden_b = hidden_b.clone();
             move |be: &mut TransportBackend<MpcTransport>| {
                 be.set_nonlin(nonlin.mode());
+                if let Some(w) = wire_bits_for(nbits) {
+                    be.set_wire_bits(w);
+                }
                 let t = Instant::now();
                 let raws = import_raw_batch(be, me, &hidden_open, &hidden_masks, h, nbits);
                 let vs: Vec<ShareRef> = raws
@@ -1714,6 +1753,9 @@ pub fn run_cnn_hybrid_in_session(
             // does not reach it — deliberately: it is `nclasses−1` comparisons
             // against a layer's thousands, and the phase breakdown shows it.
             be.set_nonlin(nonlin.mode());
+            if let Some(w) = wire_bits_for(nbits) {
+                be.set_wire_bits(w);
+            }
             let raws = import_raw_batch(be, me, &dense_open, &dense_masks, nclasses, nbits);
             let logits: Vec<ShareRef> = raws
                 .iter()
