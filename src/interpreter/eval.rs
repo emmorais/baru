@@ -1427,18 +1427,31 @@ pub fn reduce_expression(
                                 // with an ordinary call rather than duplicated.
                                 Types::NativeApply => {
                                     if mut_collected.len() != 2 {
-                                        panic!(
-                                            "apply expects (apply f arg-list), got {} arguments",
-                                            mut_collected.len()
-                                        );
+                                        stack.push(Apply(
+                                            *cont,
+                                            ErrObj::raise(format!(
+                                                "apply expects (apply f arg-list), got {} arguments",
+                                                mut_collected.len()
+                                            )),
+                                            env.clone(),
+                                        ));
+                                        continue;
                                     }
                                     let spread = mut_collected.pop().expect("2 args");
                                     let func = mut_collected.pop().expect("2 args");
                                     let mut items = match spread {
                                         Types::List(v) => v,
-                                        other => panic!(
-                                            "apply: last argument must be a list, got {other:?}"
-                                        ),
+                                        other => {
+                                            stack.push(Apply(
+                                                *cont,
+                                                ErrObj::raise_with(
+                                                    "apply: last argument must be a list",
+                                                    vec![other],
+                                                ),
+                                                env.clone(),
+                                            ));
+                                            continue;
+                                        }
                                     };
                                     match items.pop() {
                                         // Zero arguments: hand the operator to the
@@ -1637,12 +1650,21 @@ pub fn reduce_expression(
                                         let sref = be.share_secret(fr, norm_nbits, 0);
                                         stack.push(Apply(*cont, Types::Share(sref), env.clone()));
                                     }
-                                    _ => {
-                                        // other types not supported for normalization
-                                        panic!(
-                                            "cannot normalize branch result to share: {:?}",
-                                            val
-                                        );
+                                    other => {
+                                        // Reachable: `(if <share> "yes" "no")`.
+                                        // A branch under a secret condition must
+                                        // produce something shareable, since the
+                                        // result has to stay secret.
+                                        stack.push(Apply(
+                                            *cont,
+                                            ErrObj::raise_with(
+                                                "a branch under a secret condition must \
+                                                 produce a number or share",
+                                                vec![other],
+                                            ),
+                                            env.clone(),
+                                        ));
+                                        continue;
                                     }
                                 }
                             }
@@ -1833,7 +1855,10 @@ impl Participant {
                 return ErrObj::raise("dot expects 2 args: (dot vec-a vec-b)");
             }
             match (&args[0], &args[1]) {
-                (Types::List(a), Types::List(b)) => vec_dot(&dot_backend, a, b),
+                (Types::List(a), Types::List(b)) => match vec_dot(&dot_backend, a, b) {
+                    Ok(v) => v,
+                    Err(e) => e,
+                },
                 _ => ErrObj::raise("dot expects two lists"),
             }
         });
@@ -1853,7 +1878,10 @@ impl Participant {
                     for item in items {
                         acc = Some(match acc {
                             None => item.clone(),
-                            Some(s) => vec_add(&vsum_backend, &s, item),
+                            Some(s) => match vec_add(&vsum_backend, &s, item) {
+                                Ok(v) => v,
+                                Err(e) => return e,
+                            },
                         });
                     }
                     acc.unwrap_or(Types::Num(0))
@@ -1873,7 +1901,10 @@ impl Participant {
             }
             match (&args[0], &args[1]) {
                 (Types::List(rows), Types::List(v)) => {
-                    Types::List(matvec_impl(&matvec_backend, rows, v))
+                    match matvec_impl(&matvec_backend, rows, v) {
+                        Ok(out) => Types::List(out),
+                        Err(e) => e,
+                    }
                 }
                 _ => ErrObj::raise("matvec expects a list of lists and a list"),
             }
@@ -1968,19 +1999,35 @@ impl Participant {
                     Types::Str(s) => s.as_str(),
                     _ => return ErrObj::raise("nn-forward: layer activation must be a string"),
                 };
-                let pre = matvec_impl(&nn_forward_backend, weights, &cur);
-                let biased: Vec<Types> = pre
+                let pre = match matvec_impl(&nn_forward_backend, weights, &cur) {
+                    Ok(v) => v,
+                    Err(e) => return e,
+                };
+                // `collect::<Result<_, _>>()` short-circuits on the first bad
+                // element, so a malformed layer stops the forward pass instead
+                // of being carried into the next one.
+                let biased: Vec<Types> = match pre
                     .iter()
                     .zip(bias.iter())
                     .map(|(p, b)| vec_add(&nn_forward_backend, p, b))
-                    .collect();
+                    .collect::<Result<Vec<_>, Types>>()
+                {
+                    Ok(v) => v,
+                    Err(e) => return e,
+                };
                 cur = match activation {
-                    "relu" => biased
+                    "relu" => match biased
                         .iter()
                         .map(|t| vec_relu(&nn_forward_backend, t))
-                        .collect(),
+                        .collect::<Result<Vec<_>, Types>>()
+                    {
+                        Ok(v) => v,
+                        Err(e) => return e,
+                    },
                     "identity" => biased,
-                    other => return ErrObj::raise(format!("nn-forward: unknown activation '{other}'")),
+                    other => {
+                        return ErrObj::raise(format!("nn-forward: unknown activation '{other}'"))
+                    }
                 };
             }
             Types::List(cur)
@@ -2803,9 +2850,9 @@ impl Participant {
         // (fhe-eval circuit-str keys '("pub-x") '(3) '("enc-y") '(ct))
         let fhe_eval_fn = Arc::new(move |args: Vec<Types>| -> Types {
             if args.len() != 6 {
-                panic!(
+                return ErrObj::raise(
                     "fhe-eval expects 6 args: \
-                     (fhe-eval circuit-str keys '(pub-keys) '(pub-vals) '(enc-keys) '(enc-cts))"
+                     (fhe-eval circuit-str keys '(pub-keys) '(pub-vals) '(enc-keys) '(enc-cts))",
                 );
             }
             let circuit_json = match &args[0] {
@@ -4200,17 +4247,23 @@ fn fixed_share_binop(
             };
             Types::Share(r)
         }
-        other => panic!(
-            "operation {:?} is not supported on fixed-point shares",
-            other
-        ),
+        // Reachable, e.g. `(mod <share> 2.5)`. The function returns `Types`, so
+        // the condition is simply the result — it raises when the caller's
+        // continuation receives it.
+        other => ErrObj::raise(format!(
+            "operation {other:?} is not supported on fixed-point shares"
+        )),
     }
 }
 
 /// Element-wise product for the vector builtins.  Handles Num, Fixed and
 /// Share operands (including Q16.16 shares) following the interpreter's
 /// scalar coercion rules.
-fn vec_mul(backend: &Arc<Mutex<Box<dyn Backend>>>, a: &Types, b: &Types) -> Types {
+fn vec_mul(
+    backend: &Arc<Mutex<Box<dyn Backend>>>,
+    a: &Types,
+    b: &Types,
+) -> Result<Types, Types> {
     use crate::interpreter::ast::FIXED_SCALE;
     let to_fixed = |v: &Types| -> i64 {
         match v {
@@ -4220,23 +4273,30 @@ fn vec_mul(backend: &Arc<Mutex<Box<dyn Backend>>>, a: &Types, b: &Types) -> Type
         }
     };
     match (a, b) {
-        (Types::Num(x), Types::Num(y)) => Types::Num(x.wrapping_mul(*y)),
+        (Types::Num(x), Types::Num(y)) => Ok(Types::Num(x.wrapping_mul(*y))),
         (Types::Fixed(_), Types::Fixed(_))
         | (Types::Fixed(_), Types::Num(_))
         | (Types::Num(_), Types::Fixed(_)) => {
             let prod = (to_fixed(a) as i128 * to_fixed(b) as i128) >> 16;
-            Types::Fixed(prod as i64)
+            Ok(Types::Fixed(prod as i64))
         }
         _ if matches!(a, Types::Share(_)) || matches!(b, Types::Share(_)) => {
             let mut be = backend.lock().unwrap_or_else(|e| e.into_inner());
-            Types::Share(share_mul_typed(&mut **be, a, b))
+            Ok(Types::Share(share_mul_typed(&mut **be, a, b)))
         }
-        _ => panic!("vector builtins: cannot multiply {:?} and {:?}", a, b),
+        _ => Err(ErrObj::raise_with(
+            "vector builtins: cannot multiply these operands",
+            vec![a.clone(), b.clone()],
+        )),
     }
 }
 
 /// Element-wise sum for the vector builtins.  Same operand rules as `vec_mul`.
-fn vec_add(backend: &Arc<Mutex<Box<dyn Backend>>>, a: &Types, b: &Types) -> Types {
+fn vec_add(
+    backend: &Arc<Mutex<Box<dyn Backend>>>,
+    a: &Types,
+    b: &Types,
+) -> Result<Types, Types> {
     use crate::interpreter::ast::FIXED_SCALE;
     let to_fixed = |v: &Types| -> i64 {
         match v {
@@ -4246,15 +4306,20 @@ fn vec_add(backend: &Arc<Mutex<Box<dyn Backend>>>, a: &Types, b: &Types) -> Type
         }
     };
     match (a, b) {
-        (Types::Num(x), Types::Num(y)) => Types::Num(x.wrapping_add(*y)),
+        (Types::Num(x), Types::Num(y)) => Ok(Types::Num(x.wrapping_add(*y))),
         (Types::Fixed(_), Types::Fixed(_))
         | (Types::Fixed(_), Types::Num(_))
-        | (Types::Num(_), Types::Fixed(_)) => Types::Fixed(to_fixed(a).wrapping_add(to_fixed(b))),
+        | (Types::Num(_), Types::Fixed(_)) => {
+            Ok(Types::Fixed(to_fixed(a).wrapping_add(to_fixed(b))))
+        }
         _ if matches!(a, Types::Share(_)) || matches!(b, Types::Share(_)) => {
             let mut be = backend.lock().unwrap_or_else(|e| e.into_inner());
-            Types::Share(share_addsub_typed(&mut **be, a, b, false))
+            Ok(Types::Share(share_addsub_typed(&mut **be, a, b, false)))
         }
-        _ => panic!("vector builtins: cannot add {:?} and {:?}", a, b),
+        _ => Err(ErrObj::raise_with(
+            "vector builtins: cannot add these operands",
+            vec![a.clone(), b.clone()],
+        )),
     }
 }
 
@@ -4266,7 +4331,11 @@ fn vec_add(backend: &Arc<Mutex<Box<dyn Backend>>>, a: &Types, b: &Types) -> Type
 /// transparently. Any Num/Fixed mix, or a public-weights/private-input
 /// combination (the precompile only accepts bare `ShareRef`s on both
 /// sides), falls through to the per-row `vec_dot` loop unchanged.
-fn matvec_impl(backend: &Arc<Mutex<Box<dyn Backend>>>, rows: &[Types], v: &[Types]) -> Vec<Types> {
+fn matvec_impl(
+    backend: &Arc<Mutex<Box<dyn Backend>>>,
+    rows: &[Types],
+    v: &[Types],
+) -> Result<Vec<Types>, Types> {
     let all_shares = |vs: &[Types]| vs.iter().all(|t| matches!(t, Types::Share(_)));
     let rows_are_share_lists = rows
         .iter()
@@ -4296,12 +4365,15 @@ fn matvec_impl(backend: &Arc<Mutex<Box<dyn Backend>>>, rows: &[Types], v: &[Type
         let out = crate::precompile::mpc_matvec::registry()
             .champion()
             .matvec(&mut **be, &w_refs, &x_refs);
-        return out.into_iter().map(Types::Share).collect();
+        return Ok(out.into_iter().map(Types::Share).collect());
     }
     rows.iter()
         .map(|row| match row {
             Types::List(r) => vec_dot(backend, r, v),
-            _ => panic!("matvec: matrix rows must be lists"),
+            other => Err(ErrObj::raise_with(
+                "matvec: matrix rows must be lists",
+                vec![other.clone()],
+            )),
         })
         .collect()
 }
@@ -4310,36 +4382,47 @@ fn matvec_impl(backend: &Arc<Mutex<Box<dyn Backend>>>, rows: &[Types], v: &[Type
 /// the mux-via-mul pattern from `bench::nn`'s Layer workload: `mask = (0 <
 /// x)`, then `x * mask` — no fixed-point rescale needed since `mask` is a
 /// plain 0/1 bit, not Q16.16-scaled.
-fn vec_relu(backend: &Arc<Mutex<Box<dyn Backend>>>, x: &Types) -> Types {
+fn vec_relu(backend: &Arc<Mutex<Box<dyn Backend>>>, x: &Types) -> Result<Types, Types> {
     match x {
-        Types::Num(n) => Types::Num((*n).max(0)),
-        Types::Fixed(f) => Types::Fixed((*f).max(0)),
+        Types::Num(n) => Ok(Types::Num((*n).max(0))),
+        Types::Fixed(f) => Ok(Types::Fixed((*f).max(0))),
         Types::Share(sr) => {
             let mut be = backend.lock().unwrap_or_else(|e| e.into_inner());
             let zero = be.sub(sr, sr);
             let mask = be.lt(&zero, sr);
             let mut r = be.mul(sr, &mask);
             r.fixed = sr.fixed;
-            Types::Share(r)
+            Ok(Types::Share(r))
         }
-        _ => panic!("nn-forward: relu expects Num, Fixed, or Share elements"),
+        other => Err(ErrObj::raise_with(
+            "nn-forward: relu expects a number, fixed-point value or share",
+            vec![other.clone()],
+        )),
     }
 }
 
 /// Dot product of two element vectors (used by both `dot` and `matvec`).
-fn vec_dot(backend: &Arc<Mutex<Box<dyn Backend>>>, a: &[Types], b: &[Types]) -> Types {
+fn vec_dot(
+    backend: &Arc<Mutex<Box<dyn Backend>>>,
+    a: &[Types],
+    b: &[Types],
+) -> Result<Types, Types> {
     if a.len() != b.len() {
-        panic!("dot: length mismatch ({} vs {})", a.len(), b.len());
+        return Err(ErrObj::raise(format!(
+            "dot: length mismatch ({} vs {})",
+            a.len(),
+            b.len()
+        )));
     }
     let mut acc: Option<Types> = None;
     for (x, y) in a.iter().zip(b.iter()) {
-        let p = vec_mul(backend, x, y);
+        let p = vec_mul(backend, x, y)?;
         acc = Some(match acc {
             None => p,
-            Some(s) => vec_add(backend, &s, &p),
+            Some(s) => vec_add(backend, &s, &p)?,
         });
     }
-    acc.unwrap_or(Types::Num(0))
+    Ok(acc.unwrap_or(Types::Num(0)))
 }
 
 // Convert a signed i64 value into an unsigned field element representing two's complement with `nbits` bits

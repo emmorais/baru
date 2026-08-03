@@ -1712,3 +1712,55 @@ fn test_list_operations_still_work_after_raising_their_errors() {
     assert_eq!(eval("(null? (list))"), 1);
     assert_eq!(eval("(not 0)"), 1);
 }
+
+/// The vector builtins (`dot`, `vsum`, `matvec`, `nn-forward`) share a set of
+/// fallible helpers, so their length and type errors raise together.
+#[test]
+fn test_vector_builtin_failures_are_catchable() {
+    for src in [
+        "(guard (e 1) (dot (list 1 2) (list 1)))",   // length mismatch
+        "(guard (e 1) (dot (list \"x\") (list 1)))", // bad element type
+        "(guard (e 1) (vsum (list \"x\" 1)))",
+        "(guard (e 1) (matvec (list 5) (list 1)))",  // row is not a list
+    ] {
+        assert_eq!(eval(src), 1, "{src}");
+    }
+    assert!(eval_plain_string("(guard (e (error-message e)) (dot (list 1 2) (list 1)))")
+        .contains("length mismatch"));
+}
+
+/// And they still compute the right answers.
+#[test]
+fn test_vector_builtins_still_correct() {
+    assert_eq!(eval("(dot (list 1 2) (list 3 4))"), 11);
+    assert_eq!(eval("(vsum (list 1 2 3))"), 6);
+    assert_eq!(eval("(car (matvec (list (list 1 2)) (list 3 4)))"), 11);
+}
+
+/// Secret-dependent paths raise too. A branch taken under a *secret* condition
+/// must produce something shareable, since the result has to stay secret — so a
+/// string branch is a condition rather than an abort.
+#[test]
+fn test_secret_dependent_failures_are_catchable() {
+    assert_eq!(
+        eval_shared("(guard (e 1) (let ((z :sint32 5)) (if (> z 0) \"yes\" \"no\")))"),
+        1
+    );
+    // An operation with no fixed-point-share implementation.
+    assert_eq!(
+        eval_shared("(guard (e 1) (let ((z :sint32 5)) (reconstruct (mod z 2.5))))"),
+        1
+    );
+    // The normal secret branch still works and stays a share.
+    assert_eq!(
+        eval_shared("(let ((z :sint32 5)) (reconstruct (if (> z 0) 1 2)))"),
+        1
+    );
+}
+
+#[test]
+fn test_apply_and_fhe_eval_argument_errors_are_catchable() {
+    assert_eq!(eval("(guard (e 1) (apply + 5))"), 1);
+    assert_eq!(eval("(guard (e 1) (apply))"), 1);
+    assert_eq!(eval("(guard (e 1) (fhe-eval \"x\"))"), 1);
+}

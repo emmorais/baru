@@ -221,15 +221,22 @@ Three consequences worth knowing:
 - **every MPC, FHE and ZKP builtin failure** — bad arguments, malformed JSON, a
   missing model or proof file, a wrong quantisation scale.
 
-Still a panic, so **not** catchable:
+- length and type errors in the vector builtins `dot`, `vsum`, `matvec` and
+  `nn-forward`;
+- secret-dependent failures: a branch under a shared condition that cannot
+  produce a share (`(if <share> "yes" "no")`), and operations with no
+  fixed-point-share implementation such as `(mod <share> 2.5)`.
 
-- the `MAX_FRAMES` step budget, and two internal invariants that indicate a bug
-  in the evaluator rather than in the program;
-- type errors inside the vector helpers (`dot`, `vsum`, `matvec`, `nn-forward`)
-  — these share fallible helpers whose signatures need to change together, a
-  contained follow-up rather than a hazard;
+Still a panic, so **not** catchable — 17 sites, each deliberate:
+
+- the `MAX_FRAMES` step budget, and one internal invariant that would indicate a
+  bug in the evaluator rather than in the program;
+- six type invariants guarded by an outer match that has already established the
+  type, so no program can reach them (verified: `and`/`or` on shares, which
+  looked like the likely route, dispatch correctly);
 - the `eval_plain` / `eval_shared` / `eval_fhe` test harness, where a panic is
-  the point: a test should fail loudly.
+  the point: a test should fail loudly rather than return a condition a
+  careless assertion might ignore.
 
 `guard` cannot be compiled to a circuit: a circuit has no control flow to unwind,
 so there is nothing for a handler to intercept.
@@ -876,10 +883,10 @@ the distinction matters because only the first is a matter of effort:
 (`define-syntax`/`syntax-rules`), string and char procedures beyond equality, and
 the numeric tower (only `i64` and Q16.16 exist).
 
-Errors *are* now catchable via `guard` (§3), across the evaluator, the Scheme
-procedures and the MPC/FHE/ZKP builtins. Four small areas still panic — the
-`MAX_FRAMES` budget, two evaluator invariants, the vector helpers, and the test
-harness. The exact list is in §3.
+Errors *are* now catchable via `guard` (§3): the evaluator, the Scheme
+procedures, the MPC/FHE/ZKP builtins and the vector builtins all raise. The 17
+remaining panics are the `MAX_FRAMES` budget, one evaluator invariant, six
+unreachable type invariants and the test harness. The exact list is in §3.
 
 Also: `define` binds in the *current* environment rather than being hoisted like
 Scheme's internal `define` (which behaves as `letrec*` at the head of a body), so
