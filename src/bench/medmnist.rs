@@ -25,10 +25,14 @@
 //! degree 3977 against `n = 4096`.
 //!
 //! So an RGB MedMNIST set (PathMNIST, DermaMNIST) is a *training and embedding*
-//! task now, not a packing one. The packing limit that does still bite is a wide
-//! **intermediate** layer: 16 channels at 13×13 needs degree 5266, which is what
-//! caps the first conv at 12 channels and would need channel splitting or
-//! `n = 8192`.
+//! task now, not a packing one. The wide **intermediate** layer used to be the limit
+//! that still bit — 16 channels at 13×13 needs degree 5266, which is what capped the
+//! first conv at 12 channels — and **channel splitting removed it** on 2026-08-04
+//! ([`crate::fhe::conv_pack::channel_groups`], wired through `hybrid_conv_open`).
+//! A layer too wide for one ciphertext is evaluated as equal channel groups whose
+//! products are added, which is free homomorphically: it costs one multiplication per
+//! group per output channel and still no evaluation key and no bootstrap. Both limits
+//! are now training problems rather than packing ones.
 //!
 //! | dataset | task | classes | test set |
 //! |---|---|---|---|
@@ -60,12 +64,16 @@
 //!
 //! # Results (2026-08-01, Apple M1 Pro / 8 cores, 20 images per config)
 //!
+//! Organa was retrained wider on 2026-08-04 — see the channel-splitting note below —
+//! so its column is the `conv(16,32)` model; pneumonia is unchanged at `conv(8,16)`.
+//!
 //! | | pneumonia | organa |
 //! |---|---|---|
-//! | integer accuracy, 300 embedded images | **85.00%** | **84.00%** |
-//! | integer accuracy, full test set | 84.78% (624) | 81.18% (17 778) |
-//! | 95% CI on the full-test figure | [81.7, 87.4] | [80.6, 81.8] |
-//! | balanced accuracy / AUC, **full test** | 80.64% / **0.9314** | 80.49% / **0.9590** |
+//! | architecture | conv(8,16) | **conv(16,32)**, conv2 split 2×12 |
+//! | integer accuracy, 300 embedded images | **85.00%** | **85.00%** |
+//! | integer accuracy, full test set | 84.78% (624) | **82.93%** (17 778) |
+//! | 95% CI on the full-test figure | [81.7, 87.4] | **[82.4, 83.5]** |
+//! | balanced accuracy / AUC, **full test** | 80.64% / **0.9314** | **82.21%** / **0.9605** |
 //! | sensitivity / specificity, full test | 97.18% / **64.10%** | — |
 //! | published ResNet-18 (28×28), ACC / AUC | 0.854 / 0.944 | 0.935 / 0.997 |
 //! | majority-class baseline | 62.50% | 18.48% |
@@ -188,7 +196,7 @@ pub struct TrainedCnn {
     pub dataset: &'static str,
     pub task: &'static str,
     pub class_names: Vec<&'static str>,
-    /// Side length of the square, single-channel input the model expects.
+    /// Side length of the square input the model expects.
     pub d: usize,
     pub kernels: Vec<Vec<i64>>,
     pub cbias: Vec<i64>,
@@ -222,12 +230,39 @@ pub struct TrainedCnn {
 }
 
 impl TrainedCnn {
+    /// Input channels, **derived from the embedded images** rather than stored.
+    ///
+    /// An image is a flat `in_c · d · d`, so the channel count falls out of its
+    /// length. Deriving it avoids adding a field to the generated files, which are
+    /// marked "do not edit" and would otherwise all need regenerating — and
+    /// regenerating them would churn their weights and every accuracy figure quoted
+    /// against them, as a side effect of a format change. It is also impossible to
+    /// get out of step with the data, which a stored field would not be.
+    pub fn in_c(&self) -> usize {
+        let per_channel = self.d * self.d;
+        self.images
+            .first()
+            .map(|img| {
+                assert_eq!(
+                    img.len() % per_channel,
+                    0,
+                    "embedded image of {} values is not a whole number of {}x{} channels",
+                    img.len(),
+                    self.d,
+                    self.d
+                );
+                img.len() / per_channel
+            })
+            .unwrap_or(1)
+    }
+
     /// Build the runnable model. `nbits` is calibrated from the observed
     /// activation range over the embedded images, exactly as the synthetic
     /// model does, so it fits the depth-1 noise budget.
     pub fn model(&self) -> CnnModel {
         CnnModel::from_trained(
             self.d,
+            self.in_c(),
             self.kernels.clone(),
             self.cbias.clone(),
             self.extra_conv
@@ -257,6 +292,13 @@ mod pneumonia;
 #[allow(dead_code)]
 mod organa;
 
+/// The RGB set: three input channels, which the conv packing takes at one
+/// ciphertext multiplication per output channel — colour does *not* triple the
+/// work. `TrainedCnn::in_c` derives the channel count from the image length.
+#[path = "../../examples/data/derma_cnn.rs"]
+#[allow(dead_code)]
+mod derma;
+
 /// A dataset's `--dataset` name paired with the loader its generated weight
 /// file exports.
 pub type Embedded = (&'static str, fn() -> TrainedCnn);
@@ -265,6 +307,7 @@ pub type Embedded = (&'static str, fn() -> TrainedCnn);
 pub const DATASETS: &[Embedded] = &[
     ("pneumonia", pneumonia::trained),
     ("organa", organa::trained),
+    ("derma", derma::trained),
 ];
 
 pub fn load(name: &str) -> Result<TrainedCnn, String> {
@@ -1119,6 +1162,50 @@ mod tests {
     /// accuracy, and must beat its majority-class baseline — the check that
     /// catches a quantisation or flatten-order regression, which shows up as
     /// a classifier collapsed onto one class.
+    /// **The shipped organa model exercises channel splitting**, and this pins that
+    /// the capability is actually in use rather than merely available.
+    ///
+    /// Retrained 2026-08-04 at `--conv 16,32`, which the trainer used to refuse: its
+    /// second convolution takes 16 channels at 13×13, degree 5266 against `n = 4096`,
+    /// so it runs as two groups of 12 whose products are added. That widening is what
+    /// took organa from 81.64% to **82.93%** on 17 778 test images — disjoint
+    /// confidence intervals, so a real gain rather than seed noise.
+    ///
+    /// The cost is visible and worth stating: conv2 goes from 32 ciphertext
+    /// multiplications to 64, because each output channel now multiplies two input
+    /// groups. Still no evaluation key, still no bootstrap — group results combine by
+    /// homomorphic addition.
+    #[test]
+    fn the_shipped_organa_model_uses_channel_splitting() {
+        let model = super::DATASETS
+            .iter()
+            .find(|(n, _)| *n == "organa")
+            .expect("organa must be embedded")
+            .1()
+            .model();
+        let plan = crate::bench::cnn::packing_plan(&model, crate::fhe::bfv::BfvParams::DEFAULT.n);
+        assert_eq!(plan.len(), 2, "organa is a two-conv model");
+
+        let (c1, gs1, ng1) = plan[0];
+        assert_eq!((gs1, ng1), (c1.in_c, 1), "conv1 fits one ciphertext");
+
+        let (c2, gs2, ng2) = plan[1];
+        assert_eq!(c2.in_c, 16, "conv2 must take the widened 16 channels");
+        assert_eq!(
+            (gs2, ng2),
+            (12, 2),
+            "conv2 at {}x{} must split into 2 groups of 12 (degree {} vs n={})",
+            c2.h,
+            c2.w,
+            c2.required_degree(),
+            crate::fhe::bfv::BfvParams::DEFAULT.n
+        );
+        assert!(
+            c2.required_degree() > crate::fhe::bfv::BfvParams::DEFAULT.n,
+            "the point of this test is that the layer does NOT fit unsplit"
+        );
+    }
+
     #[test]
     fn embedded_accuracy_is_reasonable() {
         for (name, _) in DATASETS {

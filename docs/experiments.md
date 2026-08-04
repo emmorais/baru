@@ -1101,14 +1101,14 @@ baru bench-medmnist --dataset all --hybrid 3 --both
 
 | | pneumonia (chest X-ray, 2 classes) | organa (abdominal CT, 11 classes) |
 |---|---|---|
-| integer accuracy, full test set | **84.78%** (624 imgs) | **81.18%** (17 778 imgs) |
+| integer accuracy, full test set | **84.78%** (624 imgs) | **82.93%** (17 778 imgs) |
 | float accuracy of the same net | 84.78% | 81.03% |
 | majority-class baseline | 62.50% | 18.48% |
 | published ResNet-18 (28×28) | 0.854 | 0.935 |
 | 95% CI on the full-test figure | [81.7, 87.4] | [80.6, 81.8] |
-| **AUC, full test set** | **0.9314** | **0.9590** (macro OvR) |
+| **AUC, full test set** | **0.9314** | **0.9605** (macro OvR) |
 | published ResNet-18 AUC | 0.944 | 0.997 |
-| **balanced accuracy, full test set** | **80.64%** | **80.49%** |
+| **balanced accuracy, full test set** | **80.64%** | **82.21%** |
 | sensitivity / specificity | 97.18% / **64.10%** | — |
 | encrypted == plaintext diagnosis | **300/300** | **300/300** |
 | FHE bootstraps | 0 | 0 |
@@ -1734,14 +1734,28 @@ workload through the **identical** transport stack (`LatencyTransport` +
 
 ### The headline
 
-| Workload | bytes | interactive calls | wall clock (WAN, 25 ms one-way) |
-|---|---|---|---|
-| Comparisons, n=32, 32-bit | **2.63×** | **1.06×** | **1.23×** |
-| Dot product, n=64, 32-bit | 2.44× | 2.00× | 2.87× |
+| Workload | bytes, equal width | bytes, **packed base** | interactive calls | wall clock (WAN, 25 ms one-way) |
+|---|---|---|---|---|
+| Comparisons, n=32, 32-bit | **2.63×** | **9.70×** | **1.06×** | **1.23×** |
+| Dot product, n=64, 32-bit | 2.44× | 2.85× | 2.00× | 2.87× |
 
 The comparison row is the one that matters for private inference: every ReLU,
 max-pool and argmax reduces to a comparison, so it is the entire nonlinear
-surface. Active security there costs **2.6× the bytes and 1.06× the rounds**.
+surface.
+
+**Two byte columns, added 2026-08-03, and they differ by 3.7×.** The verified leg
+cannot pack its wire — `aby3_verify::headroom_bits` is `128 − used_bits`, so its
+statistical security *is* the slack between the values' width and the full ring, and
+narrowing to the value width would set λ to 0. The semi-honest leg has no such
+constraint: on the comparison row it packs 234 036 B → 63 416 B while the verified leg
+stays at 615 446 B. So *equal width* is the cost of the MAC when both run unpacked,
+and *packed base* is the cost to a deployment that would otherwise have packed.
+
+Active security on the nonlinear surface therefore costs **2.63× the bytes at equal
+width, 9.70× against a packed baseline, and 1.06× the rounds** either way. Default
+`bench-malicious` reports the first; `BARU_WIRE_BITS=auto bench-malicious` the second.
+The default was left at equal width so that flipping the repo's global encoding could
+not silently redefine a published ratio.
 
 That is the predicted shape, and the prediction was worth making explicit
 because it is the repository's recurring lesson applied to a new protocol: the

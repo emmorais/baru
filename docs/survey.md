@@ -39,7 +39,9 @@ not. Among the results that only a single-harness study can produce: the
 FHE-versus-MPC crossover is a property of *the baseline's preprocessing*, not of
 either cryptosystem, and it disappears entirely once MPC is given SHE-based
 preprocessing; and active security on the nonlinear surface of private inference
-costs 2.63× bytes but only 1.06× rounds; and the choice between a garbled and a
+costs 2.63× bytes but only 1.06× rounds — and 9.70× bytes once the semi-honest
+baseline it is measured against is allowed to pack, which only the unverified side
+can do; and the choice between a garbled and a
 `wrap3`-style comparison protocol has a boundary at 30–40 Mbps that moves with RTT.
 We also report our own withdrawn claims — a ZKP backend that proved nothing, an MPC
 bit-decomposition that leaked its inputs, and that last boundary, whose location we
@@ -261,17 +263,36 @@ whether both batch is comparing implementations, not protocols.
 **Cost of active security** (verified 2026-08-01, `bench-malicious --n 32
 --bits 32`):
 
-| workload | bytes | interactive calls | wall clock (WAN, 25 ms) |
-|---|---|---|---|
-| **comparisons, n=32, 32-bit** | **2.63×** | **1.06×** | **1.26×** |
-| dot product, n=32, 32-bit | 2.47× | 1.75× | 2.80× |
+| workload | bytes, equal width | bytes, **packed baseline** | interactive calls | wall clock (WAN, 25 ms) |
+|---|---|---|---|---|
+| **comparisons, n=32, 32-bit** | **2.63×** | **9.70×** | **1.06×** | **1.26×** |
+| dot product, n=64, 32-bit | 2.44× | 2.85× | 2.00× | 2.26× |
 
-The comparison row is the one that matters for inference, since every ReLU,
-max-pool and argmax reduces to a comparison. **Active security costs bytes, not
-rounds**: the MAC doubles what is sent but batches into the same round. The
-dot-product row is a small-workload artifact — the semi-honest leg needs only 4
-interactive calls, so a fixed pair-pool cost is amortized against nothing — and
-we report it rather than hide it.
+**Two byte columns, because the honest answer depends on what you compare against,
+and they differ by 3.7×.** The verified leg cannot narrow its wire: its statistical
+security is `128 − used_bits` (`headroom_bits`), so packing it to the values' own
+width would set λ to zero. The semi-honest leg has no such constraint and packs
+freely — 234 036 B → 63 416 B on the comparison row, with the verified leg unchanged
+at 615 446 B.
+
+So *equal width* answers "what does the MAC cost if both protocols run unpacked",
+and *packed baseline* answers "what does active security cost a deployment that would
+otherwise have packed" — which is the question a practitioner buying it is asking.
+**On the workload that matters for inference the answer is 9.70×, not 2.63×.**
+
+The comparison row is the one that matters, since every ReLU, max-pool and argmax
+reduces to a comparison. **Active security costs bytes, not rounds**: the MAC
+multiplies what is sent but batches into the same round. The dot-product row moves
+much less between the two columns (2.44 → 2.85×) because its traffic is input sharing
+and reveals rather than ring resharing, so there was little padding to recover — the
+same reason `bench-nn` was unaffected by the encoding fix. Its high interactive-call
+ratio is a small-workload artifact, a fixed pair-pool cost amortized against almost
+nothing, and we report it rather than hide it.
+
+Reproduce both with `bench-malicious` (equal width, the default) and
+`BARU_WIRE_BITS=auto bench-malicious` (packed baseline). We kept the default at equal
+width so that flipping the repo's global encoding could not silently redefine a
+published ratio.
 
 A second result generalizes, **with a correction we owe to §7.3's encoding fix.**
 The statistical slack that ring-based verification normally charges as a widening to
@@ -287,11 +308,10 @@ it: its security is `128 − used_bits`, so narrowing the wire to the value widt
 λ to zero. The slack was never free — it was invisible, because nothing in the repo
 was packed and so nothing revealed its price.
 
-The consequence for the row above: **2.63× is a fair ratio at equal width and
-understates the cost of active security against a packed baseline**, because only the
-semi-honest side can pack. The multiplier is bounded by the packing factor we measured
-on comparable paths (3.1–5.6×), but we have not run the combination and so claim no
-number for it. It is on the agenda.
+The consequence is the second byte column above, and it is now measured rather than
+bounded: **9.70× against a packed baseline, against 2.63× at equal width.** The
+prediction was that the gap would fall inside the packing factors measured on
+comparable paths (3.1–5.6×); the measured ratio of ratios is 3.69×, so it did.
 
 ### 5.2 Garbled circuits
 
@@ -654,9 +674,9 @@ stops being about handwritten digits.
 | | PneumoniaMNIST | OrganAMNIST |
 |---|---|---|
 | task | chest X-ray, pneumonia vs normal | abdominal CT, 11 organs |
-| integer accuracy, full test set | 84.78% (624) | 81.18% (17,778) |
+| integer accuracy, full test set | 84.78% (624) | **82.93%** (17,778) |
 | 95% Wilson CI | [81.7, 87.4] | [80.6, 81.8] |
-| balanced accuracy / AUC | 80.64% / **0.9314** | 80.49% / **0.9590** |
+| balanced accuracy / AUC | 80.64% / **0.9314** | **82.21%** / **0.9605** |
 | sensitivity / specificity | 97.18% / **64.10%** | — |
 | published ResNet-18 (28×28) | 0.854 / 0.944 | 0.935 / 0.997 |
 | majority-class baseline | 62.50% | 18.48% |
@@ -683,8 +703,35 @@ crypto.** We initially attributed the model's size to the FHE noise budget. That
 was wrong. Three limits bind, and noise is the third: spatially, 3×3 valid
 convolution plus pooling takes 28 → 13 → 5 → 1, admitting at most three convs;
 by *packing*, `2·in_c·H·W ≲ n` caps the first conv at 12 channels before the
-second conv's input passes `n = 4096`. That is a packing constraint that relaxes
-at `n = 8192`, not a limit of the construction. Depth, meanwhile, really is free.
+second conv's input passes `n = 4096`. Depth, meanwhile, really is free.
+
+**The packing limit is now lifted, and without growing the ring** (2026-08-04).
+Convolution is linear in the input channels, so a layer too wide for one ciphertext
+evaluates as equal channel groups whose products are **added** — free homomorphically,
+needing no evaluation key and no depth. Doubling to `n = 8192` would also have worked
+and would have charged every operation in the pipeline; splitting charges only the
+layers that overrun.
+
+**And it buys accuracy — on one of the two datasets.** We retrained both at
+`conv(16,32)`, whose second convolution takes 16 channels at 13×13 (degree 5266
+against `n = 4096`) and therefore runs as two groups of 12:
+
+| | pneumonia (4 708 train) | organa (34 561 train) |
+|---|---|---|
+| conv(8,16) baseline | **84.78%** [81.7, 87.4] | 81.64% [81.1, 82.2] |
+| conv(16,32), split | 83.97% [80.9, 86.6] | **82.93%** [82.4, 83.5] |
+| verdict | no gain — CIs overlap, validation rose while test fell | **+1.29 points, CIs disjoint** |
+
+Both are bit-exact under encryption with zero bootstraps; the split costs conv2 twice
+the ciphertext multiplications (32 → 64) and no evaluation key.
+
+**So "the packing was the accuracy ceiling" is true conditionally, and the condition
+is data.** On organa, 34 561 training images can use the extra capacity and the
+packing limit really was what bound. On pneumonia, 4 708 cannot: the wider model
+overfits — its validation accuracy *improves* while its test accuracy falls — so the
+ceiling there is the dataset, and no amount of packing headroom would have moved it.
+Reporting only one of these experiments would have been misleading in whichever
+direction it pointed.
 
 ---
 

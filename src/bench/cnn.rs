@@ -181,9 +181,20 @@ const NCLASSES: usize = 10;
 /// because only one side can pack. Quantifying it needs a run, not an argument, so no
 /// figure is claimed here.
 pub fn wire_bits_for(nbits: usize) -> Option<u32> {
-    let Ok(spec) = std::env::var("BARU_WIRE_BITS") else {
-        return Some(nbits as u32 + 1);
-    };
+    wire_bits_override(nbits).or(Some(nbits as u32 + 1))
+}
+
+/// `BARU_WIRE_BITS` if it is set, and nothing otherwise — the same parsing as
+/// [`wire_bits_for`] but **without** its narrowed default.
+///
+/// For callers that must stay at 128 unless explicitly told not to.
+/// `bench::malicious` is the case: its semi-honest and verified legs are compared at
+/// *equal* width, and that ratio (2.63x bytes) is a published result. Narrowing the
+/// semi-honest leg by default would silently redefine it. With this, the default run
+/// still reports the equal-width ratio and an explicit `BARU_WIRE_BITS=auto` reports
+/// the packed-baseline one, which is a different and also meaningful quantity.
+pub fn wire_bits_override(nbits: usize) -> Option<u32> {
+    let spec = std::env::var("BARU_WIRE_BITS").ok()?;
     match spec.as_str() {
         // The safe choice, and the reason it is spelled rather than numeric: the
         // floor is `nbits + 1`, which is a property of the *model*. Pneumonia runs
@@ -330,6 +341,7 @@ impl CnnModel {
     #[allow(clippy::too_many_arguments)]
     pub fn from_trained(
         d: usize,
+        in_c: usize,
         kernels: Vec<Vec<i64>>,
         cbias: Vec<i64>,
         extra_conv: Vec<ConvLayer>,
@@ -356,7 +368,7 @@ impl CnnModel {
         let ph = oh / POOL;
         let mut model = CnnModel {
             d,
-            in_c: 1,
+            in_c,
             kernels,
             cbias,
             extra_conv,
@@ -413,9 +425,10 @@ impl CnnModel {
     /// generated weight files exist to prevent.
     pub fn architecture(&self) -> String {
         let mut s = format!(
-            "1×{0}×{0} → conv({1}, {K}×{K}) → ReLU → pool",
+            "{2}×{0}×{0} → conv({1}, {K}×{K}) → ReLU → pool",
             self.d,
-            self.out_channels()
+            self.out_channels(),
+            self.in_c
         );
         for cl in &self.extra_conv {
             s += &format!(" → conv({}, {K}×{K}) → ReLU → pool", cl.out_c());
@@ -573,10 +586,27 @@ fn rows_per_chunk(n: usize, in_dim: usize) -> usize {
 /// count used to be re-derived by hand in `MaskPool::for_model`; that is the
 /// kind of duplication the exact-consumption assertions existed to catch, and
 /// deriving both from one traversal removes the possibility instead.)
-fn weight_polys(s: &Bfv, model: &CnnModel) -> Vec<Vec<u64>> {
+/// The channel grouping for one convolution, or a panic naming the real remedy.
+///
+/// Every site that packs or consumes a convolution's polynomials must agree on this,
+/// so it is computed here rather than derived twice. Returns `(group_size, n_groups)`;
+/// `n_groups == 1` reproduces the pre-splitting behaviour byte for byte, because
+/// `pack_*_group` with a full-width group is the unsplit packing.
+fn groups_for(shape: ConvShape, n: usize) -> (usize, usize) {
+    crate::fhe::conv_pack::channel_groups(shape, n).unwrap_or_else(|e| panic!("{e}"))
+}
+
+fn weight_polys(s: &Bfv, model: &CnnModel) -> (Vec<Vec<u64>>, usize) {
     let n = s.params.n;
     let t_mask = s.params.t() - 1;
     let mut out: Vec<Vec<u64>> = Vec::new();
+    // Mask draws, counted in the *same* traversal. This is not `out.len()`: a
+    // scheme-switch mask is drawn once per opened value — one per conv output
+    // channel and one per dense chunk — while a *split* conv pushes one weight
+    // polynomial per (output channel, channel group). The two counts coincided
+    // exactly until channel splitting landed, which is why one number used to
+    // serve both and why `assert_fully_consumed` caught the divergence.
+    let mut mask_draws = 0usize;
 
     let conv1 = ConvShape {
         in_c: model.in_c,
@@ -585,8 +615,17 @@ fn weight_polys(s: &Bfv, model: &CnnModel) -> Vec<Vec<u64>> {
         kh: K,
         kw: K,
     };
+    // One poly per (output channel, channel group), in exactly the order
+    // `hybrid_conv_open` consumes them — the weight cursor is positional, so a
+    // mismatch here multiplies the wrong kernel by the wrong input group and the
+    // result is wrong rather than refused. `groups_for` is the single source of the
+    // grouping in both places.
     for kernel in &model.kernels {
-        out.push(conv_pack::pack_kernel(kernel, conv1, n, t_mask));
+        let (gs, ng) = groups_for(conv1, n);
+        for gi in 0..ng {
+            out.push(conv_pack::pack_kernel_group(kernel, conv1, gi, gs, n, t_mask));
+        }
+        mask_draws += 1; // one opened value per output channel, however many groups
     }
     for cl in &model.extra_conv {
         let shape = ConvShape {
@@ -596,8 +635,12 @@ fn weight_polys(s: &Bfv, model: &CnnModel) -> Vec<Vec<u64>> {
             kh: K,
             kw: K,
         };
+        let (gs, ng) = groups_for(shape, n);
         for kernel in &cl.kernels {
-            out.push(conv_pack::pack_kernel(kernel, shape, n, t_mask));
+            for gi in 0..ng {
+                out.push(conv_pack::pack_kernel_group(kernel, shape, gi, gs, n, t_mask));
+            }
+            mask_draws += 1;
         }
     }
 
@@ -608,13 +651,15 @@ fn weight_polys(s: &Bfv, model: &CnnModel) -> Vec<Vec<u64>> {
     for (hidden_w, _) in &model.hidden {
         for chunk in hidden_w.chunks(rows_per_chunk(n, in_dim)) {
             out.push(s.pack_weights(chunk));
+            mask_draws += 1; // dense is 1:1 — one chunk, one multiply, one mask
         }
         in_dim = hidden_w.len();
     }
     for chunk in model.dense_w.chunks(rows_per_chunk(n, in_dim)) {
         out.push(s.pack_weights(chunk));
+        mask_draws += 1;
     }
-    out
+    (out, mask_draws)
 }
 
 /// The model's weight ciphertexts, encrypted once per **session**.
@@ -839,6 +884,52 @@ fn masks_src(pool: &mut Option<MaskPool>) -> Masks<'_> {
 }
 
 /// The feature-map shape entering the first dense layer.
+/// Every convolution in the model, as a packing shape, in evaluation order.
+pub fn conv_shapes(model: &CnnModel) -> Vec<ConvShape> {
+    let mut v = vec![ConvShape {
+        in_c: model.in_c,
+        h: model.d,
+        w: model.d,
+        kh: K,
+        kw: K,
+    }];
+    v.extend(model.extra_conv.iter().map(|cl| ConvShape {
+        in_c: cl.in_c,
+        h: cl.in_h,
+        w: cl.in_w,
+        kh: K,
+        kw: K,
+    }));
+    v
+}
+
+/// What packing each convolution needs at ring dimension `n`: the shape, the
+/// channel-group size, how many groups, and the ciphertext multiplications per
+/// output channel (which is the group count).
+///
+/// # Why this exists rather than a comment
+///
+/// "The first convolution is capped at 12 channels" has been folklore in these docs.
+/// It is not a modelling choice — it is `conv_pack::max_group_channels` for the
+/// *second* convolution's input, because conv1's output channels are conv2's input
+/// channels and 16 of them at 13×13 needs degree 5266 against `n = 4096`. Computing
+/// it makes the constraint checkable and tells anyone widening the model exactly what
+/// it will cost: `groups` multiplications per output channel instead of one.
+///
+/// A `groups` above 1 is *evaluable but not yet wired*: `fhe::conv_pack` can split
+/// and sum (channel splitting is free, being homomorphic addition), while
+/// `hybrid_conv_open` still takes a single input ciphertext. See the plan note there.
+pub fn packing_plan(model: &CnnModel, n: usize) -> Vec<(ConvShape, usize, usize)> {
+    conv_shapes(model)
+        .into_iter()
+        .map(|shape| match crate::fhe::conv_pack::channel_groups(shape, n) {
+            Ok((gs, ng)) => (shape, gs, ng),
+            // A single channel overruns the ring: no group size helps.
+            Err(_) => (shape, 0, 0),
+        })
+        .collect()
+}
+
 fn last_feature_shape(model: &CnnModel) -> Chw {
     let mut shape = model.pool_shape;
     for cl in &model.extra_conv {
@@ -960,7 +1051,7 @@ fn hybrid_matvec_open(
 fn hybrid_conv_open(
     s: &Bfv,
     ek: &crate::fhe::bfv::EncryptKey,
-    c_input: &BfvCt,
+    c_inputs: &[BfvCt],
     shape: ConvShape,
     kernels: &[Vec<i64>],
     profile: NetworkProfile,
@@ -971,11 +1062,19 @@ fn hybrid_conv_open(
 ) -> (Vec<u64>, Vec<[u64; 3]>, FhePhases) {
     let n = s.params.n;
     let t_mask = s.params.t() - 1;
-    assert!(
-        shape.required_degree() < n,
-        "conv packing needs degree {} < ring dimension {n}",
-        shape.required_degree()
+    // A layer too wide for one ciphertext is split across channel groups and the
+    // products **added** — free homomorphically, so a wide layer costs `ng`
+    // multiplications per output channel and still zero bootstraps. See
+    // `fhe::conv_pack::channel_groups` for why the groups must be equal-sized.
+    let (gs, ng) = groups_for(shape, n);
+    assert_eq!(
+        c_inputs.len(),
+        ng,
+        "conv needs one input ciphertext per channel group ({ng} of {gs} channels)"
     );
+    // Read-out is at the *group* geometry: `output_position` depends on `in_c`, so a
+    // split layer's answers land where a `gs`-channel convolution would put them.
+    let gshape = crate::fhe::conv_pack::group_shape(shape, gs);
     let out_c = kernels.len();
     let (oh, ow) = (shape.out_h(), shape.out_w());
     let mut opened = Vec::with_capacity(out_c * oh * ow);
@@ -984,17 +1083,25 @@ fn hybrid_conv_open(
     // Every output channel multiplies against the *same* encrypted input, so
     // its forward NTT is computed once and reused (`mul_pre`).
     let t = Instant::now();
-    let cxt = s.transform(c_input);
+    let cxts: Vec<_> = c_inputs.iter().map(|c| s.transform(c)).collect();
     ph.mul_ms += ms(t);
 
     for kernel in kernels.iter() {
-        let prod = weights_src.mul_next(
-            s,
-            ek,
-            &cxt,
-            || conv_pack::pack_kernel(kernel, shape, n, t_mask),
-            &mut ph,
-        );
+        let mut acc: Option<BfvCt> = None;
+        for (gi, cxt) in cxts.iter().enumerate() {
+            let p = weights_src.mul_next(
+                s,
+                ek,
+                cxt,
+                || conv_pack::pack_kernel_group(kernel, shape, gi, gs, n, t_mask),
+                &mut ph,
+            );
+            acc = Some(match acc {
+                None => p,
+                Some(a) => s.add(&a, &p),
+            });
+        }
+        let prod = acc.expect("at least one channel group");
 
         // Fresh masks per output channel (reuse across channels would leak
         // the difference of their pre-activations).
@@ -1006,13 +1113,68 @@ fn hybrid_conv_open(
         sleep_link(&profile, conv_bytes + oh * ow * 8, 2);
         for oy in 0..oh {
             for ox in 0..ow {
-                let pos = shape.output_position(oy, ox);
+                let pos = gshape.output_position(oy, ox);
                 opened.push(y[pos]);
                 masks.push([chan_masks[0][pos], chan_masks[1][pos], chan_masks[2][pos]]);
             }
         }
     }
     (opened, masks, ph)
+}
+
+/// [`pack_shares_to_fhe`] split across channel groups: one ciphertext per group,
+/// each carrying only that group's channels, zero-padded to the group width.
+///
+/// The share components are laid out `[in_c][h][w]` row-major, exactly as
+/// `conv_pack::pack_input` expects, so slicing channels here is the same operation
+/// `pack_input_group` performs on plaintext — done on each party's components before
+/// they are summed under encryption.
+fn pack_shares_to_fhe_groups(
+    s: &Bfv,
+    ek: &crate::fhe::bfv::EncryptKey,
+    per_party: &[Vec<Fr>],
+    shape: ConvShape,
+    grouping: (usize, usize),
+    t_mask: u64,
+    profile: NetworkProfile,
+) -> (Vec<BfvCt>, usize, FhePhases) {
+    let (group_size, n_groups) = grouping;
+    if n_groups == 1 {
+        let (c, bytes, ph) = pack_shares_to_fhe(s, ek, per_party, t_mask, profile);
+        return (vec![c], bytes, ph);
+    }
+    let hw = shape.h * shape.w;
+    let mut outs = Vec::with_capacity(n_groups);
+    let mut bytes = 0usize;
+    let mut ph = FhePhases::default();
+    let t = Instant::now();
+    for gi in 0..n_groups {
+        let mut c: Option<BfvCt> = None;
+        for comps in per_party {
+            let mut m = vec![0u64; group_size * hw];
+            for c_i in 0..group_size {
+                let src = gi * group_size + c_i;
+                if src < shape.in_c {
+                    for k in 0..hw {
+                        m[c_i * hw + k] = (comps[src * hw + k] as u64) & t_mask;
+                    }
+                }
+            }
+            // Shorter than `n`; `encrypt_poly_pre` zero-extends, as the ungrouped
+            // path above also relies on.
+            let enc = s.encrypt_poly_pre(ek, &m);
+            bytes += s.ct_bytes(&enc);
+            c = Some(match c {
+                None => enc,
+                Some(acc) => s.add(&acc, &enc),
+            });
+        }
+        outs.push(c.expect("three parties"));
+    }
+    ph.reencrypt_ms += ms(t);
+    ph.n_reencrypt += per_party.len() * n_groups;
+    sleep_link(&profile, bytes, 1);
+    (outs, bytes, ph)
 }
 
 /// Re-encrypt a layer's MPC output (three parties' additive share
@@ -1444,7 +1606,14 @@ pub struct CnnSession {
     ek: crate::fhe::bfv::EncryptKey,
     enc_model: Option<EncryptedModel>,
     /// One per ct×ct multiply — also the number of masks each query needs.
-    n_weight_cts: usize,
+    /// Scheme-switch masks one query consumes.
+    ///
+    /// Deliberately *not* the weight-ciphertext count, which is what this used to be
+    /// sized from. A split convolution multiplies once per (output channel, channel
+    /// group) and then opens **one** summed result per output channel, so weights
+    /// outnumber masks as soon as any layer splits. `EncryptedModel::cts.len()` is the
+    /// weight count if it is ever wanted.
+    n_mask_draws: usize,
     keygen_ms: f64,
 }
 
@@ -1475,10 +1644,16 @@ impl CnnSession {
         let keygen_ms = ms(tk);
 
         // One walk of the model gives both halves of the preamble: the weight
-        // polynomials to encrypt, and (since every ct×ct multiply is followed by
-        // exactly one switch) the number of masks each query will pool.
-        let polys = weight_polys(&s, model);
-        let n_weight_cts = polys.len();
+        // polynomials to encrypt, and the number of masks each query will pool.
+        //
+        // These used to be the same number, on the reasoning that "every ct×ct
+        // multiply is followed by exactly one switch". **Channel splitting broke
+        // that**: a split conv multiplies once per (output channel, group) and then
+        // opens *one* summed result, so weights outnumber masks. Both counts now come
+        // from the single traversal in `weight_polys`, which is what that function's
+        // own doc comment prescribes — and `MaskPool::assert_fully_consumed` is what
+        // caught the divergence rather than letting it become a silent over-encrypt.
+        let (polys, n_mask_draws) = weight_polys(&s, model);
         let ek = s.encrypt_key(&ck);
         let enc_model = precompute.then(|| EncryptedModel::encrypt(&s, &ek, &polys));
         let dk = s.decrypt_key(&ck);
@@ -1487,7 +1662,7 @@ impl CnnSession {
             dk,
             ek,
             enc_model,
-            n_weight_cts,
+            n_mask_draws,
             keygen_ms,
         }
     }
@@ -1555,7 +1730,7 @@ pub fn run_cnn_hybrid_in_session(
         MaskPool::with_len(
             s,
             &session.ek,
-            session.n_weight_cts,
+            session.n_mask_draws,
             &mut rand::thread_rng(),
         )
     });
@@ -1589,10 +1764,31 @@ pub fn run_cnn_hybrid_in_session(
         kh: K,
         kw: K,
     };
+    // One input ciphertext per channel group. At the shapes shipped today this is a
+    // single group (an RGB 28×28 conv needs degree 3977 against n = 4096), so the
+    // encryption below is the same one this line has always done.
+    let (c1_gs, c1_ng) = groups_for(conv1_shape, s.params.n);
+    let c_inputs: Vec<BfvCt> = if c1_ng == 1 {
+        vec![c_input]
+    } else {
+        (0..c1_ng)
+            .map(|gi| {
+                let m = conv_pack::pack_input_group(
+                    input,
+                    conv1_shape,
+                    gi,
+                    c1_gs,
+                    s.params.n,
+                    t_mask,
+                );
+                s.encrypt_poly_pre(&session.ek, &m)
+            })
+            .collect()
+    };
     let (conv_open, conv_masks, ph) = hybrid_conv_open(
         s,
         &session.ek,
-        &c_input,
+        &c_inputs,
         conv1_shape,
         &model.kernels,
         profile,
@@ -1627,9 +1823,6 @@ pub fn run_cnn_hybrid_in_session(
     //    conv is just the same three steps composed again — no bootstrap. ──
     for cl in &model.extra_conv {
         let tc = Instant::now();
-        let (c_conv_in, _, ph) =
-            pack_shares_to_fhe(s, &session.ek, &per_party_feat, t_mask, profile);
-        fhe_ph.add(&ph);
         let shape = ConvShape {
             in_c: cl.in_c,
             h: cl.in_h,
@@ -1637,6 +1830,19 @@ pub fn run_cnn_hybrid_in_session(
             kh: K,
             kw: K,
         };
+        // This is the layer the channel cap binds on: its input channels are the
+        // previous conv's output channels, and 16 of them at 13x13 overrun n = 4096.
+        let (gs, ng) = groups_for(shape, s.params.n);
+        let (c_conv_in, _, ph) = pack_shares_to_fhe_groups(
+            s,
+            &session.ek,
+            &per_party_feat,
+            shape,
+            (gs, ng),
+            t_mask,
+            profile,
+        );
+        fhe_ph.add(&ph);
         let (co, cm, ph) = hybrid_conv_open(
             s,
             &session.ek,
@@ -1847,8 +2053,38 @@ pub fn run_cnn_hybrid_in_session(
         ring_n: s.params.n,
         log2_q: s.params.log2_q,
         log2_t: s.params.log2_t,
-        conv_mults: model.out_channels()
-            + model.extra_conv.iter().map(|c| c.out_c()).sum::<usize>(),
+        // One multiplication per (output channel, channel group). A layer narrow
+        // enough to pack in one ciphertext contributes exactly its output-channel
+        // count, as it always did; a split layer costs its group count more.
+        conv_mults: {
+            let n = s.params.n;
+            let per_layer = |shape: ConvShape, out_c: usize| out_c * groups_for(shape, n).1;
+            per_layer(
+                ConvShape {
+                    in_c: model.in_c,
+                    h: model.d,
+                    w: model.d,
+                    kh: K,
+                    kw: K,
+                },
+                model.out_channels(),
+            ) + model
+                .extra_conv
+                .iter()
+                .map(|c| {
+                    per_layer(
+                        ConvShape {
+                            in_c: c.in_c,
+                            h: c.in_h,
+                            w: c.in_w,
+                            kh: K,
+                            kw: K,
+                        },
+                        c.out_c(),
+                    )
+                })
+                .sum::<usize>()
+        },
         conv_mults_toeplitz: conv_pack::toeplitz_multiplications(
             ConvShape {
                 in_c: model.in_c,
@@ -2387,7 +2623,7 @@ mod tests {
             log2_t: model.nbits as u32,
         });
         let (ck, _sk) = s.keygen();
-        let polys = weight_polys(&s, &model);
+        let (polys, _mask_draws) = weight_polys(&s, &model);
         let ek = s.encrypt_key(&ck);
         let enc = EncryptedModel::encrypt(&s, &ek, &polys);
 
@@ -2560,6 +2796,55 @@ mod tests {
     ///
     /// The claim this settles: `fhe::conv_pack`'s reversed channel offset was
     /// always multi-channel (it has `in_c = 2` and `in_c = 3` unit tests), but
+    /// **The 12-channel cap is a computed consequence, not a modelling choice.**
+    ///
+    /// These docs have long said the first convolution is "capped at 12 channels"
+    /// without saying by what. It is the *second* convolution's input packing:
+    /// conv1's output channels are conv2's input channels, and at 13×13 the largest
+    /// group that fits `n = 4096` is exactly 12. This pins that, so widening the model
+    /// cannot silently step over the constraint — and shows what stepping over it
+    /// costs, which is one extra ciphertext multiplication per output channel per
+    /// group.
+    #[test]
+    fn the_channel_cap_is_where_the_packing_says_it_is() {
+        use crate::fhe::conv_pack::max_group_channels;
+        let n = BfvParams::DEFAULT.n;
+
+        // Conv2's input geometry: 13×13 after the first pool.
+        let at_13 = |in_c: usize| ConvShape {
+            in_c,
+            h: 13,
+            w: 13,
+            kh: K,
+            kw: K,
+        };
+        assert_eq!(
+            max_group_channels(at_13(16), n),
+            12,
+            "the cap the docs quote must be what the packing computes"
+        );
+        assert!(at_13(12).required_degree() < n, "12 channels must fit");
+        assert!(at_13(13).required_degree() >= n, "13 must not");
+
+        // And the plan for a shipped-shape model: every layer single-group today.
+        let (model, _) = CnnModel::random(28, 7);
+        for (shape, gs, ng) in packing_plan(&model, n) {
+            assert!(ng >= 1, "shipped model must be evaluable: {shape:?}");
+            assert_eq!(
+                ng, 1,
+                "shipped model is expected to fit in one group per layer; {shape:?} \
+                 needs {ng} groups of {gs}"
+            );
+        }
+
+        // A 16-channel first conv is what channel splitting buys: still evaluable,
+        // at two multiplications per output channel rather than one.
+        let (_, gs, ng) = crate::fhe::conv_pack::channel_groups(at_13(16), n)
+            .map(|(g, k)| (at_13(16), g, k))
+            .expect("16 channels must be splittable");
+        assert_eq!((gs, ng), (12, 2));
+    }
+
     /// `CnnModel` hardcoded `in_c = 1` at three `ConvShape` sites, so no RGB
     /// image had ever reached the *hybrid*. Now one does.
     ///
@@ -2585,6 +2870,86 @@ mod tests {
             model.out_channels(),
             "three input channels must not cost three times the multiplications"
         );
+    }
+
+    /// A model whose second convolution is **too wide to pack**, run end to end
+    /// under encryption and split across channel groups.
+    ///
+    /// This is the payoff of `conv_pack::channel_groups`: 16 input channels at 13×13
+    /// needs degree 5266 against `n = 4096`, which is the constraint that has capped
+    /// the first convolution at 12 output channels. Splitting evaluates it as two
+    /// groups whose products are **added**, so it costs one extra multiplication per
+    /// output channel and still needs no evaluation key and no bootstrap.
+    ///
+    /// The assertion that matters is `r.correct`: the summed groups must decrypt to
+    /// the same class as the plaintext reference. A wrong grouping — unequal groups,
+    /// or a read-out at the full-width geometry instead of the group's — produces a
+    /// clean decryption of the wrong number, so nothing but a value check finds it.
+    #[test]
+    #[ignore] // full encrypted pipeline
+    fn a_conv_too_wide_to_pack_is_split_and_still_exact() {
+        // A two-conv model whose *second* convolution takes 16 channels at 13x13 —
+        // the shape that overruns n = 4096 and therefore must split. Built directly
+        // rather than by widening `CnnModel::random`, which has no second conv.
+        const WIDE_C: usize = 16;
+        let mut rng = StdRng::seed_from_u64(0xC0FFEE);
+        let mut small = |n: usize| -> Vec<i64> {
+            (0..n).map(|_| rng.gen_range(-2i64..=2)).collect()
+        };
+        let d = 28;
+        let kernels: Vec<Vec<i64>> = (0..WIDE_C).map(|_| small(K * K)).collect();
+        let cbias = vec![0i64; WIDE_C];
+        let conv2_out = 4;
+        let extra = vec![ConvLayer {
+            kernels: (0..conv2_out).map(|_| small(WIDE_C * K * K)).collect(),
+            cbias: vec![0i64; conv2_out],
+            in_c: WIDE_C,
+            in_h: 13,
+            in_w: 13,
+        }];
+        // conv2: 13 -> 11 valid, then pool -> 5, so the dense stack sees 4*5*5.
+        let in_dim = conv2_out * 5 * 5;
+        let classes = 3;
+        let dense_w: Vec<Vec<i64>> = (0..classes).map(|_| small(in_dim)).collect();
+        let dense_b = vec![0i64; classes];
+        let input: Vec<i64> = (0..d * d).map(|_| rng.gen_range(0i64..32)).collect();
+        let model = CnnModel::from_trained(
+            d,
+            1, // grayscale
+            kernels,
+            cbias,
+            extra,
+            Vec::new(),
+            dense_w,
+            dense_b,
+            8,
+            std::slice::from_ref(&input),
+        );
+
+        let plan = packing_plan(&model, BfvParams::DEFAULT.n);
+        let splits: Vec<usize> = plan.iter().map(|&(_, _, ng)| ng).collect();
+        assert!(
+            splits.iter().any(|&ng| ng > 1),
+            "this test is pointless unless a layer actually splits; plan {splits:?}"
+        );
+
+        let r = run_cnn_hybrid(&model, &input, NetworkProfile::INSTANT);
+        assert!(
+            r.correct,
+            "split conv: encrypted class {} != plaintext {}",
+            r.class, r.expected
+        );
+        assert_eq!(r.bootstraps, 0, "splitting must not cost a bootstrap");
+        // Multiplications now count per (output channel, group).
+        let want: usize = plan
+            .iter()
+            .zip(
+                std::iter::once(model.out_channels())
+                    .chain(model.extra_conv.iter().map(|c| c.kernels.len())),
+            )
+            .map(|((_, _, ng), out_c)| out_c * ng)
+            .sum();
+        assert_eq!(r.conv_mults, want, "grouped multiplication count");
     }
 
     /// The degree bound, asserted rather than assumed — an RGB 28×28 conv must

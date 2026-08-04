@@ -948,12 +948,63 @@ everything is "planned" cannot express priority.
   is training on an RGB set and embedding the weights, plus teaching
   `tools/train_medmnist.py` not to call `to_grayscale`.
 
-* **Channel splitting for wide intermediate layers.** This is the packing problem
-  that *is* real: 16 channels at 13×13 needs degree 5266 against `n = 4096`, which
-  is what caps the first conv at 12 channels. Splitting `in_c` into groups and
-  summing the partial products is free (homomorphic addition), so this is the
-  cheapest route to a wider model — and the prerequisite for CIFAR scale that does
-  *not* forfeit the no-evaluation-keys property the way SIMD packing would.
+* ~~**Channel splitting for wide intermediate layers.**~~ **Built 2026-08-04**
+  (`fhe::conv_pack::{channel_groups, pack_input_group, pack_kernel_group}`). The
+  limit was real — 16 channels at 13×13 needs degree 5266 against `n = 4096`, and
+  `max_group_channels` returns exactly **12** for that shape, which is precisely the
+  cap the first conv has been living under. Splitting `in_c` into groups and summing
+  the partial products is free: homomorphic addition needs no evaluation key and
+  consumes no depth, so a wide layer costs `n_groups` multiplications and still zero
+  bootstraps. That is what keeps the no-evaluation-keys property SIMD packing would
+  forfeit.
+
+  One subtlety worth carrying forward, because getting it wrong is silent:
+  `output_position` is `(in_c − 1)·hw + …`, so **the answer's coefficient depends on
+  the group's channel count.** Groups must be equal-sized with the final one
+  zero-padded, or a short last group writes to different coefficients and the sum is
+  nonsense that still decrypts. Both tests check against the *unsplit* plaintext
+  convolution, which is what catches it — including under real encryption
+  (`channel_splitting_stays_exact_under_encryption`, 4 channels of 5×5 at `n = 64`).
+
+  **The cap is now a computed property, not folklore.** `bench::cnn::packing_plan`
+  reports, per convolution, the group size and the multiplications per output channel;
+  `the_channel_cap_is_where_the_packing_says_it_is` pins that `max_group_channels` at
+  13×13 returns exactly **12**, that 13 does not fit, and that a 16-channel first conv
+  is evaluable at 2 groups. So the constraint is checkable and a future widening cannot
+  step over it silently.
+
+  **Wired onto the hybrid path 2026-08-04.** All five sites are done —
+  `weight_polys` emits one poly per (output channel, group), `hybrid_conv_open` takes
+  one input ciphertext per group and sums the products, conv1 encrypts per group,
+  conv2's `pack_shares_to_fhe_groups` slices the shares before re-encryption, and
+  `n_weight_cts` follows from `polys.len()` automatically. A single `groups_for` is the
+  only place the grouping is computed, because the weight cursor is **positional**: a
+  disagreement between the packing site and the consuming site multiplies the wrong
+  kernel by the wrong input group and yields a clean decryption of a wrong number.
+
+  `a_conv_too_wide_to_pack_is_split_and_still_exact` runs a real two-conv model whose
+  second convolution takes 16 channels at 13×13 — degree 5266 against `n = 4096` — as
+  two groups: bit-exact against the plaintext reference, **0 bootstraps**, at the
+  grouped multiplication count. `conv_mults` now counts per (output channel, group)
+  rather than per output channel, so a split layer reports its real cost.
+
+  **Retrained, and it paid off on organa** (2026-08-04). `conv(16,32)` takes organa
+  from 81.64% [81.1, 82.2] to **82.93% [82.4, 83.5]** — disjoint intervals on 17 778
+  test images — bit-exact under encryption with zero bootstraps, conv2 running as two
+  groups of 12. Pneumonia gained nothing from the same widening (84.78% → 83.97%,
+  overlapping intervals, validation up and test down): 4 708 training images overfit
+  the extra capacity where organa's 34 561 use it. **So the packing limit was the
+  ceiling only where there was data to exploit it**, which is a sharper claim than the
+  docs previously made and needed both experiments to state.
+
+  One latent coupling surfaced doing this and is worth remembering: the scheme-switch
+  mask pool was sized from the weight-ciphertext count, on the invariant that "every
+  ct×ct multiply is followed by exactly one switch". Splitting breaks it — a split conv
+  multiplies per (output channel, group) and opens one summed result per output channel
+  — so weights now outnumber masks. `MaskPool::assert_fully_consumed` caught it as an
+  over-count rather than letting it become wasted offline work, and both counts now
+  come from one traversal of the model, which `weight_polys`' own doc comment had
+  already prescribed.
 
 ## 8. What to cut, or at least defer
 

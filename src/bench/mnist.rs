@@ -85,6 +85,9 @@ fn load_model() -> (CnnModel, Vec<Vec<i64>>, Vec<u8>) {
     let dense_w: Vec<Vec<i64>> = data::DENSE_W.iter().map(|r| r.to_vec()).collect();
     let model = CnnModel::from_trained(
         data::D,
+        // MNIST is grayscale; the medmnist loader derives this from the embedded
+        // image length instead, but this path builds the model directly.
+        1,
         kernels,
         data::CBIAS.to_vec(),
         extra_conv,

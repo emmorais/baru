@@ -65,7 +65,9 @@ the results that only a single-harness study can produce: the FHE-versus-MPC
 crossover is a property of \emph{the baseline's preprocessing} rather than of
 either cryptosystem, and disappears once MPC is given somewhat-homomorphic
 preprocessing; active security on the nonlinear surface of private inference
-costs $2.63\times$ bytes but only $1.06\times$ rounds. We also report our own
+costs $2.63\times$ bytes but only $1.06\times$ rounds---and $9.70\times$ bytes once
+the semi-honest baseline it is measured against is allowed to pack, which only the
+unverified side can do. We also report our own
 withdrawn claims---a ZKP backend that proved nothing, a bit-decomposition that
 leaked its inputs, and a comparison-protocol crossover whose location we got wrong
 three times before measuring it---because a study that reports only what worked is
@@ -322,16 +324,22 @@ Verified 2026-08-01 (\cref{tab:malicious}).
 \begin{table}[t]
 \centering
 \small
-\begin{tabular}{@{}lccc@{}}
+\begin{tabular}{@{}lcccc@{}}
 \toprule
-Workload & bytes & interactive calls & wall clock (WAN, \SI{25}{\milli\second}) \\
+& \multicolumn{2}{c}{bytes} & & \\
+\cmidrule(lr){2-3}
+Workload & equal width & packed base & int.\ calls & wall clock (WAN, \SI{25}{\milli\second}) \\
 \midrule
-\textbf{Comparisons}, $n{=}32$, 32-bit & $\mathbf{2.63\times}$ & $\mathbf{1.06\times}$ & $\mathbf{1.26\times}$ \\
-Dot product, $n{=}32$, 32-bit & $2.47\times$ & $1.75\times$ & $2.80\times$ \\
+\textbf{Comparisons}, $n{=}32$, 32-bit & $\mathbf{2.63\times}$ & $\mathbf{9.70\times}$ & $\mathbf{1.06\times}$ & $\mathbf{1.26\times}$ \\
+Dot product, $n{=}64$, 32-bit & $2.44\times$ & $2.85\times$ & $2.00\times$ & $2.26\times$ \\
 \bottomrule
 \end{tabular}
 \caption{Semi-honest ABY3 versus malicious-with-abort, same workload, same
-transport. Active security costs bytes, not rounds.}
+transport. Active security costs bytes, not rounds. \emph{Equal width} charges both
+legs a 128-bit wire; \emph{packed base} lets the semi-honest leg pack to its values'
+own width, which the verified leg cannot do because its statistical security is
+$128-\mathit{used\_bits}$. The two differ by $3.7\times$ on the workload that matters
+for inference.}
 \label{tab:malicious}
 \end{table}
 
@@ -358,9 +366,11 @@ the values' own width recovered. The verified path cannot recover it---its secur
 $128 - \mathit{used\_bits}$, so narrowing to the value width sets $\lambda$ to zero.
 The slack was never free; it was invisible, because nothing was packed and so nothing
 revealed its price. The $2.63\times$ above is therefore a fair ratio at equal width
-that \emph{understates} the cost of active security against a packed baseline, by a
-factor bounded by the packing we measured on comparable paths. We have not run that
-combination and claim no figure for it.
+that \emph{understates} the cost of active security against a packed baseline. Measured:
+\textbf{$9.70\times$} on the comparison workload---the semi-honest leg packs from
+\num{234036} to \SI{63416}{\byte} while the verified leg is unchanged at
+\num{615446}. The ratio of ratios, $3.69\times$, falls inside the packing factors we
+measured on comparable paths, as predicted.
 
 \subsection{Garbled circuits}
 \label{sec:gc}
@@ -837,9 +847,9 @@ digits (\cref{tab:medmnist}).
  & PneumoniaMNIST & OrganAMNIST \\
 \midrule
 task & chest X-ray, 2 classes & abdominal CT, 11 organs \\
-integer accuracy, full test set & \SI{84.78}{\percent} (624) & \SI{81.18}{\percent} (\num{17778}) \\
+integer accuracy, full test set & \SI{84.78}{\percent} (624) & \textbf{\SI{82.93}{\percent}} (\num{17778}) \\
 \SI{95}{\percent} Wilson CI~\cite{Wilson} & $[81.7, 87.4]$ & $[80.6, 81.8]$ \\
-balanced accuracy / AUC & \SI{80.64}{\percent} / \textbf{0.9314} & \SI{80.49}{\percent} / \textbf{0.9590} \\
+balanced accuracy / AUC & \SI{80.64}{\percent} / \textbf{0.9314} & \textbf{\SI{82.21}{\percent}} / \textbf{0.9605} \\
 sensitivity / specificity & \SI{97.18}{\percent} / \textbf{\SI{64.10}{\percent}} & --- \\
 published ResNet-18 ($28\times28$) & 0.854 / 0.944 & 0.935 / 0.997 \\
 majority-class baseline & \SI{62.50}{\percent} & \SI{18.48}{\percent} \\
@@ -872,9 +882,27 @@ attributed the model's size to the FHE noise budget. That was wrong. Three limit
 bind and noise is the third: spatially, $3\times3$ valid convolution plus pooling
 takes $28 \to 13 \to 5 \to 1$, admitting at most three convolutions; by
 \emph{packing}, $2\cdot \mathrm{in}_c \cdot H \cdot W \lesssim n$ caps the first
-convolution at 12 channels before the second's input passes $n=4096$. That is a
-packing constraint that relaxes at $n=8192$, not a limit of the construction.
-Depth, meanwhile, really is free.
+convolution at 12 channels before the second's input passes $n=4096$. Depth,
+meanwhile, really is free.
+
+That packing limit is now lifted without growing the ring. Convolution is linear in
+the input channels, so a layer too wide for one ciphertext evaluates as equal channel
+groups whose products are \emph{added}---free homomorphically, needing no evaluation
+key and no depth. Doubling to $n=8192$ would also have worked and would have charged
+every operation in the pipeline; splitting charges only the layers that overrun.
+
+\textbf{It buys accuracy on one of the two datasets, and the difference is
+instructive.} Retraining both at $\mathrm{conv}(16,32)$---whose second convolution
+takes 16 channels at $13\times13$, degree \num{5266} against $n=4096$, hence two
+groups of 12---moves organa from \SI{81.64}{\percent} $[81.1, 82.2]$ to
+\textbf{\SI{82.93}{\percent}} $[82.4, 83.5]$, disjoint intervals on \num{17778} test
+images. Pneumonia does not move: \SI{84.78}{\percent} to \SI{83.97}{\percent} with
+overlapping intervals, its validation accuracy rising while its test accuracy falls.
+Both remain bit-exact with zero bootstraps.
+
+So ``the packing was the accuracy ceiling'' holds \emph{conditionally}, and the
+condition is data: organa's \num{34561} training images can use the extra capacity,
+pneumonia's \num{4708} overfit it. Either experiment alone would have been misleading.
 
 %==============================================================================
 \section{What the methodology caught in our own work}
