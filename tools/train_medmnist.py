@@ -70,12 +70,18 @@ Get the data:
                 "https://ossci-datasets.s3.amazonaws.com/mnist/$f.gz"; done
 
 RGB datasets.  Four of the twelve MedMNIST v2 2D sets ship (N,28,28,3):
-Path, Derma, Blood, Retina.  The FHE conv packing assumes a single input
-channel, so those are folded to luminance (ITU-R BT.601: 0.299R+0.587G+
-0.114B, rounded to uint8) before anything else happens.  That is a real
-change to the task -- colour carries diagnostic signal in dermatoscopy and
-histology -- so the generated file records it and the accuracy must be read
-against a grayscale baseline, never against the published RGB ResNet-18.
+Path, Derma, Blood, Retina.  `--rgb` keeps the three channels; the default folds
+them to luminance (ITU-R BT.601: 0.299R+0.587G+0.114B, rounded to uint8).
+
+The packing does NOT require the fold -- see `fold_channels` for the claim that
+was wrong here for a long time.  An RGB 28x28 convolution fits one ciphertext at
+one multiplication per output channel.  The fold stays the default only because
+every other weight file in the repo was measured with it.
+
+Folding is a real change to the task -- colour carries diagnostic signal in
+dermatoscopy and histology, measured at AUC 0.8519 against 0.7667 on DermaMNIST
+-- so the generated file records which was used, and a folded accuracy must be
+read against a grayscale baseline rather than the published RGB ResNet-18.
 
 Usage: python3 tools/train_medmnist.py <npz|mnist-dir> <rust-out>
          [--epochs N] [--n-test N] [--test-order first|random] [--linear]

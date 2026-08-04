@@ -842,24 +842,30 @@ digits (\cref{tab:medmnist}).
 \begin{table}[t]
 \centering
 \small
-\begin{tabular}{@{}lrr@{}}
+\begin{tabular}{@{}lrrr@{}}
 \toprule
- & PneumoniaMNIST & OrganAMNIST \\
+ & PneumoniaMNIST & OrganAMNIST & DermaMNIST \\
 \midrule
-task & chest X-ray, 2 classes & abdominal CT, 11 organs \\
-integer accuracy, full test set & \SI{84.78}{\percent} (624) & \textbf{\SI{82.93}{\percent}} (\num{17778}) \\
-\SI{95}{\percent} Wilson CI~\cite{Wilson} & $[81.7, 87.4]$ & $[80.6, 81.8]$ \\
-balanced accuracy / AUC & \SI{80.64}{\percent} / \textbf{0.9314} & \textbf{\SI{82.21}{\percent}} / \textbf{0.9605} \\
-sensitivity / specificity & \SI{97.18}{\percent} / \textbf{\SI{64.10}{\percent}} & --- \\
-published ResNet-18 ($28\times28$) & 0.854 / 0.944 & 0.935 / 0.997 \\
-majority-class baseline & \SI{62.50}{\percent} & \SI{18.48}{\percent} \\
-\textbf{encrypted $=$ plaintext} & \textbf{300/300} & \textbf{300/300} \\
-FHE bootstraps & 0 & 0 \\
-online latency / diagnosis & \textbf{\SI{268}{\milli\second}} & \SI{291}{\milli\second} \\
+task & chest X-ray, 2 classes & abdominal CT, 11 organs & dermatoscopy, 7 lesions \\
+input & $1\times28\times28$ & $1\times28\times28$ & $\mathbf{3\times28\times28}$ (RGB) \\
+integer accuracy, full test set & \SI{84.78}{\percent} (624) & \textbf{\SI{82.93}{\percent}} (\num{17778}) & \SI{72.12}{\percent} (\num{2005}) \\
+\SI{95}{\percent} Wilson CI~\cite{Wilson} & $[81.7, 87.4]$ & $[82.4, 83.5]$ & $[70.1, 74.0]$ \\
+balanced accuracy / AUC & \SI{80.64}{\percent} / \textbf{0.9314} & \textbf{\SI{82.21}{\percent}} / \textbf{0.9605} & \SI{30.14}{\percent} / \textbf{0.8519} \\
+sensitivity / specificity & \SI{97.18}{\percent} / \textbf{\SI{64.10}{\percent}} & --- & --- \\
+published ResNet-18 ($28\times28$) & 0.854 / 0.944 & 0.935 / 0.997 & 0.735 / 0.917 \\
+majority-class baseline & \SI{62.50}{\percent} & \SI{18.48}{\percent} & \textbf{\SI{66.88}{\percent}} \\
+\textbf{encrypted $=$ plaintext} & \textbf{300/300} & \textbf{300/300} & \textbf{300/300} \\
+FHE bootstraps & 0 & 0 & 0 \\
+online latency / diagnosis & \textbf{\SI{268}{\milli\second}} & \SI{291}{\milli\second} & \SI{271}{\milli\second} \\
 \bottomrule
 \end{tabular}
 \caption{Private diagnosis on real biomedical images, image \emph{and} weights
-encrypted, only the class index revealed.}
+encrypted, only the class index revealed. DermaMNIST is read on balanced accuracy and
+AUC: its largest class is \SI{66.88}{\percent} of the test set, which published
+ResNet-18 beats by under seven points. Its RGB input costs nothing extra---an RGB
+$28\times28$ convolution needs degree \num{3977} against $n=4096$ and so fits one
+ciphertext at one multiplication per output channel, which is why its latency matches
+the grayscale rows.}
 \label{tab:medmnist}
 \end{table}
 

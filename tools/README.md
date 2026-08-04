@@ -14,7 +14,24 @@ add another generated file, add its command below in the same breath.
 | `mnist_cnn.rs` | `baru bench-mnist` | `train_medmnist.py mnist/ examples/data/mnist_cnn.rs --epochs 30 --test-order first --classes 0,1,2,3,4,5,6,7,8,9 --dataset MNIST --task "handwritten digit recognition"` |
 | `pneumonia_cnn.rs` | `baru bench-medmnist --dataset pneumonia` | `train_medmnist.py pneumoniamnist.npz examples/data/pneumonia_cnn.rs --epochs 25 --classes normal,pneumonia --dataset PneumoniaMNIST --task "pediatric chest X-ray: pneumonia vs normal"` |
 | `organa_cnn.rs` | `baru bench-medmnist --dataset organa` | `train_medmnist.py organamnist.npz examples/data/organa_cnn.rs --epochs 45 --classes bladder,femur-left,femur-right,heart,kidney-left,kidney-right,liver,lung-left,lung-right,pancreas,spleen --dataset OrganAMNIST --task "abdominal CT: 11-organ classification (axial views)"` |
+| `derma_cnn.rs` | `baru bench-medmnist --dataset derma` | `train_medmnist.py dermamnist.npz examples/data/derma_cnn.rs --epochs 40 --rgb --classes actinic-keratoses,basal-cell-carcinoma,benign-keratosis,dermatofibroma,melanoma,melanocytic-nevi,vascular-lesion --dataset DermaMNIST --task "dermatoscopy: 7-class skin lesion"` |
 | `pneumonia_linear.rs` | `cargo run --example mnist -- --pneumonia` | `train_medmnist.py pneumoniamnist.npz examples/data/pneumonia_linear.rs --linear --epochs 30 --classes normal,pneumonia --dataset PneumoniaMNIST --task "pediatric chest X-ray: pneumonia vs normal"` |
+
+**`derma_cnn.rs` is the RGB one, and `--rgb` is load-bearing.** Without it the
+dataset is folded to luminance and the result is a different experiment: measured at
+40 epochs, colour is worth **AUC 0.8519 against 0.7667** and balanced accuracy
+**30.14% against 23.30%**. Dermatoscopy is where colour should matter, and it does.
+The fold remains the default for every other set because every figure in the repo was
+measured that way.
+
+**`organa_cnn.rs` is `--conv 16,32`, not the default `8,16`.** Its second convolution
+takes 16 channels at 13×13, which needs degree 5266 against a ring dimension of 4096
+and therefore runs as two channel groups — free homomorphically, at two ciphertext
+multiplications per output channel instead of one. That widening is worth **82.93%
+against 81.64%** on 17 778 test images, with disjoint confidence intervals. Pneumonia
+was left at `8,16` because the same widening gained it nothing: 4 708 training images
+overfit the extra capacity, and its validation accuracy rose while its test accuracy
+fell.
 
 `examples/data/mnist_data.rs` is the one exception: its 784 weights are
 hand-written (extracted from `tests/nn.rs`), not trained, so there is nothing
@@ -65,11 +82,20 @@ Going deeper is the way to spend the budget that is left: `--conv 8,12,32` is
 three convs, runs encrypted bit-exactly, and needs no bootstrap.
 
 Four of the twelve MedMNIST v2 2D sets ship RGB (Path, Derma, Blood, Retina).
-The FHE conv packing assumes one input channel, so those are folded to BT.601
-luminance before training. That is a real change to the task — colour carries
-diagnostic signal in dermatoscopy and histology — so the run says so, the
-generated file records it, and the accuracy must be read against a grayscale
-baseline, never against the published RGB ResNet-18.
+**`--rgb` keeps the colour; without it they are folded to BT.601 luminance.**
+
+This used to say the FHE conv packing "assumes one input channel", and that was
+wrong — the fourth place in this repo to say it. `fhe::conv_pack` has always been
+multi-channel, because channels summing on a shared coefficient is the entire point
+of its reversed offset; what was single-channel was the Rust plumbing, which
+hardcoded `in_c = 1`. An RGB 28×28 convolution needs degree 3977 against a ring
+dimension of 4096, so it fits one ciphertext at **one multiplication per output
+channel** — three channels do not cost three times the work.
+
+The fold is therefore a choice, and it stays the default because every other weight
+file and every accuracy figure in the repo was measured with it. When it is applied
+the run says so and the generated file records it, and such an accuracy must be read
+against a grayscale baseline rather than the published RGB ResNet-18.
 
 ## Getting the data
 
@@ -78,7 +104,7 @@ rather than redistributed.
 
 ```sh
 # MedMNIST v2 (CC BY 4.0) — https://medmnist.com
-for d in pneumoniamnist organamnist; do
+for d in pneumoniamnist organamnist dermamnist; do
   curl -sLo $d.npz "https://zenodo.org/records/10519652/files/$d.npz?download=1"
 done
 

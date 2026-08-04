@@ -34,10 +34,11 @@
 //! group per output channel and still no evaluation key and no bootstrap. Both limits
 //! are now training problems rather than packing ones.
 //!
-//! | dataset | task | classes | test set |
-//! |---|---|---|---|
-//! | `pneumonia` | pediatric chest X-ray, pneumonia vs normal | 2 | 624 |
-//! | `organa` | abdominal CT, which organ (axial views) | 11 | 17 778 |
+//! | dataset | task | classes | channels | test set |
+//! |---|---|---|---|---|
+//! | `pneumonia` | pediatric chest X-ray, pneumonia vs normal | 2 | 1 | 624 |
+//! | `organa` | abdominal CT, which organ (axial views) | 11 | 1 | 17 778 |
+//! | `derma` | dermatoscopy, 7-class skin lesion | 7 | **3 (RGB)** | 2 005 |
 //!
 //! # What is measured
 //!
@@ -64,16 +65,31 @@
 //!
 //! # Results (2026-08-01, Apple M1 Pro / 8 cores, 20 images per config)
 //!
-//! Organa was retrained wider on 2026-08-04 — see the channel-splitting note below —
-//! so its column is the `conv(16,32)` model; pneumonia is unchanged at `conv(8,16)`.
+//! Two changes landed 2026-08-04: organa was retrained wider (`conv(16,32)`, its
+//! second conv split across two channel groups) and `derma` was added as the first
+//! **RGB** set. Pneumonia is unchanged at `conv(8,16)`.
 //!
-//! | | pneumonia | organa |
-//! |---|---|---|
-//! | architecture | conv(8,16) | **conv(16,32)**, conv2 split 2×12 |
-//! | integer accuracy, 300 embedded images | **85.00%** | **85.00%** |
-//! | integer accuracy, full test set | 84.78% (624) | **82.93%** (17 778) |
-//! | 95% CI on the full-test figure | [81.7, 87.4] | **[82.4, 83.5]** |
-//! | balanced accuracy / AUC, **full test** | 80.64% / **0.9314** | **82.21%** / **0.9605** |
+//! | | pneumonia | organa | derma (RGB) |
+//! |---|---|---|---|
+//! | architecture | conv(8,16) | **conv(16,32)**, conv2 split 2×12 | conv(8,16), 3 channels |
+//! | integer accuracy, 300 embedded images | **85.00%** | **85.00%** | 69.33% |
+//! | integer accuracy, full test set | 84.78% (624) | **82.93%** (17 778) | **72.12%** (2 005) |
+//! | 95% CI on the full-test figure | [81.7, 87.4] | **[82.4, 83.5]** | [70.1, 74.0] |
+//! | balanced accuracy / AUC, **full test** | 80.64% / **0.9314** | **82.21%** / **0.9605** | **30.14%** / **0.8519** |
+//! | majority-class baseline | 62.50% | 18.48% | 66.88% |
+//!
+//! **Read derma on balanced accuracy and AUC, not accuracy.** Its largest class is
+//! 66.88% of the test set, and published ResNet-18 reaches 0.735 — beating the
+//! majority by under seven points. Accuracy is nearly uninformative at that skew,
+//! which is why `embedded_accuracy_is_reasonable` checks balanced accuracy against
+//! chance rather than accuracy against the majority.
+//!
+//! **Colour is worth having, and costs nothing in ciphertext multiplications.**
+//! Against a grayscale-folded control trained identically, RGB gives AUC **0.8519 vs
+//! 0.7667** and balanced accuracy **30.14% vs 23.30%** — dermatoscopy is where colour
+//! should carry signal, and it does. An RGB 28×28 convolution needs degree 3977
+//! against `n = 4096`, so it fits one ciphertext at **one multiplication per output
+//! channel**: three channels do not triple the work, they sum on shared coefficients.
 //! | sensitivity / specificity, full test | 97.18% / **64.10%** | — |
 //! | published ResNet-18 (28×28), ACC / AUC | 0.854 / 0.944 | 0.935 / 0.997 |
 //! | majority-class baseline | 62.50% | 18.48% |
@@ -1162,6 +1178,49 @@ mod tests {
     /// accuracy, and must beat its majority-class baseline — the check that
     /// catches a quantisation or flatten-order regression, which shows up as
     /// a classifier collapsed onto one class.
+    /// **The shipped derma model is genuinely RGB**, and this is the fast guard for it.
+    ///
+    /// The slow guard — `encrypted_matches_plaintext_on_real_scans` — takes twenty
+    /// minutes across three datasets and five protocol configurations, so it is not
+    /// the thing that should be relied on to notice a three-channel model quietly
+    /// becoming a one-channel one. That failure has a specific shape worth naming: the
+    /// trainer folds RGB to luminance unless `--rgb` is passed, and a regenerated
+    /// weight file missing that flag would still load, still train, still score
+    /// plausibly, and silently be a different experiment. A `--rgb` flag that fails to
+    /// reach the trainer is not hypothetical — it happened, via shell word-splitting,
+    /// and produced two "RGB vs grayscale" arms that were both grayscale.
+    ///
+    /// So this checks the property that distinguishes them: the channel count, derived
+    /// from the embedded image length rather than declared, and the packing cost that
+    /// follows from it.
+    #[test]
+    fn the_shipped_derma_model_is_rgb_and_costs_one_multiply_per_channel() {
+        let data = load("derma").expect("derma must be embedded");
+        assert_eq!(
+            data.in_c(),
+            3,
+            "derma must be RGB — a grayscale fold means --rgb never reached the trainer"
+        );
+        assert_eq!(
+            data.images[0].len(),
+            3 * data.d * data.d,
+            "an RGB image is three channels of d×d, laid out channel-major"
+        );
+
+        let model = data.model();
+        let n = crate::fhe::bfv::BfvParams::DEFAULT.n;
+        let plan = crate::bench::cnn::packing_plan(&model, n);
+        let (c1, _, ng1) = plan[0];
+        assert_eq!(c1.in_c, 3, "the first conv sees three channels");
+        assert_eq!(
+            ng1, 1,
+            "RGB 28×28 must fit ONE ciphertext (degree {} against n={n}) — three \
+             channels sum on shared coefficients rather than costing three multiplies",
+            c1.required_degree()
+        );
+        assert_eq!(c1.required_degree(), 3977, "the degree this rests on");
+    }
+
     /// **The shipped organa model exercises channel splitting**, and this pins that
     /// the capability is actually in use rather than merely available.
     ///
@@ -1218,11 +1277,29 @@ mod tests {
                 .filter(|(img, &l)| model.forward(img).0 == l as usize)
                 .count();
             let acc = correct as f64 / data.images.len() as f64;
+
+            // **Balanced accuracy against chance, not accuracy against the majority
+            // class.** This assertion exists to catch a wiring error — a wrong
+            // quantisation mapping or flatten order — and plain accuracy cannot do
+            // that on a severely imbalanced multi-class set. DermaMNIST's largest
+            // class is 67% of it, and published ResNet-18 beats that by only ~6.6
+            // points, so "majority + 5" is unreachable there for reasons that have
+            // nothing to do with wiring. Balanced accuracy against `1/nclasses` is
+            // the check that works for every shape of dataset: a misflattened input
+            // scores at chance whatever the class balance is.
+            let nclasses = data.class_names.len();
+            let logits: Vec<Vec<i64>> = data
+                .images
+                .iter()
+                .map(|img| model.forward_logits(img).0)
+                .collect();
+            let m = ClassificationMetrics::compute(&logits, &data.labels, nclasses);
+            let chance = 1.0 / nclasses as f64;
             assert!(
-                acc > data.majority_baseline + 0.05,
-                "{name}: subset accuracy {acc:.3} barely beats the majority baseline \
-                 {:.3} — check the quantisation mapping or the flatten order",
-                data.majority_baseline
+                m.balanced_accuracy > chance * 1.5,
+                "{name}: balanced accuracy {:.3} is near chance {chance:.3} — check the \
+                 quantisation mapping or the flatten order",
+                m.balanced_accuracy
             );
             assert!(
                 (acc - data.full_test_accuracy).abs() < 0.10,

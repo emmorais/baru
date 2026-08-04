@@ -671,18 +671,32 @@ MedMNIST v2 distributes twelve biomedical datasets at 28×28 — exactly MNIST's
 shape — so a private-inference pipeline runs on them unchanged, and the artifact
 stops being about handwritten digits.
 
-| | PneumoniaMNIST | OrganAMNIST |
-|---|---|---|
-| task | chest X-ray, pneumonia vs normal | abdominal CT, 11 organs |
-| integer accuracy, full test set | 84.78% (624) | **82.93%** (17,778) |
-| 95% Wilson CI | [81.7, 87.4] | [80.6, 81.8] |
-| balanced accuracy / AUC | 80.64% / **0.9314** | **82.21%** / **0.9605** |
-| sensitivity / specificity | 97.18% / **64.10%** | — |
-| published ResNet-18 (28×28) | 0.854 / 0.944 | 0.935 / 0.997 |
-| majority-class baseline | 62.50% | 18.48% |
-| **encrypted == plaintext** | **300/300** | **300/300** |
-| FHE bootstraps | 0 | 0 |
-| online latency / diagnosis | **268 ms** | 291 ms |
+| | PneumoniaMNIST | OrganAMNIST | DermaMNIST |
+|---|---|---|---|
+| task | chest X-ray, pneumonia vs normal | abdominal CT, 11 organs | dermatoscopy, 7 lesions |
+| input | 1×28×28 | 1×28×28 | **3×28×28 (RGB)** |
+| integer accuracy, full test set | 84.78% (624) | **82.93%** (17,778) | 72.12% (2,005) |
+| 95% Wilson CI | [81.7, 87.4] | [82.4, 83.5] | [70.1, 74.0] |
+| balanced accuracy / AUC | 80.64% / **0.9314** | **82.21%** / **0.9605** | 30.14% / **0.8519** |
+| sensitivity / specificity | 97.18% / **64.10%** | — | — |
+| published ResNet-18 (28×28) | 0.854 / 0.944 | 0.935 / 0.997 | 0.735 / 0.917 |
+| majority-class baseline | 62.50% | 18.48% | **66.88%** |
+| **encrypted == plaintext** | **300/300** | **300/300** | **300/300** |
+| FHE bootstraps | 0 | 0 | 0 |
+| online latency / diagnosis | **268 ms** | 291 ms | 271 ms |
+
+DermaMNIST is read on balanced accuracy and AUC, not accuracy: its largest class is
+66.88% of the test set and the published ResNet-18 beats that by under seven points,
+so accuracy carries almost no signal at that skew.
+
+**Colour is worth having and costs nothing in ciphertext multiplications.** Against a
+grayscale-folded control trained identically, RGB gives AUC **0.8519 against 0.7667**
+and balanced accuracy **30.14% against 23.30%** — dermatoscopy is where colour should
+carry diagnostic signal, and it does. The packing takes it for free: an RGB 28×28
+convolution needs degree 3977 against `n = 4096`, so it fits one ciphertext at **one
+multiplication per output channel**. Three channels sum on shared coefficients rather
+than costing three times the work, which is why the RGB row's latency matches the
+grayscale ones.
 
 Three points a privacy venue should care about.
 

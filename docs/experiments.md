@@ -1105,7 +1105,7 @@ baru bench-medmnist --dataset all --hybrid 3 --both
 | float accuracy of the same net | 84.78% | 81.03% |
 | majority-class baseline | 62.50% | 18.48% |
 | published ResNet-18 (28×28) | 0.854 | 0.935 |
-| 95% CI on the full-test figure | [81.7, 87.4] | [80.6, 81.8] |
+| 95% CI on the full-test figure | [81.7, 87.4] | [82.4, 83.5] |
 | **AUC, full test set** | **0.9314** | **0.9605** (macro OvR) |
 | published ResNet-18 AUC | 0.944 | 0.997 |
 | **balanced accuracy, full test set** | **80.64%** | **82.21%** |
