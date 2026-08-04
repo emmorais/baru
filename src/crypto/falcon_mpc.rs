@@ -2640,6 +2640,67 @@ mod tests {
         bytes: u64,
     }
 
+    /// **The width-matched byte comparison against Falcon's reported LeNet figure.**
+    ///
+    /// Every byte number on `falcon-reproduction.md` was at `ℓ = 20` (the hybrid's
+    /// activations calibrate there) against Falcon's `ℓ = 32`. Comparing them is comparing
+    /// two ring widths, and this page's whole history is wrong answers of exactly that
+    /// shape — so this measures **at their width**, and reports the quantities separately
+    /// rather than picking the flattering one.
+    ///
+    /// # Why this is MPC-only, and why that is right
+    ///
+    /// The hybrid cannot run at `ℓ = 32`: `CnnModel` asserts `log2_t ≤ 30` because that is
+    /// the depth-1 BFV noise budget at `n = 4096, q = 2^100`. But Falcon has **no FHE side**
+    /// — its 0.74 MB is nonlinearity traffic — so the comparable quantity is the DReLU
+    /// traffic, not a pipeline total. Reporting our FHE bytes against their MPC bytes would
+    /// be the same category error in a new place.
+    ///
+    /// # Two DReLU counts, because the schedule differs
+    ///
+    /// `4 693` is what Baru's LeNet-5 actually asks for (max-pool before the nonlinearity;
+    /// see `bench::cnn::lenet_end_to_end_is_exact_and_costed`). `8 044` is what an
+    /// ReLU-then-pool schedule needs and what Falcon's own count corresponds to. Both are
+    /// reported: the first is our cost, the second is the like-for-like workload.
+    #[test]
+    #[ignore] // real 3-party transport at LeNet scale, ℓ = 32
+    fn the_width_matched_lenet_byte_comparison() {
+        const L: u32 = 32; // Falcon's ring width
+        const FALCON_REPORTED_MB: f64 = 0.74;
+
+        for (label, n) in [("baru schedule (pool→relu)", 4693usize), ("relu→pool", 8044)] {
+            let (off, on) = measure_drelu_phases(n, L);
+            let total_mb = (off.bytes + on.bytes) as f64 / 1e6;
+            let online_mb = on.bytes as f64 / 1e6;
+            println!(
+                "\n  {label}, n={n}, ℓ={L}, per party:\n    \
+                 offline {:.2} MB  online {:.2} MB  total {:.2} MB\n    \
+                 vs Falcon reported {FALCON_REPORTED_MB} MB → \
+                 total {:.2}x, online {:.2}x",
+                off.bytes as f64 / 1e6,
+                online_mb,
+                total_mb,
+                total_mb / FALCON_REPORTED_MB,
+                online_mb / FALCON_REPORTED_MB,
+            );
+            assert!(off.bytes > 0 && on.bytes > 0, "{label}: both phases must be measured");
+            // The offline phase dominates, which is the fact that decides which number is
+            // quotable against theirs — and it is why this reports both rather than one.
+            assert!(
+                off.bytes > on.bytes,
+                "{label}: preprocessing should dominate; offline {} online {}",
+                off.bytes, on.bytes
+            );
+        }
+
+        println!(
+            "\n  ⚠ Falcon's 0.74 MB is semi-honest LAN and this measurement does not \
+             establish\n    whether it includes preprocessing. The total and online figures \
+             above bracket\n    the comparison; quoting one of them as *the* answer is the \
+             error this page\n    has already made twice."
+        );
+    }
+
     /// **`Π_DReLU`'s offline and online costs, measured apart.**
     ///
     /// This is the measurement `docs/falcon-reproduction.md` needed and could not

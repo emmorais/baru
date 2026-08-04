@@ -18,7 +18,12 @@ at 268 ms against Falcon's 47 ms for a comparable network (LeNet, ~60 k
 parameters vs our 53 k), in the *same* stated threat model — semi-honest,
 honest-majority, 3 party. That is 5.7× slower with 14× the communication, and no
 amount of optimising the FHE hybrid closes it: **our FHE segment alone is 99 ms**,
-more than Falcon's entire inference. Two sessions of measurement have made that
+more than Falcon's entire inference.
+
+> Those framing numbers compare across ring widths and networks. The width-matched
+> comparison — LeNet-5, ℓ = 32, their workload — is in *The width-matched comparison*
+> below, and it brackets rather than settles: our **total** bytes are 6.7× theirs, our
+> **online** bytes 0.57× theirs, and which is fair depends on what their figure includes. Two sessions of measurement have made that
 concrete, and two candidate optimisations died on it:
 
 - **per-layer `nbits`** — every layer is within 2 bits of the global width, so
@@ -342,8 +347,44 @@ would understate them.
    | this reproduction, all parties | **1.57 MB** |
    | Falcon, reported | **0.74 MB** (LeNet, semi-honest LAN) |
 
-   *(Superseded by the validation below — this extrapolation counted only
-   `Π_PC`, not the full DReLU, and so understated by ~2×.)*
+   *(Superseded twice. First by the validation below — this extrapolation counted only
+   `Π_PC`, not the full DReLU, and so understated by ~2×. Then by the width-matched
+   measurement, which is the honest version of this table.)*
+
+### The width-matched comparison (2026-08-04)
+
+Everything above compares our `ℓ = 20` bytes against Falcon's `ℓ = 32`. That is a
+comparison between two ring widths, and this page's entire error history has that shape,
+so `the_width_matched_lenet_byte_comparison` measures **at their width**. Per party,
+ℓ = 32:
+
+| schedule | DReLUs | offline | online | **total** |
+|---|---|---|---|---|
+| Baru (max-pool before ReLU) | 4 693 | 2.62 MB | 0.25 MB | **2.87 MB** |
+| ReLU before max-pool | 8 044 | 4.50 MB | 0.42 MB | **4.92 MB** |
+| Falcon, reported | 8 044 | — | — | **0.74 MB** (semi-honest LAN) |
+
+**Read as a bracket, not a verdict.** Against their 0.74 MB our *total* is 3.9–6.7× worse
+and our *online* phase is 0.33–0.57× of it — a 3× advantage. Which comparison is the fair
+one depends on whether their figure includes preprocessing, and **this measurement does not
+establish that**; it is a question about the paper's accounting. Both numbers are given
+because picking one is precisely the error made twice already on this page.
+
+What the measurement does settle:
+
+- **The near-parity this table used to suggest (0.52 vs 0.74) was an online-phase number
+  compared against an unknown.** At matched width the total is 4.92 MB for the same
+  workload — 6.7×, not 0.7×.
+- **The offline phase is 91% of the bytes at ℓ = 32** (2.62 of 2.87), independently
+  reproducing the 91% figure measured elsewhere on this page. That is why the offline/online
+  distinction decides the comparison rather than merely refining it.
+- **The schedule is worth 1.7× in bytes as well as in count.** 2.87 MB against 4.92 MB for
+  the same network, from max-pooling before the nonlinearity.
+
+This is MPC-only, and deliberately: the hybrid **cannot** run at ℓ = 32 — `CnnModel` asserts
+`log2_t ≤ 30`, the depth-1 BFV noise budget at `n = 4096, q = 2^100` — but Falcon has no FHE
+side, so nonlinearity traffic is the comparable quantity. Putting our FHE bytes against their
+MPC bytes would be the same category error in a new place.
 
 ## Validated against Falcon's published complexity (2026-08-01)
 
