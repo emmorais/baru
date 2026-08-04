@@ -120,7 +120,17 @@ use crate::interpreter::backend::{Backend, ShareRef};
 use crate::interpreter::transport_backend::TransportBackend;
 
 const OC: usize = 8; // conv output channels
-const K: usize = 3; // conv kernel size
+/// Default conv kernel size — the one the shipped MedMNIST models were trained with.
+///
+/// **Not the only one.** Kernel size is a per-layer field (`CnnModel::k`, `ConvLayer::k`)
+/// so LeNet's 5×5 can be expressed; this constant is what the existing constructors and
+/// tests use, and it exists so those shapes did not all have to be respelled when the
+/// field was introduced. `fhe::conv_pack` was already general in `kh`/`kw` — the
+/// single-kernel-size assumption lived entirely in this module's model representation.
+const K: usize = 3;
+
+/// [`K`], public for the modules that build [`ConvLayer`]s from shipped weight files.
+pub const DEFAULT_K: usize = K;
 const POOL: usize = 2; // max-pool window / stride
 const NCLASSES: usize = 10;
 
@@ -184,6 +194,23 @@ pub fn wire_bits_for(nbits: usize) -> Option<u32> {
     wire_bits_override(nbits).or(Some(nbits as u32 + 1))
 }
 
+/// The wire width a *route* needs.
+///
+/// All three routes take [`wire_bits_for`]'s narrowed width. Falcon is worth a note
+/// because for a while it could not: its truncation **opens** `a + r`, so `r` has to
+/// cover the ring to hide `a`, and the first fix for that was to widen the ring by a
+/// statistical parameter `κ` — which is exactly the slack the narrowing spends, and
+/// measured ~1.9× *dearer* in bytes than `a2b`.
+///
+/// Computing the wrap bit instead removed the conflict, so the function stays trivial
+/// and the narrowed wire applies everywhere. It is kept as a named seam rather than
+/// inlined because "which width does this route need" turned out to be a real question
+/// with a route-dependent answer once, and may be again — `bench-malicious` already has
+/// a different answer for a different reason.
+pub fn wire_bits_for_nonlin(nbits: usize, _nonlin: Nonlin) -> Option<u32> {
+    wire_bits_for(nbits)
+}
+
 /// `BARU_WIRE_BITS` if it is set, and nothing otherwise — the same parsing as
 /// [`wire_bits_for`] but **without** its narrowed default.
 ///
@@ -223,6 +250,8 @@ pub struct ConvLayer {
     pub in_c: usize,
     pub in_h: usize,
     pub in_w: usize,
+    /// Square kernel side. [`K`] for the shipped models, 5 for LeNet.
+    pub k: usize,
 }
 
 impl ConvLayer {
@@ -230,10 +259,20 @@ impl ConvLayer {
         self.kernels.len()
     }
     fn out_h(&self) -> usize {
-        self.in_h - K + 1
+        self.in_h - self.k + 1
     }
     fn out_w(&self) -> usize {
-        self.in_w - K + 1
+        self.in_w - self.k + 1
+    }
+    /// The shape this layer presents to the FHE packing.
+    fn shape(&self) -> ConvShape {
+        ConvShape {
+            in_c: self.in_c,
+            h: self.in_h,
+            w: self.in_w,
+            kh: self.k,
+            kw: self.k,
+        }
     }
 }
 
@@ -249,7 +288,9 @@ pub struct CnnModel {
     /// channels across ciphertexts; a wide *intermediate* layer is what does not
     /// (16 channels at 13×13 needs 5266), and that constraint is unchanged.
     pub in_c: usize,
-    pub kernels: Vec<Vec<i64>>, // first conv: [OC][in_c*K*K], row-major (in_c, ky, kx)
+    /// First conv's square kernel side. [`K`] for the shipped models, 5 for LeNet.
+    pub k: usize,
+    pub kernels: Vec<Vec<i64>>, // first conv: [OC][in_c*k*k], row-major (in_c, ky, kx)
     pub cbias: Vec<i64>,        // [OC]
     /// Additional conv layers after the first (each followed by ReLU∘rescale
     /// and max-pool). Empty for the shallow model `bench-cnn` exercises; one
@@ -273,19 +314,46 @@ pub struct CnnModel {
 }
 
 impl CnnModel {
+    /// The first convolution's packing shape.
+    ///
+    /// Four call sites used to spell this out with a hardcoded kernel size. Kernel size is
+    /// now per-layer, and "the same shape, derived twice" is the shape of two bugs already
+    /// on the record here (the weight cursor and the mask pool), so it is derived once.
+    pub fn conv1_shape(&self) -> ConvShape {
+        ConvShape {
+            in_c: self.in_c,
+            h: self.d,
+            w: self.d,
+            kh: self.k,
+            kw: self.k,
+        }
+    }
+
     pub fn random(d: usize, seed: u64) -> (Self, Vec<i64>) {
+        Self::random_with_kernel(d, seed, K)
+    }
+
+    /// [`CnnModel::random`] at an arbitrary square kernel size.
+    ///
+    /// Exists so 5×5 — LeNet's kernel — is reachable without a trained weight file. The
+    /// FHE packing was always general in `kh`/`kw`; what was fixed at 3×3 was this module's
+    /// model representation, and `packed_layout_computes_the_convolution` now covers 5×5
+    /// and 5×4 shapes that no test reached before.
+    pub fn random_with_kernel(d: usize, seed: u64, k: usize) -> (Self, Vec<i64>) {
+        assert!(k >= 1 && k <= d, "kernel {k} does not fit a {d}×{d} input");
         assert!(
-            (d - (K - 1)).is_multiple_of(POOL),
-            "conv output side must be even for pooling"
+            (d - (k - 1)).is_multiple_of(POOL),
+            "conv output side {} must be even for pooling (d={d}, k={k})",
+            d - (k - 1)
         );
-        let oh = d - (K - 1);
+        let oh = d - (k - 1);
         let ph = oh / POOL;
         let flat = OC * ph * ph;
         let shift = 6;
 
         let mut rng = StdRng::seed_from_u64(seed);
         let kernels = (0..OC)
-            .map(|_| (0..K * K).map(|_| rng.gen_range(-4i64..=4)).collect())
+            .map(|_| (0..k * k).map(|_| rng.gen_range(-4i64..=4)).collect())
             .collect();
         let cbias = (0..OC).map(|_| rng.gen_range(-16i64..=16)).collect();
         let dense_w = (0..NCLASSES)
@@ -296,6 +364,7 @@ impl CnnModel {
 
         let mut model = CnnModel {
             d,
+            k,
             in_c: 1,
             kernels,
             cbias,
@@ -333,6 +402,96 @@ impl CnnModel {
         (model, input)
     }
 
+    /// **LeNet-5**, with random weights: `1×28×28 → conv(6,5×5) → pool → conv(16,5×5) →
+    /// pool → dense(→120) → dense(→84) → dense(→10)`.
+    ///
+    /// This is the architecture `docs/falcon-reproduction.md`'s comparison targets —
+    /// 281 640 MACs, matching its "Falcon's LeNet is ~282 k MACs" — so it is the one that
+    /// makes the comparison like-for-like. The doc's own "what must be true" section says to
+    /// reproduce their network rather than ours, and this is that network.
+    ///
+    /// # Getting the network wrong is easy and was done once
+    ///
+    /// The first version of this constructor built **20/50/500** — the Caffe LeNet, which is
+    /// a different and much larger network: 2 293 000 MACs, 8× LeNet-5, and 15 229 DReLUs
+    /// against LeNet-5's 4 684. Measured against the doc's 8 044 it read as "the
+    /// extrapolation understates by 1.89×", which was not a finding about the extrapolation
+    /// at all — it was two different architectures being compared. [`CnnModel::lenet_caffe`]
+    /// exists so that variant is still reachable, under a name that says which it is.
+    ///
+    /// # What this gives you
+    ///
+    /// The weights are **random**, so accuracy is chance and must never be quoted. Cost is
+    /// real — bytes, messages, ciphertext multiplications and comparison counts follow from
+    /// the shapes, not the values — and exactness against the plaintext reference is still
+    /// asserted, so an agreeing run is evidence the pipeline computes this architecture
+    /// correctly at its true cost.
+    pub fn lenet5(seed: u64) -> (Self, Vec<i64>) {
+        Self::lenet_shaped(seed, 6, 16, &[120, 84])
+    }
+
+    /// The **Caffe** LeNet: `conv(20,5×5) → pool → conv(50,5×5) → pool → dense(→500)`.
+    ///
+    /// A different network from [`CnnModel::lenet5`] — 8× the MACs — kept because it is what
+    /// many "LeNet" figures in the literature actually mean, and because its second conv
+    /// (`in_c = 20` at `12×12`, 5×5) needs degree 5 667 against `n = 4096` and so **must**
+    /// split channels. That makes it the first architecture here where channel splitting is
+    /// load-bearing rather than exercised by a synthetic shape.
+    pub fn lenet_caffe(seed: u64) -> (Self, Vec<i64>) {
+        Self::lenet_shaped(seed, 20, 50, &[500])
+    }
+
+    /// Shared body of [`CnnModel::lenet5`] and [`CnnModel::lenet_caffe`]: 5×5 convs at
+    /// 28×28, two conv layers, then the given hidden widths.
+    fn lenet_shaped(seed: u64, c1: usize, c2: usize, hidden_widths: &[usize]) -> (Self, Vec<i64>) {
+        const D: usize = 28;
+        const KS: usize = 5;
+        const CLASSES: usize = 10;
+
+        let mut rng = StdRng::seed_from_u64(seed);
+        // Small ranges on purpose: activations compound over four or five layers and `nbits`
+        // must stay inside the depth-1 noise budget (log2_t ≤ 30). Same constraint the
+        // trainer's `pick_gain` respects, reached from the other direction.
+        let mut w = |n: usize, lim: i64| -> Vec<i64> {
+            (0..n).map(|_| rng.gen_range(-lim..=lim)).collect()
+        };
+
+        let kernels: Vec<Vec<i64>> = (0..c1).map(|_| w(KS * KS, 2)).collect();
+        let cbias: Vec<i64> = w(c1, 4);
+
+        let h1 = D - (KS - 1); // 24
+        let p1 = h1 / POOL; // 12
+        let conv2 = ConvLayer {
+            kernels: (0..c2).map(|_| w(c1 * KS * KS, 1)).collect(),
+            cbias: w(c2, 4),
+            in_c: c1,
+            in_h: p1,
+            in_w: p1,
+            k: KS,
+        };
+        let h2 = p1 - (KS - 1); // 8
+        let p2 = h2 / POOL; // 4
+        let mut fan_in = c2 * p2 * p2; // 256 for LeNet-5, 800 for Caffe
+
+        let mut hidden = Vec::new();
+        for &width in hidden_widths {
+            hidden.push((
+                (0..width).map(|_| w(fan_in, 1)).collect::<Vec<Vec<i64>>>(),
+                w(width, 4),
+            ));
+            fan_in = width;
+        }
+        let dense_w: Vec<Vec<i64>> = (0..CLASSES).map(|_| w(fan_in, 1)).collect();
+        let dense_b = w(CLASSES, 4);
+
+        let input: Vec<i64> = (0..D * D).map(|_| rng.gen_range(0i64..16)).collect();
+        let model = Self::from_trained_with_kernel(
+            D, 1, KS, kernels, cbias, vec![conv2], hidden, dense_w, dense_b, 4,
+            std::slice::from_ref(&input),
+        );
+        (model, input)
+    }
+
     /// Build a model from **trained, quantised** weights (see
     /// `examples/data/mnist_cnn.rs`). The weight tensors are already in the
     /// integer fixed-point scheme `forward` expects; `nbits` is calibrated
@@ -342,6 +501,30 @@ impl CnnModel {
     pub fn from_trained(
         d: usize,
         in_c: usize,
+        kernels: Vec<Vec<i64>>,
+        cbias: Vec<i64>,
+        extra_conv: Vec<ConvLayer>,
+        hidden: Vec<(Vec<Vec<i64>>, Vec<i64>)>,
+        dense_w: Vec<Vec<i64>>,
+        dense_b: Vec<i64>,
+        shift: u32,
+        sample_inputs: &[Vec<i64>],
+    ) -> Self {
+        Self::from_trained_with_kernel(
+            d, in_c, K, kernels, cbias, extra_conv, hidden, dense_w, dense_b, shift,
+            sample_inputs,
+        )
+    }
+
+    /// [`CnnModel::from_trained`] at an arbitrary first-conv kernel size.
+    ///
+    /// Separate rather than an eleventh parameter on `from_trained`, whose two callers both
+    /// load 3×3 weight files and would gain nothing but a constant to pass.
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_trained_with_kernel(
+        d: usize,
+        in_c: usize,
+        k: usize,
         kernels: Vec<Vec<i64>>,
         cbias: Vec<i64>,
         extra_conv: Vec<ConvLayer>,
@@ -364,10 +547,11 @@ impl CnnModel {
             );
         }
         let oc = kernels.len();
-        let oh = d - (K - 1);
+        let oh = d - (k - 1);
         let ph = oh / POOL;
         let mut model = CnnModel {
             d,
+            k,
             in_c,
             kernels,
             cbias,
@@ -425,13 +609,14 @@ impl CnnModel {
     /// generated weight files exist to prevent.
     pub fn architecture(&self) -> String {
         let mut s = format!(
-            "{2}×{0}×{0} → conv({1}, {K}×{K}) → ReLU → pool",
+            "{2}×{0}×{0} → conv({1}, {3}×{3}) → ReLU → pool",
             self.d,
             self.out_channels(),
-            self.in_c
+            self.in_c,
+            self.k
         );
         for cl in &self.extra_conv {
-            s += &format!(" → conv({}, {K}×{K}) → ReLU → pool", cl.out_c());
+            s += &format!(" → conv({}, {}×{}) → ReLU → pool", cl.out_c(), cl.k, cl.k);
         }
         for (w, _) in &self.hidden {
             s += &format!(" → dense(→{}) → ReLU", w.len());
@@ -447,9 +632,9 @@ impl CnnModel {
         let mut acc = 0i64;
         let hw = self.d * self.d;
         for ic in 0..self.in_c {
-            for ky in 0..K {
-                for kx in 0..K {
-                    acc += self.kernels[oc][(ic * K + ky) * K + kx]
+            for ky in 0..self.k {
+                for kx in 0..self.k {
+                    acc += self.kernels[oc][(ic * self.k + ky) * self.k + kx]
                         * input[ic * hw + (oy + ky) * self.d + (ox + kx)];
                 }
             }
@@ -502,9 +687,9 @@ impl CnnModel {
                     for ox in 0..cow {
                         let mut dot = 0i64;
                         for ic in 0..cl.in_c {
-                            for ky in 0..K {
-                                for kx in 0..K {
-                                    dot += cl.kernels[oc][(ic * K + ky) * K + kx]
+                            for ky in 0..cl.k {
+                                for kx in 0..cl.k {
+                                    dot += cl.kernels[oc][(ic * cl.k + ky) * cl.k + kx]
                                         * feat[(ic * cl.in_h + (oy + ky)) * cl.in_w + (ox + kx)];
                                 }
                             }
@@ -608,13 +793,7 @@ fn weight_polys(s: &Bfv, model: &CnnModel) -> (Vec<Vec<u64>>, usize) {
     // serve both and why `assert_fully_consumed` caught the divergence.
     let mut mask_draws = 0usize;
 
-    let conv1 = ConvShape {
-        in_c: model.in_c,
-        h: model.d,
-        w: model.d,
-        kh: K,
-        kw: K,
-    };
+    let conv1 = model.conv1_shape();
     // One poly per (output channel, channel group), in exactly the order
     // `hybrid_conv_open` consumes them — the weight cursor is positional, so a
     // mismatch here multiplies the wrong kernel by the wrong input group and the
@@ -628,13 +807,7 @@ fn weight_polys(s: &Bfv, model: &CnnModel) -> (Vec<Vec<u64>>, usize) {
         mask_draws += 1; // one opened value per output channel, however many groups
     }
     for cl in &model.extra_conv {
-        let shape = ConvShape {
-            in_c: cl.in_c,
-            h: cl.in_h,
-            w: cl.in_w,
-            kh: K,
-            kw: K,
-        };
+        let shape = cl.shape();
         let (gs, ng) = groups_for(shape, n);
         for kernel in &cl.kernels {
             for gi in 0..ng {
@@ -886,20 +1059,8 @@ fn masks_src(pool: &mut Option<MaskPool>) -> Masks<'_> {
 /// The feature-map shape entering the first dense layer.
 /// Every convolution in the model, as a packing shape, in evaluation order.
 pub fn conv_shapes(model: &CnnModel) -> Vec<ConvShape> {
-    let mut v = vec![ConvShape {
-        in_c: model.in_c,
-        h: model.d,
-        w: model.d,
-        kh: K,
-        kw: K,
-    }];
-    v.extend(model.extra_conv.iter().map(|cl| ConvShape {
-        in_c: cl.in_c,
-        h: cl.in_h,
-        w: cl.in_w,
-        kh: K,
-        kw: K,
-    }));
+    let mut v = vec![model.conv1_shape()];
+    v.extend(model.extra_conv.iter().map(|cl| cl.shape()));
     v
 }
 
@@ -1224,6 +1385,7 @@ fn mpc_conv_relu_pool(
     nbits: usize,
     profile: NetworkProfile,
     nonlin: Nonlin,
+    falcon_pool: usize,
 ) -> (Vec<Vec<Fr>>, CommStats, MpcPhases) {
     let (oh, ow, oc_n) = (conv_shape.h, conv_shape.w, conv_shape.c);
     let (out, comm) = run_parties(profile, move |me| {
@@ -1232,9 +1394,13 @@ fn mpc_conv_relu_pool(
         let cbias = cbias.clone();
         move |be: &mut TransportBackend<MpcTransport>| {
             be.set_nonlin(nonlin.mode());
-            if let Some(w) = wire_bits_for(nbits) {
+            if let Some(w) = wire_bits_for_nonlin(nbits, nonlin) {
                 be.set_wire_bits(w);
             }
+            // Offline, before any timer below: fill this segment's Falcon pool from the
+            // plan. `fill_falcon_pool` is a no-op for the other nonlinearity modes'
+            // callers because they pass 0.
+            let falcon_offline_ms = fill_falcon_segment(be, falcon_pool, nbits);
             // Reconstruct + bias every conv output locally (share_secret / add
             // are communication-free), then run the whole ReLU layer as one
             // batched a2b + one batched multiply, then max-pool.
@@ -1280,12 +1446,17 @@ fn mpc_conv_relu_pool(
                 .iter()
                 .map(|p| be.my_additive_component(p))
                 .collect::<Vec<Fr>>();
+            let (falcon_pool_served, falcon_pool_missed) = pool_accounting(be);
             (
                 comps,
                 MpcPhases {
                     import_ms,
                     relu_ms,
                     pool_ms,
+                    falcon_comparisons: be.falcon_comparisons(),
+                    falcon_offline_ms,
+                    falcon_pool_served,
+                    falcon_pool_missed,
                     ..Default::default()
                 },
             )
@@ -1303,6 +1474,47 @@ fn ms(t: Instant) -> f64 {
 
 /// Where the FHE segment's time actually goes.
 ///
+/// Which MPC segment of a diagnosis a Falcon preprocessing pool belongs to.
+///
+/// The CNN runs **one `run_parties` call per segment**, each with a fresh backend, so a
+/// pool cannot span a diagnosis: every segment needs its own, sized for what that segment
+/// will ask for. This enum is the key those sizes are carried under.
+///
+/// # Why a key and not a list
+///
+/// Threading sizes as a `Vec` in call order would work and would be a bug waiting to
+/// happen — the same positional coupling that broke the scheme-switch mask pool when
+/// channel splitting changed how many multiplies a layer performed. A wrong entry there
+/// is silent: an over-size wastes preprocessing, an under-size falls back to generating
+/// inline, and both still compute the right answer. `Conv(i)` also extends to any depth,
+/// which a fixed-field struct would not.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, PartialOrd, Ord)]
+pub enum Segment {
+    /// `Conv(0)` is the first convolution; `Conv(i)` the `i`-th extra one.
+    Conv(usize),
+    /// The `i`-th hidden dense layer's nonlinearity. Indexed for the same reason `Conv`
+    /// is: `model.hidden` is a list, and a stacked model has one segment per entry.
+    Hidden(usize),
+    /// The final argmax over the logits.
+    Argmax,
+}
+
+/// Per-segment Falcon pool sizes, measured rather than derived.
+///
+/// Produced by a cold run (`CnnRun::falcon_plan`) and consumed by a warm one. The sizes
+/// **cannot** be computed from the model shapes without mirroring the batching decisions
+/// inside `maxpool2d`, `fused_relu_rescale` and `argmax` — see
+/// [`MpcPhases::falcon_comparisons`] — so the honest way to get them is to run once and
+/// count, exactly as `the_warm_falcon_cost_is_measured_against_the_cold_one` does at the
+/// primitive level.
+///
+/// A missing or short entry is **safe but visible**: `lt_falcon_batch` falls back to
+/// generating preprocessing inline, so the answer stays right while
+/// `MpcPhases::falcon_pool_missed` goes non-zero. That distinction matters, because a
+/// benchmark reporting an "online" latency that quietly included preprocessing would be
+/// reporting a total — the exact error this page has already made once.
+pub type FalconPoolPlan = std::collections::BTreeMap<Segment, usize>;
+
 /// Same motivation as [`MpcPhases`], applied to the side that now dominates:
 /// "FHE" is four different operations with different fixes. A
 /// ciphertext$\times$ciphertext multiply is irreducible work the construction
@@ -1361,10 +1573,38 @@ pub struct MpcPhases {
     pub pool_ms: f64,
     /// The final argmax over the logits.
     pub argmax_ms: f64,
+    /// Comparison elements `NonlinMode::Falcon` requested in this segment, 0 for the
+    /// other modes.
+    ///
+    /// **This is the per-segment pool size**, and it is counted rather than derived. The
+    /// CNN runs one `run_parties` call per MPC segment, each with a fresh backend, so a
+    /// single pool cannot span a diagnosis — every segment needs its own, sized for what
+    /// it will ask for. Re-deriving that from the layer shapes would mean mirroring the
+    /// batching decisions inside `maxpool2d`, `fused_relu_rescale` and `argmax`, which is
+    /// the duplication that made the scheme-switch mask pool break when channel
+    /// splitting landed.
+    pub falcon_comparisons: usize,
+    /// Wall-clock spent **before** this segment's timers, filling its Falcon pool from a
+    /// [`FalconPoolPlan`]. Zero on a cold run.
+    ///
+    /// Reported separately rather than folded into the segment time because that is the
+    /// whole point: a warm server pays only the online cost, a cold one pays this too, and
+    /// both are real deployments. Adding them and quoting the sum as "online" is the error
+    /// that produced this experiment's first withdrawn crossover.
+    pub falcon_offline_ms: f64,
+    /// Preprocessing items the pool could **not** serve, so the online path generated them
+    /// itself. Non-zero means the reported online time is secretly a partial total.
+    pub falcon_pool_missed: usize,
+    /// Preprocessing items served from the pool.
+    pub falcon_pool_served: usize,
 }
 
 impl MpcPhases {
     fn add(&mut self, o: &MpcPhases) {
+        self.falcon_comparisons += o.falcon_comparisons;
+        self.falcon_offline_ms += o.falcon_offline_ms;
+        self.falcon_pool_missed += o.falcon_pool_missed;
+        self.falcon_pool_served += o.falcon_pool_served;
         self.import_ms += o.import_ms;
         self.relu_ms += o.relu_ms;
         self.pool_ms += o.pool_ms;
@@ -1430,6 +1670,34 @@ fn import_raw_batch(
 /// The pipeline's nonlinearity, `out = (v >= 0) ? (v >> shift) : 0`, under
 /// whichever protocol `nonlin` selects. The two branches are extensionally
 /// equal — that is what the `gc_matches_a2b_*` tests pin.
+/// Fill one segment's Falcon pool, returning the offline milliseconds spent.
+///
+/// `n == 0` means "no plan for this segment", which is the cold path and must cost
+/// nothing — not even a zero-size pool, since an empty pool would make every request a
+/// *miss* and turn the miss counter from a signal into noise.
+fn fill_falcon_segment(
+    be: &mut TransportBackend<MpcTransport>,
+    n: usize,
+    nbits: usize,
+) -> f64 {
+    if n == 0 {
+        return 0.0;
+    }
+    // Both Falcon paths lift their `Π_SS` bit at `nbits` — `lt_falcon_batch` because that
+    // is what it compared at, `relu_falcon_batch` because its truncation ring is `nbits`
+    // wide. That agreement is what lets **one** pool serve a segment's max-pool
+    // comparisons and its ReLU gates; if the lifts ever diverge, `take_falcon_preproc`
+    // will refuse the mismatched width and the misses will say so.
+    be.fill_falcon_pool(n, nbits as u32, nbits as u32)
+}
+
+/// `served`/`missed` for the segment just run, or zeros if it never touched the pool.
+fn pool_accounting(be: &TransportBackend<MpcTransport>) -> (usize, usize) {
+    be.falcon_pool_stats()
+        .map(|(_, served, missed)| (served, missed))
+        .unwrap_or((0, 0))
+}
+
 fn fused_relu_rescale(
     be: &mut TransportBackend<MpcTransport>,
     vs: &[ShareRef],
@@ -1442,12 +1710,26 @@ fn fused_relu_rescale(
         // One garble round for the whole layer, versus ~log(nbits) rounds of
         // decomposition plus a batched multiply for the sign gate.
         Nonlin::Gc => be.relu_gc_batch(vs, nbits, shift as usize),
-        // Falcon has no fused relu∘rescale: its ReLU and its truncation are
-        // separate protocols. Routing the fused form through the generic
-        // `lt`-based path keeps the semantics identical, at the cost of not
-        // exercising `Π_ReLU` directly — see `falcon-reproduction.md`.
-        Nonlin::Falcon => fused_relu_rescale_batch(be, vs, shift, nbits),
+        // Falcon has no *fused* relu∘rescale — its ReLU (Π_DReLU + a multiply)
+        // and its truncation (Π_Trunc) are separate protocols, so this runs
+        // both in sequence. Gating first is what makes the composition legal:
+        // Π_Trunc needs `a + r` not to wrap, and `ReLU(v)` is non-negative, so
+        // the bound holds and the arithmetic shift equals the logical one.
+        // Checked bit-identical to the a2b arm by `falcon_and_a2b_relu_agree`.
+        Nonlin::Falcon => be.relu_falcon_batch(vs, nbits, shift),
     }
+}
+
+/// `fused_relu_rescale_batch` for cross-route tests: the `a2b` reference that
+/// `relu_falcon_batch` must agree with bit for bit.
+#[cfg(test)]
+pub(crate) fn fused_relu_rescale_for_test(
+    be: &mut TransportBackend<MpcTransport>,
+    vs: &[ShareRef],
+    shift: u32,
+    nbits: usize,
+) -> Vec<ShareRef> {
+    fused_relu_rescale_batch(be, vs, shift, nbits)
 }
 
 fn fused_relu_rescale_batch(
@@ -1511,7 +1793,22 @@ pub struct CnnRun {
     pub comm: CommStats,
     pub bootstraps: u64,
     /// ct×ct multiplications the packed convolution actually performed.
+    /// Comparison elements the Falcon path requested, summed over the MPC segments.
+    /// 0 for the other nonlinearity modes. See `MpcPhases::falcon_comparisons` for why
+    /// the per-segment split is what a pool actually needs.
+    pub falcon_comparisons: usize,
+    /// The per-segment sizes this run **measured**, ready to feed back into
+    /// [`run_cnn_hybrid_in_session_pooled`] as a warm run's plan.
+    ///
+    /// Present on every run, including a warm one — where it should reproduce the plan it
+    /// was given, and a divergence means the pool was sized for a different workload than
+    /// the one that ran.
+    pub falcon_plan: FalconPoolPlan,
     pub conv_mults: usize,
+    // NOTE: `mpc_ms` is the **total** for the MPC segments, including any Falcon pool
+    // fill, because the fill happens inside the same `run_parties` call it times. Use
+    // [`CnnRun::online_mpc_ms`] for the warm figure — see that method for why the
+    // distinction is not cosmetic.
     /// What an im2col/Toeplitz matvec of the same convolution would cost.
     pub conv_mults_toeplitz: usize,
     /// FHE ring dimension and modulus actually used — recorded so the
@@ -1540,8 +1837,16 @@ pub enum Nonlin {
     A2b,
     /// Three-party garbled circuits, one round per layer.
     Gc,
-    /// Falcon's `wrap3` sign extraction over `Z_p` — the lowest-bandwidth of
-    /// the three, and the one a bandwidth-bound deployment should pick.
+    /// Falcon's `wrap3` sign extraction over `Z_p`, for every comparison *and* for ReLU
+    /// (`Π_DReLU` gate then `Π_Trunc` shift).
+    ///
+    /// Cheaper in bytes than `Gc` and dearer in messages, so it wins where bandwidth
+    /// binds and loses where latency does. The ratios are not quoted here because they
+    /// have changed three times — with the wire encoding, and twice with the truncation's
+    /// privacy — and a stale constant in a doc comment is how this repo published four
+    /// wrong crossovers. `falcons_round_cost_is_mostly_per_call` and
+    /// `the_pure_falcon_relu_trades_bytes_for_rounds` measure them; the pipeline figures
+    /// are in `docs/falcon-reproduction.md`.
     Falcon,
 }
 
@@ -1571,6 +1876,29 @@ impl Nonlin {
             Nonlin::Gc => "gc",
             Nonlin::Falcon => "falcon",
         }
+    }
+}
+
+impl CnnRun {
+    /// MPC time **excluding** Falcon pool preprocessing — the online cost a warm server
+    /// pays.
+    ///
+    /// `mpc_ms` cannot be it: the pool fill runs inside the same `run_parties` call that
+    /// `mpc_ms` brackets, so a warm run's `mpc_ms` still contains its own offline phase.
+    /// Comparing warm `mpc_ms` against cold `mpc_ms` therefore compares (fill + online)
+    /// against (inline + online) and understates the effect badly — it read as "1.18×
+    /// shorter" when the online phase had actually dropped several times further.
+    ///
+    /// This is the same error, in miniature, that produced this experiment's first
+    /// withdrawn crossover: a total quoted as an online cost. It is worth a named method
+    /// rather than a subtraction at each call site, so there is one place to be right.
+    pub fn online_mpc_ms(&self) -> f64 {
+        (self.mpc_ms - self.phases.falcon_offline_ms).max(0.0)
+    }
+
+    /// Total latency a **cold** server pays: everything, preprocessing included.
+    pub fn cold_total_ms(&self) -> f64 {
+        self.total_ms
     }
 }
 
@@ -1703,6 +2031,57 @@ pub fn run_cnn_hybrid_in_session(
     nonlin: Nonlin,
     precompute: bool,
 ) -> CnnRun {
+    run_cnn_hybrid_in_session_pooled(
+        session,
+        model,
+        input,
+        profile,
+        nonlin,
+        precompute,
+        &FalconPoolPlan::new(),
+    )
+}
+
+/// One inference with Falcon preprocessing **pre-generated per segment**, so the reported
+/// segment times are online costs rather than totals.
+///
+/// Pass an empty plan for the cold path — that is what [`run_cnn_hybrid_in_session`] does,
+/// and it is the default because a plan cannot be derived from the model. Get one by
+/// running cold and reading [`CnnRun::falcon_plan`], then feed it back:
+///
+/// ```text
+/// let cold = run_cnn_hybrid_in_session(&session, &model, img, profile, Falcon, false);
+/// let warm = run_cnn_hybrid_in_session_pooled(
+///     &session, &model, img, profile, Falcon, false, &cold.falcon_plan);
+/// ```
+///
+/// The warm run must agree with the cold one and must report
+/// `phases.falcon_pool_missed == 0`; if it does not, its "online" latency still contains
+/// preprocessing. Both are asserted by `a_pooled_diagnosis_matches_an_inline_one`.
+#[allow(clippy::too_many_arguments)]
+pub fn run_cnn_hybrid_in_session_pooled(
+    session: &CnnSession,
+    model: &CnnModel,
+    input: &[i64],
+    profile: NetworkProfile,
+    nonlin: Nonlin,
+    precompute: bool,
+    plan: &FalconPoolPlan,
+) -> CnnRun {
+    // The plan applies **only** to the Falcon route. Without this guard a warm sweep fills
+    // Falcon pools for `gc` and `a2b` too, charging them bytes and messages for
+    // preprocessing they never consume — which is not a subtle miscount: it moved `gc`'s
+    // traffic from 61 messages / 10.1 MB to 154 / 12.2 on a run where `gc`'s code was
+    // untouched. That an unchanged control moved is what exposed it, and it is the same
+    // failure as every other on this page: one protocol charged for another's work.
+    let seg = |k: Segment| {
+        if matches!(nonlin, Nonlin::Falcon) {
+            plan.get(&k).copied().unwrap_or(0)
+        } else {
+            0
+        }
+    };
+    let mut measured_plan = FalconPoolPlan::new();
     let (expected, max_abs) = model.forward(input);
     assert!(
         (max_abs as i128) < (1i128 << (model.nbits - 1)),
@@ -1757,13 +2136,7 @@ pub fn run_cnn_hybrid_in_session(
     // *is* the sliding-window convolution and every output pixel of that
     // channel appears at once. See `fhe::conv_pack`.
     let t0 = Instant::now();
-    let conv1_shape = ConvShape {
-        in_c: model.in_c,
-        h: model.d,
-        w: model.d,
-        kh: K,
-        kw: K,
-    };
+    let conv1_shape = model.conv1_shape();
     // One input ciphertext per channel group. At the shapes shipped today this is a
     // single group (an RGB 28×28 conv needs degree 3977 against n = 4096), so the
     // encryption below is the same one this line has always done.
@@ -1812,7 +2185,9 @@ pub fn run_cnn_hybrid_in_session(
         nbits,
         profile,
         nonlin,
+        seg(Segment::Conv(0)),
     );
+    measured_plan.insert(Segment::Conv(0), ph.falcon_comparisons);
     phases.add(&ph);
     comm = comm + conv_comm;
     mpc_ms += t0.elapsed().as_secs_f64() * 1000.0;
@@ -1821,15 +2196,9 @@ pub fn run_cnn_hybrid_in_session(
     // ── Additional conv layers: switch pooled features back to FHE, convolve
     //    (multi-channel packing), open, MPC ReLU∘rescale + pool. Each extra
     //    conv is just the same three steps composed again — no bootstrap. ──
-    for cl in &model.extra_conv {
+    for (cl_i, cl) in model.extra_conv.iter().enumerate() {
         let tc = Instant::now();
-        let shape = ConvShape {
-            in_c: cl.in_c,
-            h: cl.in_h,
-            w: cl.in_w,
-            kh: K,
-            kw: K,
-        };
+        let shape = cl.shape();
         // This is the layer the channel cap binds on: its input channels are the
         // previous conv's output channels, and 16 of them at 13x13 overrun n = 4096.
         let (gs, ng) = groups_for(shape, s.params.n);
@@ -1873,7 +2242,9 @@ pub fn run_cnn_hybrid_in_session(
             nbits,
             profile,
             nonlin,
+            seg(Segment::Conv(cl_i + 1)),
         );
+        measured_plan.insert(Segment::Conv(cl_i + 1), ph2.falcon_comparisons);
         phases.add(&ph2);
         comm = comm + comm2;
         mpc_ms += tm.elapsed().as_secs_f64() * 1000.0;
@@ -1898,7 +2269,7 @@ pub fn run_cnn_hybrid_in_session(
     //    ReLU∘rescale → switch back. Same machinery as the output dense + the
     //    conv ReLU, composed once per hidden layer — the "no bootstrap, just
     //    switch again" invariant made concrete for arbitrary depth. ──
-    for (hidden_w, hidden_b) in model.hidden.clone() {
+    for (h_i, (hidden_w, hidden_b)) in model.hidden.clone().into_iter().enumerate() {
         let th = Instant::now();
         let (hidden_open, hidden_masks, ph) = hybrid_matvec_open(
             s,
@@ -1917,15 +2288,17 @@ pub fn run_cnn_hybrid_in_session(
 
         let t1 = Instant::now();
         let h = hidden_w.len();
+        let hidden_pool = seg(Segment::Hidden(h_i));
         let (per_party_hidden, hidden_comm) = run_parties(profile, |me| {
             let hidden_open = hidden_open.clone();
             let hidden_masks = hidden_masks.clone();
             let hidden_b = hidden_b.clone();
             move |be: &mut TransportBackend<MpcTransport>| {
                 be.set_nonlin(nonlin.mode());
-                if let Some(w) = wire_bits_for(nbits) {
+                if let Some(w) = wire_bits_for_nonlin(nbits, nonlin) {
                     be.set_wire_bits(w);
                 }
+                let falcon_offline_ms = fill_falcon_segment(be, hidden_pool, nbits);
                 let t = Instant::now();
                 let raws = import_raw_batch(be, me, &hidden_open, &hidden_masks, h, nbits);
                 let vs: Vec<ShareRef> = raws
@@ -1944,16 +2317,25 @@ pub fn run_cnn_hybrid_in_session(
                     .iter()
                     .map(|p| be.my_additive_component(p))
                     .collect::<Vec<Fr>>();
+                let (falcon_pool_served, falcon_pool_missed) = pool_accounting(be);
                 (
                     comps,
                     MpcPhases {
                         import_ms,
                         relu_ms,
+                        falcon_comparisons: be.falcon_comparisons(),
+                        falcon_offline_ms,
+                        falcon_pool_served,
+                        falcon_pool_missed,
                         ..Default::default()
                     },
                 )
             }
         });
+        measured_plan.insert(
+            Segment::Hidden(h_i),
+            per_party_hidden[0].1.falcon_comparisons,
+        );
         phases.add(&per_party_hidden[0].1);
         let per_party_hidden: Vec<Vec<Fr>> = per_party_hidden.into_iter().map(|(c, _)| c).collect();
         comm = comm + hidden_comm;
@@ -1989,18 +2371,26 @@ pub fn run_cnn_hybrid_in_session(
     let t0 = Instant::now();
     let dense_b = model.dense_b.clone();
     let nclasses = model.nclasses();
+    let argmax_pool = seg(Segment::Argmax);
     let (classes, argmax_comm) = run_parties(profile, |me| {
         let dense_open = dense_open.clone();
         let dense_masks = dense_masks.clone();
         let dense_b = dense_b.clone();
         move |be: &mut TransportBackend<MpcTransport>| {
-            // `argmax` reduces over scalar `lt`, not `lt_batch`, so the GC flag
-            // does not reach it — deliberately: it is `nclasses−1` comparisons
-            // against a layer's thousands, and the phase breakdown shows it.
+            // `argmax` reduces over scalar `lt`, not `lt_batch`, so the **GC** flag does
+            // not reach it — deliberately: it is `nclasses−1` comparisons against a
+            // layer's thousands, and the phase breakdown shows it.
+            //
+            // Falcon's flag *does* reach it, which is measured rather than assumed:
+            // `a_pooled_diagnosis_matches_an_inline_one` reports `Argmax: 9` on a
+            // ten-class model, i.e. exactly `nclasses−1`. So this segment needs its own
+            // (small) pool, and it gets one. Two protocols behaving differently at the
+            // same call site is the kind of thing a comment would have got wrong.
             be.set_nonlin(nonlin.mode());
-            if let Some(w) = wire_bits_for(nbits) {
+            if let Some(w) = wire_bits_for_nonlin(nbits, nonlin) {
                 be.set_wire_bits(w);
             }
+            let falcon_offline_ms = fill_falcon_segment(be, argmax_pool, nbits);
             let raws = import_raw_batch(be, me, &dense_open, &dense_masks, nclasses, nbits);
             let logits: Vec<ShareRef> = raws
                 .iter()
@@ -2013,15 +2403,26 @@ pub fn run_cnn_hybrid_in_session(
             let t = Instant::now();
             let idx = argmax(be, &logits, nbits);
             let argmax_ms = ms(t);
+            // `falcon_comparisons` is reported here rather than dropped, because whether
+            // `argmax` reaches the Falcon path is a *measurement*, not an assumption: it
+            // reduces over scalar `lt`, and the comment above says the GC flag does not
+            // reach it. Counting says whether Falcon's does, and so whether this segment
+            // needs a pool at all.
+            let (falcon_pool_served, falcon_pool_missed) = pool_accounting(be);
             (
                 (be.reveal(&idx, None) as u64 & (t_mask)) as usize,
                 MpcPhases {
                     argmax_ms,
+                    falcon_comparisons: be.falcon_comparisons(),
+                    falcon_offline_ms,
+                    falcon_pool_served,
+                    falcon_pool_missed,
                     ..Default::default()
                 },
             )
         }
     });
+    measured_plan.insert(Segment::Argmax, classes[0].1.falcon_comparisons);
     phases.add(&classes[0].1);
     comm = comm + argmax_comm;
     mpc_ms += t0.elapsed().as_secs_f64() * 1000.0;
@@ -2040,6 +2441,8 @@ pub fn run_cnn_hybrid_in_session(
         correct: class == expected,
         class,
         expected,
+        falcon_comparisons: phases.falcon_comparisons,
+        falcon_plan: measured_plan,
         total_ms: start.elapsed().as_secs_f64() * 1000.0,
         fhe_ms,
         mpc_ms,
@@ -2392,11 +2795,309 @@ pub fn run_cli(args: &[String]) -> Result<(), String> {
 mod tests {
     use super::*;
 
+    /// **The two LeNets are different networks, and only one of them splits channels.**
+    ///
+    /// Cheap and not ignored, because it is the guard on the mistake that made the first
+    /// end-to-end LeNet measurement meaningless: building Caffe's 20/50/500 and comparing it
+    /// against a figure derived from LeNet-5's 6/16/120/84. Shapes and packing plans need no
+    /// encryption, so this can run on every `cargo test`.
+    #[test]
+    fn the_two_lenets_are_not_the_same_network() {
+        let (l5, _) = CnnModel::lenet5(1);
+        let (caffe, _) = CnnModel::lenet_caffe(1);
+
+        // MACs differ by ~8x. Counted from the shapes rather than asserted as a constant.
+        let macs = |m: &CnnModel| -> usize {
+            let c1 = m.out_channels() * 24 * 24 * m.k * m.k * m.in_c;
+            let cl = &m.extra_conv[0];
+            let c2 = cl.out_c() * cl.out_h() * cl.out_w() * cl.in_c * cl.k * cl.k;
+            let mut fan = cl.out_c() * (cl.out_h() / POOL) * (cl.out_w() / POOL);
+            let mut dense = 0;
+            for (w, _) in &m.hidden {
+                dense += w.len() * fan;
+                fan = w.len();
+            }
+            c1 + c2 + dense + m.nclasses() * fan
+        };
+        let (m5, mc) = (macs(&l5), macs(&caffe));
+        println!("  LeNet-5 {m5} MACs, Caffe LeNet {mc} MACs ({:.1}x)", mc as f64 / m5 as f64);
+        assert!(
+            mc > 5 * m5,
+            "the two nets must be far apart, or conflating them would be harmless: \
+             {m5} vs {mc}"
+        );
+
+        // Both are 5x5 at 28x28 — that much they share, and it is why they get confused.
+        assert_eq!((l5.k, caffe.k), (5, 5));
+        assert_eq!((l5.d, caffe.d), (28, 28));
+
+        // Only Caffe's second conv overruns the ring. LeNet-5's `in_c = 6` at 12x12 fits in
+        // one ciphertext, so channel splitting is *not* load-bearing for LeNet-5 — a claim
+        // worth pinning in both directions.
+        let split = |m: &CnnModel| packing_plan(m, 4096)[1].2;
+        println!("  conv1 groups at n=4096: LeNet-5 {}, Caffe {}", split(&l5), split(&caffe));
+        assert_eq!(split(&l5), 1, "LeNet-5's second conv should fit one ciphertext");
+        assert!(
+            split(&caffe) > 1,
+            "Caffe's second conv needs degree 5667 at n=4096 and must split"
+        );
+    }
+
+    /// **LeNet end to end, measured rather than extrapolated.**
+    ///
+    /// `docs/falcon-reproduction.md` compares against Falcon's LeNet figures by multiplying
+    /// a per-DReLU byte cost by a DReLU count (8 044). Its own "what must be true" section
+    /// says that is not good enough — "reproduce *their* architecture, not ours" — and this
+    /// is the run that replaces the extrapolation with a measurement, over the whole
+    /// pipeline including the linear layers and scheme switches a per-op figure excludes.
+    ///
+    /// The weights are random, so **accuracy here is chance and is not reported**; what is
+    /// reported is cost, which the shapes determine. Exactness against the plaintext
+    /// reference is still asserted, so the numbers describe a pipeline that computes this
+    /// architecture correctly.
+    ///
+    /// **The first version of this test measured the wrong network** — Caffe's 20/50/500
+    /// rather than LeNet-5's 6/16/120/84 — and reported "the extrapolation understates by
+    /// 1.89×". It does not; the two nets differ by 8× in MACs. The assertions below pin the
+    /// architecture layer by layer so that cannot recur silently, which matters more than
+    /// any single number here: every wrong result on this page came from comparing two
+    /// things that were not the same thing.
+    #[test]
+    #[ignore] // full LeNet through BFV × ABY3; slow in debug
+    fn lenet_end_to_end_is_exact_and_costed() {
+        let (model, input) = CnnModel::lenet5(11);
+        println!("  {}", model.architecture());
+        println!("  nbits {} shift {}", model.nbits, model.shift);
+
+        // The packing plan: LeNet's second conv cannot fit one ciphertext, so this is where
+        // channel splitting stops being synthetic.
+        for (i, (shape, group_channels, groups)) in
+            packing_plan(&model, 4096).iter().enumerate()
+        {
+            println!(
+                "    conv{i}: in_c {} {}×{} k{}×{} → {groups} group(s) of \
+                 {group_channels} channel(s)",
+                shape.in_c, shape.h, shape.w, shape.kh, shape.kw,
+            );
+        }
+
+        let r = run_cnn_hybrid_with(&model, &input, NetworkProfile::INSTANT, Nonlin::Falcon);
+        println!(
+            "  falcon: {:.0} ms total ({:.0} fhe / {:.0} mpc), {} messages, {:.2} MB, \
+             {} comparisons, {} bootstraps",
+            r.total_ms,
+            r.fhe_ms,
+            r.mpc_ms,
+            r.comm.messages,
+            r.comm.bytes as f64 / 1e6,
+            r.falcon_comparisons,
+            r.bootstraps
+        );
+        println!("  per-segment pool plan: {:?}", r.falcon_plan);
+        println!(
+            "  ring bytes {:.2} MB of {:.2} MB total ({:.0}%), {:.0} B per comparison",
+            r.comm.ring_bytes as f64 / 1e6,
+            r.comm.bytes as f64 / 1e6,
+            100.0 * r.comm.ring_bytes as f64 / r.comm.bytes.max(1) as f64,
+            r.comm.ring_bytes as f64 / r.falcon_comparisons.max(1) as f64,
+        );
+        // Against the extrapolation's 8 044, which assumes ReLU *then* pool.
+        println!(
+            "  → 8044 DReLUs if ReLU precedes pooling; this schedule needs {} ({:.2}x fewer)",
+            r.falcon_comparisons,
+            8044.0 / r.falcon_comparisons as f64,
+        );
+
+        assert!(
+            r.correct,
+            "LeNet must be exact: encrypted class {} != plaintext {}",
+            r.class, r.expected
+        );
+        assert_eq!(r.bootstraps, 0, "depth-1 must need no bootstrap, at any depth of network");
+        // The architecture must actually be LeNet-5's, or the comparison is against a
+        // different network — which is exactly what happened on the first attempt at this
+        // test (Caffe's 20/50/500, 8× the MACs) and is the failure this pins shut.
+        assert_eq!(model.k, 5, "LeNet-5's kernel is 5×5");
+        assert_eq!(model.out_channels(), 6, "LeNet-5's first conv has 6 channels");
+        assert_eq!(model.extra_conv.len(), 1, "LeNet-5 has a second conv");
+        assert_eq!(model.extra_conv[0].out_c(), 16, "LeNet-5's second conv has 16 channels");
+        assert_eq!(model.hidden.len(), 2, "LeNet-5 has two hidden dense layers");
+        assert_eq!(model.hidden[0].0.len(), 120, "LeNet-5's first hidden layer is 120 wide");
+        assert_eq!(model.hidden[1].0.len(), 84, "LeNet-5's second hidden layer is 84 wide");
+        assert_eq!(model.nclasses(), 10, "LeNet-5 has 10 classes");
+
+        // The comparison count, which is the whole point. Baru pools *before* the
+        // nonlinearity (they commute), so it runs ReLU on 1 120 pooled values rather than
+        // 4 480 unpooled ones: 1 324 ReLU gates + 3 360 pool comparisons = 4 684, against
+        // the 8 044 an ReLU-then-pool schedule needs. Asserted because it is a structural
+        // property of the schedule, not a measurement that could drift.
+        let relu_gates = 6 * 12 * 12 + 16 * 4 * 4 + 120 + 84;
+        let pool_comps = 3 * (6 * 12 * 12 + 16 * 4 * 4);
+        assert_eq!(
+            r.falcon_comparisons,
+            relu_gates + pool_comps + (model.nclasses() - 1),
+            "LeNet-5's DReLU count should be {} ReLU gates + {} pool comparisons + argmax",
+            relu_gates,
+            pool_comps
+        );
+    }
+
+    /// **The encrypted pipeline is exact at LeNet's 5×5 kernel, not only at 3×3.**
+    ///
+    /// Every shipped model is 3×3, and until 2026-08-04 so was every test — kernel size was
+    /// a module constant, so "does this generalise" was unanswerable rather than merely
+    /// unanswered. `fhe::conv_pack` was already general in `kh`/`kw`; what was fixed was
+    /// this module's model representation.
+    ///
+    /// 5×5 matters because it is what Falcon's LeNet uses, and this page's comparison
+    /// against their 0.74 MB / 47 ms is only like-for-like at their architecture. It is also
+    /// where the packing's two exactness arguments are most stretched: the row-wrap argument
+    /// (contamination needs `ox ≤ −1`) had only ever been exercised with a one- or
+    /// two-column overhang, and a 5-wide kernel gives four.
+    ///
+    /// Checked at both kernel sizes in one loop so a regression at 3×3 cannot hide behind a
+    /// pass at 5×5, and `d` is chosen per kernel to keep the conv output even for pooling.
+    #[test]
+    #[ignore] // real BFV × ABY3 hybrid
+    fn the_hybrid_is_exact_at_lenets_kernel_size() {
+        // (kernel, input side) with `d − (k − 1)` even, as pooling requires.
+        for (k, d) in [(3usize, 8usize), (3, 10), (5, 10), (5, 12)] {
+            let (model, input) = CnnModel::random_with_kernel(d, 7, k);
+            assert_eq!(model.k, k, "the model must carry the kernel it was built with");
+            assert_eq!(
+                model.conv1_shape().kh, k,
+                "the packing shape must follow the model's kernel"
+            );
+
+            let r = run_cnn_hybrid(&model, &input, NetworkProfile::INSTANT);
+            println!(
+                "  k={k} d={d}: {} → class {} (plaintext {}), {} ct×ct mults, {} bootstraps",
+                model.architecture(), r.class, r.expected, r.conv_mults, r.bootstraps
+            );
+            assert!(
+                r.correct,
+                "k={k} d={d}: encrypted class {} != plaintext {}",
+                r.class, r.expected
+            );
+            assert_eq!(r.bootstraps, 0, "k={k} d={d}: depth-1 must need no bootstrap");
+            assert!(r.comm.messages > 0, "k={k} d={d}: must use the real MPC protocol");
+        }
+    }
+
+    /// **A pooled diagnosis matches an inline one, and the pool actually serves it.**
+    ///
+    /// This is the gate on per-segment Falcon preprocessing. The pool exists so the two
+    /// honest costs are separately measurable — a cold server pays the total, a warm one
+    /// pays only the online phase — and that split is worthless if it changes the answer,
+    /// and *worse* than worthless if the "online" number quietly contains preprocessing.
+    /// So both are asserted: the class, and `falcon_pool_missed == 0`.
+    ///
+    /// The plan comes from a cold run rather than from the model shapes, which is the whole
+    /// design. Sizes are not derivable without mirroring the batching inside `maxpool2d`,
+    /// `fused_relu_rescale` and `argmax`, and the keys are a `Segment` enum rather than a
+    /// positional list because positional coupling is what broke the scheme-switch mask
+    /// pool when channel splitting changed a layer's multiply count.
+    ///
+    /// It also prints the measured plan, which is how the argmax question got answered:
+    /// whether `argmax`'s scalar `lt` reaches the Falcon path is a measurement, and the
+    /// counter says so rather than a comment guessing.
+    #[test]
+    #[ignore] // full encrypted pipeline, three MPC segments
+    fn a_pooled_diagnosis_matches_an_inline_one() {
+        let (model, input) = CnnModel::random(8, 1);
+        let session = CnnSession::new(&model, false);
+        let profile = NetworkProfile::INSTANT;
+
+        let cold = run_cnn_hybrid_in_session(
+            &session, &model, &input, profile, Nonlin::Falcon, false);
+        assert!(
+            cold.falcon_comparisons > 0,
+            "the Falcon route must request comparisons, or this test proves nothing"
+        );
+        println!("  measured plan (cold): {:?}", cold.falcon_plan);
+        println!(
+            "  cold: class {} in {:.1} ms mpc, {} comparisons, offline {:.1} ms",
+            cold.class, cold.mpc_ms, cold.falcon_comparisons, cold.phases.falcon_offline_ms
+        );
+        assert_eq!(
+            cold.phases.falcon_offline_ms, 0.0,
+            "a cold run has no plan and so must spend no offline time"
+        );
+
+        let warm = run_cnn_hybrid_in_session_pooled(
+            &session, &model, &input, profile, Nonlin::Falcon, false, &cold.falcon_plan);
+        println!(
+            "  warm: class {} in {:.1} ms mpc total = {:.1} online + {:.1} offline, \
+             served {}, missed {}",
+            warm.class,
+            warm.mpc_ms,
+            warm.online_mpc_ms(),
+            warm.phases.falcon_offline_ms,
+            warm.phases.falcon_pool_served,
+            warm.phases.falcon_pool_missed,
+        );
+
+        // 1. Same answer. A faster wrong diagnosis is not a result.
+        assert_eq!(warm.class, cold.class, "pooling must not change the diagnosis");
+        assert_eq!(
+            warm.class, cold.expected,
+            "both runs must match the plaintext reference"
+        );
+        assert!(cold.correct && warm.correct, "both runs must be exact");
+
+        // 2. The pool served everything. A miss means the reported online time is a
+        //    partial total — the precise error that produced this experiment's first
+        //    withdrawn crossover, so it is a hard failure rather than a warning.
+        assert_eq!(
+            warm.phases.falcon_pool_missed, 0,
+            "every request must come from the pool, else the online figure includes \
+             preprocessing; served {}, missed {}, plan {:?}",
+            warm.phases.falcon_pool_served, warm.phases.falcon_pool_missed, cold.falcon_plan
+        );
+        assert!(
+            warm.phases.falcon_pool_served >= cold.falcon_comparisons,
+            "served {} should cover the {} comparisons the cold run counted",
+            warm.phases.falcon_pool_served, cold.falcon_comparisons
+        );
+
+        // 3. The plan is stable: a warm run measures what it was sized for. A divergence
+        //    would mean the pool was filled for a different workload than the one that ran.
+        assert_eq!(
+            warm.falcon_plan, cold.falcon_plan,
+            "the warm run must request the same per-segment counts it was sized for"
+        );
+
+        // 4. Preprocessing moved off the critical path rather than vanishing: the warm run
+        //    reports real offline time, and its online MPC is shorter.
+        assert!(
+            warm.phases.falcon_offline_ms > 0.0,
+            "the warm run must report the offline time it spent filling pools"
+        );
+        // Compared on `online_mpc_ms`, not `mpc_ms`: the warm run's `mpc_ms` still
+        // contains the pool fill it performed, so comparing totals would measure almost
+        // nothing. The cold run has no offline phase, so its two figures coincide.
+        assert!(
+            warm.online_mpc_ms() < cold.online_mpc_ms(),
+            "pooling must shorten the ONLINE MPC segment: cold {:.1} ms, warm {:.1} ms",
+            cold.online_mpc_ms(),
+            warm.online_mpc_ms()
+        );
+        println!(
+            "  → online MPC {:.2}x shorter ({:.1} → {:.1} ms), {:.1} ms moved offline",
+            cold.online_mpc_ms() / warm.online_mpc_ms().max(1e-9),
+            cold.online_mpc_ms(),
+            warm.online_mpc_ms(),
+            warm.phases.falcon_offline_ms
+        );
+    }
+
     /// Why the nonlinearity is a garbled *comparator* plus an **arithmetic**
     /// select, rather than one fused garbled max-of-4.
     ///
-    /// Measured 2026-08-01 at N=5256 (the pool's comparison count for
-    /// pneumonia), solving the two-point cost model:
+    /// Measured 2026-08-01 at N=5256 — then pneumonia's whole Falcon comparison
+    /// count, now just its max-pool share, since `Π_ReLU` routes activations
+    /// through the same path. Kept as the batch size so the figures below stay
+    /// comparable. Solving the two-point cost model:
     ///
     /// | | |
     /// |---|---|
@@ -2420,7 +3121,7 @@ mod tests {
     #[test]
     #[ignore] // profiling probe, real 3-party transport
     fn profile_lt_versus_mul_under_gc() {
-        const N: usize = 5256; // the pool's comparison count for pneumonia
+        const N: usize = 5256; // pneumonia's max-pool comparisons; see the note above
         let (out, _) = run_parties(NetworkProfile::INSTANT, |me| {
             move |be: &mut TransportBackend<MpcTransport>| {
                 be.set_gc_nonlinearities(true);
@@ -2743,6 +3444,7 @@ mod tests {
             .collect();
         let cbias: Vec<i64> = (0..c2).map(|_| rng.gen_range(-4i64..=4)).collect();
         model.extra_conv = vec![ConvLayer {
+            k: K,
             kernels,
             cbias,
             in_c: OC,
@@ -2901,6 +3603,7 @@ mod tests {
         let cbias = vec![0i64; WIDE_C];
         let conv2_out = 4;
         let extra = vec![ConvLayer {
+            k: K,
             kernels: (0..conv2_out).map(|_| small(WIDE_C * K * K)).collect(),
             cbias: vec![0i64; conv2_out],
             in_c: WIDE_C,

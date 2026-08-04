@@ -388,6 +388,28 @@ mod tests {
                 kh: 2,
                 kw: 2,
             },
+            // 5×5, which is LeNet's kernel and was untested until 2026-08-04: every
+            // shape above has `kh ≤ 3`, so the row-wrap argument (contamination would
+            // need `ox ≤ −1`) had only ever been exercised with a one- or two-column
+            // overhang. LeNet's first layer is this shape at `h = w = 28`.
+            ConvShape {
+                in_c: 1,
+                h: 12,
+                w: 12,
+                kh: 5,
+                kw: 5,
+            },
+            // 5×5 with several input channels, where the channel-offset argument
+            // (`c + (C−1−c′) = C−1` iff `c = c′`) and the wider overhang interact.
+            // Sized to the n = 512 ring above: `in_c: 3, h: 10, w: 11` needs degree 596
+            // and asserts, which is the packing bound doing its job rather than a bug.
+            ConvShape {
+                in_c: 2,
+                h: 8,
+                w: 8,
+                kh: 5,
+                kw: 4,
+            },
         ] {
             let img = pseudo(shape.input_len(), 1);
             let kernel = pseudo(shape.in_c * shape.kh * shape.kw, 2);

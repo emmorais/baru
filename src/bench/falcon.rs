@@ -496,6 +496,7 @@ fn nonlin<T: crate::crypto::net::Transport>(
                 r_shifted: three(r >> d),
                 r_lo: three(r & ((1u64 << d) - 1)),
                 sel: sel_pre(9000 + i as u64, l_bits, me),
+                sel_wrap: sel_pre(29000 + i as u64, l_bits, me),
             }
         })
         .collect();
@@ -709,6 +710,660 @@ pub fn run_cli(args: &[String]) -> Result<(), String> {
 mod tests {
     use super::*;
     use crate::interpreter::transport_backend::NonlinMode;
+
+    /// **The wrap correction is exact for every mask, including the wrapping ones.**
+    ///
+    /// This is the identity `truncate_batch` rests on, checked over *all* `(a, r)` at a
+    /// small ring rather than sampled:
+    ///
+    /// ```text
+    /// a>>d = (c>>d) − (r>>d) − [c_lo < r_lo] + [c < r]·2^(l−d),   c = (a+r) mod 2^l
+    /// ```
+    ///
+    /// Exhaustive matters here because the interesting inputs are the rare ones. `r` is
+    /// uniform over the whole ring, so `a + r` wraps about half the time and the wrap
+    /// term is exercised constantly — but the *borrow* and the wrap interact only when
+    /// `c_lo < r_lo` and `c < r` at once, and a sampled test can miss the corner where
+    /// both corrections apply. At `l = 10, d = 3` this is 524 288 pairs and runs in
+    /// milliseconds.
+    ///
+    /// It also pins the second claim the protocol needs: that `[c < r]` really is the
+    /// wrap indicator `[a + r ≥ 2^l]`. That equivalence is why the wrap is computable
+    /// from an opened `c` and a shared `r` at all, and it is not obvious enough to leave
+    /// as a comment.
+    #[test]
+    fn the_wrap_correction_is_exact_over_every_mask() {
+        const L: u32 = 10;
+        const D: u32 = 3;
+        let ring = 1u64 << L;
+        let dmask = (1u64 << D) - 1;
+        let mut checked = 0u64;
+
+        // `a` non-negative and below half the ring, as a ReLU output is.
+        for a in 0..(ring / 2) {
+            for r in 0..ring {
+                let c = (a + r) % ring;
+                let borrow = u64::from((c & dmask) < (r & dmask));
+                let wrap = u64::from(c < r);
+
+                // The wrap bit is the overflow indicator — the fact that makes it
+                // computable from a public `c` and a secret `r`.
+                assert_eq!(
+                    wrap,
+                    u64::from(a + r >= ring),
+                    "[c<r] must equal the wrap indicator at a={a}, r={r}"
+                );
+
+                let got = ((c >> D)
+                    .wrapping_sub(r >> D)
+                    .wrapping_sub(borrow)
+                    .wrapping_add(wrap << (L - D)))
+                    % ring;
+                assert_eq!(got, a >> D, "truncating a={a} by {D} with r={r}");
+                checked += 1;
+            }
+        }
+        assert_eq!(checked, (ring / 2) * ring, "the sweep must be exhaustive");
+        println!("wrap-corrected truncation exact over {checked} (a, r) pairs at l={L}, d={D}");
+    }
+
+    /// **A mask narrower than the ring is rejected, not silently accepted.**
+    ///
+    /// The leak this guards against was not a wrong answer — it was `random_trunc_pairs`
+    /// being asked for a mask that fit the no-wrap bound, obliging, and producing a
+    /// protocol run that computed the right activations while leaking ≈0.72 bits of each
+    /// one. Nothing in the type system distinguished the two requests.
+    ///
+    /// So the narrow request is now unrepresentable: `r_bits` must equal `l_bits`. This
+    /// test is the guard on that, and it is a panic test rather than a value test because
+    /// the property being protected is *refusal*.
+    #[test]
+    #[should_panic(expected = "the mask must cover the whole ring")]
+    fn a_truncation_mask_narrower_than_the_ring_is_refused() {
+        // `r_bits = 19` under an `l_bits = 20` ring: the exact configuration that leaked.
+        crate::crypto::falcon_mpc::assert_full_ring_mask(19, 20);
+    }
+
+    /// The other side of the same guard: the full-ring mask is accepted.
+    ///
+    /// Without this, `a_truncation_mask_narrower_than_the_ring_is_refused` would still
+    /// pass if the check rejected *everything*.
+    #[test]
+    fn a_full_ring_truncation_mask_is_accepted() {
+        for l in [4u32, 10, 20, 21, 64] {
+            crate::crypto::falcon_mpc::assert_full_ring_mask(l, l);
+        }
+    }
+
+    /// **Falcon keeps the narrowed wire**, which is the point of the wrap bit.
+    ///
+    /// The first fix for the truncation leak widened the ring by a statistical parameter
+    /// `κ`, and that is incompatible with the narrowing: narrowing spends the slack
+    /// between the value width and the ring width, and statistical hiding needs exactly
+    /// that slack. Measured, it made Falcon's ReLU ~1.9× *dearer* in bytes than `a2b`'s —
+    /// a secure protocol whose cost erased the reason to prefer it.
+    ///
+    /// Computing the wrap instead hides *perfectly* and needs only one extra bit of
+    /// width, for the `c − r` difference. This pins that all three routes share one
+    /// width, so nothing silently reintroduces a route-specific ring.
+    #[test]
+    fn falcon_keeps_the_narrowed_wire() {
+        use crate::bench::cnn::{wire_bits_for, wire_bits_for_nonlin, Nonlin};
+        for nbits in [20usize, 21, 23] {
+            let narrow = wire_bits_for(nbits).expect("the default narrows");
+            for route in [Nonlin::A2b, Nonlin::Gc, Nonlin::Falcon] {
+                assert_eq!(
+                    wire_bits_for_nonlin(nbits, route),
+                    Some(narrow),
+                    "nbits={nbits}, {route:?}: every route takes the narrowed wire"
+                );
+            }
+            // And the wire must clear what `relu_falcon_batch` asserts: the `nbits`-bit
+            // ring plus one bit for the wrap difference.
+            let needed = nbits as u32 + 1;
+            assert!(
+                narrow >= needed,
+                "nbits={nbits}: the narrow wire {narrow} must reach {needed} to leave \
+                 room for the wrap bit"
+            );
+        }
+    }
+
+    /// **Falcon's own `ReLU∘rescale` must agree with the `a2b` reference exactly.**
+    ///
+    /// This is the gate on `relu_falcon_batch`. Until it existed, `NonlinMode::Falcon`
+    /// routed ReLU through `a2b` for a good reason — there was no *secure* Falcon
+    /// truncation to route to — so a "falcon" run put only its max-pool comparisons
+    /// through Falcon. `random_trunc_pairs` closed that, and this checks the resulting
+    /// ReLU against the route it replaces.
+    ///
+    /// The inputs deliberately straddle zero and include the boundary cases: the gate
+    /// flips at 0, and the truncation's borrow flips where `r_lo = c_lo + 1`, which is
+    /// the input `Π_PC` cannot handle and the reason Falcon's truncation uses bit
+    /// decomposition for its borrow instead.
+    #[test]
+    #[ignore] // real 3-party transport
+    fn falcon_and_a2b_relu_agree() {
+        const NBITS: usize = 20;
+        const SHIFT: u32 = 8;
+        let l = 1i128 << NBITS;
+        // Straddle zero, hit 0 and ±1, and include values whose low SHIFT bits vary.
+        let vals: Vec<i128> = vec![
+            0, 1, -1, 255, 256, 257, -255, -256, -257, 4095, 4096, -4096, 65535, -65535,
+            (1 << (NBITS - 2)) as i128,
+            -((1 << (NBITS - 2)) as i128),
+        ];
+        let want: Vec<i128> = vals
+            .iter()
+            .map(|&v| if v >= 0 { v >> SHIFT } else { 0 })
+            .collect();
+        let n = vals.len();
+
+        let mut results = Vec::new();
+        for falcon in [false, true] {
+            let vs = vals.clone();
+            let (out, _) = run_parties(NetworkProfile::INSTANT, move |_me| {
+                let vs = vs.clone();
+                move |be: &mut TransportBackend<MpcTransport>| {
+                    let enc = |v: i128| ((v + l) % l) as u128;
+                    let shares: Vec<_> =
+                        vs.iter().map(|&v| be.share_public(enc(v), NBITS)).collect();
+                    let acts = if falcon {
+                        be.relu_falcon_batch(&shares, NBITS, SHIFT)
+                    } else {
+                        // The reference: one a2b, shift and sign bit from the same bits.
+                        be.set_nonlin(NonlinMode::A2b);
+                        crate::bench::cnn::fused_relu_rescale_for_test(be, &shares, SHIFT, NBITS)
+                    };
+                    acts.iter().map(|a| be.reveal(a, None)).collect::<Vec<_>>()
+                }
+            });
+            let got: Vec<i128> = out[0]
+                .iter()
+                .map(|&r| {
+                    let m = (r & ((1u128 << NBITS) - 1)) as i128;
+                    if m >= l / 2 { m - l } else { m }
+                })
+                .collect();
+            assert_eq!(
+                got, want,
+                "{} route disagrees with the plaintext reference",
+                if falcon { "falcon" } else { "a2b" }
+            );
+            results.push(got);
+        }
+        assert_eq!(
+            results[0], results[1],
+            "the Falcon ReLU must be bit-identical to the a2b one over {n} values"
+        );
+    }
+
+    /// **Falcon's own ReLU costs slightly more messages for roughly the same bytes.**
+    ///
+    /// Before `Π_ReLU` was wired in, a "falcon" run used Falcon only for its max-pool
+    /// comparisons and fell back to `a2b` for ReLU. Making the route pure does not make
+    /// it cheaper: `Π_DReLU` + `Π_Trunc` carry their comparisons in `Z_p` (6-bit
+    /// elements) and use `a2b` only on two narrow sign bits, but they are four protocols
+    /// in sequence against `a2b`'s one decomposition.
+    ///
+    /// Measured at ℓ = 20, batch 256: **bytes 1.05× cheaper, messages 1.10× dearer.**
+    /// Near enough a wash, which is the useful thing to know — the two terms enter the
+    /// cost model with opposite signs (`rounds × RTT + bytes / bandwidth`), so a route
+    /// that is 5% better in one and 10% worse in the other has no regime where it wins
+    /// by much on ReLU alone. Falcon's leverage in the pipeline is its *max-pool*
+    /// comparisons, not its ReLU.
+    ///
+    /// # Two ways this measurement was wrong before, both by comparing incommensurables
+    ///
+    /// **At a common 128-bit wire it read 7.5× cheaper in bytes.** Neither route deploys
+    /// there: `a2b`'s full-width decomposition is what 128 bits punishes, so the ratio was
+    /// measuring the wire, not the protocol. Both routes now run at
+    /// `wire_bits_for_nonlin`.
+    ///
+    /// **With a leaking truncation it read 7.5× at 128 bits and 1.9× *dearer* under a
+    /// `κ`-widened ring.** The first version of `relu_falcon_batch` masked with
+    /// `r_bits = nbits − 1`, which opens `a + r` with no slack; the first fix widened the
+    /// ring by `κ = 40`, which is incompatible with the narrowed wire. Only the wrap-bit
+    /// construction is both private and narrow, so only its numbers describe something
+    /// shippable. See `truncate_batch`.
+    #[test]
+    #[ignore] // real 3-party transport
+    fn the_pure_falcon_relu_trades_bytes_for_rounds() {
+        const NBITS: usize = 20;
+        const SHIFT: u32 = 8;
+        let l = 1i128 << NBITS;
+        let n = 256usize;
+        let vals: Vec<i128> = (0..n as i128).map(|i| (i * 37) % 4001 - 2000).collect();
+        let want: Vec<i128> = vals.iter().map(|&v| if v >= 0 { v >> SHIFT } else { 0 }).collect();
+
+        let run = |falcon: bool| {
+            let vs = vals.clone();
+            let (out, comm) = run_parties(NetworkProfile::INSTANT, move |_me| {
+                let vs = vs.clone();
+                move |be: &mut TransportBackend<MpcTransport>| {
+                    use crate::bench::cnn::{wire_bits_for_nonlin, Nonlin};
+                    let route = if falcon { Nonlin::Falcon } else { Nonlin::A2b };
+                    if let Some(w) = wire_bits_for_nonlin(NBITS, route) {
+                        be.set_wire_bits(w);
+                    }
+                    let enc = |v: i128| ((v + l) % l) as u128;
+                    let shares: Vec<_> =
+                        vs.iter().map(|&v| be.share_public(enc(v), NBITS)).collect();
+                    let acts = if falcon {
+                        be.relu_falcon_batch(&shares, NBITS, SHIFT)
+                    } else {
+                        be.set_nonlin(NonlinMode::A2b);
+                        crate::bench::cnn::fused_relu_rescale_for_test(be, &shares, SHIFT, NBITS)
+                    };
+                    acts.iter().map(|a| be.reveal(a, None)).collect::<Vec<_>>()
+                }
+            });
+            let got: Vec<i128> = out[0]
+                .iter()
+                .map(|&r| {
+                    let m = (r & ((1u128 << NBITS) - 1)) as i128;
+                    if m >= l / 2 { m - l } else { m }
+                })
+                .collect();
+            (got, comm.messages, comm.bytes)
+        };
+
+        let (a2b_got, a2b_msgs, a2b_bytes) = run(false);
+        let (fal_got, fal_msgs, fal_bytes) = run(true);
+
+        // The trade is only meaningful between routes computing the same function.
+        assert_eq!(a2b_got, want, "the a2b reference must be correct");
+        assert_eq!(fal_got, want, "the Falcon route must be correct");
+
+        println!(
+            "relu over {n} values at deployed widths: a2b {a2b_msgs} msgs / {a2b_bytes} B, \
+             falcon {fal_msgs} msgs / {fal_bytes} B (bytes {:.2}x, messages {:.2}x)",
+            a2b_bytes as f64 / fal_bytes as f64,
+            fal_msgs as f64 / a2b_msgs as f64,
+        );
+
+        // Falcon costs more messages: four sequential stages against one decomposition.
+        // This direction is structural and does not depend on the widths.
+        assert!(
+            fal_msgs > a2b_msgs,
+            "Falcon's ReLU should cost more messages than a2b's: {fal_msgs} vs {a2b_msgs}"
+        );
+
+        // The byte direction is *not* asserted, because at deployed widths it is no
+        // longer a given: Falcon's `Z_p` comparisons are cheap but its statistically
+        // hiding truncation runs in an `nbits + κ + 1` bit ring while `a2b` runs in
+        // `nbits + 1`. Which term wins is the measurement, so it is printed and checked
+        // against the pipeline rather than baked in as an expectation here.
+        println!(
+            "  → falcon is {} in bytes at deployed widths",
+            if fal_bytes < a2b_bytes { "cheaper" } else { "DEARER" }
+        );
+    }
+
+    /// **Falcon's round cost is mostly per-call, so batch granularity decides the trade.**
+    ///
+    /// `the_pure_falcon_relu_trades_bytes_for_rounds` measures one batch of 256 and
+    /// finds Falcon only ~1.10× dearer in messages. The full CNN measures a larger
+    /// ratio. Both are right: the CNN calls ReLU once per conv layer, on batches an
+    /// order of magnitude smaller, and Falcon pays a larger *fixed* round count per call
+    /// (Π_DReLU, its Π_SS lift, the multiply, then Π_Trunc with its own two sign bits —
+    /// four sequential stages against a2b's one decomposition).
+    ///
+    /// Fitting `messages = fixed + slope · n` over three batch sizes separates the
+    /// terms, and the answer is that there is no `n` term at all: both routes send a
+    /// fixed number of messages regardless of batch size, because every stage batches
+    /// its whole input into one message per round. So the entire difference between
+    /// the routes is a per-call constant.
+    ///
+    /// The test therefore reveals only one output. Revealing all `n` would add two
+    /// messages per element — a property of the *harness*, not the protocol — and
+    /// would swamp the term being measured. (It did, on the first attempt: both
+    /// routes fitted `2.000·n`, which was the reveal loop.)
+    ///
+    /// The consequence is practical: Falcon's costs are realised per *call*, so the
+    /// round penalty is amortised only by large batches. A layer-at-a-time schedule pays
+    /// it per layer, which is why the whole-CNN message ratio is so much worse than one
+    /// big batch's.
+    #[test]
+    #[ignore] // real 3-party transport
+    fn falcons_round_cost_is_mostly_per_call() {
+        const NBITS: usize = 20;
+        const SHIFT: u32 = 8;
+        let l = 1i128 << NBITS;
+
+        let run = |falcon: bool, n: usize| {
+            let vals: Vec<i128> = (0..n as i128).map(|i| (i * 37) % 4001 - 2000).collect();
+            let (_out, comm) = run_parties(NetworkProfile::INSTANT, move |_me| {
+                let vs = vals.clone();
+                move |be: &mut TransportBackend<MpcTransport>| {
+                    let enc = |v: i128| ((v + l) % l) as u128;
+                    let shares: Vec<_> =
+                        vs.iter().map(|&v| be.share_public(enc(v), NBITS)).collect();
+                    let acts = if falcon {
+                        be.relu_falcon_batch(&shares, NBITS, SHIFT)
+                    } else {
+                        be.set_nonlin(NonlinMode::A2b);
+                        crate::bench::cnn::fused_relu_rescale_for_test(be, &shares, SHIFT, NBITS)
+                    };
+                    // One reveal, not `n`: see the note above on the harness term.
+                    be.reveal(&acts[0], None)
+                }
+            });
+            comm.messages as f64
+        };
+
+        // Two points fix the line; the third checks it is actually a line.
+        let sizes = [32usize, 128, 512];
+        let mut fits = Vec::new();
+        for falcon in [false, true] {
+            let m: Vec<f64> = sizes.iter().map(|&n| run(falcon, n)).collect();
+            // Least squares on three points, by hand.
+            let xs: Vec<f64> = sizes.iter().map(|&n| n as f64).collect();
+            let xm = xs.iter().sum::<f64>() / 3.0;
+            let ym = m.iter().sum::<f64>() / 3.0;
+            let sxy: f64 = xs.iter().zip(&m).map(|(x, y)| (x - xm) * (y - ym)).sum();
+            let sxx: f64 = xs.iter().map(|x| (x - xm).powi(2)).sum();
+            let slope = sxy / sxx;
+            let fixed = ym - slope * xm;
+            let name = if falcon { "falcon" } else { "a2b" };
+            println!(
+                "{name:7} messages = {fixed:.0} + {slope:.3}·n   (measured {:?})",
+                m.iter().map(|v| *v as u64).collect::<Vec<_>>()
+            );
+            fits.push((fixed, slope, m));
+        }
+
+        let (a2b_fixed, a2b_slope, _) = fits[0].clone();
+        let (fal_fixed, fal_slope, _) = fits[1].clone();
+
+        // The claim: Falcon's extra messages are a per-call constant, not per element.
+        assert!(
+            fal_fixed > a2b_fixed,
+            "Falcon should pay a larger fixed round cost: {fal_fixed:.0} vs {a2b_fixed:.0}"
+        );
+        // And the claim's other half: neither route's message count grows with `n`.
+        // A batch 16x larger must not cost meaningfully more messages.
+        for (name, slope) in [("a2b", a2b_slope), ("falcon", fal_slope)] {
+            assert!(
+                slope.abs() < 0.01,
+                "{name} messages should not grow with batch size, got {slope:.4}/element"
+            );
+        }
+        println!(
+            "→ the whole difference is {:.0} messages, paid once per call, \
+             independent of batch size",
+            fal_fixed - a2b_fixed,
+        );
+    }
+
+    /// **The warm-server cost, measured** — the number the withdrawn crossover was
+    /// missing.
+    ///
+    /// Every Falcon figure this repo has published is a *cold* one, because
+    /// `lt_falcon_batch` generated preprocessing inline. With 91% of Falcon's bytes in
+    /// that phase, a warm server — one that generated its correlated randomness before
+    /// the query arrived — pays a fraction of it, and comparing a cold Falcon against
+    /// garbled circuits (which has no offline phase to speak of) is the accounting error
+    /// the crossover was withdrawn for.
+    ///
+    /// The sizing is *counted, not derived*: a first cold run reports how many comparison
+    /// elements the workload actually asked for, and the warm run pools exactly that. The
+    /// alternative — re-deriving the count from the layer shapes — would mean mirroring
+    /// the batching decisions inside `maxpool2d`, `fused_relu_rescale` and `argmax`, and
+    /// a second implementation to keep in step is how the mask pool broke when channel
+    /// splitting landed.
+    #[test]
+    #[ignore] // real 3-party transport
+    fn the_warm_falcon_cost_is_measured_against_the_cold_one() {
+        const NBITS: usize = 20;
+        let l = 1i128 << NBITS;
+        // A batch big enough that per-element cost dominates the fixed framing.
+        let n = 256usize;
+        let cases: Vec<(i128, i128)> = (0..n as i128).map(|i| (i % 97 - 48, (i * 7) % 89 - 44)).collect();
+        let want: Vec<u64> = cases.iter().map(|&(a, b)| u64::from(a < b)).collect();
+
+        let run = move |warm: bool, size: usize| {
+            let cs = cases.clone();
+            let (out, comm) = run_parties(NetworkProfile::INSTANT, move |_me| {
+                let cs = cs.clone();
+                move |be: &mut TransportBackend<MpcTransport>| {
+                    be.set_nonlin(NonlinMode::Falcon);
+                    let offline_ms = if warm {
+                        be.fill_falcon_pool(size, NBITS as u32, NBITS as u32)
+                    } else {
+                        0.0
+                    };
+                    let enc = |v: i128| ((v + l) % l) as u128;
+                    let pairs: Vec<_> = cs
+                        .iter()
+                        .map(|&(a, b)| (be.share_public(enc(a), NBITS), be.share_public(enc(b), NBITS)))
+                        .collect();
+                    let t = std::time::Instant::now();
+                    let bits = be.lt_batch(&pairs);
+                    let got: Vec<u64> =
+                        bits.iter().map(|x| (be.reveal(x, None) & 1) as u64).collect();
+                    let online_ms = t.elapsed().as_secs_f64() * 1e3;
+                    (got, online_ms, offline_ms, be.falcon_comparisons(), be.falcon_pool_stats())
+                }
+            });
+            let (got, online_ms, offline_ms, count, stats) = out[0].clone();
+            (got, online_ms, offline_ms, count, stats, comm.bytes)
+        };
+
+        // Cold: preprocessing on the critical path. Also tells us the pool size.
+        let (cold_got, cold_ms, _, count, _, cold_bytes) = run(false, 0);
+        let _ = &run; // keep the closure available for the bandwidth sweep below
+        assert_eq!(cold_got, want, "cold run must be correct");
+        assert_eq!(count, n, "the counter must report the elements actually requested");
+
+        // Warm: same workload, preprocessing pooled beforehand.
+        let (warm_got, warm_ms, off_ms, _, stats, warm_bytes) = run(true, count);
+        assert_eq!(warm_got, want, "warm run must agree with cold");
+        let (_, served, missed) = stats.expect("warm run must report pool stats");
+        assert_eq!((served, missed), (n, 0), "warm run must be fully served by the pool");
+
+        println!(
+            "\n  Falcon at ℓ={NBITS}, n={n} — cold vs warm\n    \
+             cold  : {cold_ms:8.1} ms online (preprocessing on the critical path)\n    \
+             warm  : {warm_ms:8.1} ms online + {off_ms:.1} ms offline, pooled\n    \
+             speedup on the critical path: {:.1}x\n    \
+             total bytes are unchanged: {cold_bytes} cold, {warm_bytes} warm\n",
+            cold_ms / warm_ms.max(1e-9),
+        );
+
+        // The claim: pooling moves work off the critical path rather than removing it.
+        // Bytes must be essentially unchanged — a warm run that sent materially less
+        // would mean the pool had skipped work rather than pre-done it.
+        let ratio = warm_bytes as f64 / cold_bytes as f64;
+        assert!(
+            (0.9..1.1).contains(&ratio),
+            "pooling must not change total traffic: {cold_bytes} cold vs {warm_bytes} \
+             warm ({:.2}x) — a difference means work was skipped, not moved",
+            ratio
+        );
+        assert!(
+            warm_ms < cold_ms,
+            "the warm critical path must be shorter: cold {cold_ms:.1} ms vs warm \
+             {warm_ms:.1} ms"
+        );
+    }
+
+    /// **How the warm/cold gap widens as bandwidth binds** — the number that decides
+    /// whether a warm crossover boundary is worth chasing.
+    ///
+    /// `the_warm_falcon_cost_is_measured_against_the_cold_one` finds 2.9× at zero
+    /// latency, well short of the ~11× the 91%-of-bytes split suggests, because at
+    /// infinite bandwidth compute dominates and the online phase still has real work.
+    /// The prediction is that the gap approaches the byte ratio as bandwidth binds. That
+    /// is a prediction about the *shape* of the warm boundary, so the trend is **reported
+    /// rather than asserted**: if the gap does not widen, pooling buys little where the
+    /// crossover actually lives and wiring it into the sweep would not change any
+    /// conclusion.
+    ///
+    /// # Why the trend is not asserted, measured rather than assumed
+    ///
+    /// It *was* asserted (`ratios.last() > ratios.first()`), and it failed whenever the
+    /// ignored suite ran in parallel — not because the claim is false but because the
+    /// **baseline** is the noisy cell. At unlimited bandwidth the run is pure compute, so
+    /// CPU contention inflated it 892 → 1615 ms and drove the first ratio from 2.44× to
+    /// 4.11×, while the 0.2 Mbps cell, being network-bound, barely moved (3104 → 2996 ms).
+    /// Using a compute-bound measurement as the reference for a bandwidth-sensitivity
+    /// claim is the defect; the ordering it produced was an artifact of load.
+    ///
+    /// What remains asserted is only that pooling shortens the critical path *at all*, at
+    /// every profile — a 2–4× effect, robust to the contention that a 1.8× ordering is not.
+    /// The trend itself stays in the printed table, where a human can read it without a
+    /// flaky gate calling load a regression.
+    ///
+    /// **Asserting the mechanism instead does not work with this harness, and the attempt
+    /// is recorded so it is not retried.** The deterministic quantity would be
+    /// *critical-path* bytes — those sent after the timer starts — since pooling relocates
+    /// preprocessing traffic rather than removing it. But `run_parties` reports only
+    /// whole-run totals, and cold and warm move **identical** total bytes (49 928 each at
+    /// `n = 128`); that identity is itself a documented invariant of the pool. Measuring
+    /// the split needs a byte counter that can be snapshotted mid-run, which does not
+    /// exist. Substituting a proxy would be worse than leaving the trend unasserted.
+    #[test]
+    #[ignore] // real 3-party transport, several network profiles
+    fn the_warm_gap_widens_as_bandwidth_binds() {
+        const NBITS: usize = 20;
+        let l = 1i128 << NBITS;
+        let n = 128usize;
+        let cases: Vec<(i128, i128)> =
+            (0..n as i128).map(|i| (i % 61 - 30, (i * 11) % 53 - 26)).collect();
+
+        let measure = move |profile: NetworkProfile, warm: bool| -> f64 {
+            let cs = cases.clone();
+            let (out, _) = run_parties(profile, move |_me| {
+                let cs = cs.clone();
+                move |be: &mut TransportBackend<MpcTransport>| {
+                    be.set_nonlin(NonlinMode::Falcon);
+                    if warm {
+                        be.fill_falcon_pool(n, NBITS as u32, NBITS as u32);
+                    }
+                    let enc = |v: i128| ((v + l) % l) as u128;
+                    let pairs: Vec<_> = cs
+                        .iter()
+                        .map(|&(a, b)| (be.share_public(enc(a), NBITS), be.share_public(enc(b), NBITS)))
+                        .collect();
+                    let t = std::time::Instant::now();
+                    let bits = be.lt_batch(&pairs);
+                    for x in &bits {
+                        let _ = be.reveal(x, None);
+                    }
+                    t.elapsed().as_secs_f64() * 1e3
+                }
+            });
+            out[0]
+        };
+
+        // Unlimited, then pipes tight enough that the byte term actually dominates.
+        // A first attempt used 100 and 20 Mbps and found the ratio *flat* — at this
+        // batch size those pipes contribute ~140 ms against ~840 ms of compute, so the
+        // measurement never entered the regime the hypothesis is about. The bandwidths
+        // below put the byte term ahead of compute, which is where a crossover lives.
+        let mbps = [f64::INFINITY, 5.0, 1.0, 0.2];
+        let mut ratios = Vec::new();
+        println!("\n  warm/cold critical-path ratio vs bandwidth (ℓ={NBITS}, n={n})");
+        for &m in &mbps {
+            let profile = if m.is_infinite() {
+                NetworkProfile::INSTANT
+            } else {
+                NetworkProfile::INSTANT.with_bandwidth(m * 1e6 / 8.0)
+            };
+            let cold = measure(profile, false);
+            let warm = measure(profile, true);
+            let r = cold / warm.max(1e-9);
+            let label = if m.is_infinite() {
+                "unlimited".to_string()
+            } else {
+                // `{:.0}` printed 0.2 as "0"; sub-1 Mbps is where the gap is largest.
+                format!("{m:.3} Mbps").replace(".000", "")
+            };
+            println!("    {label:>10}: cold {cold:8.1} ms  warm {warm:8.1} ms  ratio {r:5.2}x");
+            ratios.push(r);
+        }
+        println!();
+
+        assert!(
+            ratios.iter().all(|&r| r > 1.0),
+            "pooling must shorten the critical path at every profile: {ratios:?}"
+        );
+
+        // The trend across bandwidths is deliberately NOT asserted — see the note above.
+        // The printed table is the result; a gate on it reads CPU load as a regression.
+    }
+
+    /// **A pooled Falcon run computes the same comparisons as an inline one**, and the
+    /// pool actually serves them.
+    ///
+    /// The pool exists so the two honest costs are separately measurable: with 91% of
+    /// Falcon's bytes in preprocessing, a cold server pays the total and a warm one pays
+    /// only the online phase. That split is worthless if it changes the answer, and it
+    /// would be worse than worthless if a benchmark quoted an online latency while
+    /// quietly generating preprocessing on the critical path — so this asserts both the
+    /// results and the `served`/`missed` accounting.
+    #[test]
+    #[ignore] // real 3-party transport
+    fn a_pooled_falcon_run_matches_an_inline_one() {
+        const NBITS: usize = 20;
+        let l = 1i128 << NBITS;
+        let cases: Vec<(i128, i128)> = vec![(5, 3), (3, 5), (0, 0), (-7, 2), (2, -7), (100, -100)];
+        let want: Vec<u64> = cases.iter().map(|&(a, b)| u64::from(a < b)).collect();
+        let n = cases.len();
+
+        // Two runs, identical except for where preprocessing came from.
+        let mut outs = Vec::new();
+        let mut stats = Vec::new();
+        for pooled in [false, true] {
+            let cs = cases.clone();
+            let (out, _) = run_parties(NetworkProfile::INSTANT, move |_me| {
+                let cs = cs.clone();
+                move |be: &mut TransportBackend<MpcTransport>| {
+                    be.set_nonlin(NonlinMode::Falcon);
+                    // Offline, before anything a query depends on.
+                    let offline_ms = if pooled {
+                        be.fill_falcon_pool(n, NBITS as u32, NBITS as u32)
+                    } else {
+                        0.0
+                    };
+                    let enc = |v: i128| ((v + l) % l) as u128;
+                    let pairs: Vec<_> = cs
+                        .iter()
+                        .map(|&(a, b)| {
+                            (
+                                be.share_public(enc(a), NBITS),
+                                be.share_public(enc(b), NBITS),
+                            )
+                        })
+                        .collect();
+                    let bits = be.lt_batch(&pairs);
+                    let got: Vec<u64> = bits.iter().map(|x| (be.reveal(x, None) & 1) as u64).collect();
+                    (got, be.falcon_pool_stats(), offline_ms)
+                }
+            });
+            let (got, st, offline_ms) = out[0].clone();
+            assert_eq!(got, want, "pooled={pooled}: wrong comparisons");
+            outs.push(got);
+            stats.push((st, offline_ms));
+        }
+
+        assert_eq!(outs[0], outs[1], "pooling must not change the answer");
+
+        // Inline: no pool at all.
+        assert!(stats[0].0.is_none(), "the inline run must not have a pool");
+
+        // Pooled: every item served, none generated on the critical path, and the
+        // offline phase actually cost something — a zero would mean it never ran.
+        let (st, offline_ms) = &stats[1];
+        let (pool_ms, served, missed) = st.expect("the pooled run must report stats");
+        assert_eq!(served, n, "every item must come from the pool");
+        assert_eq!(missed, 0, "nothing may be generated on the critical path");
+        assert!(
+            pool_ms > 0.0 && *offline_ms > 0.0,
+            "the offline phase must be measured, not defaulted: pool {pool_ms} ms"
+        );
+    }
 
     /// The three comparison backends must be **interchangeable**: same inputs,
     /// same bits out, whichever protocol runs underneath.

@@ -581,11 +581,40 @@ fn clone_wrap(p: &WrapPreproc) -> WrapPreproc {
     }
 }
 
+/// Panics unless the truncation mask covers the whole ring.
+///
+/// A separate function because it is the one line standing between the protocol and a
+/// silent 0.72-bit-per-call leak, and a caller can satisfy [`truncate_batch`]'s *other*
+/// precondition (`a + r` must not wrap) by violating this one. Named so it can be tested
+/// without a transport, and so the reason appears at the failure rather than in a doc.
+pub fn assert_full_ring_mask(r_bits: u32, l_bits: u32) {
+    assert_eq!(
+        r_bits, l_bits,
+        "the mask must cover the whole ring, or opening `a + r` leaks about `a` \
+         (~0.72 bits per truncation) — see `truncate_batch`"
+    );
+}
+
+/// Id space one [`truncate_batch`] call needs: two narrowed `a2b`s (the borrow and the
+/// wrap) and two `Π_SS` lifts, each on disjoint ids.
+pub const TRUNC_ID_BLOCK: u64 = 4 * (crate::crypto::aby3_protocol::A2B_ID_BLOCK + PC_ID_BLOCK) + 16;
+
 /// Preprocessing for one exact truncation by `d` bits.
 ///
 /// A truncation pair `(r, r>>d)` — ABY3's `Π_trunc2` — plus the bits of `r mod
 /// 2^d` over `Z_p`, which is what makes the borrow computable.
 pub struct TruncPreproc {
+    /// `r`, uniform over the **whole** ring `Z_{2^l_bits}`, shared valid mod
+    /// `2^(l_bits+1)`.
+    ///
+    /// Uniform over the whole ring is what makes the opened `c = a + r` uniform too, and
+    /// therefore *perfectly* independent of `a`. A mask restricted to the no-wrap range
+    /// would keep `a + r` inside the ring — which is why an earlier version chose one —
+    /// but it also leaves `c` correlated with `a`, leaking ≈0.72 bits per truncation.
+    /// [`truncate_batch`] pays for the wrap instead, with a bit it computes.
+    ///
+    /// The extra bit of width is for that computation: the wrap bit is the sign of
+    /// `c − r`, which needs `l_bits + 1` bits to hold a difference of two `l_bits` values.
     pub r: PartyShare,
     pub r_shifted: PartyShare,
     /// Ring shares of `r mod 2^d` — the low bits the borrow compares against.
@@ -593,15 +622,21 @@ pub struct TruncPreproc {
     /// A *ring* sharing, not `Z_p` bit-shares, because the borrow cannot use
     /// `Π_PC`: see [`truncate_batch`].
     pub r_lo: PartyShare,
+    /// `Π_SS` selector lifting the **borrow** bit into the ring.
     pub sel: SelectPreproc,
+    /// `Π_SS` selector lifting the **wrap** bit. A second one, because each `Π_SS` lift
+    /// consumes its own daBit — sharing one between the two bits would correlate them.
+    pub sel_wrap: SelectPreproc,
 }
 
 /// Exact truncation by `d` bits, batched — Falcon's "exact yet expensive"
 /// variant, on the transport.
 ///
 /// ```text
-/// c = a + r  (opened)
-/// a>>d = (c>>d) − (r>>d) − borrow,   borrow = 1 ⟺ c_lo < r_lo
+/// c = a + r  (opened, mod 2^l_bits)
+/// a>>d = (c>>d) − (r>>d) − borrow + wrap·2^(l_bits−d)
+///   borrow = 1 ⟺ c_lo < r_lo
+///   wrap   = 1 ⟺ c   < r        (equivalently, a + r overflowed the ring)
 /// ```
 ///
 /// `c_lo` is public once `c` is opened but **`r_lo` is secret**, so the borrow
@@ -628,8 +663,29 @@ pub struct TruncPreproc {
 /// The resulting bit is lifted into the ring with `Π_SS`, which is how a `Z_2`
 /// value becomes subtractable from a `Z_L` one without a conversion protocol.
 ///
-/// Requires `a + r` not to wrap, which the preprocessing controls by keeping
-/// the mask below `L − max|a|`.
+/// # Why the wrap term exists: `r` is the mask, so it must cover the whole ring
+///
+/// Step 1 **opens** `c`, so `r` is the only thing hiding `a`. That forces `r` uniform
+/// over the *whole* ring — then `c` is uniform and perfectly independent of `a`.
+///
+/// The first version of this protocol instead required `a + r` not to wrap and kept `r`
+/// below `L − max|a|` to guarantee it. That is correct, and it leaks: with `r` no wider
+/// than `a`, the posterior on `a` given `c` is uniform on a support of size
+/// `min(c, A) − max(0, c − A)` — **1** when `c = 0` — for an average leak of
+/// `1 / (2 ln 2) ≈ 0.72` bits per truncation. Every correctness test passed throughout,
+/// because leakage is not a wrong answer.
+///
+/// Covering the ring means `a + r` *does* wrap, about half the time, so the wrap has to
+/// be corrected rather than avoided. The correction is one bit, and it has the same shape
+/// as the borrow already being computed — public `c`, secret `r` — so it costs a second
+/// narrowed `a2b` and a second `Π_SS` lift, and **the ring stays narrow**. That last part
+/// is the reason to prefer this over widening `r` by a statistical parameter `κ`: the
+/// alternative needs an `nbits + κ + 1` bit ring, which is incompatible with the narrowed
+/// wire encoding and measured ~1.9× *dearer* than `a2b` in bytes. This is cheaper and
+/// hides perfectly rather than statistically.
+///
+/// The identity is verified exhaustively over all `(a, r)` at `l_bits = 10` by
+/// `the_wrap_correction_is_exact_over_every_mask`.
 #[allow(clippy::too_many_arguments)]
 pub fn truncate_batch<T: Transport>(
     a: &[PartyShare],
@@ -686,13 +742,47 @@ pub fn truncate_batch<T: Transport>(
     // is worth 32x, because this a2b was 96% of an all-RSS network.
     let bits =
         crate::crypto::aby3_protocol::a2b_batch_party_at(&diffs, w, 4, base_op_id + 1, me, mbx);
-    let borrow_bits: Vec<[u64; 2]> = bits
+    let msb_of = |bits: &[Vec<PartyShare>], w: usize| -> Vec<[u64; 2]> {
+        bits.iter()
+            .map(|bv| {
+                let msb = &bv[w - 1];
+                [(msb.left & 1) as u64, (msb.right & 1) as u64]
+            })
+            .collect()
+    };
+    let borrow_bits = msb_of(&bits, w);
+
+    // 2b. wrap = sign of (c − r) over l_bits+1 bits. Same construction as the borrow
+    //     and for the same reason — `Π_PC` is undefined at `r = c`, which for the wrap
+    //     is the `a = 0` case and so anything but rare. Narrowed to 4 bits on the same
+    //     grounds: only the top bit is ever read.
+    //
+    //     `r`'s shares are valid mod `2^(l_bits+1)`, which is what lets the difference
+    //     be formed without the subtraction itself wrapping.
+    let ww = l_bits as usize + 1;
+    let wmask: Fr = (1u128 << ww) - 1;
+    let wdiffs: Vec<PartyShare> = c
         .iter()
-        .map(|bv| {
-            let msb = &bv[w - 1];
-            [(msb.left & 1) as u64, (msb.right & 1) as u64]
+        .zip(pre)
+        .map(|(&ci, p)| {
+            let cv = ci as Fr;
+            let pub0 = if me == 0 { cv } else { 0 };
+            let pub1 = if me == 2 { cv } else { 0 };
+            PartyShare {
+                left: pub0.wrapping_sub(p.r.left) & wmask,
+                right: pub1.wrapping_sub(p.r.right) & wmask,
+            }
         })
         .collect();
+    let wbits = crate::crypto::aby3_protocol::a2b_batch_party_at(
+        &wdiffs,
+        ww,
+        4,
+        base_op_id + 1 + crate::crypto::aby3_protocol::A2B_ID_BLOCK,
+        me,
+        mbx,
+    );
+    let wrap_bits = msb_of(&wbits, ww);
 
     // 3. Lift the borrow into the ring with Π_SS: select between 0 and 1.
     let zeros = vec![PartyShare { left: 0, right: 0 }; n];
@@ -715,12 +805,32 @@ pub fn truncate_batch<T: Transport>(
         &borrow_bits,
         &sel,
         l_bits,
-        base_op_id + 2 + PC_ID_BLOCK,
+        base_op_id + 2 + PC_ID_BLOCK + 2 * crate::crypto::aby3_protocol::A2B_ID_BLOCK,
+        me,
+        mbx,
+    );
+    let sel_wrap: Vec<SelectPreproc> = pre
+        .iter()
+        .map(|p| SelectPreproc {
+            c_bit: p.sel_wrap.c_bit,
+            c_ring: p.sel_wrap.c_ring.clone(),
+        })
+        .collect();
+    let wrap = select_batch(
+        &zeros,
+        &ones,
+        &wrap_bits,
+        &sel_wrap,
+        l_bits,
+        base_op_id + 2 + 2 * PC_ID_BLOCK + 2 * crate::crypto::aby3_protocol::A2B_ID_BLOCK,
         me,
         mbx,
     );
 
-    // 4. out = (c>>d) − (r>>d) − borrow, with the public term in component 0.
+    // 4. out = (c>>d) − (r>>d) − borrow + wrap·2^(l_bits−d), public term in component 0.
+    //    The wrap term restores the `2^l_bits` the opening lost, divided by `2^d`
+    //    because it is being added in the shifted domain.
+    let wrap_weight: Fr = 1u128 << (l_bits - d);
     (0..n)
         .map(|i| {
             let hi = (c[i] >> d) as Fr;
@@ -730,10 +840,12 @@ pub fn truncate_batch<T: Transport>(
                 left: pub0
                     .wrapping_sub(pre[i].r_shifted.left)
                     .wrapping_sub(borrow[i].left)
+                    .wrapping_add(wrap[i].left.wrapping_mul(wrap_weight))
                     & mask,
                 right: pub1
                     .wrapping_sub(pre[i].r_shifted.right)
                     .wrapping_sub(borrow[i].right)
+                    .wrapping_add(wrap[i].right.wrapping_mul(wrap_weight))
                     & mask,
             }
         })
@@ -1380,6 +1492,123 @@ pub fn random_dabits_ring<T: Transport>(
     (z2, ring)
 }
 
+/// Truncation pairs for [`truncate_batch`], generated by bit composition.
+///
+/// Returns `count` `TruncPreproc`, each a uniform `r < 2^r_bits` with `r >> d` and
+/// `r mod 2^d` shared consistently, plus the `Π_SS` selector the borrow's lift needs.
+/// **No party learns `r`.**
+///
+/// # Why this is much cheaper than [`random_wrap_masks`]
+///
+/// Both build their mask from shared random bits, but wrap3 then needs `δ` — a *carry*
+/// out of a three-summand sum, which costs an `a2b`. Truncation needs no carry at all,
+/// because **shifting is re-weighting**: from the same `r_bits` daBits,
+///
+/// ```text
+/// r         = Σ_k      2^k     · b_k
+/// r >> d    = Σ_{k≥d}  2^{k−d} · b_k
+/// r mod 2^d = Σ_{k<d}  2^k     · b_k
+/// ```
+///
+/// are three *local* weighted sums of one set of shares. The invariant
+/// `truncate_batch` relies on — `r = (r>>d)·2^d + r_lo`, exactly, over the integers —
+/// holds by construction rather than being computed, so it cannot be violated by a
+/// wrong carry. The whole protocol is the daBits: two batched multiplications.
+///
+/// Only the *ring* images are needed, so this draws [`random_dabits_ring`] rather than
+/// the triple — the `Z_p` images `Π_PC` wants are not part of a truncation pair.
+///
+/// # `r_bits` is a *security* parameter, not only a correctness one
+///
+/// [`truncate_batch`] requires `a + r` not to wrap, so `r_bits` must leave room for the
+/// largest `|a|`. That much is a correctness bound, and it is tempting to read it as the
+/// whole story — generating fewer bits satisfies it and costs proportionally less.
+///
+/// **It is not the whole story, because [`truncate_batch`] opens `c = a + r`.** `r` is
+/// also the mask hiding `a`, so shrinking it to the correctness minimum maximises
+/// leakage: see [`TRUNC_STAT_BITS`] for the analysis and the ≈0.72 bits per truncation
+/// that a zero-slack choice costs. Callers should take both widths from
+/// [`trunc_widths`] rather than picking `r_bits` to fit the bound.
+pub fn random_trunc_pairs<T: Transport>(
+    count: usize,
+    d: u32,
+    r_bits: u32,
+    l_bits: u32,
+    base_op_id: u64,
+    me: PartyId,
+    mbx: &Mailbox<T>,
+) -> Vec<TruncPreproc> {
+    use crate::crypto::aby3_protocol::scalar_mul_party;
+    if count == 0 {
+        return Vec::new();
+    }
+    assert_full_ring_mask(r_bits, l_bits);
+    assert!(d < l_bits, "random_trunc_pairs: need d < l_bits, got d={d}, l_bits={l_bits}");
+    let rb = r_bits as usize;
+    // One bit wider than the ring: `truncate_batch` forms `c − r` to get the wrap bit,
+    // and that difference needs `l_bits + 1` bits.
+    let wide = l_bits + 1;
+    let mask: Fr = if wide >= 128 { Fr::MAX } else { (1u128 << wide) - 1 };
+
+    // `r_bits` bits per element, plus two selectors each: one for the borrow's `Π_SS`
+    // lift and one for the wrap's.
+    let (_, bits) = random_dabits_ring(count * rb, wide as usize, base_op_id, me, mbx);
+    let sel_base = base_op_id.wrapping_add(dabit_id_span(count * rb));
+    let (sel_z2, sel_ring) = random_dabits_ring(count, l_bits as usize, sel_base, me, mbx);
+    let selw_base = sel_base.wrapping_add(dabit_id_span(count));
+    let (selw_z2, selw_ring) = random_dabits_ring(count, l_bits as usize, selw_base, me, mbx);
+
+    let weighted = |b: &PartyShare, w: u32| -> PartyShare {
+        let s = scalar_mul_party(b, 1u128 << w);
+        PartyShare {
+            left: s.left & mask,
+            right: s.right & mask,
+        }
+    };
+    let add = |a: PartyShare, b: PartyShare| PartyShare {
+        left: a.left.wrapping_add(b.left) & mask,
+        right: a.right.wrapping_add(b.right) & mask,
+    };
+
+    (0..count)
+        .map(|e| {
+            let mut r = PartyShare { left: 0, right: 0 };
+            let mut r_shifted = PartyShare { left: 0, right: 0 };
+            let mut r_lo = PartyShare { left: 0, right: 0 };
+            for k in 0..rb {
+                let b = &bits[e * rb + k];
+                r = add(r, weighted(b, k as u32));
+                if (k as u32) < d {
+                    r_lo = add(r_lo, weighted(b, k as u32));
+                } else {
+                    r_shifted = add(r_shifted, weighted(b, k as u32 - d));
+                }
+            }
+            TruncPreproc {
+                r,
+                r_shifted,
+                r_lo,
+                sel: SelectPreproc {
+                    c_bit: sel_z2[e],
+                    c_ring: sel_ring[e].clone(),
+                },
+                sel_wrap: SelectPreproc {
+                    c_bit: selw_z2[e],
+                    c_ring: selw_ring[e].clone(),
+                },
+            }
+        })
+        .collect()
+}
+
+/// Operation ids one [`random_trunc_pairs`] call consumes.
+///
+/// Two selector daBits per element, not one: the borrow and the wrap each need their own
+/// `Π_SS` lift.
+pub fn trunc_pair_id_span(count: usize, r_bits: u32) -> u64 {
+    dabit_id_span(count * r_bits as usize) + 2 * dabit_id_span(count)
+}
+
 /// Random **non-zero** `Z_p` masks for `Π_PC`'s final opening.
 ///
 /// `Π_PC` reveals `m · Π c[i]` and reads only its zero-ness. `m` must therefore
@@ -1728,6 +1957,93 @@ mod tests {
         }
     }
 
+    /// **The invariant `truncate_batch` rests on, checked from the shares.**
+    ///
+    /// A truncation pair is three objects that must agree exactly:
+    /// `r = (r>>d)·2^d + (r mod 2^d)`, over the integers, with `r_lo < 2^d`. Bit
+    /// composition makes that hold by construction — the three parts are re-weightings
+    /// of one set of bit-shares — but "by construction" is a claim about code, so this
+    /// reconstructs all three from the parties' shares and checks them against each
+    /// other. A pair that violated it would produce silently wrong truncations, the
+    /// same failure mode as an inconsistent `Π_WA` mask.
+    #[test]
+    #[ignore] // real 3-party transport
+    fn composed_truncation_pairs_are_mutually_consistent() {
+        const COUNT: usize = 16;
+        const D: u32 = 4;
+        const LB: u32 = 20;
+        // The mask spans the whole ring — anything narrower leaks when `a + r` is
+        // opened, and `random_trunc_pairs` refuses it.
+        const RB: u32 = LB;
+        let out = run3(|me, mbx| random_trunc_pairs(COUNT, D, RB, LB, 3_000, me, mbx));
+        let mask: Fr = (1u128 << LB) - 1;
+        let rec = |p: &[Vec<TruncPreproc>], e: usize, f: fn(&TruncPreproc) -> Fr| -> Fr {
+            (f(&p[0][e]).wrapping_add(f(&p[1][e])).wrapping_add(f(&p[2][e]))) & mask
+        };
+
+        let mut seen = std::collections::HashSet::new();
+        for e in 0..COUNT {
+            let r = rec(&out, e, |t| t.r.left);
+            let hi = rec(&out, e, |t| t.r_shifted.left);
+            let lo = rec(&out, e, |t| t.r_lo.left);
+
+            assert!(r < (1u128 << RB), "pair {e}: r = {r} exceeds 2^{RB}");
+            assert!(lo < (1u128 << D), "pair {e}: r_lo = {lo} is not below 2^{D}");
+            assert_eq!(
+                r,
+                (hi << D) + lo,
+                "pair {e}: r = {r} but (r>>{D})·2^{D} + r_lo = {}",
+                (hi << D) + lo
+            );
+            assert_eq!(hi, r >> D, "pair {e}: r_shifted {hi} != r>>{D} = {}", r >> D);
+
+            // Replication must be well formed, or the pair is malformed in a way the
+            // online protocol cannot detect.
+            for p in 0..3 {
+                assert_eq!(
+                    out[p][e].r.right,
+                    out[(p + 1) % 3][e].r.left,
+                    "pair {e}: r replication broken between {p} and {}",
+                    (p + 1) % 3
+                );
+            }
+            seen.insert(r);
+        }
+        assert!(
+            seen.len() > COUNT / 2,
+            "{COUNT} pairs took only {} distinct values — not randomness",
+            seen.len()
+        );
+    }
+
+    /// **No party may learn `r`** — the property that makes the mask a mask.
+    #[test]
+    #[ignore] // real 3-party transport
+    fn no_party_view_determines_a_truncation_mask() {
+        const COUNT: usize = 32;
+        const LB: u32 = 20;
+        let out = run3(|me, mbx| random_trunc_pairs(COUNT, 4, LB, LB, 4_000, me, mbx));
+        let mask: Fr = (1u128 << LB) - 1;
+        for p in 0..3 {
+            let mut matched = 0;
+            #[allow(clippy::needless_range_loop)]
+            for e in 0..COUNT {
+                let r = (out[0][e].r.left)
+                    .wrapping_add(out[1][e].r.left)
+                    .wrapping_add(out[2][e].r.left)
+                    & mask;
+                let guess = out[p][e].r.left.wrapping_add(out[p][e].r.right) & mask;
+                if guess == r {
+                    matched += 1;
+                }
+            }
+            assert!(
+                matched <= COUNT / 4,
+                "party {p}'s own summands predicted the mask {matched}/{COUNT} times"
+            );
+        }
+    }
+
     /// A `Π_PC` mask must never be zero: the opening reads only zero-ness, so a
     /// zero mask reports "product is zero" whatever the product was. At `p = 37`
     /// an unchecked draw is wrong 1 time in 37, which is not a tail event.
@@ -1941,6 +2257,233 @@ mod tests {
     /// something is wrong with it. Printing the extrapolation rather than only
     /// the unit cost is deliberate: a per-op number that is never carried
     /// through to the workload is how an implementation stays plausibly wrong.
+    /// **Where the offline bytes actually go**, which is what decides whether any
+    /// given optimisation of the offline phase is worth building.
+    ///
+    /// `the_online_drelu_figure_is_not_the_whole_cost` shows preprocessing is 91% of
+    /// the cost. That alone does not say *which part* of preprocessing, and the answer
+    /// matters: a construction that removes the `a2b` is worth building only if the
+    /// `a2b` is where the bytes are.
+    ///
+    /// Measured at ℓ = 32 it splits **54/46**: the `ℓ` daBits that supply the mask's
+    /// bits over `Z_p` cost 304 B/element, and computing δ — the `a2b` plus the
+    /// ring→`Z₂` conversion — costs 255 B. Neither half is negligible, so this is a
+    /// split rather than a single target, and an arithmetic guess put it at 79/21
+    /// before it was measured.
+    ///
+    /// What it settles is narrower and was the point: **replacing the `a2b` with a
+    /// garbled comparator is not worth building.** That construction (derived in
+    /// `docs/falcon-reproduction.md`) costs `ℓ` AND gates at 32 B each — 1024 B at
+    /// ℓ = 32 — against the 255 B it would replace. It looked cheaper when it was
+    /// derived because the `a2b` then ran at a 128-bit wire; narrowing that to
+    /// `DELTA_WIRE_BITS = 4` made the thing it was meant to improve four times cheaper
+    /// than the improvement.
+    #[test]
+    #[ignore] // real 3-party transport
+    fn the_offline_bytes_split_between_dabits_and_the_delta_computation() {
+        use crate::bench::comm::CountingTransport;
+        const LB: u32 = 32;
+        const N: usize = 400;
+
+        // Each phase measured on its own, so the split is measured rather than
+        // apportioned. Same batch size, so the numbers are directly comparable.
+        let dabits = {
+            let handles = InprocHandle::create(3);
+            let mut comm = None;
+            let mut joins = Vec::new();
+            for h in handles {
+                let counted = CountingTransport::new(h, 3);
+                if comm.is_none() {
+                    comm = Some(counted.handle());
+                }
+                joins.push(thread::spawn(move || {
+                    let mbx = Mailbox::new(counted);
+                    let me = mbx.id();
+                    // ℓ per element, exactly as `random_wrap_masks` draws them.
+                    let _ = random_dabits_triple(N * LB as usize, LB as usize, 700_000, me, &mbx);
+                }));
+            }
+            for j in joins {
+                j.join().expect("party panicked");
+            }
+            comm.unwrap().stats().bytes
+        };
+
+        // The whole offline phase, for reference.
+        let (off, _on) = measure_drelu_phases(N, LB);
+        let a2b_and_rest = off.bytes.saturating_sub(dabits);
+
+        println!(
+            "\n  offline composition at ℓ={LB}, n={N} — party 0\n    \
+             ℓ daBits per element : {:>9} B  ({:>4.0} B/element, {:.0}%)\n    \
+             a2b + conversion     : {:>9} B  ({:>4.0} B/element, {:.0}%)\n    \
+             offline total        : {:>9} B  ({:>4.0} B/element)\n",
+            dabits,
+            dabits as f64 / N as f64,
+            100.0 * dabits as f64 / off.bytes as f64,
+            a2b_and_rest,
+            a2b_and_rest as f64 / N as f64,
+            100.0 * a2b_and_rest as f64 / off.bytes as f64,
+            off.bytes,
+            off.bytes as f64 / N as f64,
+        );
+
+        assert!(
+            dabits > a2b_and_rest,
+            "the daBits are expected to dominate the offline phase: daBits {dabits} B \
+             vs everything else {a2b_and_rest} B. If this inverts, the δ computation \
+             has become the target and a cheaper wrap3 is worth revisiting."
+        );
+    }
+
+    /// **Which side of Falcon's line this reproduction lands on, once preprocessing
+    /// is counted.**
+    ///
+    /// `the_lenet_extrapolation_holds_at_lenet_scale` measures the *online* DReLU at
+    /// 52.8 B, below Falcon's analytic `3kn`. Taken alone that reads as this
+    /// reproduction beating the paper it reproduces, which is the shape of every claim
+    /// this repo has had to withdraw — so the first explanation to eliminate is the
+    /// obvious one: that measurement runs against dealt preprocessing and counts no
+    /// offline traffic at all.
+    ///
+    /// This measures both phases with the real offline phase, at two batch sizes, and
+    /// reports the marginal total. It does not attempt to decide what Falcon's `3kn`
+    /// covers — that is a question about the paper's accounting, not this code — but it
+    /// does settle whether the online figure is the whole cost. It is not.
+    #[test]
+    #[ignore] // real 3-party transport, generates preprocessing for the whole batch
+    fn the_online_drelu_figure_is_not_the_whole_cost() {
+        const LB: u32 = 32;
+        let (o1, n1) = measure_drelu_phases(500, LB);
+        let (o2, n2) = measure_drelu_phases(1000, LB);
+
+        // Marginals, so the fixed setup cancels out of both phases.
+        let d = 500.0;
+        let off_per = (o2.bytes - o1.bytes) as f64 / d;
+        let on_per = (n2.bytes - n1.bytes) as f64 / d;
+        let total = off_per + on_per;
+
+        let k = crate::crypto::field::ELEM_BITS as f64;
+        let falcon_3kn = 3.0 * LB as f64 * k / 8.0;
+        let drelus = 8044.0; // LeNet's count
+
+        println!(
+            "\n  Π_DReLU marginal cost at ℓ={LB}, BOTH phases, per party\n    \
+             offline : {off_per:8.1} B/DReLU\n    \
+             online  : {on_per:8.1} B/DReLU\n    \
+             total   : {total:8.1} B/DReLU   (Falcon 3kn = {falcon_3kn:.1})\n    \
+             LeNet   : {:.2} MB/party total, of which {:.2} MB online\n    \
+             offline share: {:.0}%\n",
+            total * drelus / 1e6,
+            on_per * drelus / 1e6,
+            100.0 * off_per / total,
+        );
+
+        assert!(
+            off_per > 0.0 && on_per > 0.0,
+            "both phases must communicate — a zero means the split measures nothing"
+        );
+        // The claim being pinned: the online figure understates the real cost, so
+        // comparing it against a figure that may be a total is not a like-for-like
+        // comparison. If preprocessing ever became the smaller half, the reasoning in
+        // `docs/falcon-reproduction.md` about the 0.42-vs-0.74 gap would need redoing.
+        assert!(
+            off_per > on_per,
+            "preprocessing is expected to dominate: offline {off_per:.1} vs online \
+             {on_per:.1} B/DReLU"
+        );
+    }
+
+    /// **The LeNet figure is an extrapolation; this measures the assumption it
+    /// rests on.**
+    ///
+    /// `measure_batched_private_compare_and_extrapolate_to_lenet` computes LeNet's
+    /// cost as Falcon's analytic `DReLU = 4kn` times a counted 8 044 DReLUs. The
+    /// per-operation term is checked against measurement elsewhere, but the *scaling*
+    /// never was: everything was measured at n = 200–1000 and multiplied up by 8–40×.
+    /// If batching degraded at scale — an extra round, a growing per-element overhead,
+    /// a message-size cliff — the extrapolation would overstate how well this
+    /// reproduction holds up, and nothing would have caught it.
+    ///
+    /// So this measures the online DReLU at LeNet's actual batch size. Two claims
+    /// follow if it passes, and both are load-bearing for the comparison against
+    /// Falcon's reported 0.74 MB:
+    ///
+    /// - **Marginal bytes per DReLU are flat in batch size**, so multiplying up is
+    ///   legitimate rather than optimistic.
+    /// - **Round count is constant in batch size**, which is the property that makes
+    ///   a whole layer one synchronisation instead of thousands.
+    ///
+    /// A true end-to-end LeNet also folds in the linear layers and the scheme switches.
+    /// ✅ **Done 2026-08-04** (`bench::cnn::lenet_end_to_end_is_exact_and_costed`): kernel
+    /// size became a per-layer field, and LeNet-5 measures **4 693** comparisons rather than
+    /// the 8 044 below, because Baru max-pools *before* the nonlinearity — they commute, so
+    /// ReLU runs on 1 120 pooled values instead of 4 480 unpooled ones.
+    ///
+    /// This test is kept as-is. Its subject is whether the per-DReLU cost is **flat in batch
+    /// size**, which is a property of the primitive and is what makes any extrapolation
+    /// legitimate; 8 044 is simply the batch size it uses to check that. The end-to-end run
+    /// vindicated it — 329 B per comparison at full-network scale against 323 B here, 2%
+    /// apart — so the method was sound and only the count it was multiplied by was wrong.
+    #[test]
+    #[ignore] // real 3-party transport, and the largest batch here is slow
+    fn the_lenet_extrapolation_holds_at_lenet_scale() {
+        const L: u32 = 32;
+        // LeNet's own count, as the extrapolation uses it.
+        let relus = 6 * 24 * 24 + 16 * 8 * 8 + 120 + 84;
+        let windows = 6 * 12 * 12 + 16 * 4 * 4;
+        let drelus = relus + 3 * windows;
+        assert_eq!(drelus, 8044, "LeNet's DReLU count, as the extrapolation states");
+
+        // Marginal cost between successive sizes: the fixed framing cancels.
+        let sizes = [500usize, 1000, 2000, 4000, drelus];
+        let mut prev: Option<(usize, u64)> = None;
+        let mut marginals = Vec::new();
+        let mut round_counts = Vec::new();
+        for n in sizes {
+            let (msgs, bytes) = measure_drelu(n, L);
+            round_counts.push(msgs);
+            if let Some((pn, pb)) = prev {
+                marginals.push(((n, pn), (bytes - pb) as f64 / (n - pn) as f64));
+            }
+            prev = Some((n, bytes));
+        }
+
+        let per: Vec<f64> = marginals.iter().map(|&(_, m)| m).collect();
+        let (lo, hi) = per.iter().fold((f64::MAX, 0.0f64), |(l, h), &v| (l.min(v), h.max(v)));
+        let k = crate::crypto::field::ELEM_BITS as f64;
+        let falcon_4kn = 4.0 * L as f64 * k / 8.0;
+
+        println!(
+            "\n  online Π_DReLU marginal cost vs batch size, ℓ={L}\n    \
+             {}\n    \
+             spread {lo:.1}–{hi:.1} B/DReLU  (Falcon's 4kn = {falcon_4kn:.1})\n    \
+             rounds {round_counts:?}  (must be constant)\n    \
+             LeNet {drelus} DReLUs → {:.2} MB/party at the measured rate\n",
+            marginals
+                .iter()
+                .map(|&((n, pn), m)| format!("{pn}→{n}: {m:.1} B"))
+                .collect::<Vec<_>>()
+                .join("  "),
+            hi * drelus as f64 / 1e6,
+        );
+
+        assert!(
+            round_counts.windows(2).all(|w| w[0] == w[1]),
+            "round count must not grow with batch size: {round_counts:?}"
+        );
+        // Flat to within 5%: wider would mean the per-element cost depends on the
+        // batch, and multiplying a small-batch measurement up to 8 044 would then be
+        // an assumption rather than arithmetic.
+        assert!(
+            hi <= lo * 1.05,
+            "marginal bytes/DReLU must be flat in batch size, got {lo:.1}–{hi:.1} \
+             ({:.1}% spread) — the extrapolation to {drelus} DReLUs is only valid if \
+             this is",
+            100.0 * (hi / lo - 1.0)
+        );
+    }
+
     #[test]
     #[ignore] // real 3-party transport
     fn measure_batched_private_compare_and_extrapolate_to_lenet() {
@@ -2554,6 +3097,7 @@ mod tests {
                             }
                         },
                         sel: sel_preproc(i as u64, LB, me),
+                        sel_wrap: sel_preproc(50000 + i as u64, LB, me),
                     }
                 })
                 .collect();
@@ -2565,6 +3109,68 @@ mod tests {
             let got = ((out[0][i].left + out[1][i].left + out[2][i].left) & mask) as u64;
             assert_eq!(got, *want, "truncating value {} by {D}", i * 3);
         }
+    }
+
+    /// **Exact truncation over securely generated pairs**, which is what unlocks a pure
+    /// Falcon ReLU.
+    ///
+    /// `transport_truncation_is_exact` proves the protocol correct against *dealt*
+    /// preprocessing — a locally computed `[r/3, r/3, r−2(r/3)]` split that every party
+    /// can reconstruct, so not secret. That was the last dealt piece in the Falcon stack
+    /// after `random_wrap_masks` closed `Π_WA`, and it is the reason
+    /// `cnn::fused_relu_rescale` routes Falcon's ReLU through `a2b`: without secure
+    /// truncation pairs there is no secure Falcon ReLU to route to.
+    ///
+    /// This runs the same protocol over [`random_trunc_pairs`] and checks exactness over
+    /// every value in range. Both tests are kept: one isolates the protocol, this one
+    /// says the preprocessing it needs can be generated without a dealer.
+    #[test]
+    #[ignore] // real 3-party transport
+    fn truncation_is_exact_over_securely_generated_pairs() {
+        const LB: u32 = 12;
+        const D: u32 = 4;
+        // `r` spans the **whole** ring, so `a + r` wraps for roughly half the masks and
+        // `truncate_batch`'s wrap correction is exercised on most values here rather
+        // than never — which is the point: the earlier `RB = LB − 1` kept the sum inside
+        // the ring, so this test passed without ever running the wrap path, and it
+        // passed just as happily on the version that leaked.
+        const RB: u32 = LB;
+        let l = 1u64 << LB;
+        let vals: Vec<u64> = (0..l / 2).step_by(7).collect();
+        let expected: Vec<u64> = vals.iter().map(|&v| v >> D).collect();
+        let n = vals.len();
+
+        let out = run3(move |me, mbx| {
+            let a: Vec<PartyShare> = vals
+                .iter()
+                .map(|&v| {
+                    let s = [v / 3, v / 3, v - 2 * (v / 3)];
+                    PartyShare {
+                        left: s[me % 3] as u128,
+                        right: s[(me + 1) % 3] as u128,
+                    }
+                })
+                .collect();
+            // Offline: the pairs, generated rather than dealt.
+            let pre = random_trunc_pairs(n, D, RB, LB, 500_000, me, mbx);
+            truncate_batch(&a, &pre, D, LB, PC_ID_BLOCK, me, mbx)
+        });
+
+        let mask = (1u128 << LB) - 1;
+        let mut wrong = Vec::new();
+        for (i, want) in expected.iter().enumerate() {
+            let got = ((out[0][i].left + out[1][i].left + out[2][i].left) & mask) as u64;
+            if got != *want {
+                wrong.push((i * 7, got, *want));
+            }
+        }
+        assert!(
+            wrong.is_empty(),
+            "truncation must be exact over generated pairs; {} of {n} wrong, first few \
+             (value, got, want): {:?}",
+            wrong.len(),
+            &wrong[..wrong.len().min(5)]
+        );
     }
 
     /// A whole fixed-point layer end to end — `ReLU(truncate(W·x, d))` — against
@@ -2631,6 +3237,7 @@ mod tests {
                                 right: [lo, 0, 0][(me + 1) % 3] as u128,
                             },
                             sel: sel_preproc(1000 + i as u64, LB, me),
+                            sel_wrap: sel_preproc(51000 + i as u64, LB, me),
                         }
                     })
                     .collect(),

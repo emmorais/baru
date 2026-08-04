@@ -76,6 +76,7 @@ fn load_model() -> (CnnModel, Vec<Vec<i64>>, Vec<u8>) {
         .map(|(kernels, cbias, in_c, in_h, in_w)| ConvLayer {
             kernels,
             cbias,
+            k: crate::bench::cnn::DEFAULT_K,
             in_c,
             in_h,
             in_w,

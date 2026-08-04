@@ -612,18 +612,43 @@ interface, verified to compute the same function bit-exactly. Latency per encryp
 MedMNIST diagnosis, with **both** protocols charged for their preprocessing and
 neither paying for serialisation padding (2026-08-03):
 
-| RTT | 1000 | 100 | 60 | 40 | 30 | 20 | 15 | 10 Mbps |
-|---|---|---|---|---|---|---|---|---|
-| **0 ms** gc | **566** | **2928** | **5405** | **6672** | 8228 | 12294 | 15978 | 23525 |
-| **0 ms** falcon | 1950 | 5459 | 5805 | 6824 | **7898** | **10714** | **13533** | **19297** |
-| **20 ms** gc | **2273** | **4450** | **5931** | **7811** | **9713** | **13515** | **17364** | 24996 |
-| **20 ms** falcon | 6865 | 8087 | 9339 | 10645 | 12153 | 15029 | 17822 | **23386** |
+Medians of three repeats, on a route that is Falcon end to end and privately so
+(2026-08-04 — the earlier single-run grid measured a Falcon that used `a2b` for its ReLUs
+and, once it did not, leaked; see the truncation note above):
 
-**Crossover between 30 and 40 Mbps at RTT 0, and between 10 and 15 Mbps at RTT
-20 ms.** Garbled circuits win above, Falcon below; higher RTT moves the boundary
-*down*, shrinking Falcon's region. The mechanism is visible in the same run: Falcon
-sends 3.5 MB against gc's 10.1 (2.88× cheaper) in 288 messages against 61 (4.7×
-dearer), so the two cost terms trade and the boundary is where the trade balances.
+| RTT | 40 | 30 | 20 | 15 | 10 | 8 Mbps |
+|---|---|---|---|---|---|---|
+| **0 ms** gc | **6552** | 8453 | 12337 | 16639 | 24269 | 29982 |
+| **0 ms** falcon | 7255 | 8607 | **11859** | **15109** | **20979** | **24717** |
+| **20 ms** gc | **8157** | **10098** | **13925** | **17770** | **25744** | 31504 |
+| **20 ms** falcon | 13572 | 14969 | 17860 | 20784 | 27476 | 31836 |
+
+**Crossover between 20 and 30 Mbps at RTT 0; no crossover down to 8 Mbps at RTT 20 ms.**
+Garbled circuits win above, Falcon below; higher RTT moves the boundary *down*, shrinking
+Falcon's region. The mechanism is visible in the same run: Falcon sends 3.4 MB against gc's
+10.1 (2.94× cheaper) in 450 messages against 61 (7.4× dearer), so the two cost terms trade
+and the boundary is where the trade balances.
+
+**There are two boundaries, and a warm server's sits a decade of bandwidth higher.**
+Falcon's preprocessing is query-independent, so a deployment that generates it before the
+query arrives pays only the online phase. Measured per MPC segment (pneumonia):
+
+|  | RTT 0 ms | RTT 20 ms |
+|---|---|---|
+| cold — server pays the total | crossover 20–30 Mbps | none down to 8 Mbps |
+| warm — preprocessing hoisted | falcon wins to ≥100 Mbps | crossover 20–40 Mbps |
+
+Garbled circuits have **no** query-independent phase to hoist here, so their column is
+identical warm and cold. That asymmetry is what the comparison is about, and it is also why
+the warm boundary must be quoted *alongside* the cold one and never instead of it —
+otherwise it becomes one protocol's online cost against another's total, which is exactly
+how our first crossover went wrong. Online MPC latency falls 2.9–3.2× across the three
+datasets, on pools of 7 137 / 14 154 / 7 142 comparisons split across four segments.
+
+**The resolution is ±1 grid step, and the repeats do not improve that.** They re-run inside
+one session on warm caches and spread under 2%, but an *unchanged* `gc` configuration
+re-run as a separate process moved a cell by 13%. So the 30 Mbps and 8 Mbps cells — 1.8%
+and 1.1% apart — are ties in substance whatever the marker says.
 
 **This section previously reported three other answers, and the sequence is the more
 useful result.** Each was reproducible, computed the correct diagnosis, and agreed
@@ -768,6 +793,26 @@ max-pool, argmax — leaked its activations. The advertised "no extra
 communication per bit" was a *symptom*: the carry chain was free because every
 operand was already public. Fixing it cost 4.4× MPC time and ~130× bandwidth,
 later recovered by triple-free multiplication and batching.
+
+**A truncation whose mask was sized for correctness, not for privacy.** Falcon's
+exact truncation opens `c = a + r`. Its stated precondition is that `a + r` must not
+wrap — a *ceiling* on the mask — and the first pure-Falcon ReLU met it the cheapest
+way, with `r` no wider than the value. That is correct and hides almost nothing: the
+posterior on `a` given `c` collapses to a point at `c = 0`, and for uniform `a` the leak
+is ≈0.72 bits per truncation. The aggregate over an image was not measured — activations
+are correlated, so the per-truncation figures do not add — but the size of the number is
+not what matters. The `a2b` route it replaced leaks **nothing**, so making the route
+"purer" replaced a strictly private construction with a less private one.
+
+Nothing in the test suite could have caught it — leakage is not a wrong answer — and
+the three tests covering truncation preprocessing all passed a mask narrower than the
+ring, so none ever exercised a wrapping one. The fix is not slack but a **wrap bit**:
+let `r` cover the whole ring, making the opened value uniform and *perfectly*
+independent of `a`, then correct the resulting overflow with `[c < r]`, which is
+computable from a public `c` and a secret `r` and costs one narrowed `a2b` and one
+`Π_SS` lift. The alternative — `κ` bits of statistical slack — needs a ring wider than
+the narrowed wire encoding permits and measured 1.9× *dearer* in bytes than `a2b`. The
+narrow request is now unrepresentable rather than merely documented.
 
 **An insecure FHE scheme, removed rather than caveated.** The fast engine was a
 scale-invariant NTRU port. Analysis showed it insecure at the parameters the
