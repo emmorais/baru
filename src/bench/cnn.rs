@@ -1385,7 +1385,7 @@ fn mpc_conv_relu_pool(
     nbits: usize,
     profile: NetworkProfile,
     nonlin: Nonlin,
-    falcon_pool: usize,
+    falcon_pool: SegmentPool,
 ) -> (Vec<Vec<Fr>>, CommStats, MpcPhases) {
     let (oh, ow, oc_n) = (conv_shape.h, conv_shape.w, conv_shape.c);
     let (out, comm) = run_parties(profile, move |me| {
@@ -1400,7 +1400,13 @@ fn mpc_conv_relu_pool(
             // Offline, before any timer below: fill this segment's Falcon pool from the
             // plan. `fill_falcon_pool` is a no-op for the other nonlinearity modes'
             // callers because they pass 0.
-            let falcon_offline_ms = fill_falcon_segment(be, falcon_pool, nbits);
+            let falcon_offline_ms = fill_falcon_segment(
+                be,
+                falcon_pool.comparisons,
+                falcon_pool.truncations,
+                nbits,
+                shift,
+            );
             // Reconstruct + bias every conv output locally (share_secret / add
             // are communication-free), then run the whole ReLU layer as one
             // batched a2b + one batched multiply, then max-pool.
@@ -1454,6 +1460,7 @@ fn mpc_conv_relu_pool(
                     relu_ms,
                     pool_ms,
                     falcon_comparisons: be.falcon_comparisons(),
+                    falcon_truncations: be.falcon_truncations(),
                     falcon_offline_ms,
                     falcon_pool_served,
                     falcon_pool_missed,
@@ -1513,7 +1520,20 @@ pub enum Segment {
 /// `MpcPhases::falcon_pool_missed` goes non-zero. That distinction matters, because a
 /// benchmark reporting an "online" latency that quietly included preprocessing would be
 /// reporting a total — the exact error this page has already made once.
-pub type FalconPoolPlan = std::collections::BTreeMap<Segment, usize>;
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SegmentPool {
+    /// Comparison elements: max-pool, argmax **and** ReLU gates.
+    pub comparisons: usize,
+    /// Truncation pairs: one per ReLU, zero for a segment that only compares.
+    ///
+    /// Separate from `comparisons` because they are counts of different things and the
+    /// ratio is not fixed — pneumonia's first conv wants 5 408 comparisons and 1 352
+    /// truncations, a 4× difference, and each truncation pair is `ℓ` daBits. Sizing one
+    /// from the other would over-generate the expensive half.
+    pub truncations: usize,
+}
+
+pub type FalconPoolPlan = std::collections::BTreeMap<Segment, SegmentPool>;
 
 /// Same motivation as [`MpcPhases`], applied to the side that now dominates:
 /// "FHE" is four different operations with different fixes. A
@@ -1584,6 +1604,8 @@ pub struct MpcPhases {
     /// the duplication that made the scheme-switch mask pool break when channel
     /// splitting landed.
     pub falcon_comparisons: usize,
+    /// Truncation pairs this segment requested. See [`SegmentPool::truncations`].
+    pub falcon_truncations: usize,
     /// Wall-clock spent **before** this segment's timers, filling its Falcon pool from a
     /// [`FalconPoolPlan`]. Zero on a cold run.
     ///
@@ -1602,6 +1624,7 @@ pub struct MpcPhases {
 impl MpcPhases {
     fn add(&mut self, o: &MpcPhases) {
         self.falcon_comparisons += o.falcon_comparisons;
+        self.falcon_truncations += o.falcon_truncations;
         self.falcon_offline_ms += o.falcon_offline_ms;
         self.falcon_pool_missed += o.falcon_pool_missed;
         self.falcon_pool_served += o.falcon_pool_served;
@@ -1670,6 +1693,14 @@ fn import_raw_batch(
 /// The pipeline's nonlinearity, `out = (v >= 0) ? (v >> shift) : 0`, under
 /// whichever protocol `nonlin` selects. The two branches are extensionally
 /// equal — that is what the `gc_matches_a2b_*` tests pin.
+/// The pool a segment turned out to need, from what it actually requested.
+fn pool_of(ph: &MpcPhases) -> SegmentPool {
+    SegmentPool {
+        comparisons: ph.falcon_comparisons,
+        truncations: ph.falcon_truncations,
+    }
+}
+
 /// Fill one segment's Falcon pool, returning the offline milliseconds spent.
 ///
 /// `n == 0` means "no plan for this segment", which is the cold path and must cost
@@ -1678,9 +1709,11 @@ fn import_raw_batch(
 fn fill_falcon_segment(
     be: &mut TransportBackend<MpcTransport>,
     n: usize,
+    truncations: usize,
     nbits: usize,
+    shift: u32,
 ) -> f64 {
-    if n == 0 {
+    if n == 0 && truncations == 0 {
         return 0.0;
     }
     // Both Falcon paths lift their `Π_SS` bit at `nbits` — `lt_falcon_batch` because that
@@ -1688,7 +1721,13 @@ fn fill_falcon_segment(
     // wide. That agreement is what lets **one** pool serve a segment's max-pool
     // comparisons and its ReLU gates; if the lifts ever diverge, `take_falcon_preproc`
     // will refuse the mismatched width and the misses will say so.
-    be.fill_falcon_pool(n, nbits as u32, nbits as u32)
+    be.fill_falcon_pool(&crate::interpreter::transport_backend::FalconPoolSpec {
+        comparisons: n,
+        truncations,
+        nbits: nbits as u32,
+        lift_bits: nbits as u32,
+        shift,
+    })
 }
 
 /// `served`/`missed` for the segment just run, or zeros if it never touched the pool.
@@ -2074,11 +2113,11 @@ pub fn run_cnn_hybrid_in_session_pooled(
     // traffic from 61 messages / 10.1 MB to 154 / 12.2 on a run where `gc`'s code was
     // untouched. That an unchanged control moved is what exposed it, and it is the same
     // failure as every other on this page: one protocol charged for another's work.
-    let seg = |k: Segment| {
+    let seg = |k: Segment| -> SegmentPool {
         if matches!(nonlin, Nonlin::Falcon) {
-            plan.get(&k).copied().unwrap_or(0)
+            plan.get(&k).copied().unwrap_or_default()
         } else {
-            0
+            SegmentPool::default()
         }
     };
     let mut measured_plan = FalconPoolPlan::new();
@@ -2187,7 +2226,7 @@ pub fn run_cnn_hybrid_in_session_pooled(
         nonlin,
         seg(Segment::Conv(0)),
     );
-    measured_plan.insert(Segment::Conv(0), ph.falcon_comparisons);
+    measured_plan.insert(Segment::Conv(0), pool_of(&ph));
     phases.add(&ph);
     comm = comm + conv_comm;
     mpc_ms += t0.elapsed().as_secs_f64() * 1000.0;
@@ -2244,7 +2283,7 @@ pub fn run_cnn_hybrid_in_session_pooled(
             nonlin,
             seg(Segment::Conv(cl_i + 1)),
         );
-        measured_plan.insert(Segment::Conv(cl_i + 1), ph2.falcon_comparisons);
+        measured_plan.insert(Segment::Conv(cl_i + 1), pool_of(&ph2));
         phases.add(&ph2);
         comm = comm + comm2;
         mpc_ms += tm.elapsed().as_secs_f64() * 1000.0;
@@ -2298,7 +2337,13 @@ pub fn run_cnn_hybrid_in_session_pooled(
                 if let Some(w) = wire_bits_for_nonlin(nbits, nonlin) {
                     be.set_wire_bits(w);
                 }
-                let falcon_offline_ms = fill_falcon_segment(be, hidden_pool, nbits);
+                let falcon_offline_ms = fill_falcon_segment(
+                    be,
+                    hidden_pool.comparisons,
+                    hidden_pool.truncations,
+                    nbits,
+                    shift,
+                );
                 let t = Instant::now();
                 let raws = import_raw_batch(be, me, &hidden_open, &hidden_masks, h, nbits);
                 let vs: Vec<ShareRef> = raws
@@ -2324,6 +2369,7 @@ pub fn run_cnn_hybrid_in_session_pooled(
                         import_ms,
                         relu_ms,
                         falcon_comparisons: be.falcon_comparisons(),
+                        falcon_truncations: be.falcon_truncations(),
                         falcon_offline_ms,
                         falcon_pool_served,
                         falcon_pool_missed,
@@ -2332,10 +2378,7 @@ pub fn run_cnn_hybrid_in_session_pooled(
                 )
             }
         });
-        measured_plan.insert(
-            Segment::Hidden(h_i),
-            per_party_hidden[0].1.falcon_comparisons,
-        );
+        measured_plan.insert(Segment::Hidden(h_i), pool_of(&per_party_hidden[0].1));
         phases.add(&per_party_hidden[0].1);
         let per_party_hidden: Vec<Vec<Fr>> = per_party_hidden.into_iter().map(|(c, _)| c).collect();
         comm = comm + hidden_comm;
@@ -2390,7 +2433,13 @@ pub fn run_cnn_hybrid_in_session_pooled(
             if let Some(w) = wire_bits_for_nonlin(nbits, nonlin) {
                 be.set_wire_bits(w);
             }
-            let falcon_offline_ms = fill_falcon_segment(be, argmax_pool, nbits);
+            let falcon_offline_ms = fill_falcon_segment(
+                be,
+                argmax_pool.comparisons,
+                argmax_pool.truncations,
+                nbits,
+                shift,
+            );
             let raws = import_raw_batch(be, me, &dense_open, &dense_masks, nclasses, nbits);
             let logits: Vec<ShareRef> = raws
                 .iter()
@@ -2414,6 +2463,7 @@ pub fn run_cnn_hybrid_in_session_pooled(
                 MpcPhases {
                     argmax_ms,
                     falcon_comparisons: be.falcon_comparisons(),
+                    falcon_truncations: be.falcon_truncations(),
                     falcon_offline_ms,
                     falcon_pool_served,
                     falcon_pool_missed,
@@ -2422,7 +2472,7 @@ pub fn run_cnn_hybrid_in_session_pooled(
             )
         }
     });
-    measured_plan.insert(Segment::Argmax, classes[0].1.falcon_comparisons);
+    measured_plan.insert(Segment::Argmax, pool_of(&classes[0].1));
     phases.add(&classes[0].1);
     comm = comm + argmax_comm;
     mpc_ms += t0.elapsed().as_secs_f64() * 1000.0;
@@ -3054,10 +3104,28 @@ mod tests {
              preprocessing; served {}, missed {}, plan {:?}",
             warm.phases.falcon_pool_served, warm.phases.falcon_pool_missed, cold.falcon_plan
         );
+        // Served must cover **both** kinds of preprocessing. Until 2026-08-04 the pool
+        // carried only the DReLU's, so `Π_Trunc` pairs were generated inline even on a warm
+        // run and the "online" figure was a partial total. `missed == 0` alone did not catch
+        // that, because an unpooled request never consulted the pool to miss it.
+        let want = cold.falcon_comparisons + cold.phases.falcon_truncations;
         assert!(
-            warm.phases.falcon_pool_served >= cold.falcon_comparisons,
-            "served {} should cover the {} comparisons the cold run counted",
-            warm.phases.falcon_pool_served, cold.falcon_comparisons
+            warm.phases.falcon_pool_served >= want,
+            "served {} should cover {} comparisons + {} truncations = {want}",
+            warm.phases.falcon_pool_served,
+            cold.falcon_comparisons,
+            cold.phases.falcon_truncations
+        );
+        assert!(
+            cold.phases.falcon_truncations > 0,
+            "a model with a ReLU must request truncations, or this covers nothing"
+        );
+        // And the two counts must differ, or `SegmentPool`'s two fields are redundant and
+        // one could be derived from the other after all.
+        assert_ne!(
+            cold.falcon_comparisons, cold.phases.falcon_truncations,
+            "comparisons and truncations should not coincide: max-pool costs comparisons \
+             and no truncation"
         );
 
         // 3. The plan is stable: a warm run measures what it was sized for. A divergence

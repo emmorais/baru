@@ -1532,11 +1532,14 @@ mod tests {
             let warm = run_cnn_hybrid_in_session_pooled(
                 &session, &model, img, profile, Nonlin::Falcon, true, &cold.falcon_plan);
 
-            let total: usize = cold.falcon_plan.values().sum();
-            println!("\n  {name}: {} comparisons over {} segments", total,
-                     cold.falcon_plan.len());
-            for (seg, n) in &cold.falcon_plan {
-                println!("    {seg:?}: {n}");
+            let total: usize = cold.falcon_plan.values().map(|p| p.comparisons).sum();
+            let truncs: usize = cold.falcon_plan.values().map(|p| p.truncations).sum();
+            println!(
+                "\n  {name}: {total} comparisons + {truncs} truncations over {} segments",
+                cold.falcon_plan.len()
+            );
+            for (seg, p) in &cold.falcon_plan {
+                println!("    {seg:?}: {} cmp, {} trunc", p.comparisons, p.truncations);
             }
             println!(
                 "    online MPC {:.1} → {:.1} ms ({:.2}x), offline {:.1} ms",

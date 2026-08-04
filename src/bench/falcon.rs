@@ -708,6 +708,7 @@ pub fn run_cli(args: &[String]) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
+    use crate::interpreter::transport_backend::FalconPoolSpec;
     use super::*;
     use crate::interpreter::transport_backend::NonlinMode;
 
@@ -1129,7 +1130,13 @@ mod tests {
                 move |be: &mut TransportBackend<MpcTransport>| {
                     be.set_nonlin(NonlinMode::Falcon);
                     let offline_ms = if warm {
-                        be.fill_falcon_pool(size, NBITS as u32, NBITS as u32)
+                        be.fill_falcon_pool(&FalconPoolSpec {
+                            comparisons: size,
+                            truncations: 0, // the `lt` path truncates nothing
+                            nbits: NBITS as u32,
+                            lift_bits: NBITS as u32,
+                            shift: 0,
+                        })
                     } else {
                         0.0
                     };
@@ -1239,7 +1246,13 @@ mod tests {
                 move |be: &mut TransportBackend<MpcTransport>| {
                     be.set_nonlin(NonlinMode::Falcon);
                     if warm {
-                        be.fill_falcon_pool(n, NBITS as u32, NBITS as u32);
+                        be.fill_falcon_pool(&FalconPoolSpec {
+                            comparisons: n,
+                            truncations: 0,
+                            nbits: NBITS as u32,
+                            lift_bits: NBITS as u32,
+                            shift: 0,
+                        });
                     }
                     let enc = |v: i128| ((v + l) % l) as u128;
                     let pairs: Vec<_> = cs
@@ -1323,7 +1336,13 @@ mod tests {
                     be.set_nonlin(NonlinMode::Falcon);
                     // Offline, before anything a query depends on.
                     let offline_ms = if pooled {
-                        be.fill_falcon_pool(n, NBITS as u32, NBITS as u32)
+                        be.fill_falcon_pool(&FalconPoolSpec {
+                            comparisons: n,
+                            truncations: 0,
+                            nbits: NBITS as u32,
+                            lift_bits: NBITS as u32,
+                            shift: 0,
+                        })
                     } else {
                         0.0
                     };

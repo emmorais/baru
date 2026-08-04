@@ -79,6 +79,13 @@ pub struct TransportBackend<T: Transport> {
     /// depend on their own batching decisions. Counting what was actually requested is
     /// exact where re-deriving it would be a second implementation to keep in step.
     falcon_comparisons: std::sync::atomic::AtomicUsize,
+    /// `Π_Trunc` pairs requested — **not** the same as comparisons, and that is the whole
+    /// reason it is counted separately. A max-pool window costs comparisons and no
+    /// truncation; a ReLU costs one of each. Pneumonia's first conv segment asks for 5 408
+    /// comparisons but only 1 352 truncations, so sizing a truncation pool from the
+    /// comparison count would over-generate 4× — and each pair is `ℓ` daBits, the
+    /// expensive kind.
+    falcon_truncations: std::sync::atomic::AtomicUsize,
 }
 
 /// Correlated randomness for `NonlinMode::Falcon`, generated before a query arrives.
@@ -105,6 +112,18 @@ pub struct TransportBackend<T: Transport> {
 struct FalconPool {
     wrap: std::collections::VecDeque<crate::crypto::falcon_mpc::WrapPreproc>,
     sel: std::collections::VecDeque<crate::crypto::falcon_mpc::SelectPreproc>,
+    /// `Π_Trunc` pairs. Empty for a segment that only compares.
+    ///
+    /// These were generated inline until 2026-08-04 even when the pool was warm, so a
+    /// "warm" ReLU still paid `ℓ` daBits per activation on the critical path — roughly half
+    /// the offline phase, which made the measured warm speedup an understatement rather
+    /// than a wrong number.
+    trunc: std::collections::VecDeque<crate::crypto::falcon_mpc::TruncPreproc>,
+    /// Shift and ring width `trunc` was generated for. A pair is built for one `d`: its
+    /// `r >> d` and `r mod 2^d` are fixed at generation, so serving it at another shift
+    /// would truncate by the wrong amount — silently, and with the right *shape*.
+    trunc_d: u32,
+    trunc_l: u32,
     /// The width `wrap` was generated for.
     nbits: u32,
     /// The width `sel`'s ring image was generated for, which is **not** always `nbits`:
@@ -119,6 +138,25 @@ struct FalconPool {
     /// because the pool was empty or the wrong width.
     served: usize,
     missed: usize,
+}
+
+/// What one segment's Falcon pool must carry.
+///
+/// A struct rather than five positional arguments because two of the fields are counts of
+/// different things at the same type, and `fill(n_cmp, n_trunc, ..)` transposed is a pool
+/// that is silently the wrong size in both directions. Named fields make that a compile
+/// error to write and a diff to read.
+pub struct FalconPoolSpec {
+    /// Comparison elements (`Π_DReLU` preprocessing): max-pool, argmax **and** ReLU gates.
+    pub comparisons: usize,
+    /// Truncation pairs (`Π_Trunc`): one per ReLU, zero for a segment that only compares.
+    pub truncations: usize,
+    /// Ring width the comparisons run at.
+    pub nbits: u32,
+    /// Width the `Π_SS` lift must produce. See `falcon_drelu_ring`.
+    pub lift_bits: u32,
+    /// Fixed-point shift the truncations use. Ignored when `truncations == 0`.
+    pub shift: u32,
 }
 
 /// Id space one `lt_falcon_batch` reserves: the inner `Π_WA`, its `Π_PC` tree
@@ -185,6 +223,7 @@ impl<T: Transport> TransportBackend<T> {
             wire_bits: 128,
             falcon_pool: None,
             falcon_comparisons: std::sync::atomic::AtomicUsize::new(0),
+            falcon_truncations: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
@@ -255,20 +294,68 @@ impl<T: Transport> TransportBackend<T> {
     ///
     /// All parties must call this with the same arguments: it consumes operation ids, and
     /// the id counter is a lockstep sequence every party advances identically.
-    pub fn fill_falcon_pool(&mut self, n: usize, nbits: u32, lift_bits: u32) -> f64 {
+    pub fn fill_falcon_pool(&mut self, spec: &FalconPoolSpec) -> f64 {
+        use crate::crypto::falcon_mpc::{random_trunc_pairs, trunc_pair_id_span};
         let t = std::time::Instant::now();
-        let (wp, sp) = self.gen_falcon_preproc(n, nbits, lift_bits);
+        let (wp, sp) = self.gen_falcon_preproc(spec.comparisons, spec.nbits, spec.lift_bits);
+        // The truncation pairs, generated here rather than inline. `r_bits == l_bits` is
+        // forced — a narrower mask leaks when `a + r` is opened — so the widths follow the
+        // ring and there is nothing to choose.
+        let trunc = if spec.truncations > 0 {
+            let l = spec.nbits;
+            let off = self.alloc_block(trunc_pair_id_span(spec.truncations, l));
+            random_trunc_pairs(
+                spec.truncations,
+                spec.shift,
+                l,
+                l,
+                off,
+                self.me,
+                &self.mailbox,
+            )
+        } else {
+            Vec::new()
+        };
         let ms = t.elapsed().as_secs_f64() * 1e3;
         self.falcon_pool = Some(FalconPool {
-            lift_bits,
+            lift_bits: spec.lift_bits,
             wrap: wp.into(),
             sel: sp.into(),
-            nbits,
+            trunc: trunc.into(),
+            trunc_d: spec.shift,
+            trunc_l: spec.nbits,
+            nbits: spec.nbits,
             offline_ms: ms,
             served: 0,
             missed: 0,
         });
         ms
+    }
+
+    /// Draw `n` truncation pairs for shift `d` in an `l_bits` ring, or `None`.
+    ///
+    /// Refuses a shift or width mismatch as well as an empty pool. A pair's `r >> d` and
+    /// `r mod 2^d` are fixed when it is generated, so serving it at a different `d` gives a
+    /// value truncated by the wrong amount — the right *shape*, silently wrong.
+    fn take_trunc_preproc(
+        &mut self,
+        n: usize,
+        d: u32,
+        l_bits: u32,
+    ) -> Option<Vec<crate::crypto::falcon_mpc::TruncPreproc>> {
+        let p = self.falcon_pool.as_mut()?;
+        if p.trunc_d != d || p.trunc_l != l_bits || p.trunc.len() < n {
+            p.missed += n;
+            return None;
+        }
+        p.served += n;
+        Some(p.trunc.drain(..n).collect())
+    }
+
+    /// Truncation pairs the Falcon path has requested — the second number a pool needs.
+    pub fn falcon_truncations(&self) -> usize {
+        self.falcon_truncations
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Draw `n` items at width `nbits` from the pool, or `None` if it cannot serve them.
@@ -735,8 +822,18 @@ impl<T: Transport> TransportBackend<T> {
         );
 
         // ── shift: Falcon's exact truncation over generated pairs ──
-        let off = self.alloc_block(trunc_pair_id_span(n, r_bits));
-        let pre = random_trunc_pairs(n, shift, r_bits, t_bits, off, self.me, &self.mailbox);
+        self.falcon_truncations
+            .fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+        // Pooled if a plan supplied them, generated inline otherwise. Inline is safe and
+        // visible: `falcon_pool_stats`' miss counter goes non-zero, and a benchmark that
+        // reports the result as an online cost is then reporting a partial total.
+        let pre = match self.take_trunc_preproc(n, shift, t_bits) {
+            Some(pooled) => pooled,
+            None => {
+                let off = self.alloc_block(trunc_pair_id_span(n, r_bits));
+                random_trunc_pairs(n, shift, r_bits, t_bits, off, self.me, &self.mailbox)
+            }
+        };
         let base = self.alloc_block(TRUNC_ID_BLOCK);
         // The result is non-negative and `< 2^(val_bits − shift)`, so although it is
         // produced mod `2^t_bits` it is equally valid at the caller's `nbits`.

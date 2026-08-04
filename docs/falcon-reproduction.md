@@ -1019,14 +1019,45 @@ the boundary back toward Falcon. Neither is measured, so neither is claimed.
   which `a_pooled_diagnosis_matches_an_inline_one` treats as a hard failure rather than a
   warning: a miss means the reported "online" latency is secretly a partial total.
 
-  | model | comparisons | Conv(0) | Conv(1) | Hidden(0) | Argmax | online MPC |
-  |---|---|---|---|---|---|---|
-  | pneumonia | 7 137 | 5 408 | 1 600 | 128 | 1 | 2185 → 760 ms (**2.88×**) |
-  | organa | 14 154 | 10 816 | 3 200 | 128 | 10 | 3920 → 1224 ms (**3.20×**) |
-  | derma | 7 142 | 5 408 | 1 600 | 128 | 6 | 2299 → 756 ms (**3.04×**) |
+  | model | comparisons | truncations | Conv(0) | Conv(1) | Hidden(0) | Argmax | online MPC |
+  |---|---|---|---|---|---|---|---|
+  | pneumonia | 7 137 | 1 880 | 5 408 / 1 352 | 1 600 / 400 | 128 / 128 | 1 / 0 | 2361 → 739 ms (**3.19×**) |
+  | organa | 14 154 | 3 632 | 10 816 / 2 704 | 3 200 / 800 | 128 / 128 | 10 / 0 | 4069 → 1166 ms (**3.49×**) |
+  | derma | 7 142 | 1 880 | 5 408 / 1 352 | 1 600 / 400 | 128 / 128 | 6 / 0 | 2426 → 767 ms (**3.16×**) |
+
+  (per-segment cells are `comparisons / truncations`)
+
+  **A segment needs two counts, not one.** A max-pool window costs comparisons and no
+  truncation; a ReLU costs one of each. Pneumonia's first conv wants 5 408 comparisons and
+  1 352 truncations — a 3.8× difference — so sizing a truncation pool from the comparison
+  count would over-generate the expensive half, each pair being `ℓ` daBits. `SegmentPool`
+  carries both, and `a_pooled_diagnosis_matches_an_inline_one` asserts they differ, so
+  neither can quietly be derived from the other.
 
   These supersede the 5 256 / 10 512 / 5 256 recorded earlier on this page, which counted
   **max-pool comparisons only** — before `Π_ReLU` routed activations through the same path.
+
+  **The truncation preprocessing was not pooled at first, so a "warm" ReLU still generated
+  `Π_Trunc` pairs inline and its online figure was a partial total.** `falcon_pool_missed`
+  did not catch it: an unpooled request never consults the pool, so it cannot miss. Fixed by
+  extending `FalconPool` to carry `TruncPreproc` keyed on `(shift, ring width)` — a pair's
+  `r >> d` and `r mod 2^d` are fixed at generation, so serving one at another shift would
+  truncate by the wrong amount with the right shape.
+
+  > **The size of that gap was over-estimated, by me, by an order of magnitude.** The
+  > prediction was "roughly half the offline phase is unpooled, so the warm gain should
+  > roughly double". It did not: the ratios moved from 2.88/3.20/3.04× to 3.19/3.49/3.16×,
+  > and offline generation grew only 1309 → 1372 ms, putting truncation pairs at **~5% of
+  > the offline phase**. The reasoning error was comparing "`ℓ` daBits per element" for both
+  > without noticing there are 3.8× fewer truncations than comparisons *and* that the DReLU's
+  > per-element preprocessing is much heavier — wrap masks **plus** δ's `a2b` **plus** `Π_PC`
+  > masks **plus** a selector, against the truncation's daBits alone.
+  >
+  > A +4 to +11% ratio change is also inside the ~13% run-to-run noise documented above, so
+  > the direction is consistent across all three datasets but the magnitude is not resolved
+  > by single runs. **The value of this fix is that the warm figure is now a genuine online
+  > cost rather than a partial total** — a correctness-of-measurement property, independent
+  > of how much faster it made anything.
 
   Two things the measurement corrected, neither of which a test would have caught:
 
