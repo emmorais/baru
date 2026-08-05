@@ -814,6 +814,25 @@ computable from a public `c` and a secret `r` and costs one narrowed `a2b` and o
 the narrowed wire encoding permits and measured 1.9× *dearer* in bytes than `a2b`. The
 narrow request is now unrepresentable rather than merely documented.
 
+**A blinding mask that was opened in order to be tested.** `Π_PC` opens `m · Π cᵢ` and
+reads only whether the result is zero. The `cᵢ` carry no randomness of their own — they are
+determined by the compared bits, the public `r` and the secret `β` — so the unit `m` is the
+only thing between the transcript and the product, and our own code comment said exactly
+that. The routine that sampled `m` nevertheless opened each candidate to reject zeros and
+returned the same shares, justified on the grounds that opening *whether* a mask is zero
+leaks nothing because `m` is input-independent. The premise is true and the conclusion does
+not follow: the code opened `m` itself, and `m`'s purpose is to blind a **later** opening, so
+a public `m` blinds nothing. Measured at ℓ = 6, one predicate class contains 31 distinct
+products — about 5 bits where the predicate is entitled to one — and since `Π_WA` compares
+the wrap mask `x` against the public `r = a + x`, those are bits of the activation. The
+repair tests the mask without opening it, by drawing a fresh `s` and opening `m·s`.
+
+We record how it was found, because it was not found by testing: every correctness test
+passed before and after, since leakage is not a wrong answer. It was found by writing the
+enumeration that a composability proof requires, which forces the question *what distribution
+does the simulator sample this opening from?* at every site. Nine sites, three of which needed
+a protocol change before the answer existed.
+
 **An insecure FHE scheme, removed rather than caveated.** The fast engine was a
 scale-invariant NTRU port. Analysis showed it insecure at the parameters the
 construction needs even at depth 1 — the large LTV secret raises the fatigue
@@ -904,11 +923,21 @@ by bit composition (`random_wrap_masks`), which closed the gap and cost the §7.
 crossover its validity: preprocessing turned out to cost an `a2b` per element, the
 protocol Falcon's online phase exists to avoid.
 
-**No offline/online split.** Related, and the limit that now matters most for §7.3:
-`lt_falcon_batch` runs preprocessing inline, so every latency we report is a
-*total*. Protocols whose design puts work offline — Falcon among them — are
-therefore charged for it here in a way their own papers do not, and we cannot
-currently produce the online-only figure that would make the comparison fair.
+**~~No offline/online split.~~ Built (2026-08-04).** This was the limit that mattered most
+for §7.3: `lt_falcon_batch` ran preprocessing inline, so every latency was a *total*, and
+protocols that put work offline — Falcon among them — were charged for it in a way their own
+papers are not. Falcon's preprocessing is now generated per MPC segment from a plan measured
+by one cold run (`cnn::FalconPoolPlan`), so both figures exist: a cold server pays the total,
+a warm one the online phase. **The warm figure reverses the section's conclusion** — garbled
+circuits dominate a *cold* Falcon above ~25 Mbps, but a warm Falcon wins to ≥100 Mbps at
+RTT 0.
+
+Two honest limits remain. Garbled circuits have no query-independent phase to hoist here, so
+their column is identical warm and cold; that asymmetry is what the comparison is *about*, but
+it means the warm boundary must be quoted alongside the cold one, never instead of it. And the
+byte counters are whole-run totals, so in a warm sweep the latency column is an online cost
+while the traffic table is still a total — the two are not on the same footing, and the tool
+says so in its own output.
 
 **Workload breadth.** Findings are anchored on feed-forward CNN inference at
 28×28. Transformers, larger images, and non-inference workloads are not covered.

@@ -714,7 +714,10 @@ marginal (pneumonia, single run):
 |  | RTT 0 ms | RTT 20 ms |
 |---|---|---|
 | **cold** — server pays the total | crossover 20–30 Mbps | none down to 8 Mbps |
-| **warm** — preprocessing hoisted | **falcon wins to ≥100 Mbps** | crossover 20–30 Mbps |
+| **warm** — preprocessing hoisted | **falcon wins to ≥100 Mbps** | crossover 30–40 Mbps |
+
+(The warm RTT-20 figure was 20–30 Mbps before the *truncation* preprocessing was pooled too;
+see below. One grid step, and the 40 Mbps cell is 0.5% apart — a tie in substance.)
 
 So the choice is not "garbled circuits unless the link is very slow". It is: **a cold server
 should prefer garbled circuits above ~25 Mbps; a warm one should prefer Falcon almost
@@ -744,6 +747,59 @@ the test would pass by warming nothing.
 One asymmetry remains, labelled rather than fixed: in a warm sweep the **latency** column is
 an online cost but the **traffic** table is still a total, because the transport counts bytes
 for the whole run. The two tables are not on the same footing and the banner says so.
+
+##### Where a warm ReLU's online cost actually is — 71% of it is the truncation
+
+With preprocessing hoisted, what remains on a warm critical path is rounds, so
+`how_much_of_a_warm_relu_is_the_truncation` profiles the two protocols apart (per party,
+n = 256, ℓ = 20, d = 8):
+
+| | offline | online |
+|---|---|---|
+| `Π_DReLU` | 23 msgs / 74 196 B | 9 msgs / 8 696 B |
+| `Π_Trunc` | 7 msgs / 29 620 B | **22 msgs / 49 616 B** |
+
+(as measured *before* the `Π_SS` batching below; currently 20 msgs / 49 568 B, i.e. 69%)
+
+**`Π_Trunc` is online-heavy, which is the opposite shape from `Π_DReLU`** — and that single
+fact resolves two loose ends at once. It is why the truncation is **71% of a warm ReLU's
+online rounds and 85% of its online bytes**, and it is why pooling the pairs bought only ~5%:
+there was little there to hoist. `Π_DReLU`'s offline is 91% of its bytes; `Π_Trunc`'s offline
+is `ℓ` daBits while its online **opens a full ring element per value** and then runs two
+`a2b`s.
+
+The first version of that test asserted the opposite — that the truncation's preprocessing
+dominates its online phase — reasoning by analogy from `Π_DReLU`'s 91%. It fails, and the
+failure is the finding. Recorded because the analogy is the natural assumption and it is
+wrong.
+
+**What followed for optimisation — and it was built, measured, and half of it withdrawn.**
+`truncate_batch` ran four sequential interactive stages (open `c`, an `a2b` for the borrow, an
+`a2b` for the wrap, then two `Π_SS` lifts), and the borrow and the wrap are mutually
+independent, so each pair could be one batched call.
+
+| | rounds | online bytes | kept? |
+|---|---|---|---|
+| batch the two `a2b`s | 22 → **12** (−45%) | 49 616 → **72 160** (+45%) | ❌ withdrawn |
+| batch the two `Π_SS` lifts | 22 → **20** (−9%) | unchanged | ✅ kept |
+
+**Why the `a2b` batching lost.** One call needs one width, so the borrow's `d+1 = 9` columns
+must widen to the wrap's `ℓ+1 = 21`. The round saving is real and large, and it costs 45% more
+online bytes — which at the pipeline is roughly −10% messages for +5% bytes, worth ~2.7% at
+RTT 20 / 30 Mbps and ~0.8% **worse** at RTT 0 / 10 Mbps. Both are inside the ±13%
+run-to-run noise, so neither is a result. And it moved Falcon's ReLU from 1.05× *cheaper*
+than `a2b` in bytes to **0.93× — dearer**, i.e. strictly dominated on both terms. Spending the
+term Falcon wins on to improve the term it loses on, for a gain below the noise floor, is not
+an optimisation.
+
+The lift batching is kept because it is free, not because it is fast: it moves the whole
+ReLU's messages 576 → 574. Quoting that as a speedup would be noise dressed as a result.
+
+**Three optimisations have now been measured and rejected on this page** — cheaper δ, the
+`a2b` batching above, and per-layer `nbits` — against two that were kept (wire narrowing,
+pool-before-ReLU). The pattern in the rejections is the same each time: a real structural
+inefficiency whose removal costs more of some other term than it saves. Structure identifies
+candidates; only measurement decides them.
 
 ##### How well this grid resolves the boundary — less well than three repeats suggest
 
@@ -1021,9 +1077,13 @@ the boundary back toward Falcon. Neither is measured, so neither is claimed.
 
   | model | comparisons | truncations | Conv(0) | Conv(1) | Hidden(0) | Argmax | online MPC |
   |---|---|---|---|---|---|---|---|
-  | pneumonia | 7 137 | 1 880 | 5 408 / 1 352 | 1 600 / 400 | 128 / 128 | 1 / 0 | 2361 → 739 ms (**3.19×**) |
-  | organa | 14 154 | 3 632 | 10 816 / 2 704 | 3 200 / 800 | 128 / 128 | 10 / 0 | 4069 → 1166 ms (**3.49×**) |
-  | derma | 7 142 | 1 880 | 5 408 / 1 352 | 1 600 / 400 | 128 / 128 | 6 / 0 | 2426 → 767 ms (**3.16×**) |
+  | pneumonia | 7 137 | 1 880 | 5 408 / 1 352 | 1 600 / 400 | 128 / 128 | 1 / 0 | 2233 → 686 ms (**3.26×**) |
+  | organa | 14 154 | 3 632 | 10 816 / 2 704 | 3 200 / 800 | 128 / 128 | 10 / 0 | 3950 → 1129 ms (**3.50×**) |
+  | derma | 7 142 | 1 880 | 5 408 / 1 352 | 1 600 / 400 | 128 / 128 | 6 / 0 | 2304 → 718 ms (**3.21×**) |
+
+  The **counts** are exact and reproduce every run; the **milliseconds** carry the ~5–13%
+  run-to-run variance documented below, so the ratios are good to about ±0.2×. An earlier
+  pass of this table read 3.19/3.49/3.16× on the same code.
 
   (per-segment cells are `comparisons / truncations`)
 
@@ -1086,8 +1146,8 @@ the boundary back toward Falcon. Neither is measured, so neither is claimed.
   | | |
   |---|---|
   | architecture | `1×28×28 → conv(6,5×5) → pool → conv(16,5×5) → pool → dense(120) → dense(84) → dense(10)` |
-  | latency | **2021 ms** (266 FHE + 1753 MPC) |
-  | traffic | **2.24 MB**, of which 1.54 MB ring (69%), 613 messages |
+  | latency | **2094 ms** (255 FHE + 1838 MPC) |
+  | traffic | **2.24 MB**, of which 1.54 MB ring (69%), 607 messages |
   | comparisons | **4 693** — Conv0 3 456, Conv1 1 024, Hidden0 120, Hidden1 84, argmax 9 |
   | bootstraps | **0** |
   | exact vs plaintext | ✅ |

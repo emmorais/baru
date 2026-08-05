@@ -36,10 +36,23 @@ Joppe~W. Bos, Kristin Lauter, Jake Loftus, and Michael Naehrig.
 \newblock In {\em IMA International Conference on Cryptography and Coding},
   pages 45--64, 2013.
 
+\bibitem{CHIMERA}
+Christina Boura, Nicolas Gama, Mariya Georgieva, and Dimitar Jetchev.
+\newblock {CHIMERA}: Combining ring-{LWE}-based fully homomorphic encryption
+  schemes.
+\newblock volume~14, pages 316--338, 2020.
+
 \bibitem{BGV}
 Zvika Brakerski, Craig Gentry, and Vinod Vaikuntanathan.
 \newblock (leveled) fully homomorphic encryption without bootstrapping.
 \newblock {\em ACM Transactions on Computation Theory}, 6(3), 2014.
+
+\bibitem{BrueggemannSchneider}
+Andreas Br{\"u}ggemann and Thomas Schneider.
+\newblock When trying to catch cheaters breaks the {MPC}: Breaking and fixing
+  delayed consistency checks in trident, fantastic four, {SWIFT}, and quad.
+\newblock In {\em Advances in Cryptology --- {ASIACRYPT}}, 2026.
+\newblock Cryptology ePrint Archive, Paper 2026/234.
 
 \bibitem{HyCC}
 Niklas B{\"u}scher, Daniel Demmler, Stefan Katzenbeisser, David Kretzmer, and
@@ -55,6 +68,19 @@ Ran Canetti.
   protocols.
 \newblock In {\em 42nd IEEE Symposium on Foundations of Computer Science
   (FOCS)}, pages 136--145, 2001.
+
+\bibitem{ASTRA}
+Harsh Chaudhari, Ashish Choudhury, Arpita Patra, and Ajith Suresh.
+\newblock {ASTRA}: High throughput 3pc over rings with application to secure
+  prediction.
+\newblock In {\em ACM CCSW}, pages 81--92, 2019.
+
+\bibitem{Trident}
+Harsh Chaudhari, Rahul Rachuri, and Ajith Suresh.
+\newblock Trident: Efficient 4{PC} framework for privacy preserving machine
+  learning.
+\newblock In {\em Network and Distributed System Security Symposium (NDSS)},
+  2020.
 
 \bibitem{Silph}
 Edward Chen, Jinhao Zhu, Alex Ozdemir, Riad~S. Wahby, Fraser Brown, and Wenting
@@ -92,6 +118,18 @@ Ronald Cramer, Ivan Damg{\aa}rd, Daniel Escudero, Peter Scholl, and Chaoping
 \newblock {SPDZ}$_{2^k}$: Efficient {MPC} mod $2^k$ for dishonest majority.
 \newblock In {\em Advances in Cryptology -- CRYPTO 2018}, pages 769--798, 2018.
 
+\bibitem{CramerDamgardIshai}
+Ronald Cramer, Ivan Damg{\aa}rd, and Yuval Ishai.
+\newblock Share conversion, pseudorandom secret-sharing and applications to
+  secure computation.
+\newblock In {\em Theory of Cryptography (TCC)}, pages 342--362, 2005.
+
+\bibitem{FantasticFour}
+Anders Dalskov, Daniel Escudero, and Marcel Keller.
+\newblock Fantastic four: Honest-majority four-party secure computation with
+  malicious security.
+\newblock In {\em {USENIX} Security Symposium}, pages 2183--2200, 2021.
+
 \bibitem{DamgardNielsen}
 Ivan Damg{\aa}rd and Jesper~Buus Nielsen.
 \newblock Universally composable efficient multiparty computation from
@@ -102,6 +140,13 @@ Ivan Damg{\aa}rd and Jesper~Buus Nielsen.
 Ivan Damg{\aa}rd, Valerio Pastro, Nigel~P. Smart, and Sarah Zakarias.
 \newblock Multiparty computation from somewhat homomorphic encryption.
 \newblock In {\em CRYPTO}, pages 643--662, 2012.
+
+\bibitem{ABY}
+Daniel Demmler, Thomas Schneider, and Michael Zohner.
+\newblock {ABY} -- a framework for efficient mixed-protocol secure two-party
+  computation.
+\newblock In {\em Network and Distributed System Security Symposium (NDSS)},
+  2015.
 
 \bibitem{Binius}
 Benjamin~E. Diamond and Jim Posen.
@@ -122,11 +167,29 @@ Hendrik Eerikson, Marcel Keller, Claudio Orlandi, Pille Pullonen, Joonas Puura,
 \newblock In {\em 1st Conference on Information-Theoretic Cryptography (ITC)},
   pages 5:1--5:24, 2020.
 
+\bibitem{EdaBits}
+Daniel Escudero, Satrajit Ghosh, Marcel Keller, Rahul Rachuri, and Peter
+  Scholl.
+\newblock Improved primitives for {MPC} over mixed arithmetic-binary circuits.
+\newblock In {\em Advances in Cryptology --- {CRYPTO}}, pages 823--852, 2020.
+
 \bibitem{FV}
 Junfeng Fan and Frederik Vercauteren.
 \newblock Somewhat practical fully homomorphic encryption.
 \newblock Cryptology ePrint Archive, Paper 2012/144, 2012.
 \newblock \url{https://eprint.iacr.org/2012/144}.
+
+\bibitem{FelleisenFriedman}
+Matthias Felleisen and Daniel~P. Friedman.
+\newblock Control operators, the {SECD}-machine, and the $\lambda$-calculus.
+\newblock In {\em Formal Description of Programming Concepts III}, pages
+  193--217. North-Holland, 1986.
+
+\bibitem{Gentry}
+Craig Gentry.
+\newblock Fully homomorphic encryption using ideal lattices.
+\newblock In {\em 41st ACM Symposium on Theory of Computing (STOC)}, pages
+  169--178, 2009.
 
 \bibitem{Cheetah}
 Zhicong Huang, Wen jie Lu, Cheng Hong, and Jiansheng Ding.
@@ -138,6 +201,13 @@ Zhicong Huang, Wen jie Lu, Cheng Hong, and Jiansheng Ding.
 Yuval Ishai, Joe Kilian, Kobbi Nissim, and Erez Petrank.
 \newblock Extending oblivious transfers efficiently.
 \newblock In {\em Advances in Cryptology -- CRYPTO 2003}, pages 145--161, 2003.
+
+\bibitem{PEGASUS}
+Wen jie Lu, Zhicong Huang, Cheng Hong, Yiping Ma, and Hunter Qu.
+\newblock {PEGASUS}: Bridging polynomial and non-polynomial evaluations in
+  homomorphic encryption.
+\newblock In {\em IEEE Symposium on Security and Privacy (S\&P)}, pages
+  1057--1073, 2021.
 
 \bibitem{Gazelle}
 Chiraag Juvekar, Vinod Vaikuntanathan, and Anantha Chandrakasan.
@@ -174,10 +244,20 @@ Vladimir Kolesnikov and Thomas Schneider.
 \newblock In {\em 35th International Colloquium on Automata, Languages and
   Programming (ICALP)}, pages 486--498, 2008.
 
+\bibitem{SWIFT}
+Nishat Koti, Mahak Pancholi, Arpita Patra, and Ajith Suresh.
+\newblock {SWIFT}: Super-fast and robust privacy-preserving machine learning.
+\newblock In {\em {USENIX} Security Symposium}, pages 2651--2668, 2021.
+
 \bibitem{MNIST}
 Yann LeCun, L{\'e}on Bottou, Yoshua Bengio, and Patrick Haffner.
 \newblock Gradient-based learning applied to document recognition.
 \newblock {\em Proceedings of the IEEE}, 86(11):2278--2324, 1998.
+
+\bibitem{MiniONN}
+Jian Liu, Mika Juuti, Yao Lu, and N.~Asokan.
+\newblock Oblivious neural network predictions via {MiniONN} transformations.
+\newblock In {\em ACM CCS}, pages 619--631, 2017.
 
 \bibitem{LTV}
 Adriana L{\'o}pez-Alt, Eran Tromer, and Vinod Vaikuntanathan.
@@ -197,12 +277,36 @@ Payman Mohassel and Peter Rindal.
 \newblock {ABY3}: A mixed protocol framework for machine learning.
 \newblock In {\em ACM CCS}, pages 35--52, 2018.
 
+\bibitem{MoraisDahab}
+Eduardo Morais and Ricardo Dahab.
+\newblock Lattice-based cryptography.
+\newblock Technical Report IC-2016-1, Institute of Computing, University of
+  Campinas, April 2016.
+
 \bibitem{CirC}
 Alex Ozdemir, Fraser Brown, and Riad~S. Wahby.
 \newblock {CirC}: Compiler infrastructure for proof systems, software
   verification, and more.
 \newblock In {\em IEEE Symposium on Security and Privacy (S\&P)}, pages
   2248--2266, 2022.
+
+\bibitem{CrypTFlow2}
+Deevashwer Rathee, Mayank Rathee, Nishant Kumar, Nishanth Chandran, Divya
+  Gupta, Aseem Rastogi, and Rahul Sharma.
+\newblock {CrypTFlow2}: Practical 2-party secure inference.
+\newblock In {\em ACM CCS}, pages 325--342, 2020.
+
+\bibitem{RotaruWood}
+Dragos Rotaru and Tim Wood.
+\newblock {MArBled} circuits: Mixing arithmetic and boolean circuits with
+  active security.
+\newblock In {\em Progress in Cryptology --- {INDOCRYPT}}, pages 227--249,
+  2019.
+
+\bibitem{SEAL}
+{Microsoft SEAL} (release 4.1).
+\newblock \url{https://github.com/Microsoft/SEAL}, 2023.
+\newblock Microsoft Research, Redmond, WA.
 
 \bibitem{NTL}
 Victor Shoup.
@@ -213,6 +317,12 @@ Victor Shoup.
 {TFHE-rs}: A pure rust implementation of the {TFHE} scheme.
 \newblock \url{https://github.com/zama-ai/tfhe-rs}, 2024.
 \newblock Zama.
+
+\bibitem{SecureNN}
+Sameer Wagh, Divya Gupta, and Nishanth Chandran.
+\newblock {SecureNN}: 3-party secure computation for neural network training.
+\newblock {\em Proceedings on Privacy Enhancing Technologies}, 2019(3):26--49,
+  2019.
 
 \bibitem{Falcon}
 Sameer Wagh, Shruti Tople, Fabrice Benhamouda, Eyal Kushilevitz, Prateek

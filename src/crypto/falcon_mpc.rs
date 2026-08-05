@@ -719,9 +719,43 @@ pub fn truncate_batch<T: Transport>(
         .map(|k| ((k[0].wrapping_add(k[1]).wrapping_add(k[2])) & mask) as u64)
         .collect();
 
-    // 2. borrow = sign of (c_lo − r_lo), taken over d+1 bits so the difference
-    //    has room to go negative. Exact at equality, which Π_PC is not.
+    // 2. The two sign bits.
+    //
+    //    borrow = sign of (c_lo − r_lo)      1 ⟺ c_lo < r_lo
+    //    wrap   = sign of (c    − r)         1 ⟺ a + r overflowed the ring
+    //
+    // Signs rather than `Π_PC` because `Π_PC` is undefined when its secret equals its public
+    // argument, and for both bits that is exactly where the answer flips: `r_lo = c_lo + 1`
+    // for the borrow, `a = 0` for the wrap. Neither is rare and neither can be masked away.
+    //
+    // Narrow to 4 columns: each is read as `& 1` and then fed to `Π_SS` as a `Z₂` value,
+    // never multiplied by a wide operand, so the bit-shares only have to be valid mod 2^4.
+    // That precondition is what makes narrowing safe here and not in the general `lt` path —
+    // and it is worth 32×, because this `a2b` was 96% of an all-RSS network.
+    //
+    // # Two calls, at their own widths — a batched single call was tried and withdrawn
+    //
+    // The two bits are mutually independent (both are functions of the already-opened `c` and
+    // the preprocessed `r`), so they *can* share one `a2b` over the concatenation, and doing
+    // so cut the truncation's online rounds 22 → 12. But one call needs one width, so the
+    // borrow's `d+1 = 9` columns widen to the wrap's `l_bits+1 = 21`, and the online bytes
+    // rose 49 616 → 72 160 (+45%) for `n = 256`.
+    //
+    // That trade lost. At the pipeline it is roughly −10% messages for +5% bytes, worth ~2.7%
+    // at RTT 20 / 30 Mbps and ~0.8% *worse* at RTT 0 / 10 Mbps — both inside the ±13%
+    // run-to-run noise. Worse, it made Falcon's ReLU **dearer than `a2b` in bytes** (1.05×
+    // cheaper → 0.93×), so it spent the term Falcon wins on to improve the term it loses on,
+    // without changing which side of garbled circuits it lands. Trading away the reason a
+    // route exists for an unmeasurable gain is not an optimisation.
+    //
+    // The `Π_SS` lifts below *are* batched, because both run at `l_bits` already — no
+    // widening, so no byte cost. That is the part of the idea that survived, and it is worth
+    // being precise about how little it buys: the truncation's online rounds go 22 → 20
+    // (−9%), its bytes are unchanged, and the whole ReLU's messages move 576 → 574. Kept
+    // because it is free and the batched form is no more code than two calls, **not** because
+    // it is a speedup worth quoting.
     let w = d as usize + 1;
+    let wmask_lo: Fr = (1u128 << w) - 1;
     let diffs: Vec<PartyShare> = c
         .iter()
         .zip(pre)
@@ -730,35 +764,16 @@ pub fn truncate_batch<T: Transport>(
             let pub0 = if me == 0 { lo } else { 0 };
             let pub1 = if me == 2 { lo } else { 0 };
             PartyShare {
-                left: pub0.wrapping_sub(p.r_lo.left) & ((1u128 << w) - 1),
-                right: pub1.wrapping_sub(p.r_lo.right) & ((1u128 << w) - 1),
+                left: pub0.wrapping_sub(p.r_lo.left) & wmask_lo,
+                right: pub1.wrapping_sub(p.r_lo.right) & wmask_lo,
             }
         })
         .collect();
-    // Narrow: the borrow is read purely as a bit (`& 1` below and then a
-    // Z_2 input to Π_SS), never multiplied by a wide operand, so the
-    // bit-shares only have to be valid mod 2^4. That precondition is what
-    // makes the narrowing safe here and not in the general `lt` path — and it
-    // is worth 32x, because this a2b was 96% of an all-RSS network.
     let bits =
         crate::crypto::aby3_protocol::a2b_batch_party_at(&diffs, w, 4, base_op_id + 1, me, mbx);
-    let msb_of = |bits: &[Vec<PartyShare>], w: usize| -> Vec<[u64; 2]> {
-        bits.iter()
-            .map(|bv| {
-                let msb = &bv[w - 1];
-                [(msb.left & 1) as u64, (msb.right & 1) as u64]
-            })
-            .collect()
-    };
-    let borrow_bits = msb_of(&bits, w);
 
-    // 2b. wrap = sign of (c − r) over l_bits+1 bits. Same construction as the borrow
-    //     and for the same reason — `Π_PC` is undefined at `r = c`, which for the wrap
-    //     is the `a = 0` case and so anything but rare. Narrowed to 4 bits on the same
-    //     grounds: only the top bit is ever read.
-    //
-    //     `r`'s shares are valid mod `2^(l_bits+1)`, which is what lets the difference
-    //     be formed without the subtraction itself wrapping.
+    // `r`'s shares are valid mod `2^(l_bits+1)`, which is what lets this difference be formed
+    // without the subtraction itself wrapping.
     let ww = l_bits as usize + 1;
     let wmask: Fr = (1u128 << ww) - 1;
     let wdiffs: Vec<PartyShare> = c
@@ -782,16 +797,18 @@ pub fn truncate_batch<T: Transport>(
         me,
         mbx,
     );
+    let msb_of = |bits: &[Vec<PartyShare>], w: usize| -> Vec<[u64; 2]> {
+        bits.iter()
+            .map(|bv| {
+                let msb = &bv[w - 1];
+                [(msb.left & 1) as u64, (msb.right & 1) as u64]
+            })
+            .collect()
+    };
+    let borrow_bits = msb_of(&bits, w);
     let wrap_bits = msb_of(&wbits, ww);
 
-    // 3. Lift the borrow into the ring with Π_SS: select between 0 and 1.
-    let zeros = vec![PartyShare { left: 0, right: 0 }; n];
-    let ones: Vec<PartyShare> = (0..n)
-        .map(|_| PartyShare {
-            left: Fr::from(me == 0),
-            right: Fr::from(me == 2),
-        })
-        .collect();
+    // 3. Lift both bits into the ring with Π_SS: select between 0 and 1.
     let sel: Vec<SelectPreproc> = pre
         .iter()
         .map(|p| SelectPreproc {
@@ -799,33 +816,37 @@ pub fn truncate_batch<T: Transport>(
             c_ring: p.sel.c_ring.clone(),
         })
         .collect();
-    let borrow = select_batch(
-        &zeros,
-        &ones,
-        &borrow_bits,
-        &sel,
+    // One `Π_SS` for both lifts, for the same reason the `a2b` above is one call: the borrow
+    // and the wrap are independent, so the two selects are one batched select over the
+    // concatenation. Each bit keeps its **own** selector daBit — `sel` for the borrow,
+    // `sel_wrap` for the wrap — because sharing one would correlate the two lifted values.
+    // Batching changes when they are sent, not what randomness they use.
+    let mut both_bits: Vec<[u64; 2]> = Vec::with_capacity(2 * n);
+    both_bits.extend_from_slice(&borrow_bits);
+    both_bits.extend_from_slice(&wrap_bits);
+    let mut both_sel: Vec<SelectPreproc> = Vec::with_capacity(2 * n);
+    both_sel.extend(sel);
+    both_sel.extend(pre.iter().map(|p| SelectPreproc {
+        c_bit: p.sel_wrap.c_bit,
+        c_ring: p.sel_wrap.c_ring.clone(),
+    }));
+    let lifted = select_batch(
+        &vec![PartyShare { left: 0, right: 0 }; 2 * n],
+        &vec![
+            PartyShare {
+                left: Fr::from(me == 0),
+                right: Fr::from(me == 2),
+            };
+            2 * n
+        ],
+        &both_bits,
+        &both_sel,
         l_bits,
         base_op_id + 2 + PC_ID_BLOCK + 2 * crate::crypto::aby3_protocol::A2B_ID_BLOCK,
         me,
         mbx,
     );
-    let sel_wrap: Vec<SelectPreproc> = pre
-        .iter()
-        .map(|p| SelectPreproc {
-            c_bit: p.sel_wrap.c_bit,
-            c_ring: p.sel_wrap.c_ring.clone(),
-        })
-        .collect();
-    let wrap = select_batch(
-        &zeros,
-        &ones,
-        &wrap_bits,
-        &sel_wrap,
-        l_bits,
-        base_op_id + 2 + 2 * PC_ID_BLOCK + 2 * crate::crypto::aby3_protocol::A2B_ID_BLOCK,
-        me,
-        mbx,
-    );
+    let (borrow, wrap) = (&lifted[..n], &lifted[n..]);
 
     // 4. out = (c>>d) − (r>>d) − borrow + wrap·2^(l_bits−d), public term in component 0.
     //    The wrap term restores the `2^l_bits` the opening lost, divided by `2^d`
@@ -1611,16 +1632,35 @@ pub fn trunc_pair_id_span(count: usize, r_bits: u32) -> u64 {
 
 /// Random **non-zero** `Z_p` masks for `Π_PC`'s final opening.
 ///
-/// `Π_PC` reveals `m · Π c[i]` and reads only its zero-ness. `m` must therefore
-/// be a uniformly random *unit*: with `m = 1` the product itself is revealed,
-/// which says more than the predicate, and with `m = 0` the opening reads zero
-/// whatever the product was — at `p = 37` that is a **1-in-37 wrong answer**, not
-/// a negligible event.
+/// `Π_PC` reveals `m · Π c[i]` and reads only its zero-ness. `m` must therefore be a
+/// uniformly random *unit*: with `m = 1` the product itself is revealed, which says more
+/// than the predicate, and with `m = 0` the opening reads zero whatever the product was —
+/// at `p = 37` that is a **1-in-37 wrong answer**, not a negligible event.
 ///
-/// So the zero ones are found and resampled. Opening *whether a mask is zero*
-/// leaks nothing: `m` is drawn independently of any input, and this runs offline.
-/// Resampling is one extra round per attempt and terminates with probability
-/// `1 − p^{-attempts}`.
+/// # The mask has to be tested for zero without being opened
+///
+/// An earlier version of this function opened each candidate in order to test it, and
+/// returned the same shares. The justification on it read: *"opening whether a mask is zero
+/// leaks nothing: `m` is drawn independently of any input, and this runs offline."* The first
+/// clause is true and the conclusion does not follow, because the code opened `m` itself
+/// rather than its zero-ness, and `m`'s job is to blind a **later** opening. A public blinder
+/// blinds nothing: with `m` known, `Π c[i] = d/m` is public, and the `c[i]` carry no
+/// independent randomness, so that product is a deterministic function of the compared bits.
+/// `the_private_compare_product_leaks_more_than_the_predicate` measures the consequence — at
+/// `ℓ = 6` a single predicate class contains **31 distinct products**, so the opening carried
+/// about 5 bits where the predicate is entitled to 1. In `wrap3_batch` the compared secret is
+/// the mask `x` and `r = a + x` is public, so those bits are bits of the activation.
+///
+/// The repair is the standard one: draw a second random `s` and open `d = m·s`. Then
+/// `d ≠ 0` implies `m ≠ 0`, and conditioned on any `d = δ ≠ 0` the mask is still uniform over
+/// `Z_p^*`, because for each candidate `μ ≠ 0` there is exactly one `s = δ/μ` that produces
+/// `δ`. So the transcript fixes nothing about `m`, which
+/// `the_nonzero_test_does_not_narrow_the_mask` verifies exhaustively over `Z_p × Z_p`.
+///
+/// The cost is one extra random share and one extra batched multiplication per attempt, both
+/// offline. The per-attempt failure probability rises from `1/p` to `2/p − 1/p²` because
+/// either factor can vanish, so the retry budget is raised to keep the overall failure below
+/// `2^{-40}`.
 pub fn random_nonzero_masks<T: Transport>(
     n: usize,
     base_op_id: u64,
@@ -1631,33 +1671,57 @@ pub fn random_nonzero_masks<T: Transport>(
     if n == 0 {
         return Vec::new();
     }
+    use crate::crypto::fp_protocol::mul_batch;
+    const ATTEMPTS: usize = 12;
+
     let mut out: Vec<FpShare> = (0..n)
         .map(|i| random_share(base_op_id.wrapping_add(i as u64), me, mbx))
         .collect();
     let mut op = base_op_id.wrapping_add(n as u64);
-    // Each round resamples only the slots that came up zero, so the expected
-    // number of rounds is 1 + p^{-1} + p^{-2} + … ≈ 1.03 at p = 37.
-    for _ in 0..8 {
-        let opened = reveal_batch(&out, op, me, mbx);
-        op = op.wrapping_add(1);
-        let bad: Vec<usize> = opened
-            .iter()
-            .enumerate()
-            .filter(|(_, v)| v.is_zero())
-            .map(|(i, _)| i)
-            .collect();
-        if bad.is_empty() {
+    // Only the slots not yet accepted are probed, and an accepted mask is never probed
+    // again. Re-probing an accepted slot with a fresh witness would require all `n` slots to
+    // pass in the *same* round, whose probability is `(1 - 2/p)^n` and collapses for a large
+    // batch; accumulating per slot makes the failure probability per slot independent across
+    // attempts instead. Every party derives `pending` from opened values, so the three stay
+    // in lockstep and the operation identifiers advance identically.
+    let mut pending: Vec<usize> = (0..n).collect();
+    for _ in 0..ATTEMPTS {
+        if pending.is_empty() {
             return out;
         }
-        for (k, &i) in bad.iter().enumerate() {
-            out[i] = random_share(op.wrapping_add(k as u64), me, mbx);
+        let witness: Vec<FpShare> = (0..pending.len())
+            .map(|k| random_share(op.wrapping_add(k as u64), me, mbx))
+            .collect();
+        op = op.wrapping_add(pending.len() as u64);
+        let pairs: Vec<(FpShare, FpShare)> = pending
+            .iter()
+            .zip(&witness)
+            .map(|(&i, sw)| (out[i], *sw))
+            .collect();
+        let probe = mul_batch(&pairs, op, me, mbx);
+        op = op.wrapping_add(1);
+        let opened = reveal_batch(&probe, op, me, mbx);
+        op = op.wrapping_add(1);
+
+        // A zero product means `m = 0` or `s = 0` and does not say which, so the mask is
+        // redrawn as well; keeping it could loop forever on a zero mask.
+        let mut still: Vec<usize> = Vec::new();
+        for (k, (&i, v)) in pending.iter().zip(&opened).enumerate() {
+            if v.is_zero() {
+                out[i] = random_share(op.wrapping_add(k as u64), me, mbx);
+                still.push(i);
+            }
         }
-        op = op.wrapping_add(bad.len() as u64 + 1);
+        op = op.wrapping_add(pending.len() as u64 + 1);
+        pending = still;
     }
-    // 8 independent rounds all producing a zero has probability p^-8 ≈ 2^-41.
-    // Continuing with a possibly-zero mask would silently invert a comparison,
-    // so this stops instead.
-    panic!("random_nonzero_masks: 8 consecutive zero draws — PRF or modulus is wrong");
+    if pending.is_empty() {
+        return out;
+    }
+    // A zero product has probability `2/p − 1/p²` ≈ 0.053 at p = 37, so ATTEMPTS
+    // independent failures is ≈ 2^-42. Continuing with a possibly-zero mask would silently
+    // invert a comparison, so this stops instead.
+    panic!("random_nonzero_masks: {ATTEMPTS} consecutive zero probes — PRF or modulus is wrong");
 }
 
 #[cfg(test)]
@@ -1665,6 +1729,157 @@ mod tests {
     use super::*;
     use crate::crypto::net::InprocHandle;
     use std::thread;
+
+    /// **`Π_PC`'s final mask must stay secret, and `random_nonzero_masks` opens it.**
+    ///
+    /// `private_compare` computes `c[i] = u[i] + 1 + Σ_{k>i} w[k]` and opens `m · Π c[i]`,
+    /// reading only whether the result is zero. Its own comment states the security
+    /// argument exactly: *"the product is otherwise uniform, so only 'was some term zero'
+    /// escapes"*. The `c[i]` carry **no independent blinding** — they are deterministic in
+    /// the secret bits, the public `r` and the secret `β` — so `m` is the only thing
+    /// standing between the transcript and `Π c[i]`.
+    ///
+    /// `random_nonzero_masks` opens `m` itself in order to test it for zero, and returns the
+    /// same shares. Once `m` is public, `Π c[i] = d/m` is public too. This test establishes
+    /// the half of the break that is a statement about the protocol rather than about the
+    /// code: that `Π c[i]` is **not** a function of the comparison's output, so revealing it
+    /// leaks strictly more than the predicate.
+    ///
+    /// In `wrap3_batch` the secret compared is the preprocessed mask `x`, against the public
+    /// `r = a + x`, so information about `x` is information about the activation `a`.
+    #[test]
+    fn the_private_compare_product_leaks_more_than_the_predicate() {
+        use crate::crypto::field::{Fp, P};
+        const L: usize = 6; // bits per compared value
+
+        // The product Π c[i], computed in the clear exactly as `private_compare` does.
+        let product = |x: u64, r: u64, beta: u64| -> Fp {
+            let bit = |v: u64, i: usize| (v >> i) & 1;
+            let sign = Fp::new(1) - Fp::new(2) * Fp::new(beta);
+            let w: Vec<Fp> = (0..L)
+                .map(|i| {
+                    if bit(r, i) == 0 {
+                        Fp::new(bit(x, i))
+                    } else {
+                        Fp::new(1) - Fp::new(bit(x, i))
+                    }
+                })
+                .collect();
+            let u: Vec<Fp> = (0..L)
+                .map(|i| sign * (Fp::new(bit(x, i)) - Fp::new(bit(r, i))))
+                .collect();
+            let mut suffix = [Fp::ZERO; L + 1];
+            for i in (0..L).rev() {
+                suffix[i] = suffix[i + 1] + w[i];
+            }
+            (0..L).fold(Fp::new(1), |acc, i| acc * (u[i] + suffix[i + 1] + Fp::new(1)))
+        };
+
+        // Group the secrets by the predicate the protocol is entitled to reveal, and count
+        // how many distinct product values each group contains. One would mean the product
+        // is a function of the output and revealing it would be harmless.
+        let mut worst = 0usize;
+        let mut witness = None;
+        for r in 0..(1u64 << L) {
+            for beta in 0..2u64 {
+                let mut by_pred: [std::collections::BTreeSet<u64>; 2] =
+                    [Default::default(), Default::default()];
+                let mut example: [Option<u64>; 2] = [None, None];
+                for x in 0..(1u64 << L) {
+                    let d = product(x, r, beta);
+                    let pred = usize::from(!d.is_zero());
+                    if by_pred[pred].insert(d.value()) && example[pred].is_none() {
+                        example[pred] = Some(x);
+                    }
+                }
+                for (pred, seen) in by_pred.iter().enumerate() {
+                    if seen.len() > worst {
+                        worst = seen.len();
+                        witness = Some((r, beta, pred, seen.len()));
+                    }
+                }
+            }
+        }
+        let (r, beta, pred, distinct) = witness.expect("some group is non-empty");
+        println!(
+            "  worst case: r={r}, beta={beta}, predicate={pred} -> {distinct} distinct \
+             products among secrets sharing that predicate (p={P})"
+        );
+        println!(
+            "  so the opening carries up to log2({distinct}) = {:.1} bits, against the \
+             1 bit the predicate is entitled to",
+            (distinct as f64).log2()
+        );
+
+        // The break: some predicate class contains more than one product value, so the
+        // opened value distinguishes secrets that the output does not.
+        assert!(
+            worst > 1,
+            "if every predicate class had a single product value, revealing the product \
+             would leak nothing and `m` would not need to be secret"
+        );
+    }
+
+    /// **The zero test on `Π_PC`'s mask must not narrow the mask.**
+    ///
+    /// This is the other half of the repair described on `random_nonzero_masks`. We now open
+    /// `d = m·s` rather than `m`, and the claim is that the transcript leaves the mask
+    /// uniform over `Z_p^*`. The test is exhaustive over `Z_p × Z_p` rather than statistical,
+    /// because the property is a counting statement and `p = 37` makes counting cheap.
+    ///
+    /// Two things are checked. Accepting on `d ≠ 0` really does exclude `m = 0`, so the
+    /// protocol still gets the unit it needs; and every accepting `d` admits exactly one
+    /// witness `s` per candidate mask, so conditioned on the opened value the mask remains
+    /// uniform and the opening is simulatable without it.
+    #[test]
+    fn the_nonzero_test_does_not_narrow_the_mask() {
+        use crate::crypto::field::{Fp, P};
+
+        let mut zero_products = 0usize;
+        for d in 1..P {
+            // For an accepting opening `d`, count the witnesses for each candidate mask.
+            let mut witnesses = vec![0usize; P as usize];
+            for m in 0..P {
+                for sw in 0..P {
+                    if (Fp::new(m) * Fp::new(sw)).value() == d {
+                        witnesses[m as usize] += 1;
+                    }
+                }
+            }
+            assert_eq!(
+                witnesses[0], 0,
+                "d={d} is non-zero, so m=0 must be excluded: accepting it would let a zero \
+                 mask through and invert a comparison once in p"
+            );
+            for m in 1..P {
+                assert_eq!(
+                    witnesses[m as usize], 1,
+                    "d={d}: mask {m} should have exactly one witness s, so that no accepting \
+                     opening prefers one mask over another"
+                );
+            }
+        }
+
+        // The retry rate the doc quotes: a probe vanishes when either factor does.
+        for m in 0..P {
+            for sw in 0..P {
+                if (Fp::new(m) * Fp::new(sw)).is_zero() {
+                    zero_products += 1;
+                }
+            }
+        }
+        let rate = zero_products as f64 / (P * P) as f64;
+        println!(
+            "  every non-zero opening leaves all {} candidate masks equally likely; \
+             retry rate {:.4} (2/p - 1/p^2 = {:.4})",
+            P - 1,
+            rate,
+            2.0 / P as f64 - 1.0 / (P * P) as f64
+        );
+        assert!((rate - (2.0 / P as f64 - 1.0 / (P * P) as f64)).abs() < 1e-12);
+        // 12 attempts at that rate is below 2^-40, which is what the retry budget claims.
+        assert!(rate.powi(12) < 2f64.powi(-40), "the retry budget must reach 2^-40");
+    }
 
     /// **The daBit's defining property**: the bit shared over `Z₂` and the bit
     /// shared over `Z_p` must be the *same* bit. If they drift, `Π_PC`'s blinding
@@ -2834,6 +3049,126 @@ mod tests {
             .map(|j| j.join().expect("party panicked"))
             .collect();
         out.remove(0)
+    }
+
+    /// `Π_Trunc`'s offline and online costs, measured apart — the truncation analogue of
+    /// [`measure_drelu_phases`].
+    fn measure_trunc_phases(n: usize, l_bits: u32, d: u32) -> (Phase, Phase) {
+        use crate::bench::comm::CountingTransport;
+        use std::time::Instant;
+        let handles = InprocHandle::create(3);
+        let mut joins = Vec::new();
+        for h in handles {
+            let counted = CountingTransport::new(h, 3);
+            let handle = counted.handle();
+            joins.push(thread::spawn(move || {
+                let mbx = Mailbox::new(counted);
+                let me = mbx.id();
+                // Non-negative inputs below 2^(l-1), as a ReLU output is.
+                let a: Vec<PartyShare> = (0..n)
+                    .map(|i| {
+                        let v = ((i as u64).wrapping_mul(7)) % (1 << (l_bits - 1));
+                        let s = [v / 3, v / 3, v - 2 * (v / 3)];
+                        PartyShare {
+                            left: s[me % 3] as u128,
+                            right: s[(me + 1) % 3] as u128,
+                        }
+                    })
+                    .collect();
+
+                // ── Offline: the pairs ──
+                let t0 = Instant::now();
+                let pre = random_trunc_pairs(n, d, l_bits, l_bits, 2_000_000, me, &mbx);
+                let offline = Phase {
+                    ms: t0.elapsed().as_secs_f64() * 1e3,
+                    messages: handle.stats().messages,
+                    bytes: handle.stats().bytes,
+                };
+
+                // ── Online: the truncation itself ──
+                let t1 = Instant::now();
+                let _out = truncate_batch(&a, &pre, d, l_bits, PC_ID_BLOCK, me, &mbx);
+                let after = handle.stats();
+                let online = Phase {
+                    ms: t1.elapsed().as_secs_f64() * 1e3,
+                    messages: after.messages - offline.messages,
+                    bytes: after.bytes - offline.bytes,
+                };
+                (offline, online)
+            }));
+        }
+        let mut out: Vec<(Phase, Phase)> = joins
+            .into_iter()
+            .map(|j| j.join().expect("party panicked"))
+            .collect();
+        out.remove(0)
+    }
+
+    /// **How much of a warm Falcon ReLU's online cost is the truncation?**
+    ///
+    /// With the offline phase pooled, a warm server's cost is nearly all rounds — its online
+    /// bytes are ~9% of the total at ℓ = 32 — so this decides whether the one obvious
+    /// remaining optimisation is worth building. [`truncate_batch`] runs **four** sequential
+    /// interactive stages (open `c`, an `a2b` for the borrow, an `a2b` for the wrap, then two
+    /// `Π_SS` lifts) and the borrow and wrap are mutually independent: they could share one
+    /// batched `a2b` and one batched lift, halving the stage count.
+    ///
+    /// The share is measured before anything is built on it, because the last two structural
+    /// estimates on this page were both badly wrong — the cheaper-δ idea (withdrawn after
+    /// measurement) and a 10× over-estimate of how much preprocessing was unpooled. A
+    /// protocol having redundant round-trips is not by itself a reason to fix them.
+    #[test]
+    #[ignore] // real 3-party transport
+    fn how_much_of_a_warm_relu_is_the_truncation() {
+        const L: u32 = 20;
+        const D: u32 = 8;
+        let n = 256usize;
+
+        let (d_off, d_on) = measure_drelu_phases(n, L);
+        let (t_off, t_on) = measure_trunc_phases(n, L, D);
+
+        // A warm ReLU's online phase is the DReLU's online + the truncation's online (plus
+        // one batched multiply, which is a single round and is not isolated here).
+        let online_msgs = d_on.messages + t_on.messages;
+        let online_bytes = d_on.bytes + t_on.bytes;
+        println!("\n  per party, n={n}, ℓ={L}, d={D}:");
+        println!(
+            "    Π_DReLU   offline {:>5} msgs {:>9} B | online {:>4} msgs {:>8} B",
+            d_off.messages, d_off.bytes, d_on.messages, d_on.bytes
+        );
+        println!(
+            "    Π_Trunc   offline {:>5} msgs {:>9} B | online {:>4} msgs {:>8} B",
+            t_off.messages, t_off.bytes, t_on.messages, t_on.bytes
+        );
+        println!(
+            "    → truncation is {:.0}% of the warm online rounds and {:.0}% of its bytes",
+            100.0 * t_on.messages as f64 / online_msgs.max(1) as f64,
+            100.0 * t_on.bytes as f64 / online_bytes.max(1) as f64,
+        );
+        println!(
+            "    → and {:.0}% of the OFFLINE bytes, which is what a cold server pays",
+            100.0 * t_off.bytes as f64
+                / (t_off.bytes + d_off.bytes).max(1) as f64,
+        );
+        println!(
+            "\n    The two Π_SS lifts are already batched (free: both run at ℓ). Batching the\n    \
+             two `a2b`s as well was tried and withdrawn — it cut these rounds 22 → 12 but\n    \
+             raised online bytes 45%, because one call needs one width and the borrow's\n    \
+             d+1 columns must widen to the wrap's ℓ+1. See `truncate_batch`."
+        );
+
+        assert!(d_on.messages > 0 && t_on.messages > 0, "both phases must be measured");
+        // NOT asserted: that the truncation's preprocessing dominates its online phase. It
+        // does not, and the first version of this test asserted it did — reasoning by
+        // analogy with `Π_DReLU`, where preprocessing is ~91% of bytes. `Π_Trunc` is the
+        // opposite shape: its offline is `ℓ` daBits, while its online **opens a full ring
+        // element per value** and then runs two `a2b`s. That asymmetry is the finding, and
+        // it explains why pooling the pairs bought only ~5%: there was little there to hoist.
+        assert!(
+            t_on.bytes > t_off.bytes,
+            "the truncation is online-heavy, unlike Π_DReLU: online {} vs offline {}",
+            t_on.bytes, t_off.bytes
+        );
     }
 
     fn measure_drelu(n: usize, l_bits: u32) -> (u64, u64) {

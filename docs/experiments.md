@@ -1340,6 +1340,29 @@ from these gadgets is secure and correct by construction** — no per-architectu
 proof. The research question becomes "which architecture is *fastest*," not "is
 this one secure."
 
+**The conditional in that paragraph is where the work is, and it is not free.**
+"If each primitive UC-realizes its ideal operation" is a much stronger hypothesis
+than "if each primitive is secure": it requires that every value the primitive
+protocols open *internally* be simulatable from the ideal operation's output. That
+is a finite checklist — there are nine opening sites in the whole artifact — and
+**three of the nine needed a protocol change before the checklist could be
+completed**:
+
+| protocol | was | now |
+|---|---|---|
+| `Π_Trunc` | mask sized to the no-wrap bound, so the opened `a+r` correlated with `a` | mask covers the ring, overflow corrected by a wrap bit |
+| `Π_SS` (borrow + wrap) | one selector daBit reused for two lifted bits | one selector each |
+| `Π_PC` unit sampling | the mask `m` itself was opened to reject zeros, making `Π cᵢ = d/m` public | opens `m·s` for a fresh `s`; `m` stays uniform on `Z_p*` |
+
+The `Π_PC` case is the sharpest: the `cᵢ` carry no randomness of their own, so `m`
+was the only blinding, and at ℓ=6 a single predicate class contains **31 distinct
+products** — about 5 bits where the predicate is entitled to 1. Since `Π_WA`
+compares the wrap mask `x` against the public `r = a + x`, those are bits of the
+activation. No correctness test could see it; it was found by writing the
+enumeration the composability argument requires. The gadget-level claim is sound
+and it transfers security rather than creating it — see `paper-survey` §5 for the
+functionality, the opening lemma and the theorem."
+
 As evidence the composition is semantically exact rather than merely
 type-correct, the library includes an end-to-end LeNet-shaped classifier —
 `conv → relu → maxpool → flatten → dense → relu → dense → argmax` — that runs

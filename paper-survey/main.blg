@@ -3,44 +3,47 @@ Capacity: max_strings=200000, hash_size=200000, hash_prime=170003
 The top-level auxiliary file: main.aux
 The style file: plain.bst
 Database file #1: references.bib
-You've used 41 entries,
+Warning--empty booktitle in CHIMERA
+Warning--can't use both volume and number fields in CHIMERA
+You've used 59 entries,
             2118 wiz_defined-function locations,
-            760 strings with 11122 characters,
-and the built_in function-call counts, 17817 in all, are:
-= -- 1770
-> -- 785
-< -- 28
-+ -- 312
-- -- 268
-* -- 1131
-:= -- 2638
-add.period$ -- 126
-call.type$ -- 41
-change.case$ -- 257
+            864 strings with 14318 characters,
+and the built_in function-call counts, 25586 in all, are:
+= -- 2540
+> -- 1121
+< -- 42
++ -- 444
+- -- 382
+* -- 1616
+:= -- 3773
+add.period$ -- 182
+call.type$ -- 59
+change.case$ -- 369
 chr.to.int$ -- 0
-cite$ -- 41
-duplicate$ -- 756
-empty$ -- 1451
-format.name$ -- 268
-if$ -- 3963
+cite$ -- 61
+duplicate$ -- 1104
+empty$ -- 2094
+format.name$ -- 382
+if$ -- 5705
 int.to.chr$ -- 0
-int.to.str$ -- 41
-missing$ -- 35
-newline$ -- 211
-num.names$ -- 80
-pop$ -- 350
+int.to.str$ -- 59
+missing$ -- 51
+newline$ -- 302
+num.names$ -- 114
+pop$ -- 507
 preamble$ -- 1
-purify$ -- 216
+purify$ -- 310
 quote$ -- 0
-skip$ -- 650
+skip$ -- 940
 stack$ -- 0
-substring$ -- 1220
-swap$ -- 315
-text.length$ -- 28
+substring$ -- 1729
+swap$ -- 461
+text.length$ -- 42
 text.prefix$ -- 0
 top$ -- 0
-type$ -- 164
-warning$ -- 0
-while$ -- 175
-width$ -- 43
-write$ -- 453
+type$ -- 236
+warning$ -- 2
+while$ -- 247
+width$ -- 61
+write$ -- 650
+(There were 2 warnings)

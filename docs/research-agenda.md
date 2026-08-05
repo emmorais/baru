@@ -929,19 +929,35 @@ everything is "planned" cannot express priority.
 * **KOS-style consistency checks** for the OT extension, if any claim needs
   malicious security.
 
+* **Distributed key generation for the threshold FHE layer.** This is now the single named
+  gap in the composability argument. The MPC layer UC-realizes `F_ABB` under stated hypotheses
+  (private channels, a PRF, per-session key setup), the openings are enumerated and each is
+  simulatable, and the abort is deferred to one input-independent point. The hybrid pipeline is
+  covered except for key generation, which is dealer-keyed, so the honest statement is that it
+  realizes its functionality in a model with a key-generation setup. Closing it means DKG,
+  following Damgård–Nielsen (CRYPTO'03) for an arithmetic black box from threshold homomorphic
+  encryption and Asharov et al. (EUROCRYPT'12) for the FHE case. The input-boundary proof that
+  the malicious case also needs is already implemented.
+
 * **A LAN/WAN measurement harness** so `mpcc`'s latency and bandwidth terms are
   calibrated against a real network rather than a profile (roadmap P1).
 
-* **An offline/online split for the MPC backend.** Newly the highest-value item,
-  because its absence just cost a headline result. `lt_falcon_batch` runs its
-  preprocessing inline — the backend has no phase structure to hang it on — so
-  every latency Baru reports for it is a *total*. That is fine when protocols have
-  the same phase structure and silently unfair when they do not: the withdrawn
-  nonlinearity crossover (`falcon-reproduction.md`) compared Falcon's online cost
-  against garbled circuits' total cost, and nothing in the harness could have
-  flagged it. A split makes both the fair comparison and Falcon's own claim
-  measurable, and it generalises — every preprocessing-based protocol in the repo
-  has the same exposure.
+* ~~**An offline/online split for the MPC backend.**~~ ✅ **Done 2026-08-04.** It was the
+  highest-value item because its absence had cost a headline result: `lt_falcon_batch` ran its
+  preprocessing inline, so every latency was a *total* — fine when protocols share a phase
+  structure, silently unfair when they do not. Falcon's preprocessing is now pooled per MPC
+  segment (`cnn::FalconPoolPlan`, `--warm`), sized from counts a cold run *measures* rather
+  than shapes it derives, and `falcon_pool_missed != 0` is a hard failure so an "online"
+  latency cannot quietly contain preprocessing.
+
+  It changed the answer: a **warm** Falcon wins to ≥100 Mbps at RTT 0, where a cold one loses
+  to garbled circuits above ~25 Mbps. And it made Falcon's own claim measurable — at ℓ = 32
+  its online phase is 0.25 MB/party against a 2.87 MB total, i.e. **0.33–0.57× Falcon's
+  reported 0.74 MB** while the total is 3.9–6.7× it.
+
+  The generalisation is still open: every preprocessing-based protocol in the repo has the
+  same exposure, and only the Falcon path has the phase structure so far. `bench-malicious`
+  is the next candidate, since its MAC-check preprocessing is query-independent too.
 
 * **Multi-channel MedMNIST** (PathMNIST, DermaMNIST). No longer blocked on
   packing — see §6.1's correction. The crypto path takes RGB today; what is left
