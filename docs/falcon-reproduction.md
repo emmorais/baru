@@ -695,7 +695,7 @@ The mechanism, from the same run:
 | gc | 61 | 10.1 | 0.5 |
 | falcon | 450 | **3.4** | 2.3 |
 
-Falcon is **2.94× cheaper in bytes and 7.4× dearer in messages**, so the two terms
+Falcon is **2.94× cheaper in bytes on the party transport** (but only **1.33× on total traffic** — see the evaluator-link correction in `research-agenda.md`, 2026-08-05) **and ~7× dearer in messages**, so the two terms
 genuinely trade and the boundary is where the trade balances. Both protocols are charged
 for their preprocessing and neither pays for `u128` padding.
 

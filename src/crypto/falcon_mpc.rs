@@ -1547,9 +1547,14 @@ pub fn random_dabits_ring<T: Transport>(
 ///
 /// **It is not the whole story, because [`truncate_batch`] opens `c = a + r`.** `r` is
 /// also the mask hiding `a`, so shrinking it to the correctness minimum maximises
-/// leakage: see [`TRUNC_STAT_BITS`] for the analysis and the ≈0.72 bits per truncation
-/// that a zero-slack choice costs. Callers should take both widths from
-/// [`trunc_widths`] rather than picking `r_bits` to fit the bound.
+/// leakage — a zero-slack choice cost ≈0.72 bits per truncation when this code chose
+/// `r_bits = nbits − 1`.
+///
+/// That is history rather than a caveat: the mask now spans the **whole ring**, which
+/// hides `a` perfectly rather than statistically, and the exactness that the narrow
+/// mask was buying is recovered from the wrap bit instead. [`assert_full_ring_mask`]
+/// enforces it, so the leaking configuration is not representable and there is no
+/// width for a caller to choose.
 pub fn random_trunc_pairs<T: Transport>(
     count: usize,
     d: u32,

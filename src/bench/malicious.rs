@@ -92,7 +92,7 @@ where
     let mut joins = Vec::with_capacity(3);
     let mut comm = None;
     for (me, h) in handles.into_iter().enumerate() {
-        let counted = CountingTransport::new(LatencyTransport::new(h, profile), 3);
+        let counted = CountingTransport::new(LatencyTransport::new(h, profile, 3), 3);
         if me == 0 {
             comm = Some(counted.handle());
         }
@@ -125,7 +125,7 @@ where
     let mut joins = Vec::with_capacity(3);
     let mut comm = None;
     for (me, h) in handles.into_iter().enumerate() {
-        let counted = CountingTransport::new(LatencyTransport::new(h, profile), 3);
+        let counted = CountingTransport::new(LatencyTransport::new(h, profile, 3), 3);
         if me == 0 {
             comm = Some(counted.handle());
         }

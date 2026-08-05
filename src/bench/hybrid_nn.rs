@@ -197,9 +197,16 @@ where
     let handles = InprocHandle::create(3);
     let mut joins = Vec::with_capacity(3);
     let mut comm = None;
+    // Every party's counters, not only party 0's. What a deployment pays on its
+    // slowest link is the *busiest* party's outbound traffic, and in an
+    // asymmetric protocol that is not party 0: a three-party garbled circuit has
+    // one party ship the tables. Keeping only party 0 made every byte figure in
+    // this repo the wrong party's whenever the protocol was asymmetric.
+    let mut all: Vec<crate::bench::comm::CommHandle> = Vec::with_capacity(3);
     for (me, h) in handles.into_iter().enumerate() {
-        let lat = LatencyTransport::new(h, profile);
+        let lat = LatencyTransport::new(h, profile, 3);
         let counted = CountingTransport::new(lat, 3);
+        all.push(counted.handle());
         if me == 0 {
             comm = Some(counted.handle());
         }
@@ -213,6 +220,36 @@ where
         .into_iter()
         .map(|j| j.join().expect("MPC party thread panicked"))
         .collect();
+    if std::env::var_os("BARU_PER_PARTY_COMM").is_some() {
+        let per: Vec<CommStats> = all.iter().map(|h| h.stats()).collect();
+        let max = per.iter().map(|c| c.bytes).max().unwrap_or(0);
+        eprintln!("  per-party traffic (bytes sent, messages):");
+        for (i, c) in per.iter().enumerate() {
+            eprintln!(
+                "    party {i}: {:>12} B  {:>8} msgs{}",
+                c.bytes,
+                c.messages,
+                if c.bytes == max { "   <- busiest" } else { "" }
+            );
+        }
+        eprintln!(
+            "    party 0 is {:.2}x the busiest link; a crossover read off party 0 \
+             understates the bandwidth term by that factor",
+            per[0].bytes as f64 / max.max(1) as f64
+        );
+        // How much of the traffic is broadcast, and so how much the simulated pipe
+        // under-charges: `CountingTransport` bills a broadcast per recipient (right
+        // for point-to-point links) while `LatencyTransport` serializes it once.
+        for (i, c) in per.iter().enumerate() {
+            let share = c.broadcast_bytes as f64 / c.bytes.max(1) as f64;
+            eprintln!(
+                "    party {i}: {:.0}% of bytes are broadcast, so the pipe simulates \
+                 {:.2}x of the serialization it should",
+                100.0 * share,
+                1.0 - share / 2.0
+            );
+        }
+    }
     (results, comm.unwrap().stats())
 }
 

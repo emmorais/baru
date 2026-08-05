@@ -188,7 +188,7 @@ fn measure_gc_transport(n: usize, b: usize, profile: NetworkProfile) -> (f64, us
     let handles = InprocHandle::create(2);
     let mut wrapped: Vec<CountingTransport<LatencyTransport<InprocHandle>>> = handles
         .into_iter()
-        .map(|h| CountingTransport::new(LatencyTransport::new(h, profile), 2))
+        .map(|h| CountingTransport::new(LatencyTransport::new(h, profile, 2), 2))
         .collect();
     let comm = wrapped[0].handle();
     let evaluator = wrapped.pop().unwrap();
@@ -310,7 +310,7 @@ fn measure_gc_relu_transport(
     let handles = InprocHandle::create(2);
     let mut wrapped: Vec<CountingTransport<LatencyTransport<InprocHandle>>> = handles
         .into_iter()
-        .map(|h| CountingTransport::new(LatencyTransport::new(h, profile), 2))
+        .map(|h| CountingTransport::new(LatencyTransport::new(h, profile, 2), 2))
         .collect();
     let comm = wrapped[0].handle();
     let evaluator = wrapped.pop().unwrap();

@@ -1186,12 +1186,16 @@ Definition~\ref{def:cek} in this work.
     \bt{guard} installs one and leaving its body pops it. Therefore error handling inside a
     private computation requires no exceptions of the host language, and it cannot
     accidentally unwind past a point at which a protocol must synchronize.
-  \item \textbf{Batching is a decision of the machine.} Since $K$ is inspectable, the machine
-    can observe that an entire layer of \bt{lt} calls is independent and issue those calls as
-    one batched protocol round. We remark that this matters more than it appears to: almost
-    every cost result in this survey depends on the distinction between a cost that is paid
-    per element and a cost that is paid per call, and a batched round is what makes a whole
-    $\ReLU$ layer one synchronization instead of thousands.
+  \item \textbf{The abstraction admits batching, although the machine does not perform it.} A
+    backend primitive receives a \emph{vector} of operands, so an entire layer of \bt{lt} calls
+    can be one protocol round rather than thousands. We are precise about where that batching
+    comes from, because it is not from the continuation: our evaluator issues primitives one at
+    a time, and the parallelism is supplied either by a gadget that calls the batched primitive
+    explicitly, or by the compiler of Section~\ref{sec:cross}, which recovers it automatically
+    by levelling a dependence graph. What the abstract machine contributes is the seam that lets
+    both routes exist behind one program. We remark that this distinction matters more than it
+    appears to, since almost every cost result in this survey depends on the difference between
+    a cost paid per element and a cost paid per call.
   \item \textbf{The state is serializable.} A configuration is an ordinary value, so an
     execution can be checkpointed, replayed, or, as we use it here, run three times in
     lockstep by three parties whose operation identifiers are required to agree. We derive
@@ -1629,12 +1633,300 @@ commit to a protocol in order to emit code, whereas an interpreter can leave the
 backend and consequently hold the program fixed across the paradigms, as we argued in
 Section~\ref{sec:cek}.
 
-The third difference is \textbf{what is being optimized}. MP-SPDZ optimizes the performance of
-protocols, and our artifact optimizes the comparability of measurements, by means of an
-identical transport, a uniform accounting and a bit-exactness gate on quoting any cost, as we
-describe in Section~\ref{sec:method}. It means that the two works answer complementary
-questions: MP-SPDZ tells us how fast a protocol can be made, and a study of the present kind
-tells us whether two such numbers may be placed in the same table.
+The third difference is \textbf{maturity of the optimizer}, and here we were until recently
+describing our own artifact inaccurately. We had written that MP-SPDZ optimizes protocol
+performance while we optimize the comparability of measurements. The second half is true and the
+first half understates what we have: our compiler carries an instruction graph, an as-soon-as-
+possible levelling pass that collapses independent operations into one batched round, common
+subexpression elimination, reassociation of dependent reductions, per-protocol cost models, and
+an assignment pass that chooses a protocol per kind of operation. Those are the same categories
+of pass that make MP-SPDZ's compiler effective, and Table~\ref{tab:handvscompiled} measures what
+they buy against an expert baseline.
+
+\begin{table}[htb]
+\centering
+\small
+\begin{tabular}{@{}lrrrrrr@{}}
+\toprule
+route & calls & \textbf{waits} & messages & bytes & ms (RTT 0) & ms (RTT 20) \\
+\midrule
+hand-written gadgets & \num{24} & \textbf{\num{33}}$^\dagger$ & \num{61} & \num{33466} & 53.2 & 493.2 \\
+hand-written, gc cmp & \num{21} & \textbf{\num{12}} & \num{46} & \num{30191} & 28.4 & 279.2 \\
+\midrule
+compiled, serial & \num{15304} & \num{18362} & \num{18367} & \num{3822372} & \num{26344} & \num{245972} \\
+\quad + ASAP levelling & \num{15} & \num{43} & \num{47} & \num{881324} & 195.1 & 757.3 \\
+\quad + CSE & \num{15} & \num{43} & \num{47} & \num{33504} & 61.0 & 620.7 \\
+\quad + reassociation & \num{12} & \num{33} & \num{37} & \num{33262} & 48.3 & 486.3 \\
+\quad + gc comparisons & \num{9} & \textbf{\num{12}} & \num{22} & \num{29987} & 32.4 & 269.9 \\
+\bottomrule
+\end{tabular}
+\caption{One network, $x(16) \to \text{dense}(8) \to \ReLU \to \text{dense}(4) \to \max$ with
+secret weights, both routes over the same transport and both checked against the plaintext
+reference. The gadget route is written by an expert who called the batched primitives
+deliberately; the compiled route is scalar source with no batching hint. \emph{Calls} counts
+backend primitives, \emph{waits} counts the times a party blocked for a peer. The last rung is a
+protocol assignment rather than a compiler pass, so the hand-written route is given the same
+assignment in the second row --- the two rows in bold are the comparison that means something.
+Bytes are one run and are stable; the millisecond columns carry the harness's run-to-run variance
+of roughly \SI{13}{\percent}. $^\dagger$Waits carry a $\pm 1$ of their own, and the marker is on
+this row because it is where we first saw it: over four repetitions at RTT~0 it read \num{32},
+\num{33}, \num{32}, \num{33}, while every other row was identical in all four. A run that also
+swept RTT~20 then moved three rows by one count, so the jitter is not confined to this row --- it
+is a property of the counter. A receive that finds its message already delivered does not block, so
+the quantity is how many times a party \emph{had} to stop, and that depends on thread interleaving,
+which the network profile itself perturbs. Read every wait figure here as $\pm 1$.}
+\label{tab:handvscompiled}
+\end{table}
+
+\finding{Automatic scheduling reaches \emph{parity} with the expert, and the metric that shows it
+is neither of the two we reached for first. The compiled route makes half the primitive calls
+($\num{12}$ against $\num{24}$) and sends $0.61\times$ the messages, yet blocks the same number of
+times ($\num{33}$ against \numrange{32}{33}) and takes the same wall clock. Calls and messages do
+not predict cost here; waits do.}
+
+We should be precise about what ``the same number of times'' is doing in that sentence, because we
+were not at first, and we corrected ourselves twice. Waits are \emph{almost} deterministic, not
+deterministic. The mechanism is visible in the instrumentation: a receive is counted as a wait only
+when it actually polls the transport, and one that finds its message already delivered does not, so
+the quantity is the number of times a party \emph{had} to stop, and that depends on how the three
+threads interleave.
+
+Our first correction was to withdraw the phrase ``exact parity'', which we had written on the
+strength of two equal readings of \num{33}. Four repetitions showed the expert's route reading
+\num{32} or \num{33} while every other row held. Our second was to withdraw the accompanying claim
+that only that one row was unstable: a later run that swept a second round-trip time moved three
+rows by one count each. The network profile perturbs the interleaving, so the jitter is a property
+of the counter and not of one route. Every wait figure we report should be read as $\pm 1$.
+
+What survives is the argument, because none of it rests on a single count. Parity is parity within
+the counter's resolution, and the effects we measure against it --- a factor of \num{136} for
+levelling, \num{2.7} for the protocol assignment, \num{214} for the local-cost constant --- are not
+one-count effects. We record the two corrections because the temptation each time was to quote the
+equality we had happened to observe.
+
+The reason is that a primitive call is not a round. A \bt{mul\_batch} blocks once; a
+\bt{lt\_batch} performs an entire bit decomposition and blocks once per stage of the prefix
+adder. Counting calls therefore weighs a comparison and a multiplication equally, and a route
+that trades many multiplications for few comparisons looks better than it is. We had written
+this section twice on the strength of the call count, once claiming the compiler beat the expert
+and once attributing the residual to executor overhead; both readings were artifacts of the
+counter, and neither survived adding one that counts blocking.
+
+We read the corrected table as good news of a narrower kind. Automatic levelling over a
+dependence graph, with no hint from the source, recovers what a careful author achieves by
+remembering to call the batched primitive --- which is the premise the rest of this section needs.
+It also shows which pass does the work: levelling alone leaves the compiled route at $\num{43}$
+waits against the expert's $\num{33}$, and it is reassociating the dependent reduction that
+closes the gap to $\num{32}$. Common subexpression elimination contributes nothing to waits at
+all, and a great deal to bytes ($\num{881}$ against \SI{33.5}{\kilo\byte}), which is why the
+ladder is reported per pass rather than as one number.
+
+\paragraph{The cost of a primitive, measured.}
+Once blocking is the unit, the cost of each primitive can be measured rather than assumed, and
+Table~\ref{tab:waitcost} does so at two batch widths. The width columns agree, which is the
+property that makes levelling worth doing: a batched primitive blocks the same number of times
+whatever its width, so collapsing a layer into one call is free in rounds.
+
+\begin{table}[htb]
+\centering
+\small
+\begin{tabular}{@{}lrrr@{}}
+\toprule
+primitive & waits, width 1 & waits, width 64 & modelled rounds \\
+\midrule
+\bt{mul\_batch} & 2 & 2 & 1 \\
+\bt{lt\_batch} & 9 & 9 & 7 \\
+\bt{a2b\_batch} & 9 & 9 & 7 \\
+\bt{reveal} & 1--2 & 1--2 & 1 \\
+\bottomrule
+\end{tabular}
+\caption{Blocking cost per primitive at $\ell = 32$, against what our cost model charges}
+\label{tab:waitcost}
+\end{table}
+
+A comparison costs about four and a half multiplications, which is the ratio any scheduler
+trading one against the other has to know, and our model's structure already reflects it: it
+prices a comparison as an opening plus $\lceil \log_2 \ell \rceil + 1$ multiplication rounds,
+against one for a multiplication. The constants have not been fitted --- the model charges 1
+where the implementation blocks twice, and 7 where it blocks nine times --- so the ratio is the
+right order ($7\times$ modelled against $4.5\times$ measured) while the absolute figures are not
+yet calibrated. Now that blocking is counted, they can be.
+
+We also record a place where the model and the executor are defined differently, together with
+what that costs, because the second part is easy to assume and was not what we assumed. The model
+charges a level the \emph{maximum} over the primitives it contains, on the reasoning that a level
+is one logical round; the executor issues one batched call per \emph{kind} per level and each
+blocks, so a level holding a multiplication and a comparison pays their \emph{sum}. We expected
+this to be the largest item outstanding. Counting the mixed levels in the network of
+Table~\ref{tab:handvscompiled} shows there are \emph{none}: the schedule has \num{8} interactive
+levels and issues \num{8} batched calls. The reason is structural rather than lucky --- a
+$\ReLU$ written as $z \cdot (z > 0)$ puts its comparison and its multiplication at consecutive
+levels by construction, and so does a mux-style $\max$ --- so the two definitions differ and this
+class of program does not pay for the difference. We keep the counter (\bt{ExecStats::mixed\_levels})
+so that a schedule which does pay is visible rather than inferred, and we do not claim the
+optimisation.
+
+\paragraph{Which primitive to attack, and the assignment that follows.}
+Attributing the \num{32} waits to levels says where the budget goes: three of the eight
+interactive levels hold a comparison, and at nine blocks each they account for \SI{72}{\percent}
+of the total, against two blocks for a multiplication level. The comparison is therefore the
+primitive worth changing, and Baru has three of them. Table~\ref{tab:cmpbackends} measures what
+each costs.
+
+\begin{table}[htb]
+\centering
+\small
+\begin{tabular}{@{}lrrr@{}}
+\toprule
+comparison backend & waits & messages & kilobytes \\
+\midrule
+\bt{a2b} --- batched bit decomposition & \num{10} & \num{16} & 127.1 \\
+\bt{falcon} --- $\Pi_{\mathsf{DReLU}}$ over $\Z_p$ & \num{11} & \num{44} & \textbf{49.1} \\
+\bt{gc} --- three-party garbled circuits & \textbf{3} & \num{11} & 109.9 \\
+\bottomrule
+\end{tabular}
+\caption{\num{64} comparisons at $\ell = 32$, online phase, preprocessing filled in advance.
+Bytes are the whole run including preprocessing.}
+\label{tab:cmpbackends}
+\end{table}
+
+The spread is $3.7\times$ in blocking, which is what makes an assignment worth deriving at all:
+if the three agreed there would be nothing to choose between them. Two things follow. The first
+is that \bt{gc} \ib{strictly dominates} \bt{a2b} here, in blocking and in bytes both, and \bt{a2b}
+was the default the compiled route used --- so the assignment pass had a free improvement
+available that no correctness test and no byte count would ever have surfaced. The second is that
+\bt{falcon} is the byte-cheapest by $2.2\times$ while being the block-dearest, which is the same
+trade our crossover measurements report at the network level (\S\ref{sec:crossover-nonlin}) arriving
+here at the level of a single primitive. An assignment cannot be read off one column.
+
+\finding{Assigning the comparison levels to the constant-round backend cuts the compiled route
+from \num{33} blocks to \numrange{11}{12}, a reduction of \numrange{2.8}{3.0} times and the largest
+single lever after levelling itself. It is also \emph{not a compiler result}: giving the
+hand-written route the same assignment takes it from \numrange{32}{33} to \numrange{11}{12} as well,
+so measuring the assigned compiler against the unassigned expert would report roughly a
+$0.36\times$ win of which the compiler contributed nothing. Compared like with like the two are at
+parity, and they are at parity in the strong sense that their observed \emph{ranges} coincide over
+eight runs rather than that two particular readings happened to agree.}
+
+\paragraph{Keying the choice on the deployment, and the third term that decides it.}
+An assignment that is right for one link is not an assignment. Baru's precompile registry
+previously held one champion per gadget, set by a maintainer on the strength of a benchmark; it
+now also answers \emph{which entry for this link}, ranking the measured candidates under the
+latency model. We built that expecting Table~\ref{tab:cmpbackends} to demonstrate it: \bt{falcon}
+is $2.2\times$ cheaper on the wire and $3.7\times$ dearer in blocking, so the champion ought to
+flip between a thin pipe and a slow one. We then measured all three backends across the grid, and
+report the result because it is not the one we expected.
+
+\begin{table}[htb]
+\centering
+\small
+\begin{tabular}{@{}lrrr@{}}
+\toprule
+backend & network free & RTT 0, \SI{10}{\mega\bit\per\second} & RTT 40, \SI{100}{\mega\bit\per\second} \\
+\midrule
+\bt{a2b} & \SI{33}{\milli\second} & \SI{206}{\milli\second} & \SI{334}{\milli\second} \\
+\bt{falcon} & \SI{79}{\milli\second} & \SI{130}{\milli\second} & \SI{1056}{\milli\second} \\
+\bt{gc} & \textbf{\SI{13}{\milli\second}} & \textbf{\SI{105}{\milli\second}} & \textbf{\SI{201}{\milli\second}} \\
+\bottomrule
+\end{tabular}
+\caption{The same \num{64} comparisons at $\ell = 32$, wall clock, across three links. The first
+column is \bt{NetworkProfile::INSTANT} --- zero latency, unlimited bandwidth --- so it isolates
+local cryptographic work.}
+\label{tab:cmplinks}
+\end{table}
+
+\finding{Garbled circuits are fastest at every point of the grid, and the reason is a term our
+cost model does not contain. With the network free, Falcon's comparison costs $6\times$ what the
+garbled one does --- that is local arithmetic over $\Z_p$ together with its preprocessing --- and
+a model of the form $\text{waits} \times \text{RTT} + \text{bytes}/\text{bandwidth}$ charges every
+candidate zero for it.}
+
+The omission is not cosmetic, and it failed in two distinct ways. On a fast link the model
+predicts \SI{0}{\second} for all three candidates and cannot rank them at all, so the choice fell
+through to a tie-break which returned the \emph{dominated} entry --- a wrong answer rather than an
+arbitrary one. On a thin pipe it mispicked outright, preferring Falcon at \SI{130}{\milli\second}
+to garbled circuits at \SI{105}{\milli\second}: the \SI{78}{\kilo\byte} Falcon saves is worth
+\SI{62}{\milli\second} at \SI{10}{\mega\bit\per\second}, and it spends \SI{66}{\milli\second} more
+in local work to save it. A measured local term restores agreement with the wall clock to
+$1.00\times$ at all three points.
+
+We keep the link-keyed machinery and withdraw the example. The machinery is the right shape, the
+byte-against-blocking trade it expresses is one we measure at the level of whole routes
+(\S\ref{sec:crossover-nonlin}), and the assignment it selects is worth $2.75\times$ in blocking.
+What we no longer claim is that the comparison gadget is where the champion flips: it is not, and
+the test that asserted a flip now asserts the measured fact, so a change that produces one will
+fail it and be looked at.
+
+\paragraph{The same term in the analytic model, and what fitting it changed.}
+Our analytic cost model does not have the omission just described --- it carries a local-work term
+and reports a \emph{compute} bottleneck when that term dominates. Its problem was narrower and
+worse: the constant feeding it had carried the comment \emph{``an estimate; calibrated in P1''}
+since it was written, and that calibration never happened. Our own calibration command validates
+predicted rounds and predicted online bytes against a measured run and reports zero error on both;
+it never touched compute. So we fitted it, and we describe the method because the number is
+machine-specific and the method is not: wall clock on a free network is per-lane work \emph{plus} a
+fixed cost --- thread spawn, share setup --- so dividing one measurement by its width charges the
+fixed part to every lane. We measure four batch widths from \num{1024} to \num{65536} and fit the
+\ib{slope}, reporting the intercept separately; Table~\ref{tab:localfit} gives the result together
+with the two quantities that bracket it.
+
+\begin{table}[htb]
+\centering
+\small
+\begin{tabular}{@{}lr@{}}
+\toprule
+quantity & measured \\
+\midrule
+\bt{mul\_batch}, real transport, network free & \textbf{\SI{1072}{\nano\second}} per lane \\
+local-only \bt{add}, no communication at all & \SI{145}{\nano\second} per lane \\
+the estimate it replaced & \SI{5}{\nano\second} per lane \\
+\bottomrule
+\end{tabular}
+\caption{Fitting the per-lane local cost of an ABY3 multiplication}
+\label{tab:localfit}
+\end{table}
+
+\finding{The assumed constant was \num{214} times low for a multiplication lane, and \num{29}
+times low even for the arithmetic floor: an addition, which communicates nothing whatsoever,
+already costs \SI{145}{\nano\second} in share bookkeeping and a ring addition. A multiplication is
+$7.4\times$ an addition, the remainder being serialization and the channel round.}
+
+Neither reading rescues the constant, so we replaced it and marked it fitted, leaving every other
+protocol's at its literature estimate and marked as such. The correction is not cosmetic. On a
+three-instruction program compute is \SI{3}{\micro\second} against \SI{878}{\micro\second} of
+latency and nothing moves; on a \emph{batched} program --- \num{513} interactive operations over
+two dependence levels, which is the shape of a dense layer --- the predicted total moves from
+\SI{169}{\micro\second} to \SI{716}{\micro\second}, a factor of $4.2$, and the reported bottleneck
+flips from latency to compute. That is the regime every neural-network claim in this paper lives
+in.
+
+We are obliged to add that the resulting table is \emph{not} a ranking, and we have made the
+artifact say so. ABY3 is now the only protocol whose compute term is measured; the others carry
+estimates that are presumably low by a comparable factor, so reading a cross-protocol ordering off
+a compute-bound table would be the same error of comparing incommensurable quantities that this
+section has already recorded three times. The comparison output now emits a note whenever any row
+is compute-bound, naming which constant is fitted and declining the ordering. We also record that
+our three-party \emph{simulator} is unusable for timing --- it has no batched multiplication and
+spawns three operating-system threads per multiplication, measuring \SI{58}{\micro\second} per lane
+against the real backend's \SI{1.07}{\micro\second} --- because it is the instrument one would
+naturally reach for, and the calibration test now says so at the point of temptation.
+
+We labour the control because this benchmark's own history is three readings that compared
+quantities which were not comparable, and the test that fixes the fourth now asserts that the
+mismatched comparison is the flattering one --- so the reading that would overstate the compiler
+is pinned in place as a thing to avoid rather than described in a comment. What the result does
+establish is the premise the next section needs: the comparison backends differ enough to be
+worth choosing between, the choice is invisible to correctness, and the compiler is a good enough
+consumer of such a choice that it will not squander it.
+
+We remark that this is a narrower claim than MP-SPDZ's, and deliberately so. MP-SPDZ implements
+tens of protocols against our handful, its compiler vectorizes where ours does not, and its
+engineering is years ahead; a practitioner choosing an MPC protocol should still start there.
+What Table~\ref{tab:handvscompiled} supports is only that automatic scheduling over a dependence
+graph recovers, and slightly exceeds, what a careful author achieves by remembering to call the
+batched primitive --- which is the premise the rest of this section needs, because a per-operation
+protocol assignment is worth deriving only if the code that consumes the assignment is not itself
+leaving rounds on the table.
 
 \paragraph{Frameworks based on circuit compilation.} ABY~\cite{ABY} introduced
 mixed-protocol two-party computation with explicit conversions between arithmetic, Boolean and
@@ -1960,13 +2252,37 @@ it sharply \emph{up}. Cells within ${\approx}\SI{13}{\percent}$ are unresolved
 \label{tab:crossover}
 \end{table}
 
-The mechanism appears in the same run. Falcon sends \SI{3.4}{\mega\byte} against the
-\SI{10.1}{\mega\byte} of garbled circuits, which is $2.94\times$ cheaper, and it does so in
-\num{445} messages against \num{61}, which is $7.3\times$ dearer. It means that the two terms of
-the cost model trade against each other, and that each boundary is located where the trade
-balances. We remark that pooling the preprocessing also \emph{reduces} the messages of Falcon, to
-\num{304}, because a single draw per segment batches better than many inline ones, and since its
-bytes are unchanged, warming the server improves both terms at once.
+The mechanism appears in the same run. On the party-to-party transport Falcon sends
+\SI{3.4}{\mega\byte} against the \SI{10.1}{\mega\byte} of garbled circuits, which is $2.94\times$
+cheaper, and it does so in several hundred messages against \num{61}, which is around
+$7\times$ dearer. It means that the two terms of the cost model trade against each other, and that
+each boundary is located where the trade balances.
+
+We must qualify the byte figure, because we quoted it for some time without the qualification and
+it changes how decisive that axis is. The party-to-party transport is not all the traffic: the
+hybrid also moves FHE ciphertexts and scheme-switch payloads on the \ib{evaluator link}, which does
+not pass through the instrumented party transport and so appeared in no counter, while the latency
+column paid its bandwidth cost throughout. Fitting a diagnosis's time against the reciprocal of
+bandwidth exposed the gap --- the fit is clean and linear, with a slope near \SI{29}{\mega\byte}
+where the traffic table said \SI{10.1}{\mega\byte} --- and the missing term is
+\SI{17.0}{\mega\byte} per diagnosis, identical for both routes because it is the same pipeline
+either way. Total traffic is therefore \SI{27.0}{\mega\byte} for garbled circuits against
+\SI{20.4}{\mega\byte} for Falcon.
+
+\finding{Falcon's byte advantage is $1.33\times$ on what the deployment actually moves, not the
+$2.94\times$ the party transport alone reports --- a common additive term of \SI{17}{\mega\byte}
+dilutes it by $2.2\times$. Because the term is common, the crossover \emph{location} is unchanged:
+adding the same quantity to both curves cannot move where they cross. What changes is the
+magnitude of the advantage, and hence how strongly bandwidth ought to be expected to favour one
+route.}
+
+We remark that pooling the preprocessing also \emph{reduces} the messages of Falcon, because a
+single draw per segment batches better than many inline ones, and since its bytes are unchanged,
+warming the server improves both terms at once. Falcon's message count is no longer a fixed
+number, and we give it as a range above for that reason: closing the private-comparison leak of
+\S\ref{sec:uc} replaced an opening of the mask with an opening of a masked product, and the
+rejection sampling that needs adds a data-dependent number of retries. Two consecutive runs of the
+identical configuration measured \num{474} and \num{482}.
 
 \paragraph{We reported three other answers before this one, and we consider the sequence to
 be the more useful result.} Each of them was reproducible, each computed the correct diagnosis, and

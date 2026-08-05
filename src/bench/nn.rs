@@ -407,7 +407,7 @@ pub fn run_mpc_as(
     let overall_start = Instant::now();
 
     for (me, h) in handles.into_iter().enumerate() {
-        let lat = LatencyTransport::new(h, profile);
+        let lat = LatencyTransport::new(h, profile, 3);
         let counted = CountingTransport::new(lat, 3);
         comm_handles.push(counted.handle());
         let x = x.clone();

@@ -163,6 +163,23 @@ pub fn public_parts(key_bytes: &[u8]) -> (Vec<u128>, Vec<u128>) {
     (k.b, k.a)
 }
 
+/// Serialize a **public** key bundle from its two polynomials.
+///
+/// The inverse of [`public_parts`], for a key that was never generated in one
+/// place: distributed key generation
+/// ([`crate::fhe::threshold::dkg_aggregate_public`]) produces `b` as a sum of
+/// per-party contributions, and `s` is never assembled at all. The bundle it
+/// writes carries an empty `s`, exactly as [`Bfv::keygen`]'s server half does,
+/// so every encryption path is unchanged.
+pub fn public_key_bytes(b: &[u128], a: &[u128]) -> Vec<u8> {
+    bincode::serialize(&KeyBundle {
+        s: Vec::new(),
+        b: b.to_vec(),
+        a: a.to_vec(),
+    })
+    .expect("serialize BFV public key")
+}
+
 /// The secret polynomial `s` from a client key bundle, so it can be split into
 /// threshold shares by [`crate::fhe::threshold::deal_key_shares`].
 pub fn secret_part(client_key_bytes: &[u8]) -> Vec<u128> {

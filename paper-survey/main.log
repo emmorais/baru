@@ -1,4 +1,4 @@
-This is pdfTeX, Version 3.141592653-2.6-1.40.29 (TeX Live 2026) (preloaded format=pdflatex 2026.8.2)  5 AUG 2026 07:57
+This is pdfTeX, Version 3.141592653-2.6-1.40.29 (TeX Live 2026) (preloaded format=pdflatex 2026.8.2)  5 AUG 2026 19:04
 entering extended mode
  restricted \write18 enabled.
  %&-line parsing enabled.
@@ -1328,38 +1328,39 @@ pdfTeX warning (ext4): destination with the same identifier (name{figure.9}) ha
 s been already used, duplicate ignored
 <argument> ...shipout:D \box_use:N \l_shipout_box 
                                                   \__shipout_drop_firstpage_...
-l.1195   \item \textbf
+l.1199   \item \textbf
                       {The state is serializable.} A configuration is an ord...
 ] [17] [18
 pdfTeX warning (ext4): destination with the same identifier (name{table.3}) has
  been already used, duplicate ignored
 <argument> ...shipout:D \box_use:N \l_shipout_box 
                                                   \__shipout_drop_firstpage_...
-l.1306 
-       ] [19
+l.1304 W
+        e remark that this layer taught us the same engineering lesson on fo...
+] [19
 pdfTeX warning (ext4): destination with the same identifier (name{table.4}) has
  been already used, duplicate ignored
 <argument> ...shipout:D \box_use:N \l_shipout_box 
                                                   \__shipout_drop_firstpage_...
-l.1378 
+l.1382 
        ] [20] [21
 pdfTeX warning (ext4): destination with the same identifier (name{table.5}) has
  been already used, duplicate ignored
 <argument> ...shipout:D \box_use:N \l_shipout_box 
                                                   \__shipout_drop_firstpage_...
-l.1519 \end{table}
-                  ] [22
+l.1506 
+       ] [22
 pdfTeX warning (ext4): destination with the same identifier (name{table.6}) has
  been already used, duplicate ignored
 <argument> ...shipout:D \box_use:N \l_shipout_box 
                                                   \__shipout_drop_firstpage_...
-l.1583 
+l.1578 
        
 pdfTeX warning (ext4): destination with the same identifier (name{table.7}) has
  been already used, duplicate ignored
 <argument> ...shipout:D \box_use:N \l_shipout_box 
                                                   \__shipout_drop_firstpage_...
-l.1583 
+l.1578 
        ]
 Package microtype Info: Character `029' is missing
 (microtype)             in font `T1/lmr/m/sc/10.95'.
@@ -1369,38 +1370,65 @@ pdfTeX warning (ext4): destination with the same identifier (name{table.8}) has
  been already used, duplicate ignored
 <argument> ...shipout:D \box_use:N \l_shipout_box 
                                                   \__shipout_drop_firstpage_...
-l.1639 \paragraph
-                 {Frameworks based on circuit compilation.} ABY~\cite{ABY} i...
-] [24] [25] [26] [27] [28
+l.1645 
+       ] [24
 pdfTeX warning (ext4): destination with the same identifier (name{table.9}) has
  been already used, duplicate ignored
 <argument> ...shipout:D \box_use:N \l_shipout_box 
                                                   \__shipout_drop_firstpage_...
-l.1970 
-       ] [29
+l.1706 
+       ] [25
 pdfTeX warning (ext4): destination with the same identifier (name{table.10}) ha
 s been already used, duplicate ignored
 <argument> ...shipout:D \box_use:N \l_shipout_box 
                                                   \__shipout_drop_firstpage_...
-l.2006 
-       ] [30]
-Overfull \hbox (5.35579pt too wide) in paragraph at lines 2076--2099
- [][] 
- []
-
-[31
+l.1768 
+       ] [26
 pdfTeX warning (ext4): destination with the same identifier (name{table.11}) ha
 s been already used, duplicate ignored
 <argument> ...shipout:D \box_use:N \l_shipout_box 
                                                   \__shipout_drop_firstpage_...
-l.2133 instructive.}
-                     Retraining both at $\mathrm{conv}(16,32)$---whose secon...
-] [32] [33] [34] [35] (./main.bbl [36] [37] [38] [39]) [40] (./main.aux)
+l.1852 
+       ] [27
+pdfTeX warning (ext4): destination with the same identifier (name{table.12}) ha
+s been already used, duplicate ignored
+<argument> ...shipout:D \box_use:N \l_shipout_box 
+                                                  \__shipout_drop_firstpage_...
+l.1902 
+       
+pdfTeX warning (ext4): destination with the same identifier (name{table.13}) ha
+s been already used, duplicate ignored
+<argument> ...shipout:D \box_use:N \l_shipout_box 
+                                                  \__shipout_drop_firstpage_...
+l.1902 
+       ] [28] [29] [30] [31] [32
+pdfTeX warning (ext4): destination with the same identifier (name{table.14}) ha
+s been already used, duplicate ignored
+<argument> ...shipout:D \box_use:N \l_shipout_box 
+                                                  \__shipout_drop_firstpage_...
+l.2207 
+       ] [33
+pdfTeX warning (ext4): destination with the same identifier (name{table.15}) ha
+s been already used, duplicate ignored
+<argument> ...shipout:D \box_use:N \l_shipout_box 
+                                                  \__shipout_drop_firstpage_...
+l.2271 
+       ] [34]
+Overfull \hbox (5.35579pt too wide) in paragraph at lines 2392--2415
+ [][] 
+ []
+
+[35] [36
+pdfTeX warning (ext4): destination with the same identifier (name{table.16}) ha
+s been already used, duplicate ignored
+<argument> ...shipout:D \box_use:N \l_shipout_box 
+                                                  \__shipout_drop_firstpage_...
+l.2456 
+       ] [37] [38] [39] [40] (./main.bbl [41] [42] [43] [44]) [45] (./main.aux)
  ***********
 LaTeX2e <2025-11-01>
 L3 programming layer <2026-01-19>
  ***********
-
 
 LaTeX Font Warning: Some font shapes were not available, defaults substituted.
 
@@ -1408,13 +1436,13 @@ Package rerunfilecheck Info: File `main.out' has not changed.
 (rerunfilecheck)             Checksum: 38B6825053257A93E0428575E6BAF9F8;9439.
  ) 
 Here is how much of TeX's memory you used:
- 36618 strings out of 467525
- 755473 string characters out of 5418983
- 1226146 words of memory out of 5000000
- 64089 multiletter control sequences out of 15000+600000
- 827518 words of font info for 420 fonts, out of 8000000 for 9000
+ 36652 strings out of 467525
+ 755895 string characters out of 5418983
+ 1229243 words of memory out of 5000000
+ 64099 multiletter control sequences out of 15000+600000
+ 828173 words of font info for 425 fonts, out of 8000000 for 9000
  1141 hyphenation exceptions out of 8191
- 102i,14n,107p,1082b,1174s stack positions out of 10000i,1000n,20000p,200000b,200000s
+ 102i,14n,107p,1589b,1174s stack positions out of 10000i,1000n,20000p,200000b,200000s
 </usr/local/texlive/2026/texmf-dist/fonts/type1/public/lm/lmbsy10.pfb></usr/l
 ocal/texlive/2026/texmf-dist/fonts/type1/public/lm/lmbx10.pfb></usr/local/texli
 ve/2026/texmf-dist/fonts/type1/public/lm/lmbx12.pfb></usr/local/texlive/2026/te
@@ -1444,10 +1472,10 @@ msy8.pfb></usr/local/texlive/2026/texmf-dist/fonts/type1/public/lm/lmsy9.pfb></
 usr/local/texlive/2026/texmf-dist/fonts/type1/public/lm/lmtt10.pfb></usr/local/
 texlive/2026/texmf-dist/fonts/type1/public/amsfonts/symbols/msam10.pfb></usr/lo
 cal/texlive/2026/texmf-dist/fonts/type1/public/amsfonts/symbols/msbm10.pfb>
-Output written on main.pdf (40 pages, 693654 bytes).
+Output written on main.pdf (45 pages, 718320 bytes).
 PDF statistics:
- 1126 PDF objects out of 1200 (max. 8388607)
- 993 compressed objects within 10 object streams
- 287 named destinations out of 1000 (max. 500000)
+ 1171 PDF objects out of 1200 (max. 8388607)
+ 1032 compressed objects within 11 object streams
+ 301 named destinations out of 1000 (max. 500000)
  111989 words of extra memory for PDF output out of 128383 (max. 10000000)
 

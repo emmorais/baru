@@ -82,6 +82,13 @@ fn build_default_registry() -> Registry<dyn MpcMatVec> {
             id: "matvec-naive",
             author: "baru-core",
             description: "per-element mul+add loop; O(in_dim*out_dim) MPC rounds",
+            // No regime-dependent cost recorded: the competition found the
+            // batched entry below strictly faster at every shape tested, so the
+            // champion here is unconditional and there is nothing for
+            // `champion_for` to choose. Filling these in with figures that were
+            // not measured as (waits, bytes) at a stated shape is the error this
+            // field exists to prevent.
+            cost: None,
         },
         Box::new(NaiveMatVec) as Box<dyn MpcMatVec>,
     );
@@ -90,6 +97,7 @@ fn build_default_registry() -> Registry<dyn MpcMatVec> {
             id: "matvec-batched",
             author: "baru-core",
             description: "single mul_batch call for the whole matrix; O(1) MPC rounds",
+            cost: None,
         },
         Box::new(BatchedMatVec),
     );

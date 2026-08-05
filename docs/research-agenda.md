@@ -514,6 +514,329 @@ a rewrite that changes semantics cannot survive.
 That gives the paper a clean table: one program, N backends, and the observation
 that the optimized circuits are *different circuits*.
 
+### The wait budget, and the first assignment measured end to end (2026-08-05)
+
+`sync_waits` — the number of times a party blocks for a peer — is the counter
+that predicts wall clock; `interactive_calls` and `messages` both contradicted
+it (E33). With it in place the compiled network's 33 blocks can be *attributed*
+rather than guessed at, and the attribution is lopsided:
+
+| levels | what they hold | blocks each | share of budget |
+|---|---|---|---|
+| 3 of 8 | a comparison | 9 | **72%** |
+| 5 of 8 | multiplies / muxes only | 2 | 28% |
+
+So the comparison is the primitive worth changing, and Baru has three. Measured
+at 64 comparisons, ℓ=32, preprocessing pre-filled
+(`the_wait_cost_of_each_comparison_backend`):
+
+| backend | waits | messages | kB |
+|---|---|---|---|
+| `a2b` | 10 | 16 | 127.1 |
+| `falcon` | 11 | 44 | **49.1** |
+| `gc` | **3** | 11 | 109.9 |
+
+A **3.7× spread in blocking**, which is the precondition for an assignment pass
+being worth deriving at all — if the three agreed there would be nothing to
+choose. Two readings matter:
+
+- **`gc` strictly dominates `a2b`** on both axes, and `a2b` was the compiled
+  route's default. A free improvement, invisible to every correctness test and
+  to the byte count.
+- **`falcon` is byte-cheapest by 2.2× and block-dearest.** The same trade the
+  network-level crossover reports, arriving at the granularity of one
+  primitive. An assignment cannot be read off one column, which is why the
+  registry key has to carry the network regime.
+
+Assigning comparison levels to `gc` cuts the compiled route **33 → 12 blocks
+(2.75×)** — the largest lever after levelling — and 486 → 270 ms at RTT 20.
+
+**The control is the result.** The same assignment takes the *hand-written*
+route 33 → 12 blocks and 493 → 279 ms. The gc win is a **protocol** result,
+available to whoever writes the circuit; measuring the assigned compiler against
+the unassigned expert reports 0.36× waits of which the compiler contributed
+nothing. Like for like the two are at **parity (12 vs 12)**. `bench-compiled-nn`
+now carries a `gadget + gc` control row, the summary compares at the matched
+backend, and the parity test asserts *that the mismatched comparison is the
+flattering one*.
+
+*(All figures in this section were re-measured on the 16/8/4 network over four
+repetitions after an earlier pass quoted some of them from the 8/4/4 CLI default;
+see the jitter note below and E37.)*
+
+Per-pass ladder in the binding metric: **serial 5854 → levelling 43 → CSE 43
+(nothing) → reassociation 32 → gc comparisons 12.**
+
+**A prediction measurement killed.** The cost model charges a level the `max`
+over its primitives; the executor issues one batched call per *kind* and each
+blocks, so a mixed level pays the `sum`. I had written this into the paper as
+the most valuable change outstanding. Counting the mixed levels: **there are
+none** — 8 levels, 8 batched calls — because `z·(z>0)` and a mux-style `max`
+place comparison and multiply at consecutive levels *by construction*. The
+definitions do differ; this class of program does not pay for it.
+`ExecStats::mixed_levels` is kept so a schedule that does pay is visible, and
+the optimisation is not claimed.
+
+### The registry keyed on the link, and the third cost term measurement forced (2026-08-05)
+
+The assignment above was applied by hand to one operation kind. Making it a pass
+means keying the `precompile/` registry on the deployment, so
+`Registry::champion_for(profile)` now exists alongside `champion()`:
+`PrecompileMeta` carries an optional `MeasuredCost`, selection ranks only entries
+that have been measured, and an uncosted registry (`matvec`) behaves exactly as
+before. Registration stays the human gate — the costs are transcribed by hand
+from a named test, and nothing is auto-promoted. `precompile/mpc_compare.rs` is
+the first regime-keyed gadget, with the three comparison backends as entries.
+
+**The premise it was built on turned out to be false, and finding that out was
+the useful part.** From `falcon` being 2.2× cheaper on the wire and 3.7× dearer
+in blocking, I predicted a champion that flips — byte-cheap on a thin pipe,
+block-cheap on a slow one — and wrote a test asserting the flip. Measured:
+
+| link | a2b | falcon | gc |
+|---|---|---|---|
+| RTT 0, unlimited | 33 ms | 79 ms | **13 ms** |
+| RTT 0, 10 Mbps | 206 | 130 | **105** |
+| RTT 40, 100 Mbps | 334 | 1056 | **201** |
+
+`gc` wins **everywhere**. With the network free, `falcon` costs 6× what `gc`
+does, and that is **local cryptographic work** — Z_p arithmetic and
+preprocessing — which a model of the form `waits × RTT + bytes / bandwidth`
+charges every candidate *zero* for. Two consequences:
+
+1. The network-only model could not rank the candidates at all on a fast link
+   (all three predict 0 ms), and the tie-break returned the *dominated* entry —
+   a wrong answer, not an arbitrary one.
+2. On a thin pipe it actively mispicked: `falcon` at 130 ms over `gc` at 105 ms.
+   The 78 kB `falcon` saves is worth 62 ms at 10 Mbps; it pays 66 ms more in
+   local work to save it.
+
+`MeasuredCost` therefore carries `local_secs`, measured on
+`NetworkProfile::INSTANT`. With it the selection matches the wall clock at
+**1.00×** at all three points.
+
+What survives: the machinery (a link-keyed champion is the right shape, and it is
+exercised on synthetic entries that do trade places), and the value of the
+assignment itself (`gc` over `a2b` is 2.75× in blocking). What does not survive:
+the claim that *this* gadget is where the champion flips. The test that asserted
+a flip now asserts the measured fact, so a future change that produces one fails
+and gets looked at.
+
+*Next*: extend the key from `(gadget, link)` to
+`(gadget, shape, backend, link)` and populate from the accumulated corpus — the
+DSL vision — with the UC opening-audit lemma as the per-backend admission
+criterion.
+
+### P1 done: `local_ns_per_lane` fitted, and it was 214× low (2026-08-05)
+
+`mpcc::cost` turned out **not** to have the structural omission the section above
+predicted for it — it already carries a `local_ns` term and even reports a
+`compute` bottleneck. The problem was narrower and worse: the constant feeding it
+had carried the comment *"an estimate; calibrated in P1"* since it was written,
+and P1 never happened. `baru mpcc calibrate` validates predicted **rounds** and
+**online bytes** against a measured run and reports 0% error on both; it never
+touched compute.
+
+Fitted in `the_local_work_per_multiplication_is_what_the_spec_says`. The method is
+the part worth keeping: wall clock at `NetworkProfile::INSTANT` is per-lane work
+*plus* a fixed cost (thread spawn, share setup), so dividing one measurement by
+its width charges the fixed part to every lane. It measures four widths
+(1024…65536) and fits the **slope**, reporting the intercept separately.
+
+| quantity | measured |
+|---|---|
+| `mul_batch`, real transport, network free | **1072 ns/lane** |
+| local-only `add`, no communication at all | 145 ns/lane |
+| the old estimate | 5 ns/lane |
+
+So 5 ns was **214× low** for a multiplication lane, and **29× low even for the
+pure arithmetic floor** — an `add` that communicates nothing already costs 145 ns
+in share bookkeeping and a ring addition. A multiply is 7.4× an add; the rest is
+serialization and the channel round. Neither reading rescues the constant, so
+`aby3`'s is now 1072, documented as fitted, with every other protocol's left at
+5–80 ns and explicitly marked as still an estimate.
+
+**It changes a conclusion, in exactly the regime the NN work lives in.** On a
+3-instruction program compute is 3 µs against 878 µs of latency and nothing moves.
+On a *batched* program — 513 interactive ops, 2 dependence levels, batching
+256.5×, i.e. the shape of a dense layer:
+
+| | aby3 total | bottleneck | rank |
+|---|---|---|---|
+| old (5 ns, estimated) | 169.0 µs | latency | 1st |
+| new (1072 ns, fitted) | 716.3 µs | **compute** | 2nd, behind lowgear |
+
+4.2× on the total, and the bottleneck flips from latency to compute.
+
+**And the resulting table must not be read as a ranking.** `aby3` is now the only
+protocol whose compute term is measured; the others are unfitted estimates that
+are presumably low by a similar factor, so "lowgear beats aby3" would be the same
+incommensurable comparison this project keeps catching. `format_comparison` now
+emits a note whenever any row is compute-bound, saying which constant is fitted
+and that a cross-protocol ordering must not be read off a compute-bound table.
+
+*Also found*: `Aby3Simulator` is **not** usable as a performance instrument. It
+has no batched multiply, and `sim::mul_ab3_concurrent` spawns three OS threads and
+three inproc handles *per multiplication* — 58 µs/lane, 54× the real backend. It
+is a correctness aid, and the calibration test now says so where someone would
+otherwise reach for it.
+
+*Next on this thread*: fit the remaining constants, which needs an implementation
+of each protocol to time — so it is gated on the same roadmap as running them.
+Until then the fitted/estimated split is a caveat, not a comparison.
+
+### The byte column was not the traffic: an unaccounted link (2026-08-05)
+
+Having fitted the compute constant, the obvious question was whether the NN
+pipeline is compute-bound — which would mean every byte/round/wait optimisation
+in this repo has been tuning the wrong term. It is not, and the investigation
+turned up something more specific.
+
+Fit gc's per-diagnosis time against `1/bandwidth` at RTT 0 (from the existing
+sweep):
+
+| 1/bw (s/MB) | 0.08 | 0.133 | 0.2 | 0.267 | 0.4 | 0.8 |
+|---|---|---|---|---|---|---|
+| measured (s) | 3.17 | 4.70 | 6.49 | 8.45 | 12.45 | 23.81 |
+
+Strikingly linear — consecutive slopes 28.9, 29.8, 28.7 MB — so the model's
+*form* is right and compute is a floor rather than the dominant term. But the
+fitted slope is **~29 MB against the 10.1 MB the traffic table reported**.
+
+**Correction to the intercept.** That fit put the compute floor at 0.85 s, and I
+quoted it. Measured *directly*, with `NetworkProfile::INSTANT` so there is no
+bandwidth or latency term at all, one gc diagnosis costs **465 ms** — the fit
+over-estimated by 1.8×, because a six-point least-squares fit is dominated by its
+10 Mbps end and any slight nonlinearity there inflates the intercept (the sweep
+data also predates the Π_PC fix). A floor that can be measured directly should
+never be quoted from an extrapolation. Fully attributed by the existing
+breakdown: fhe 292 ms (weights 43, mul 56, **mask-enc 131**, decrypt 45,
+re-encrypt 10) and mpc 172 ms (import 22, relu 53, **pool 78**, argmax 7).
+
+Two candidate explanations, one killed cheaply:
+
+- **Per-party asymmetry — refuted.** `run_parties` kept only party 0's counters,
+  and in an asymmetric protocol the busiest link need not be party 0's. Added a
+  `BARU_PER_PARTY_COMM` diagnostic reporting all three. Party 0 **is** the
+  busiest in every route (1.00×); in the gc routes it sends 30 191 B against
+  6 415 and 1 571. The reported figures were the right party's.
+- **Unaccounted evaluator-link traffic — confirmed.** The CNN pipeline calls
+  `sleep_link` with FHE ciphertext and scheme-switch bytes that never cross
+  `CountingTransport`. It *really sleeps* for `bytes / bandwidth`, so the latency
+  columns have always paid for that traffic while `comm.bytes` never saw it.
+
+**Fix**: `FhePhases::link_bytes` accumulates at every `sleep_link` site in the CNN
+path and threads through `CnnTotals` → `SweepCell`. The traffic table now reads
+`MB party | of which ring | MB eval link | MB total`, with a note that the old
+`MB wire` heading covered the party transport only.
+
+**What this does and does not invalidate.** The eval-link term is *common to both
+nonlinearity protocols* — it is the same hybrid pipeline either way — so the
+**gc-vs-falcon crossover location is unaffected**; that comparison was always a
+common term plus a difference. What is affected is any **absolute** traffic
+claim: a deployment moves roughly 3× what the party column alone says. That bears
+directly on the paper's traffic comparisons against Falcon's published figures,
+which must now be stated against the total or explicitly scoped to MPC traffic.
+
+*Also found*: `CountingTransport::broadcast` charges `len × fanout` while
+`LatencyTransport::broadcast` charges `deliver_at(len)` **once** — the counting
+layer and the pipe layer disagree on what a broadcast costs. Not yet reconciled;
+it means messages and bytes are counted per recipient while the simulated pipe
+serializes a broadcast as a single transmission.
+
+*Method note*: an earlier attempt to confirm this ran the sweep in the background
+while `cargo test` and clippy ran, which contends for CPU and inflates the
+millisecond columns. Byte columns are unaffected by contention; timing columns
+from a contended run are not usable. Do not measure and build at the same time.
+
+### What the compute floor is made of, and what is already hoisted (2026-08-05)
+
+With bandwidth accounted (above), the remaining term is local compute, measured
+directly at **465 ms** per gc diagnosis. Mask encryption is its largest single
+item — 131 ms, 45% of the FHE side and 28% of the whole floor — and it is
+query-independent in principle. `--precompute` already exploits that:
+
+| | online latency | fhe | mpc |
+|---|---|---|---|
+| cold | 465 ms | 292 ms | 172 ms |
+| `--precompute` | **276 ms** | 102 ms | 173 ms |
+
+A **1.68×** reduction in online latency, with `mask-enc` and `weights` going to
+zero. The tool's own caveat is the important part and it is already there: of the
+207 ms/image hoisted, **137 ms is per-QUERY** (the mask pool is fresh for every
+image, as it must be — reusing a mask would break the scheme switch's blinding),
+so it *shifts work off the critical path without reducing total work*. Only the
+~70 ms of weight encryption is genuinely amortisable across queries, because the
+weights do not change. Total work is 276 + 207 = 483 ms against 465 ms cold,
+i.e. unchanged within noise, which is the check that the split is a split and not
+a saving.
+
+So the online compute floor is **~276 ms and MPC-dominated** (173 of 276), with
+max-pooling its largest single item at 84 ms — larger than ReLU at 50 ms.
+
+*Next on this thread*: pooling and ReLU are both comparison work, and the
+comparison backend changes local cost by 6× at the primitive level
+(`precompile/mpc_compare`: gc 13 ms, a2b 33, falcon 79 per 64 comparisons). The
+registry's `local_secs` was measured on raw comparisons; measuring it at the
+*gadget* level — a max-pool layer, a ReLU layer — would let the assignment pass
+choose on the term that now binds. That connects the two open threads: the
+backend assignment and the compute floor are the same question at high bandwidth.
+
+### DKG for threshold FHE: the dealer removed, and why it was there (2026-08-05)
+
+The single named gap in the UC argument was that threshold FHE key generation was
+dealer-based. It now is not — and the interesting part is *why the dealer was
+there*, which was not oversight.
+
+`deal_key_shares` makes components `s₀`, `s₁` **uniform mod q** while their sum is
+**ternary**, by setting `s₂ = s − s₀ − s₁`. Those two properties together are what
+a dealer buys. **No protocol in which each party samples its own component
+independently can have all three of independent sampling, a small sum, and
+uniform components.** Sampling `sᵢ` uniform makes `s` uniform mod q, and BFV
+decryption computes `c₀ + c₁·s = Δm + (e₁ + e₂·s − e·u)` — with `‖s‖ ≈ q` the
+`e₂·s` term exceeds `q/2t` and decryption fails outright, not gracefully.
+
+**The design takes the other horn.** Each party samples `sᵢ` ternary and sends it
+to its predecessor, so the replicated layout `(sᵢ, sᵢ₊₁)` is preserved — kept
+deliberately, because replication is what makes a partial decryption checkable by
+recompute-and-compare, and a DKG producing only additive shares would remove the
+dealer at the cost of the malicious-security argument.
+
+*Security of the non-uniform components.* One corruption learns two components,
+hence `k = sᵢ + sᵢ₊₁`, and that `s − k` is ternary. That reduces to the standard
+assumption rather than breaking it: `b + a·k = −(a·(s−k) + e)` is an RLWE sample
+with a ternary secret. The algebraic identity is a test — the residual sup-norm is
+exactly 3, the sum of three ternary errors — so if the identity ever failed the
+argument would be visibly vacuous rather than quietly so.
+
+*Cost.* `‖s‖∞ ≤ 3` instead of 1, about 1.6 bits of noise budget for a fresh
+ciphertext and ~3.2 for a product; `dkg_key_norm_headroom_bits` reports it, since
+it comes off the same budget as smudging.
+
+**The part that falls out for free.** A product decrypts under `s²` because Baru
+relinearizes nothing, and with replicated shares each party can form its own `s²`
+share **with no communication**:
+
+```
+s² = s₀² + s₁² + s₂² + 2(s₀s₁ + s₁s₂ + s₂s₀)
+```
+
+Party `i`, holding `(sᵢ, sᵢ₊₁)`, computes `sᵢ² + 2·sᵢ·sᵢ₊₁`; the three sum to
+exactly `s²` — the same identity ABY3 multiplication uses, because it is the same
+sharing. So the expensive part of threshold FHE, distributed generation of a
+relinearization key, is not merely deferred but **not needed**: the depth-1 design
+avoids requiring one. `partial_decrypt_any` handles degree 1 and 2 and *refuses*
+anything higher, where the old `partial_decrypt` read only `c[1]` and would have
+returned a wrong answer silently.
+
+**What is not closed, stated plainly.** The CNN hybrid still decrypts with
+`decrypt_poly_pre` and a whole `DecryptKey`, so the deployed pipeline retains a
+party that can decrypt. Key generation is what this closes; wiring the threshold
+path into the pipeline is a separate change with its own cost — three partial
+decryptions and a combine per scheme switch against one local decryption today.
+`DKG_WIRING_GAP` names it in the code so "DKG landed" cannot be read as "no party
+can decrypt".
+
 ### Per-operation protocol assignment (2026-07-28, from SING)
 
 Reading SING (USENIX Sec'26) exposed a real gap: Baru ranked **whole-program**

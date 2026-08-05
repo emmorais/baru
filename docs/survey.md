@@ -626,7 +626,7 @@ and, once it did not, leaked; see the truncation note above):
 **Crossover between 20 and 30 Mbps at RTT 0; no crossover down to 8 Mbps at RTT 20 ms.**
 Garbled circuits win above, Falcon below; higher RTT moves the boundary *down*, shrinking
 Falcon's region. The mechanism is visible in the same run: Falcon sends 3.4 MB against gc's
-10.1 (2.94× cheaper) in 450 messages against 61 (7.4× dearer), so the two cost terms trade
+10.1 on the party transport (2.94× cheaper there, but 1.33× on total traffic once the 17.0 MB evaluator link is counted — see `research-agenda.md`, 2026-08-05) in several hundred messages against 61 (~7× dearer), so the two cost terms trade
 and the boundary is where the trade balances.
 
 **There are two boundaries, and a warm server's sits a decade of bandwidth higher.**

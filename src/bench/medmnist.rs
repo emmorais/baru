@@ -539,6 +539,10 @@ pub struct SweepCell {
     /// being charged for this crate's serialisation, not for its protocol, and
     /// this repo has already drawn one wrong conclusion that way.
     pub ring_bytes: f64,
+    /// Evaluator-link bytes (FHE ciphertexts, scheme-switch payloads). Not part of
+    /// `bytes`: they never cross the counted party transport, but `ms` pays their
+    /// bandwidth cost. Reporting only `bytes` understated what a diagnosis moves.
+    pub link_bytes: f64,
     /// Every cell recomputes the same diagnosis; if one disagrees with the
     /// plaintext argmax the whole row is meaningless, so it is carried here
     /// rather than assumed.
@@ -554,7 +558,7 @@ pub struct SweepCell {
     /// withdrawn crossover claims were single-run numbers.
     ///
     /// **This range is within-session and so understates the real spread** — see
-    /// [`separable`]. It bounds jitter between back-to-back repeats sharing one
+    /// the `separable` helper. It bounds jitter between back-to-back repeats sharing one
     /// `CnnSession`, not reproducibility across invocations.
     pub ms_lo: f64,
     pub ms_hi: f64,
@@ -576,7 +580,7 @@ pub struct SweepCell {
 /// against it — a latency comparison between routes computing different things
 /// would be worthless.
 /// `repeats` re-runs each cell and reports the **median**, with the observed range
-/// kept in [`SweepCell::ms_lo`]/[`SweepCell::ms_hi`] so [`print_sweep`] can refuse to
+/// kept in [`SweepCell::ms_lo`]/[`SweepCell::ms_hi`] so the sweep printer can refuse to
 /// call a winner where the ranges overlap. One repeat is allowed and is the default,
 /// because most uses of this grid are checking correctness or orders of magnitude
 /// rather than resolving a boundary — but a boundary quoted from `repeats == 1` is a
@@ -671,6 +675,7 @@ pub fn sweep_crossover(
                     messages: last.messages,
                     bytes: last.bytes,
                     ring_bytes: last.ring_bytes,
+                    link_bytes: last.link_bytes,
                     matches_plaintext: ok,
                     ms_lo: observed[0],
                     ms_hi: observed[observed.len() - 1],
@@ -858,20 +863,31 @@ fn print_sweep(cells: &[SweepCell], rtts: &[u64], bws: &[f64], protocols: &[Nonl
     // Query-independent for a given protocol, so one row each rather than per cell.
     println!("  traffic per diagnosis (identical across the grid — only the link varies)");
     println!(
-        "    {:<10}{:>10}{:>10}{:>15}",
-        "protocol", "messages", "MB wire", "of which ring"
+        "    {:<10}{:>10}{:>10}{:>15}{:>13}{:>11}",
+        "protocol", "messages", "MB party", "of which ring", "MB eval link", "MB total"
     );
     for &p in protocols {
         if let Some(c) = cells.iter().find(|c| c.nonlin == p) {
             println!(
-                "    {:<10}{:>10.0}{:>10.1}{:>15.1}",
+                "    {:<10}{:>10.0}{:>10.1}{:>15.1}{:>13.1}{:>11.1}",
                 p.short(),
                 c.messages,
                 c.bytes / 1e6,
                 c.ring_bytes / 1e6,
+                c.link_bytes / 1e6,
+                (c.bytes + c.link_bytes) / 1e6,
             );
         }
     }
+    println!(
+        "    NOTE `MB party` is the party-to-party transport only, which is what this table\n    \
+         used to report as `MB wire`. `MB eval link` is the FHE ciphertext and scheme-switch\n    \
+         traffic: it never crosses that transport, so no counter saw it, but the latency\n    \
+         columns above have always paid its bandwidth cost. Fitting a diagnosis against 1/bw\n    \
+         gives a slope near the TOTAL, not the party column. The eval-link term is common to\n    \
+         both nonlinearity protocols, so the crossover BETWEEN them is unaffected — but an\n    \
+         absolute traffic figure taken from the party column alone understates the deployment."
+    );
     if protocols.len() == 2 {
         let get = |p: Nonlin| cells.iter().find(|c| c.nonlin == p);
         if let (Some(x), Some(y)) = (get(protocols[0]), get(protocols[1])) {
@@ -885,10 +901,33 @@ fn print_sweep(cells: &[SweepCell], rtts: &[u64], bws: &[f64], protocols: &[Nonl
             // It once made this very comparison read 3.2x the wrong way; see
             // `docs/falcon-reproduction.md`. A large `of which ring` next to a
             // large total is the signal to go and check the declared widths.
-            let cheaper_bytes = if x.bytes <= y.bytes { a } else { b };
+            // Ratios on the TOTAL, because the bandwidth term charges the total. The
+            // party column alone is the protocol-attributable part, and it is the
+            // more flattering one: the evaluator-link traffic is identical for both
+            // routes, so including it shrinks whatever byte advantage either has.
+            // Quoting the party ratio as "the" byte ratio overstated falcon's
+            // advantage by 2.2x (2.94x on party bytes, 1.32x on the total), which
+            // is the difference between a decisive axis and a mild one.
+            let xb = x.bytes + x.link_bytes;
+            let yb = y.bytes + y.link_bytes;
+            let cheaper_bytes = if xb <= yb { a } else { b };
             let cheaper_msgs = if x.messages <= y.messages { a } else { b };
-            let bratio = x.bytes.max(y.bytes) / x.bytes.min(y.bytes).max(1.0);
+            let bratio = xb.max(yb) / xb.min(yb).max(1.0);
+            let party_ratio =
+                x.bytes.max(y.bytes) / x.bytes.min(y.bytes).max(1.0);
             let mratio = x.messages.max(y.messages) / x.messages.min(y.messages).max(1.0);
+            if (party_ratio / bratio.max(1e-9)) > 1.10 {
+                println!(
+                    "    → NOTE the byte ratio below is on the TOTAL ({bratio:.2}x). On the party \n\
+                     \x20     transport alone it reads {party_ratio:.2}x, because the \n\
+                     \x20     {:.1} MB evaluator link is common to both routes and dilutes it. \n\
+                     \x20     The crossover LOCATION is unaffected (a common additive term \n\
+                     \x20     shifts both curves equally) but the advantage is {:.1}x smaller \n\
+                     \x20     than the party column suggests",
+                    x.link_bytes / 1e6,
+                    party_ratio / bratio.max(1e-9),
+                );
+            }
             // A 1.01x byte ratio is a tie, not an advantage, and calling it a
             // trade would license predicting a crossover from what is really
             // noise. Below this margin the byte axis carries no signal and the
@@ -939,6 +978,10 @@ struct CnnTotals {
     bytes: f64,
     ring_bytes: f64,
     gc_bytes: f64,
+    /// Evaluator-link bytes: FHE ciphertexts and scheme-switch payloads that never
+    /// cross the party-to-party transport, so `bytes` above excludes them while the
+    /// latency columns pay for them. See `FhePhases::link_bytes`.
+    link_bytes: f64,
     offline_query_ms: f64,
     weights_ms: f64,
     mul_ms: f64,
@@ -965,6 +1008,7 @@ impl CnnTotals {
         self.ring_bytes += r.comm.ring_bytes as f64;
         self.gc_bytes += r.comm.gc_bytes as f64;
         self.bytes += r.comm.bytes as f64;
+        self.link_bytes += r.fhe_phases.link_bytes as f64;
         self.offline_query_ms += r.offline_query_ms;
         self.weights_ms += r.fhe_phases.weights_ms;
         self.mul_ms += r.fhe_phases.mul_ms;
@@ -990,6 +1034,7 @@ impl CnnTotals {
             bytes: self.bytes / d,
             ring_bytes: self.ring_bytes / d,
             gc_bytes: self.gc_bytes / d,
+            link_bytes: self.link_bytes / d,
             offline_query_ms: self.offline_query_ms / d,
             weights_ms: self.weights_ms / d,
             mul_ms: self.mul_ms / d,
@@ -1389,6 +1434,7 @@ mod tests {
             messages: 0.0,
             bytes: 0.0,
             ring_bytes: 0.0,
+            link_bytes: 0.0,
             matches_plaintext: true,
             ms_lo: lo,
             ms_hi: hi,

@@ -259,11 +259,11 @@
 \newlabel{tab:malicious}{{4}{19}{Semi-honest ABY3 versus malicious-with-abort, same workload, same transport. Active security costs bytes, not rounds. \emph {Equal width} charges both legs a 128-bit wire; \emph {packed base} lets the semi-honest leg pack to its values' own width, which the verified leg cannot do because its statistical security is $128-\mathit {used\_bits}$. The two differ by $3.7\times $ on the workload that matters for inference}{table.4}{}}
 \newlabel{tab:malicious@cref}{{[table][4][]4}{[1][19][]19}{}{}{}}
 \@writefile{toc}{\contentsline {paragraph}{The cost of active security.}{19}{section*.22}\protected@file@percent }
-\@writefile{toc}{\contentsline {subsection}{\numberline {6.2}Garbled circuits}{19}{subsection.6.2}\protected@file@percent }
-\newlabel{sec:gc}{{6.2}{19}{Garbled circuits}{subsection.6.2}{}}
-\newlabel{sec:gc@cref}{{[subsection][2][6]6.2}{[1][19][]19}{}{}{}}
 \citation{HEStandard}
 \citation{Gazelle}
+\@writefile{toc}{\contentsline {subsection}{\numberline {6.2}Garbled circuits}{20}{subsection.6.2}\protected@file@percent }
+\newlabel{sec:gc}{{6.2}{20}{Garbled circuits}{subsection.6.2}{}}
+\newlabel{sec:gc@cref}{{[subsection][2][6]6.2}{[1][19][]20}{}{}{}}
 \@writefile{toc}{\contentsline {paragraph}{This result reverses a figure that we published.}{20}{section*.23}\protected@file@percent }
 \@writefile{toc}{\contentsline {paragraph}{A correction to another of our claims.}{20}{section*.24}\protected@file@percent }
 \@writefile{toc}{\contentsline {subsection}{\numberline {6.3}Fully homomorphic encryption}{20}{subsection.6.3}\protected@file@percent }
@@ -277,17 +277,17 @@
 \@writefile{toc}{\contentsline {subsection}{\numberline {6.4}The hybrid and the no-bootstrap result}{21}{subsection.6.4}\protected@file@percent }
 \newlabel{sec:hybrid}{{6.4}{21}{The hybrid and the no-bootstrap result}{subsection.6.4}{}}
 \newlabel{sec:hybrid@cref}{{[subsection][4][6]6.4}{[1][21][]21}{}{}{}}
-\@writefile{toc}{\contentsline {subsection}{\numberline {6.5}Zero-knowledge proofs}{21}{subsection.6.5}\protected@file@percent }
-\newlabel{sec:zkp}{{6.5}{21}{Zero-knowledge proofs}{subsection.6.5}{}}
-\newlabel{sec:zkp@cref}{{[subsection][5][6]6.5}{[1][21][]21}{}{}{}}
 \citation{Overdrive}
 \citation{MPSPDZ}
 \@writefile{lot}{\contentsline {table}{\numberline {6}{\ignorespaces Constraints grow linearly ($\approx 9$ per input); proof size does not---a $286\times $ larger circuit yields a $6\times $ larger proof. Width 784 is the MNIST input dimension.}}{22}{table.6}\protected@file@percent }
 \newlabel{tab:zkp}{{6}{22}{Constraints grow linearly ($\approx 9$ per input); proof size does not---a $286\times $ larger circuit yields a $6\times $ larger proof. Width 784 is the MNIST input dimension}{table.6}{}}
-\newlabel{tab:zkp@cref}{{[table][6][]6}{[1][21][]22}{}{}{}}
+\newlabel{tab:zkp@cref}{{[table][6][]6}{[1][22][]22}{}{}{}}
 \@writefile{lot}{\contentsline {table}{\numberline {7}{\ignorespaces Two parties, semi-honest. \textbf  {The two rows are over different domains}; see the caveat below for the apples-to-apples figure.}}{22}{table.7}\protected@file@percent }
 \newlabel{tab:triples}{{7}{22}{Two parties, semi-honest. \textbf {The two rows are over different domains}; see the caveat below for the apples-to-apples figure}{table.7}{}}
 \newlabel{tab:triples@cref}{{[table][7][]7}{[1][22][]22}{}{}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {6.5}Zero-knowledge proofs}{22}{subsection.6.5}\protected@file@percent }
+\newlabel{sec:zkp}{{6.5}{22}{Zero-knowledge proofs}{subsection.6.5}{}}
+\newlabel{sec:zkp@cref}{{[subsection][5][6]6.5}{[1][21][]22}{}{}{}}
 \@writefile{toc}{\contentsline {subsection}{\numberline {6.6}Preprocessing: OT versus SHE}{22}{subsection.6.6}\protected@file@percent }
 \newlabel{sec:triples}{{6.6}{22}{Preprocessing: OT versus SHE}{subsection.6.6}{}}
 \newlabel{sec:triples@cref}{{[subsection][6][6]6.6}{[1][22][]22}{}{}{}}
@@ -302,17 +302,41 @@
 \newlabel{tab:mpspdz@cref}{{[table][8][]8}{[1][23][]23}{}{}{}}
 \@writefile{toc}{\contentsline {section}{\numberline {7}Related work, and where this study sits}{23}{section.7}\protected@file@percent }
 \newlabel{sec:related}{{7}{23}{Related work, and where this study sits}{section.7}{}}
-\newlabel{sec:related@cref}{{[section][7][]7}{[1][22][]23}{}{}{}}
+\newlabel{sec:related@cref}{{[section][7][]7}{[1][23][]23}{}{}{}}
 \@writefile{toc}{\contentsline {subsection}{\numberline {7.1}Frameworks that run many protocols}{23}{subsection.7.1}\protected@file@percent }
 \newlabel{sec:related:frameworks}{{7.1}{23}{Frameworks that run many protocols}{subsection.7.1}{}}
 \newlabel{sec:related:frameworks@cref}{{[subsection][1][7]7.1}{[1][23][]23}{}{}{}}
 \@writefile{toc}{\contentsline {paragraph}{MP-SPDZ~\cite  {MPSPDZ}}{23}{section*.26}\protected@file@percent }
+\@writefile{lot}{\contentsline {table}{\numberline {9}{\ignorespaces One network, $x(16) \to \text  {dense}(8) \to \ensuremath  {\mathrm  {ReLU}}\to \text  {dense}(4) \to \max $ with secret weights, both routes over the same transport and both checked against the plaintext reference. The gadget route is written by an expert who called the batched primitives deliberately; the compiled route is scalar source with no batching hint. \emph  {Calls} counts backend primitives, \emph  {waits} counts the times a party blocked for a peer. The last rung is a protocol assignment rather than a compiler pass, so the hand-written route is given the same assignment in the second row --- the two rows in bold are the comparison that means something. Bytes are one run and are stable; the millisecond columns carry the harness's run-to-run variance of roughly \SI {13}{\percent }. $^\dagger $Waits carry a $\pm 1$ of their own, and the marker is on this row because it is where we first saw it: over four repetitions at RTT~0 it read \num {32}, \num {33}, \num {32}, \num {33}, while every other row was identical in all four. A run that also swept RTT~20 then moved three rows by one count, so the jitter is not confined to this row --- it is a property of the counter. A receive that finds its message already delivered does not block, so the quantity is how many times a party \emph  {had} to stop, and that depends on thread interleaving, which the network profile itself perturbs. Read every wait figure here as $\pm 1$.}}{24}{table.9}\protected@file@percent }
+\newlabel{tab:handvscompiled}{{9}{24}{One network, $x(16) \to \text {dense}(8) \to \ReLU \to \text {dense}(4) \to \max $ with secret weights, both routes over the same transport and both checked against the plaintext reference. The gadget route is written by an expert who called the batched primitives deliberately; the compiled route is scalar source with no batching hint. \emph {Calls} counts backend primitives, \emph {waits} counts the times a party blocked for a peer. The last rung is a protocol assignment rather than a compiler pass, so the hand-written route is given the same assignment in the second row --- the two rows in bold are the comparison that means something. Bytes are one run and are stable; the millisecond columns carry the harness's run-to-run variance of roughly \SI {13}{\percent }. $^\dagger $Waits carry a $\pm 1$ of their own, and the marker is on this row because it is where we first saw it: over four repetitions at RTT~0 it read \num {32}, \num {33}, \num {32}, \num {33}, while every other row was identical in all four. A run that also swept RTT~20 then moved three rows by one count, so the jitter is not confined to this row --- it is a property of the counter. A receive that finds its message already delivered does not block, so the quantity is how many times a party \emph {had} to stop, and that depends on thread interleaving, which the network profile itself perturbs. Read every wait figure here as $\pm 1$}{table.9}{}}
+\newlabel{tab:handvscompiled@cref}{{[table][9][]9}{[1][24][]24}{}{}{}}
+\@writefile{toc}{\contentsline {paragraph}{The cost of a primitive, measured.}{25}{section*.27}\protected@file@percent }
+\@writefile{lot}{\contentsline {table}{\numberline {10}{\ignorespaces Blocking cost per primitive at $\ell = 32$, against what our cost model charges}}{25}{table.10}\protected@file@percent }
+\newlabel{tab:waitcost}{{10}{25}{Blocking cost per primitive at $\ell = 32$, against what our cost model charges}{table.10}{}}
+\newlabel{tab:waitcost@cref}{{[table][10][]10}{[1][25][]25}{}{}{}}
+\@writefile{toc}{\contentsline {paragraph}{Which primitive to attack, and the assignment that follows.}{26}{section*.28}\protected@file@percent }
+\@writefile{lot}{\contentsline {table}{\numberline {11}{\ignorespaces \num {64} comparisons at $\ell = 32$, online phase, preprocessing filled in advance. Bytes are the whole run including preprocessing.}}{26}{table.11}\protected@file@percent }
+\newlabel{tab:cmpbackends}{{11}{26}{\num {64} comparisons at $\ell = 32$, online phase, preprocessing filled in advance. Bytes are the whole run including preprocessing}{table.11}{}}
+\newlabel{tab:cmpbackends@cref}{{[table][11][]11}{[1][26][]26}{}{}{}}
+\@writefile{toc}{\contentsline {paragraph}{Keying the choice on the deployment, and the third term that decides it.}{26}{section*.29}\protected@file@percent }
+\@writefile{lot}{\contentsline {table}{\numberline {12}{\ignorespaces The same \num {64} comparisons at $\ell = 32$, wall clock, across three links. The first column is \texttt  {NetworkProfile::INSTANT} --- zero latency, unlimited bandwidth --- so it isolates local cryptographic work.}}{27}{table.12}\protected@file@percent }
+\newlabel{tab:cmplinks}{{12}{27}{The same \num {64} comparisons at $\ell = 32$, wall clock, across three links. The first column is \bt {NetworkProfile::INSTANT} --- zero latency, unlimited bandwidth --- so it isolates local cryptographic work}{table.12}{}}
+\newlabel{tab:cmplinks@cref}{{[table][12][]12}{[1][26][]27}{}{}{}}
+\@writefile{toc}{\contentsline {paragraph}{The same term in the analytic model, and what fitting it changed.}{27}{section*.30}\protected@file@percent }
+\@writefile{lot}{\contentsline {table}{\numberline {13}{\ignorespaces Fitting the per-lane local cost of an ABY3 multiplication}}{27}{table.13}\protected@file@percent }
+\newlabel{tab:localfit}{{13}{27}{Fitting the per-lane local cost of an ABY3 multiplication}{table.13}{}}
+\newlabel{tab:localfit@cref}{{[table][13][]13}{[1][27][]27}{}{}{}}
 \citation{ABY}
 \citation{HyCC}
 \citation{CirC}
 \citation{Silph}
 \citation{ABY3}
 \citation{Falcon}
+\@writefile{toc}{\contentsline {paragraph}{Frameworks based on circuit compilation.}{28}{section*.31}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {7.2}Three-party honest-majority protocols}{28}{subsection.7.2}\protected@file@percent }
+\newlabel{sec:related:3pc}{{7.2}{28}{Three-party honest-majority protocols}{subsection.7.2}{}}
+\newlabel{sec:related:3pc@cref}{{[subsection][2][7]7.2}{[1][28][]28}{}{}{}}
+\@writefile{toc}{\contentsline {paragraph}{ABY3.}{28}{section*.32}\protected@file@percent }
 \citation{SecureNN}
 \citation{ASTRA}
 \citation{Chida}
@@ -325,16 +349,6 @@
 \citation{Cheetah}
 \citation{PEGASUS}
 \citation{CHIMERA}
-\@writefile{toc}{\contentsline {paragraph}{Frameworks based on circuit compilation.}{24}{section*.27}\protected@file@percent }
-\@writefile{toc}{\contentsline {subsection}{\numberline {7.2}Three-party honest-majority protocols}{24}{subsection.7.2}\protected@file@percent }
-\newlabel{sec:related:3pc}{{7.2}{24}{Three-party honest-majority protocols}{subsection.7.2}{}}
-\newlabel{sec:related:3pc@cref}{{[subsection][2][7]7.2}{[1][24][]24}{}{}{}}
-\@writefile{toc}{\contentsline {paragraph}{ABY3.}{24}{section*.28}\protected@file@percent }
-\@writefile{toc}{\contentsline {paragraph}{Falcon.}{24}{section*.29}\protected@file@percent }
-\@writefile{toc}{\contentsline {paragraph}{Other work in the honest-majority setting.}{24}{section*.30}\protected@file@percent }
-\@writefile{toc}{\contentsline {subsection}{\numberline {7.3}FHE-based and hybrid inference}{24}{subsection.7.3}\protected@file@percent }
-\newlabel{sec:related:fhe}{{7.3}{24}{FHE-based and hybrid inference}{subsection.7.3}{}}
-\newlabel{sec:related:fhe@cref}{{[subsection][3][7]7.3}{[1][24][]24}{}{}{}}
 \citation{FV}
 \citation{BGV}
 \citation{CKKS}
@@ -348,98 +362,103 @@
 \citation{KirchnerFouque}
 \citation{LTV}
 \citation{YASHE}
-\@writefile{toc}{\contentsline {subsection}{\numberline {7.4}Homomorphic encryption schemes and libraries}{25}{subsection.7.4}\protected@file@percent }
-\newlabel{sec:related:he}{{7.4}{25}{Homomorphic encryption schemes and libraries}{subsection.7.4}{}}
-\newlabel{sec:related:he@cref}{{[subsection][4][7]7.4}{[1][25][]25}{}{}{}}
-\@writefile{toc}{\contentsline {subsection}{\numberline {7.5}What is distinctive here}{25}{subsection.7.5}\protected@file@percent }
-\newlabel{sec:related:delta}{{7.5}{25}{What is distinctive here}{subsection.7.5}{}}
-\newlabel{sec:related:delta@cref}{{[subsection][5][7]7.5}{[1][25][]25}{}{}{}}
-\@writefile{toc}{\contentsline {section}{\numberline {8}Methodology}{26}{section.8}\protected@file@percent }
-\newlabel{sec:method}{{8}{26}{Methodology}{section.8}{}}
-\newlabel{sec:method@cref}{{[section][8][]8}{[1][25][]26}{}{}{}}
-\@writefile{toc}{\contentsline {subsection}{\numberline {8.1}Identical transport, uniform accounting}{26}{subsection.8.1}\protected@file@percent }
-\@writefile{toc}{\contentsline {subsection}{\numberline {8.2}A validated network model}{26}{subsection.8.2}\protected@file@percent }
-\newlabel{sec:netmodel}{{8.2}{26}{A validated network model}{subsection.8.2}{}}
-\newlabel{sec:netmodel@cref}{{[subsection][2][8]8.2}{[1][26][]26}{}{}{}}
-\@writefile{toc}{\contentsline {subsection}{\numberline {8.3}Bit-exactness as a gate on quoting cost}{26}{subsection.8.3}\protected@file@percent }
-\@writefile{toc}{\contentsline {subsection}{\numberline {8.4}Machine-checked security attestations}{27}{subsection.8.4}\protected@file@percent }
-\newlabel{sec:attest}{{8.4}{27}{Machine-checked security attestations}{subsection.8.4}{}}
-\newlabel{sec:attest@cref}{{[subsection][4][8]8.4}{[1][26][]27}{}{}{}}
-\@writefile{toc}{\contentsline {subsection}{\numberline {8.5}Recording withdrawn results---and deleting the component}{27}{subsection.8.5}\protected@file@percent }
-\newlabel{sec:withdrawn-policy}{{8.5}{27}{Recording withdrawn results---and deleting the component}{subsection.8.5}{}}
-\newlabel{sec:withdrawn-policy@cref}{{[subsection][5][8]8.5}{[1][27][]27}{}{}{}}
-\@writefile{toc}{\contentsline {section}{\numberline {9}Cross-paradigm findings}{27}{section.9}\protected@file@percent }
-\newlabel{sec:cross}{{9}{27}{Cross-paradigm findings}{section.9}{}}
-\newlabel{sec:cross@cref}{{[section][9][]9}{[1][27][]27}{}{}{}}
-\@writefile{toc}{\contentsline {subsection}{\numberline {9.1}The FHE-versus-MPC crossover belongs to the baseline's preprocessing}{27}{subsection.9.1}\protected@file@percent }
-\newlabel{sec:crossover-fhe}{{9.1}{27}{The FHE-versus-MPC crossover belongs to the baseline's preprocessing}{subsection.9.1}{}}
-\newlabel{sec:crossover-fhe@cref}{{[subsection][1][9]9.1}{[1][27][]27}{}{}{}}
+\@writefile{toc}{\contentsline {paragraph}{Falcon.}{29}{section*.33}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Other work in the honest-majority setting.}{29}{section*.34}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {7.3}FHE-based and hybrid inference}{29}{subsection.7.3}\protected@file@percent }
+\newlabel{sec:related:fhe}{{7.3}{29}{FHE-based and hybrid inference}{subsection.7.3}{}}
+\newlabel{sec:related:fhe@cref}{{[subsection][3][7]7.3}{[1][29][]29}{}{}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {7.4}Homomorphic encryption schemes and libraries}{29}{subsection.7.4}\protected@file@percent }
+\newlabel{sec:related:he}{{7.4}{29}{Homomorphic encryption schemes and libraries}{subsection.7.4}{}}
+\newlabel{sec:related:he@cref}{{[subsection][4][7]7.4}{[1][29][]29}{}{}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {7.5}What is distinctive here}{30}{subsection.7.5}\protected@file@percent }
+\newlabel{sec:related:delta}{{7.5}{30}{What is distinctive here}{subsection.7.5}{}}
+\newlabel{sec:related:delta@cref}{{[subsection][5][7]7.5}{[1][30][]30}{}{}{}}
+\@writefile{toc}{\contentsline {section}{\numberline {8}Methodology}{30}{section.8}\protected@file@percent }
+\newlabel{sec:method}{{8}{30}{Methodology}{section.8}{}}
+\newlabel{sec:method@cref}{{[section][8][]8}{[1][30][]30}{}{}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {8.1}Identical transport, uniform accounting}{30}{subsection.8.1}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {8.2}A validated network model}{30}{subsection.8.2}\protected@file@percent }
+\newlabel{sec:netmodel}{{8.2}{30}{A validated network model}{subsection.8.2}{}}
+\newlabel{sec:netmodel@cref}{{[subsection][2][8]8.2}{[1][30][]30}{}{}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {8.3}Bit-exactness as a gate on quoting cost}{31}{subsection.8.3}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {8.4}Machine-checked security attestations}{31}{subsection.8.4}\protected@file@percent }
+\newlabel{sec:attest}{{8.4}{31}{Machine-checked security attestations}{subsection.8.4}{}}
+\newlabel{sec:attest@cref}{{[subsection][4][8]8.4}{[1][31][]31}{}{}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {8.5}Recording withdrawn results---and deleting the component}{31}{subsection.8.5}\protected@file@percent }
+\newlabel{sec:withdrawn-policy}{{8.5}{31}{Recording withdrawn results---and deleting the component}{subsection.8.5}{}}
+\newlabel{sec:withdrawn-policy@cref}{{[subsection][5][8]8.5}{[1][31][]31}{}{}{}}
 \citation{HyCC}
 \citation{Silph}
 \citation{SING}
+\@writefile{lot}{\contentsline {table}{\numberline {14}{\ignorespaces One private layer with both operands secret plus a \ensuremath  {\mathrm  {ReLU}}{}; WAN, two parties, preprocessing charged per triple \emph  {consumed}.}}{32}{table.14}\protected@file@percent }
+\newlabel{tab:layer}{{14}{32}{One private layer with both operands secret plus a \ReLU {}; WAN, two parties, preprocessing charged per triple \emph {consumed}}{table.14}{}}
+\newlabel{tab:layer@cref}{{[table][14][]14}{[1][32][]32}{}{}{}}
+\@writefile{toc}{\contentsline {section}{\numberline {9}Cross-paradigm findings}{32}{section.9}\protected@file@percent }
+\newlabel{sec:cross}{{9}{32}{Cross-paradigm findings}{section.9}{}}
+\newlabel{sec:cross@cref}{{[section][9][]9}{[1][32][]32}{}{}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {9.1}The FHE-versus-MPC crossover belongs to the baseline's preprocessing}{32}{subsection.9.1}\protected@file@percent }
+\newlabel{sec:crossover-fhe}{{9.1}{32}{The FHE-versus-MPC crossover belongs to the baseline's preprocessing}{subsection.9.1}{}}
+\newlabel{sec:crossover-fhe@cref}{{[subsection][1][9]9.1}{[1][32][]32}{}{}{}}
 \citation{Falcon}
-\@writefile{lot}{\contentsline {table}{\numberline {9}{\ignorespaces One private layer with both operands secret plus a \ensuremath  {\mathrm  {ReLU}}{}; WAN, two parties, preprocessing charged per triple \emph  {consumed}.}}{28}{table.9}\protected@file@percent }
-\newlabel{tab:layer}{{9}{28}{One private layer with both operands secret plus a \ReLU {}; WAN, two parties, preprocessing charged per triple \emph {consumed}}{table.9}{}}
-\newlabel{tab:layer@cref}{{[table][9][]9}{[1][27][]28}{}{}{}}
-\@writefile{toc}{\contentsline {subsection}{\numberline {9.2}Protocol assignment can be derived, not annotated}{28}{subsection.9.2}\protected@file@percent }
-\@writefile{toc}{\contentsline {subsection}{\numberline {9.3}The nonlinearity crossover, and three wrong answers on the way to it}{28}{subsection.9.3}\protected@file@percent }
-\newlabel{sec:crossover-nonlin}{{9.3}{28}{The nonlinearity crossover, and three wrong answers on the way to it}{subsection.9.3}{}}
-\newlabel{sec:crossover-nonlin@cref}{{[subsection][3][9]9.3}{[1][28][]28}{}{}{}}
-\@writefile{lot}{\contentsline {table}{\numberline {10}{\ignorespaces Milliseconds per encrypted MedMNIST diagnosis, median of three repeats; winner in bold. \emph  {Cold} charges Falcon for preprocessing on the critical path; \emph  {warm} generates it per MPC segment beforehand and reports the online cost. Garbled circuits have no query-independent phase to hoist, so their row serves both. Cold crossover between $20$ and \SI {30}{\mega \bit \per \second } at RTT 0 and below \SI {10}{\mega \bit \per \second } at \SI {20}{\milli \second }; warm, between $100$ and \SI {1000}{\mega \bit \per \second } and between $30$ and \SI {40}{\mega \bit \per \second }. Higher round-trip time moves each boundary \emph  {down}; hoisting preprocessing moves it sharply \emph  {up}. Cells within ${\approx }\SI {13}{\percent }$ are unresolved (\cref  {sec:threats}): at RTT 0 the \SI {30}{\mega \bit \per \second } cold cell and the \SI {100}{\mega \bit \per \second } warm cell are ties, so each boundary is a band.}}{29}{table.10}\protected@file@percent }
-\newlabel{tab:crossover}{{10}{29}{Milliseconds per encrypted MedMNIST diagnosis, median of three repeats; winner in bold. \emph {Cold} charges Falcon for preprocessing on the critical path; \emph {warm} generates it per MPC segment beforehand and reports the online cost. Garbled circuits have no query-independent phase to hoist, so their row serves both. Cold crossover between $20$ and \SI {30}{\mega \bit \per \second } at RTT 0 and below \SI {10}{\mega \bit \per \second } at \SI {20}{\milli \second }; warm, between $100$ and \SI {1000}{\mega \bit \per \second } and between $30$ and \SI {40}{\mega \bit \per \second }. Higher round-trip time moves each boundary \emph {down}; hoisting preprocessing moves it sharply \emph {up}. Cells within ${\approx }\SI {13}{\percent }$ are unresolved (\cref {sec:threats}): at RTT 0 the \SI {30}{\mega \bit \per \second } cold cell and the \SI {100}{\mega \bit \per \second } warm cell are ties, so each boundary is a band}{table.10}{}}
-\newlabel{tab:crossover@cref}{{[table][10][]10}{[1][28][]29}{}{}{}}
-\@writefile{toc}{\contentsline {paragraph}{We reported three other answers before this one, and we consider the sequence to be the more useful result.}{29}{section*.31}\protected@file@percent }
+\@writefile{lot}{\contentsline {table}{\numberline {15}{\ignorespaces Milliseconds per encrypted MedMNIST diagnosis, median of three repeats; winner in bold. \emph  {Cold} charges Falcon for preprocessing on the critical path; \emph  {warm} generates it per MPC segment beforehand and reports the online cost. Garbled circuits have no query-independent phase to hoist, so their row serves both. Cold crossover between $20$ and \SI {30}{\mega \bit \per \second } at RTT 0 and below \SI {10}{\mega \bit \per \second } at \SI {20}{\milli \second }; warm, between $100$ and \SI {1000}{\mega \bit \per \second } and between $30$ and \SI {40}{\mega \bit \per \second }. Higher round-trip time moves each boundary \emph  {down}; hoisting preprocessing moves it sharply \emph  {up}. Cells within ${\approx }\SI {13}{\percent }$ are unresolved (\cref  {sec:threats}): at RTT 0 the \SI {30}{\mega \bit \per \second } cold cell and the \SI {100}{\mega \bit \per \second } warm cell are ties, so each boundary is a band.}}{33}{table.15}\protected@file@percent }
+\newlabel{tab:crossover}{{15}{33}{Milliseconds per encrypted MedMNIST diagnosis, median of three repeats; winner in bold. \emph {Cold} charges Falcon for preprocessing on the critical path; \emph {warm} generates it per MPC segment beforehand and reports the online cost. Garbled circuits have no query-independent phase to hoist, so their row serves both. Cold crossover between $20$ and \SI {30}{\mega \bit \per \second } at RTT 0 and below \SI {10}{\mega \bit \per \second } at \SI {20}{\milli \second }; warm, between $100$ and \SI {1000}{\mega \bit \per \second } and between $30$ and \SI {40}{\mega \bit \per \second }. Higher round-trip time moves each boundary \emph {down}; hoisting preprocessing moves it sharply \emph {up}. Cells within ${\approx }\SI {13}{\percent }$ are unresolved (\cref {sec:threats}): at RTT 0 the \SI {30}{\mega \bit \per \second } cold cell and the \SI {100}{\mega \bit \per \second } warm cell are ties, so each boundary is a band}{table.15}{}}
+\newlabel{tab:crossover@cref}{{[table][15][]15}{[1][33][]33}{}{}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {9.2}Protocol assignment can be derived, not annotated}{33}{subsection.9.2}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {9.3}The nonlinearity crossover, and three wrong answers on the way to it}{33}{subsection.9.3}\protected@file@percent }
+\newlabel{sec:crossover-nonlin}{{9.3}{33}{The nonlinearity crossover, and three wrong answers on the way to it}{subsection.9.3}{}}
+\newlabel{sec:crossover-nonlin@cref}{{[subsection][3][9]9.3}{[1][33][]33}{}{}{}}
+\@writefile{toc}{\contentsline {paragraph}{We reported three other answers before this one, and we consider the sequence to be the more useful result.}{34}{section*.35}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{What we can still say.}{34}{section*.36}\protected@file@percent }
 \citation{MedMNIST}
 \citation{MNIST}
-\@writefile{toc}{\contentsline {paragraph}{What we can still say.}{30}{section*.32}\protected@file@percent }
-\@writefile{toc}{\contentsline {paragraph}{The per-deployment claim, withdrawn and then restored by measurement.}{30}{section*.33}\protected@file@percent }
-\@writefile{toc}{\contentsline {paragraph}{The scope of the withdrawal.}{30}{section*.34}\protected@file@percent }
 \citation{Wilson}
-\@writefile{lot}{\contentsline {table}{\numberline {11}{\ignorespaces Private diagnosis on real biomedical images, image \emph  {and} weights encrypted, only the class index revealed. DermaMNIST is read on balanced accuracy and AUC: its largest class is \SI {66.88}{\percent } of the test set, which published ResNet-18 beats by under seven points. Its RGB input costs nothing extra---an RGB $28\times 28$ convolution needs degree \num {3977} against $n=4096$ and so fits one ciphertext at one multiplication per output channel, which is why its latency matches the grayscale rows.}}{31}{table.11}\protected@file@percent }
-\newlabel{tab:medmnist}{{11}{31}{Private diagnosis on real biomedical images, image \emph {and} weights encrypted, only the class index revealed. DermaMNIST is read on balanced accuracy and AUC: its largest class is \SI {66.88}{\percent } of the test set, which published ResNet-18 beats by under seven points. Its RGB input costs nothing extra---an RGB $28\times 28$ convolution needs degree \num {3977} against $n=4096$ and so fits one ciphertext at one multiplication per output channel, which is why its latency matches the grayscale rows}{table.11}{}}
-\newlabel{tab:medmnist@cref}{{[table][11][]11}{[1][31][]31}{}{}{}}
-\@writefile{toc}{\contentsline {section}{\numberline {10}Case study: private medical image diagnosis}{31}{section.10}\protected@file@percent }
-\newlabel{sec:medmnist}{{10}{31}{Case study: private medical image diagnosis}{section.10}{}}
-\newlabel{sec:medmnist@cref}{{[section][10][]10}{[1][30][]31}{}{}{}}
-\@writefile{toc}{\contentsline {paragraph}{Privacy costs nothing in accuracy, and we show this rather than asserting it.}{31}{section*.35}\protected@file@percent }
-\@writefile{toc}{\contentsline {paragraph}{Accuracy alone misreads a medical classifier.}{31}{section*.36}\protected@file@percent }
-\@writefile{toc}{\contentsline {paragraph}{The ceiling on accuracy is the packing and not the cryptography.}{31}{section*.37}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{The per-deployment claim, withdrawn and then restored by measurement.}{35}{section*.37}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{The scope of the withdrawal.}{35}{section*.38}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {10}Case study: private medical image diagnosis}{35}{section.10}\protected@file@percent }
+\newlabel{sec:medmnist}{{10}{35}{Case study: private medical image diagnosis}{section.10}{}}
+\newlabel{sec:medmnist@cref}{{[section][10][]10}{[1][35][]35}{}{}{}}
+\@writefile{lot}{\contentsline {table}{\numberline {16}{\ignorespaces Private diagnosis on real biomedical images, image \emph  {and} weights encrypted, only the class index revealed. DermaMNIST is read on balanced accuracy and AUC: its largest class is \SI {66.88}{\percent } of the test set, which published ResNet-18 beats by under seven points. Its RGB input costs nothing extra---an RGB $28\times 28$ convolution needs degree \num {3977} against $n=4096$ and so fits one ciphertext at one multiplication per output channel, which is why its latency matches the grayscale rows.}}{36}{table.16}\protected@file@percent }
+\newlabel{tab:medmnist}{{16}{36}{Private diagnosis on real biomedical images, image \emph {and} weights encrypted, only the class index revealed. DermaMNIST is read on balanced accuracy and AUC: its largest class is \SI {66.88}{\percent } of the test set, which published ResNet-18 beats by under seven points. Its RGB input costs nothing extra---an RGB $28\times 28$ convolution needs degree \num {3977} against $n=4096$ and so fits one ciphertext at one multiplication per output channel, which is why its latency matches the grayscale rows}{table.16}{}}
+\newlabel{tab:medmnist@cref}{{[table][16][]16}{[1][35][]36}{}{}{}}
+\@writefile{toc}{\contentsline {paragraph}{Privacy costs nothing in accuracy, and we show this rather than asserting it.}{36}{section*.39}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Accuracy alone misreads a medical classifier.}{36}{section*.40}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{The ceiling on accuracy is the packing and not the cryptography.}{36}{section*.41}\protected@file@percent }
 \citation{LTV}
 \citation{YASHE}
 \citation{ABDucas}
 \citation{KirchnerFouque}
 \citation{DucasvanWoerden}
-\@writefile{toc}{\contentsline {section}{\numberline {11}What the methodology caught in our own work}{32}{section.11}\protected@file@percent }
-\newlabel{sec:withdrawn}{{11}{32}{What the methodology caught in our own work}{section.11}{}}
-\newlabel{sec:withdrawn@cref}{{[section][11][]11}{[1][32][]32}{}{}{}}
-\@writefile{toc}{\contentsline {paragraph}{A backend for proofs that proved nothing.}{32}{section*.38}\protected@file@percent }
-\@writefile{toc}{\contentsline {paragraph}{A break of privacy in bit decomposition.}{32}{section*.39}\protected@file@percent }
-\@writefile{toc}{\contentsline {paragraph}{An insecure homomorphic scheme, removed rather than caveated.}{32}{section*.40}\protected@file@percent }
-\@writefile{toc}{\contentsline {paragraph}{A channel of selective failure that passes every functional test.}{32}{section*.41}\protected@file@percent }
-\@writefile{toc}{\contentsline {paragraph}{A crossover withdrawn three times, for three different reasons.}{33}{section*.42}\protected@file@percent }
-\@writefile{toc}{\contentsline {paragraph}{Comparison errors of framing.}{33}{section*.43}\protected@file@percent }
-\@writefile{toc}{\contentsline {paragraph}{Honest negatives retained.}{33}{section*.44}\protected@file@percent }
-\@writefile{toc}{\contentsline {section}{\numberline {12}Threats to validity}{33}{section.12}\protected@file@percent }
-\newlabel{sec:threats}{{12}{33}{Threats to validity}{section.12}{}}
-\newlabel{sec:threats@cref}{{[section][12][]12}{[1][33][]33}{}{}{}}
-\@writefile{toc}{\contentsline {paragraph}{Quality of the implementation.}{33}{section*.45}\protected@file@percent }
-\@writefile{toc}{\contentsline {paragraph}{A single machine.}{33}{section*.46}\protected@file@percent }
-\@writefile{toc}{\contentsline {paragraph}{Run-to-run variance bounds how sharply a boundary can be read.}{33}{section*.47}\protected@file@percent }
-\@writefile{toc}{\contentsline {paragraph}{The simulated network is a model.}{33}{section*.48}\protected@file@percent }
-\@writefile{toc}{\contentsline {paragraph}{One disclosed cryptographic gap.}{34}{section*.49}\protected@file@percent }
-\newlabel{sec:disclosure}{{12}{34}{A third gap, found while building the pure Falcon route, and closed}{section*.50}{}}
-\newlabel{sec:disclosure@cref}{{[section][12][]12}{[1][34][]34}{}{}{}}
-\@writefile{toc}{\contentsline {paragraph}{A third gap, found while building the pure Falcon route, and closed.}{34}{section*.50}\protected@file@percent }
-\newlabel{sec:pcdisclosure}{{12}{34}{A fourth gap, found by attempting the composability proof, and closed}{section*.51}{}}
-\newlabel{sec:pcdisclosure@cref}{{[section][12][]12}{[1][34][]34}{}{}{}}
-\@writefile{toc}{\contentsline {paragraph}{A fourth gap, found by attempting the composability proof, and closed.}{34}{section*.51}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {11}What the methodology caught in our own work}{37}{section.11}\protected@file@percent }
+\newlabel{sec:withdrawn}{{11}{37}{What the methodology caught in our own work}{section.11}{}}
+\newlabel{sec:withdrawn@cref}{{[section][11][]11}{[1][37][]37}{}{}{}}
+\@writefile{toc}{\contentsline {paragraph}{A backend for proofs that proved nothing.}{37}{section*.42}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{A break of privacy in bit decomposition.}{37}{section*.43}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{An insecure homomorphic scheme, removed rather than caveated.}{37}{section*.44}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{A channel of selective failure that passes every functional test.}{37}{section*.45}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{A crossover withdrawn three times, for three different reasons.}{37}{section*.46}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Comparison errors of framing.}{38}{section*.47}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Honest negatives retained.}{38}{section*.48}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {12}Threats to validity}{38}{section.12}\protected@file@percent }
+\newlabel{sec:threats}{{12}{38}{Threats to validity}{section.12}{}}
+\newlabel{sec:threats@cref}{{[section][12][]12}{[1][38][]38}{}{}{}}
+\@writefile{toc}{\contentsline {paragraph}{Quality of the implementation.}{38}{section*.49}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{A single machine.}{38}{section*.50}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Run-to-run variance bounds how sharply a boundary can be read.}{38}{section*.51}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{The simulated network is a model.}{38}{section*.52}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{One disclosed cryptographic gap.}{39}{section*.53}\protected@file@percent }
+\newlabel{sec:disclosure}{{12}{39}{A third gap, found while building the pure Falcon route, and closed}{section*.54}{}}
+\newlabel{sec:disclosure@cref}{{[section][12][]12}{[1][39][]39}{}{}{}}
+\@writefile{toc}{\contentsline {paragraph}{A third gap, found while building the pure Falcon route, and closed.}{39}{section*.54}\protected@file@percent }
+\newlabel{sec:pcdisclosure}{{12}{39}{A fourth gap, found by attempting the composability proof, and closed}{section*.55}{}}
+\newlabel{sec:pcdisclosure@cref}{{[section][12][]12}{[1][39][]39}{}{}{}}
+\@writefile{toc}{\contentsline {paragraph}{A fourth gap, found by attempting the composability proof, and closed.}{39}{section*.55}\protected@file@percent }
 \citation{CirC}
-\@writefile{toc}{\contentsline {paragraph}{Breadth of the workload.}{35}{section*.52}\protected@file@percent }
-\@writefile{toc}{\contentsline {paragraph}{This is not an adversarial evaluation.}{35}{section*.53}\protected@file@percent }
-\@writefile{toc}{\contentsline {section}{\numberline {13}Open problems}{35}{section.13}\protected@file@percent }
-\newlabel{sec:open}{{13}{35}{Open problems}{section.13}{}}
-\newlabel{sec:open@cref}{{[section][13][]13}{[1][35][]35}{}{}{}}
-\@writefile{toc}{\contentsline {section}{\numberline {14}Conclusion}{35}{section.14}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Breadth of the workload.}{40}{section*.56}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{This is not an adversarial evaluation.}{40}{section*.57}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {13}Open problems}{40}{section.13}\protected@file@percent }
+\newlabel{sec:open}{{13}{40}{Open problems}{section.13}{}}
+\newlabel{sec:open@cref}{{[section][13][]13}{[1][40][]40}{}{}{}}
+\@writefile{toc}{\contentsline {section}{\numberline {14}Conclusion}{40}{section.14}\protected@file@percent }
 \bibstyle{plain}
 \bibdata{references}
 \bibcite{HEStandard}{1}
@@ -501,4 +520,4 @@
 \bibcite{MedMNIST}{57}
 \bibcite{Yao}{58}
 \bibcite{HalfGates}{59}
-\gdef \@abspage@last{40}
+\gdef \@abspage@last{45}

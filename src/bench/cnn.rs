@@ -129,7 +129,8 @@ const OC: usize = 8; // conv output channels
 /// single-kernel-size assumption lived entirely in this module's model representation.
 const K: usize = 3;
 
-/// [`K`], public for the modules that build [`ConvLayer`]s from shipped weight files.
+/// The shipped models' kernel side, public for the modules that build [`ConvLayer`]s
+/// from shipped weight files.
 pub const DEFAULT_K: usize = K;
 const POOL: usize = 2; // max-pool window / stride
 const NCLASSES: usize = 10;
@@ -250,7 +251,7 @@ pub struct ConvLayer {
     pub in_c: usize,
     pub in_h: usize,
     pub in_w: usize,
-    /// Square kernel side. [`K`] for the shipped models, 5 for LeNet.
+    /// Square kernel side. [`DEFAULT_K`] for the shipped models, 5 for LeNet.
     pub k: usize,
 }
 
@@ -288,7 +289,7 @@ pub struct CnnModel {
     /// channels across ciphertexts; a wide *intermediate* layer is what does not
     /// (16 channels at 13×13 needs 5266), and that constraint is unchanged.
     pub in_c: usize,
-    /// First conv's square kernel side. [`K`] for the shipped models, 5 for LeNet.
+    /// First conv's square kernel side. [`DEFAULT_K`] for the shipped models, 5 for LeNet.
     pub k: usize,
     pub kernels: Vec<Vec<i64>>, // first conv: [OC][in_c*k*k], row-major (in_c, ky, kx)
     pub cbias: Vec<i64>,        // [OC]
@@ -1187,6 +1188,7 @@ fn hybrid_matvec_open(
         let t = Instant::now();
         let y = s.decrypt_poly_pre(dk, &masked);
         ph.decrypt_ms += ms(t);
+        ph.link_bytes += (conv_bytes + chunk.len() * 8) as u64;
         sleep_link(&profile, conv_bytes + chunk.len() * 8, 2);
         for r in 0..chunk.len() {
             let pos = s.matvec_output_position(in_dim, r);
@@ -1271,6 +1273,7 @@ fn hybrid_conv_open(
         let t = Instant::now();
         let y = s.decrypt_poly_pre(dk, &masked);
         ph.decrypt_ms += ms(t);
+        ph.link_bytes += (conv_bytes + oh * ow * 8) as u64;
         sleep_link(&profile, conv_bytes + oh * ow * 8, 2);
         for oy in 0..oh {
             for ox in 0..ow {
@@ -1334,6 +1337,7 @@ fn pack_shares_to_fhe_groups(
     }
     ph.reencrypt_ms += ms(t);
     ph.n_reencrypt += per_party.len() * n_groups;
+    ph.link_bytes += bytes as u64;
     sleep_link(&profile, bytes, 1);
     (outs, bytes, ph)
 }
@@ -1364,6 +1368,7 @@ fn pack_shares_to_fhe(
     }
     ph.reencrypt_ms += ms(t);
     ph.n_reencrypt += per_party.len();
+    ph.link_bytes += bytes as u64;
     sleep_link(&profile, bytes, 1);
     (c.expect("three parties"), bytes, ph)
 }
@@ -1562,6 +1567,20 @@ pub struct FhePhases {
     pub n_weight_enc: usize,
     pub n_mask_enc: usize,
     pub n_reencrypt: usize,
+    /// Bytes on the **evaluator link** — FHE ciphertexts and scheme-switch
+    /// payloads that do not cross the party-to-party transport and so are
+    /// invisible to [`crate::bench::comm::CommStats`].
+    ///
+    /// These were charged for in wall clock (via `sleep_link`, which really
+    /// sleeps for `bytes / bandwidth`) and counted nowhere, so the reported
+    /// "MB wire" was the MPC traffic while the reported latency paid for both.
+    /// Fitting a diagnosis's time against the reciprocal of bandwidth gives a
+    /// slope near \SI{29}{\mega\byte} where the traffic table said
+    /// \SI{10.1}{\mega\byte}; the difference is this field. It is common to
+    /// both nonlinearity protocols, so the *crossover between them* is unaffected
+    /// --- but any absolute traffic claim taken from the old column understates
+    /// what the deployment moves by roughly \(3\times\).
+    pub link_bytes: u64,
 }
 
 impl FhePhases {
@@ -1576,6 +1595,7 @@ impl FhePhases {
         self.n_weight_enc += o.n_weight_enc;
         self.n_mask_enc += o.n_mask_enc;
         self.n_reencrypt += o.n_reencrypt;
+        self.link_bytes += o.link_bytes;
     }
 }
 

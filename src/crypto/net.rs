@@ -399,6 +399,56 @@ pub struct Mailbox<T: Transport> {
     // `Send + Sync` as the `Backend` trait requires; a party drives its mailbox
     // single-threaded, so the lock is uncontended.
     buf: Mutex<VecDeque<(PartyId, MpcMsg)>>,
+    /// Times this party blocked on the wire for a message it did not already
+    /// hold, and times a `recv_matching` was served from the buffer instead.
+    ///
+    /// The first is the quantity that predicts wall clock under the latency
+    /// model of [`crate::bench::comm`], which charges a one-way delay per
+    /// message in send order: what costs time is not how many messages a party
+    /// sends, nor how many backend primitives it calls, but how many times it
+    /// stops and waits. Neither of the other two counters is a substitute, and
+    /// on the compiled-versus-hand-written comparison they disagree — one route
+    /// makes half the primitive calls and sends 0.61x the messages while taking
+    /// the same wall clock, which is only explicable in terms of waits.
+    ///
+    /// # It is almost, but not quite, deterministic
+    ///
+    /// A receive counts as a wait only when it actually polls the transport; one
+    /// whose message has already arrived is served from `buf` and counts as a
+    /// hit instead. So the figure is *the number of times a party had to stop*,
+    /// which depends slightly on how the three parties' threads interleave.
+    ///
+    /// Measured on `bench-compiled-nn` at `16/8/4` over eight runs spanning two
+    /// round-trip times:
+    ///
+    /// | route | observed |
+    /// |---|---|
+    /// | hand-written gadgets | 32–33 |
+    /// | hand-written, gc cmp | 11–12 |
+    /// | + ASAP levelling | 43 (stable) |
+    /// | + CSE | 42–43 |
+    /// | + reassociation | 33 (stable) |
+    /// | + gc comparisons | 11–12 |
+    ///
+    /// So four of six rows move by one and two do not, and the network profile
+    /// perturbs the interleaving as much as repetition does. **Quote waits with a
+    /// ±1 and never build an argument on a difference of one count.**
+    ///
+    /// We got this wrong twice, in the same direction each time. First, two equal
+    /// readings of 33 were written up as "exact parity" between the compiler and a
+    /// hand-written expert. Then, after four repetitions at one RTT, the caveat was
+    /// narrowed to "only the a2b route is unstable" — which the next run, at a
+    /// different RTT, contradicted. The temptation both times was to quote the
+    /// equality that had happened to be observed.
+    ///
+    /// What survives is everything resting on a factor rather than a count: 136x
+    /// for levelling, ~2.8x for the garbled-circuit assignment, 214x for the
+    /// fitted local-cost constant.
+    ///
+    /// [`Self::buffer_hits`] is the other half of the pair, and a route whose
+    /// waits jitter is one whose hits jitter by the same amount.
+    waits: std::sync::atomic::AtomicU64,
+    hits: std::sync::atomic::AtomicU64,
 }
 
 impl<T: Transport> Mailbox<T> {
@@ -408,7 +458,24 @@ impl<T: Transport> Mailbox<T> {
             transport,
             prf: Mutex::new(None),
             buf: Mutex::new(VecDeque::new()),
+            waits: std::sync::atomic::AtomicU64::new(0),
+            hits: std::sync::atomic::AtomicU64::new(0),
         }
+    }
+
+    /// Times this party blocked on the wire — the round count that predicts
+    /// wall clock. See the field's documentation.
+    pub fn sync_waits(&self) -> u64 {
+        self.waits.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Times a receive was satisfied from the buffer, costing nothing.
+    ///
+    /// Reported beside [`Mailbox::sync_waits`] because a high ratio of hits to
+    /// waits is what a well-batched protocol looks like: the messages of one
+    /// round arrive together and are consumed without further blocking.
+    pub fn buffer_hits(&self) -> u64 {
+        self.hits.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// This party's pairwise PRF keys, performing the one-time handshake on
@@ -468,10 +535,14 @@ impl<T: Transport> Mailbox<T> {
         {
             let mut buf = self.buf.lock().expect("mailbox buffer poisoned");
             if let Some(pos) = buf.iter().position(|(_, m)| pred(m)) {
+                self.hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 return buf.remove(pos);
             }
         }
-        // 2) Poll the transport until a match arrives or we time out.
+        // 2) Poll the transport until a match arrives or we time out. Reaching
+        //    here is a synchronization point: the party has nothing to do until
+        //    a peer speaks, so this is what a round costs.
+        self.waits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
         loop {
             if let Some((from, bytes)) = self.transport.recv() {

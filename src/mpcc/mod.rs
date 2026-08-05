@@ -529,6 +529,20 @@ pub fn format_comparison(c: &Comparison) -> String {
              (see `baru mpcc protocols` for the roadmap phase)",
         );
     }
+    // The compute term is fitted for exactly one protocol. Ranking a fitted total
+    // against estimated ones is not a ranking, and this is the one place a reader
+    // would otherwise take it for one — so say so whenever compute is deciding
+    // any row, which is precisely when the difference matters.
+    if c.ranked.iter().any(|e| e.bottleneck == "compute") {
+        seen.push(
+            "at least one row is COMPUTE-bound, and only `aby3`/`rep-field`'s compute constant \
+             has been fitted to a measurement (1072 ns/lane, from mul_batch at four widths on a \
+             free network); every other protocol still carries a 5-80 ns literature estimate and \
+             is therefore optimistic on this term by an unknown factor. Do not read a \
+             cross-protocol ordering off a compute-bound table: compare the fitted rows with each \
+             other, or the latency/bandwidth-bound rows with each other",
+        );
+    }
     if !seen.is_empty() {
         out.push_str("\nnotes:\n");
         for n in seen {

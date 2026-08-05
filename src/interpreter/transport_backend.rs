@@ -428,6 +428,24 @@ impl<T: Transport> TransportBackend<T> {
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    /// Times this party blocked waiting for a peer — the count that predicts
+    /// wall clock, and which `interactive_calls` does not.
+    ///
+    /// A primitive call is not a round: `lt_batch` performs a whole bit
+    /// decomposition and blocks once per prefix-adder stage, whereas
+    /// `mul_batch` blocks once. Comparing two routes by their call counts
+    /// therefore weighs a comparison and a multiplication equally, which is how
+    /// a route with half the calls can take the same wall clock.
+    pub fn sync_waits(&self) -> u64 {
+        self.mailbox.sync_waits()
+    }
+
+    /// Receives served from the buffer, costing nothing. See
+    /// [`Self::sync_waits`].
+    pub fn buffer_hits(&self) -> u64 {
+        self.mailbox.buffer_hits()
+    }
+
     fn note_interactive(&self) {
         self.interactive_calls
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
