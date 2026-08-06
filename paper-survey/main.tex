@@ -665,9 +665,11 @@ exactly that, and consequently evaluation keys disappear from the trusted setup 
 network. This simplification is available only because the depth is one.
 
 \paragraph{Threshold decryption.} When the secret key must not exist in a single place, it is
-shared and decryption becomes a protocol. We implement threshold decryption, and we disclose
-that our \emph{key generation} is dealer-based, which is a gap rather than a claim
-(Section~\ref{sec:threats}).
+shared and decryption becomes a protocol. We implement threshold decryption, and the key it
+decrypts under is generated distributively: no party holds it and no dealer produces it
+(Section~\ref{sec:threats}). Both fresh and once-multiplied ciphertexts are covered, the latter
+without an evaluation key, for a reason the depth-1 design supplies and which we return to
+below.
 
 
 \subsection{A composability theorem, and what it costs}
@@ -984,13 +986,23 @@ things, and we have two. The conversion of Section~\ref{sec:prelim:switch} opens
 $m + \sum_i r_i$ with each $r_i$ uniform on the plaintext space, so it satisfies
 Lemma~\ref{lem:openings}. Against a malicious adversary an input ciphertext must also be shown
 well-formed with bounded noise, because replication cannot detect a malformed one --- both
-honest co-holders compute on it faithfully and agree --- and that proof is implemented. What is
-missing is distributed key generation: our threshold decryption is dealer-keyed, so the honest
-statement is that the hybrid realizes its functionality in a model with a key-generation setup,
-which is weaker than we would like and is the same gap we disclose in
-Section~\ref{sec:threats}. The route we would follow is the one Damgård and
-Nielsen~\cite{DamgardNielsen} established for an arithmetic black box from threshold
-homomorphic encryption, and which Asharov et al.~\cite{AsharovMHE} carry to threshold FHE.
+honest co-holders compute on it faithfully and agree --- and that proof is implemented.
+
+Key generation was the last part of this argument to rest on a setup assumption, and it no longer
+does: the key is sampled distributively, so the hybrid realizes its functionality without a dealer
+rather than in a model with one. The construction follows the line Damgård and
+Nielsen~\cite{DamgardNielsen} established for an arithmetic black box from threshold homomorphic
+encryption and which Asharov et al.~\cite{AsharovMHE} carry to threshold FHE, with one adaptation
+that the replicated setting forces and one dividend that it pays; both are described in
+Section~\ref{sec:threats}. The adaptation is that components are ternary rather than uniform,
+because independent sampling cannot deliver a small key and uniform shares at once, and the
+resulting leak is one the standard assumption already absorbs. The dividend is that a product
+ciphertext needs no evaluation key at all, since replicated shares yield a sharing of $s^2$ with no
+communication.
+
+What remains is not a setup assumption but a parameter one, and we state it in
+Section~\ref{sec:threats}: the boundary proof's soundness slack is subtracted from the smudging
+budget bit for bit, which leaves a smaller $\lambda$ than an honest-input analysis reports.
 
 \subsection{Crossing between the paradigms}
 \label{sec:prelim:switch}
@@ -1800,7 +1812,7 @@ trade our crossover measurements report at the network level (\S\ref{sec:crossov
 here at the level of a single primitive. An assignment cannot be read off one column.
 
 \finding{Assigning the comparison levels to the constant-round backend cuts the compiled route
-from \num{33} blocks to \numrange{11}{12}, a reduction of \numrange{2.8}{3.0} times and the largest
+from \num{33} blocks to \numrange{11}{12}, a reduction of \numrange{2.75}{3.0} times and the largest
 single lever after levelling itself. It is also \emph{not a compiler result}: giving the
 hand-written route the same assignment takes it from \numrange{32}{33} to \numrange{11}{12} as well,
 so measuring the assigned compiler against the unassigned expert would report roughly a
@@ -1837,9 +1849,11 @@ local cryptographic work.}
 
 \finding{Garbled circuits are fastest at every point of the grid, and the reason is a term our
 cost model does not contain. With the network free, Falcon's comparison costs $6\times$ what the
-garbled one does --- that is local arithmetic over $\Z_p$ together with its preprocessing --- and
-a model of the form $\text{waits} \times \text{RTT} + \text{bytes}/\text{bandwidth}$ charges every
-candidate zero for it.}
+garbled one does at this batch size --- that is local arithmetic over $\Z_p$ together with its
+preprocessing --- and a model of the form
+$\text{waits} \times \text{RTT} + \text{bytes}/\text{bandwidth}$ charges every candidate zero for
+it. The true ratio is larger still, and we arrive at it below: measured on a whole diagnosis
+rather than on \num{64} comparisons, the factor is \num{16.4} (Table~\ref{tab:marginal}).}
 
 The omission is not cosmetic, and it failed in two distinct ways. On a fast link the model
 predicts \SI{0}{\second} for all three candidates and cannot rank them at all, so the choice fell
@@ -1850,9 +1864,55 @@ to garbled circuits at \SI{105}{\milli\second}: the \SI{78}{\kilo\byte} Falcon s
 in local work to save it. A measured local term restores agreement with the wall clock to
 $1.00\times$ at all three points.
 
+\paragraph{The microbenchmark understates the spread, and we nearly built on it.}
+Table~\ref{tab:cmplinks} measures \num{64} comparisons in a fresh session, which is the natural
+thing to measure and the wrong denominator. Measuring the same comparison work inside a whole
+diagnosis --- \num{7137} comparisons, the workload the assignment exists for --- gives the
+nonlinearity compute directly, and it does not agree.
+
+\begin{table}[htb]
+\centering
+\small
+\begin{tabular}{@{}lrrr@{}}
+\toprule
+backend & in a diagnosis & implied marginal, 64 wide & microbenchmark, 64 wide \\
+\midrule
+\bt{gc} & \SI{137}{\milli\second} & \SI{1.2}{\milli\second} & \SI{13}{\milli\second} \\
+\bt{a2b} & \SI{1063}{\milli\second} & \SI{9.5}{\milli\second} & \SI{33}{\milli\second} \\
+\bt{falcon} & \SI{2248}{\milli\second} & \SI{20.2}{\milli\second} & \SI{79}{\milli\second} \\
+\midrule
+spread & $1 : 7.8 : 16.4$ & $1 : 7.8 : 16.4$ & $1 : 2.5 : 6.1$ \\
+\bottomrule
+\end{tabular}
+\caption{Local comparison cost measured two ways. The middle column divides the first by the
+comparison count and rescales; the right column measures \num{64} comparisons on their own.}
+\label{tab:marginal}
+\end{table}
+
+A \num{64}-wide call costs roughly ten times its own marginal cost, because most of it is session
+setup and share distribution rather than comparing. The absolute inflation would not matter --- a
+ranking does not read absolute numbers --- but it is not uniform across the candidates, and the
+ratio it distorts is exactly what a ranking does read. It makes garbled circuits look
+$2.5\times$ cheaper than bit decomposition where the marginal figure is $7.8\times$.
+
+This is the same slope-against-intercept error we corrected in the analytic model's local-work
+constant, in a different instrument, and we record it as a pattern rather than as two incidents:
+\ib{a cost measured at one scale and applied at another is an intercept masquerading as a slope},
+and the symptom is that the fixed part is common while the ratio is not.
+
+We then made the correction, and it was wrong. Substituting the marginal figures for
+\bt{local\_secs} while leaving the byte term alone flipped the selection to Falcon on a thin pipe,
+where measurement says garbled circuits win --- caught by the validation test rather than by
+inspection. The error was making one term marginal and not the other, and the byte term does not
+decompose the same way: Falcon's traffic includes \emph{its own} preprocessing, which is a
+protocol-specific cost and not a fixed one common to the candidates. There is no common term to
+strip. We reverted to validated totals and kept the marginal measurement as a statement about
+direction: every correction to the ratio favours the champion already selected, so the assignment
+is more right than the registry's numbers imply and never less.
+
 We keep the link-keyed machinery and withdraw the example. The machinery is the right shape, the
 byte-against-blocking trade it expresses is one we measure at the level of whole routes
-(\S\ref{sec:crossover-nonlin}), and the assignment it selects is worth $2.75\times$ in blocking.
+(\S\ref{sec:crossover-nonlin}), and the assignment it selects is worth \numrange{2.75}{3.0} times in blocking, the range being the counter's own $\pm 1$.
 What we no longer claim is that the comparison gadget is where the champion flips: it is not, and
 the test that asserted a flip now asserts the measured fact, so a change that produces one will
 fail it and be looked at.
@@ -2557,9 +2617,87 @@ worst case, but it remains the expression $\text{rounds}\times\text{RTT} +
 \text{bytes}/\text{bandwidth}$ and not a real wide-area network with congestion, jitter or loss of
 packets.
 
-\paragraph{One disclosed cryptographic gap.} The threshold \emph{key generation} of our
-homomorphic layer is dealer-based. We record this on the code itself and in the attestation table,
-and not only in prose.
+\paragraph{The disclosed cryptographic gaps, one of which has since closed.} The threshold
+\emph{key generation} of our homomorphic layer was dealer-based, and we recorded it on the code
+itself and in the attestation table rather than only in prose. It no longer is, and the reason the
+dealer was there turns out to be worth more than its removal.
+
+A dealer makes the key components \ib{uniform} modulo $q$ while their sum stays \ib{ternary}, by
+choosing $s_2 = s - s_0 - s_1$. Both properties at once are what it buys, and no protocol in which
+each party samples its own component independently can have all three of independent sampling, a
+small sum, and uniform components. Sampling each $s_i$ uniformly makes $s$ uniform modulo $q$, and
+BFV decryption computes $c_0 + c_1 s = \Delta m + (e_1 + e_2 s - e u)$, whose $e_2 s$ term then
+exceeds $q/2t$: decryption fails outright rather than degrading.
+
+Our key generation takes the other horn. Each party samples $s_i$ ternary and sends it to its
+predecessor, so the replicated layout $(s_i, s_{i+1})$ survives --- deliberately, because
+replication is what makes a partial decryption checkable by recompute-and-compare, and a protocol
+producing only additive shares would remove the dealer at the cost of the malicious-security
+argument. A single corruption then learns two of the three components, hence
+$k = s_i + s_{i+1}$, and that $s - k$ is ternary. That is not the weakness it appears to be,
+because the adversary's residual problem is the one the scheme already rests on:
+\[
+  b + a k \;=\; -(a(s-k) + e),
+\]
+an RLWE sample whose secret $s - k$ is ternary. We cannot test hardness, but we can and do test
+the identity that the reduction rests on --- the measured residual has sup-norm exactly $3$, the
+sum of three ternary errors --- so a broken reduction would be visibly rather than quietly vacuous.
+The cost is that $\|s\|_\infty \le 3$ rather than $1$, about \num{1.6} bits of noise budget for a
+fresh ciphertext and \num{3.2} for a product, which we report rather than assume because it
+competes with the smudging budget.
+
+\finding{The expensive part of threshold FHE does not arise here at all. A product decrypts under
+$s^2$ because we relinearize nothing, and under replicated sharing each party forms its own share
+of $s^2$ \emph{with no communication}: writing $s^2 = \sum_i s_i^2 + 2(s_0s_1 + s_1s_2 + s_2s_0)$,
+party $i$ holds $(s_i, s_{i+1})$ and computes $s_i^2 + 2 s_i s_{i+1}$, and the three sum to exactly
+$s^2$. It is the same identity replicated multiplication uses, which is no coincidence --- it is
+the same sharing. Distributed generation of a relinearization key, the costly step in threshold
+FHE, is therefore not deferred but unnecessary, and that is a dividend of the depth-1 design rather
+than of the key generation.}
+
+We measured the cost of using it before proposing to, and we separate two figures that are easy to
+conflate. Against one local decryption, a threshold decryption is $3.5\times$ in \emph{total work},
+which is the throughput cost; the \emph{latency} cost is one party's partial decryption at
+$1.18\times$, plus one communication round, because the three partials are computed concurrently on
+three machines. Quoting the first as a latency figure would repeat the error this paper records
+elsewhere, so the artifact prints both with that warning and asserts that one party performs
+between a fifth and a half of the total, which is the premise the parallelism argument needs.
+
+\paragraph{What the input-boundary proof buys, and what it costs.} The boundary is the one place
+where replication cannot help and zero knowledge is unavoidable, and we can now say concretely why.
+Adding half a $\Delta$ to a single coefficient of an input ciphertext --- the mildest tamper that
+does anything at all --- turns a computed result of \num{42} into \num{43}, and two honest
+co-holders recomputing the evaluation \emph{agree} on the \num{43}, because the evaluation was
+performed correctly. The fault is in the input, which no amount of recomputation inspects. We draw
+attention to the off-by-one: a malformed input need not produce a value that a sanity check would
+reject, and an adversary with more room than half a $\Delta$ can choose noise large enough that
+whether the decryption wraps depends on the model weights, which turns a correctness failure at the
+boundary into a channel that leaks what the protocol exists to protect.
+
+The proof itself is implemented: a Schnorr-style $\Sigma$-protocol over the ring, made
+non-interactive by Fiat--Shamir, with Lyubashevsky rejection sampling rather than noise flooding, so
+that a released response is \emph{perfectly} hiding rather than statistically so. The interesting
+part is what it costs, and it is not the prover time.
+
+\finding{Soundness slack at the boundary is paid for out of the smudging budget, bit for bit. A
+$\Sigma$-protocol extracts a witness whose norm exceeds the honest one by a slack factor, so a
+verifier accepting the proof is accepting inputs with noise up to $2^{\text{slack}} \cdot B$; that
+noise grows through the evaluation and arrives at the threshold decryption, where the flooding that
+hides the key share must cover it. Our measured \num{26}-bit slack leaves $\lambda = 30$ at the
+largest modulus this implementation can represent, against the \num{40} that an
+honest-input analysis reports. The two analyses were not previously on the same footing, and the
+gap is entirely this term.}
+
+That is why the artifact's attestation for this scheme stays semi-honest: not because the proof is
+missing, but because it is a tested rather than reviewed implementation, and because $\lambda = 30$
+is below what we are willing to call a malicious-security claim. Both are settleable --- a tighter
+proof, or a wider modulus than a \bt{u128} representation admits --- and neither is settled here.
+
+\paragraph{What remains open.} Two things, neither cryptographic in the sense above. The first is
+the review and parameter question just described. The second is harness structure: our benchmark
+evaluates the homomorphic half single-threaded with one decryption key, because simulating one
+evaluator is cheaper than simulating three, so the reported figures do not yet include the
+threshold path even though the protocol no longer requires a party that can decrypt.
 
 The Falcon backend's preprocessing used to be the second such gap---dealt from a
 common seed, so all three parties could reconstruct the mask. It is now generated
@@ -2653,8 +2791,13 @@ tractable.
     zero-knowledge proof is needed \emph{only at the input boundary and never for the evaluation},
     whereas verifiable homomorphic encryption on a single server needs one over the whole
     computation. We have since implemented the boundary proof, that is, a proof that a ciphertext
-    is a well-formed encryption with bounded noise, and what remains open is to compose it with
-    the malicious secret-sharing layer so that a single protocol carries both guarantees.
+    is a well-formed encryption with bounded noise, and what remains open is a parameter question
+    rather than a construction: the proof's soundness slack is subtracted from the smudging budget
+    bit for bit, so the measured \num{26}-bit slack leaves $\lambda = 30$ at the widest modulus a
+    \bt{u128} representation admits, against the \num{40} an honest-input analysis reports. Either
+    a tighter proof or a wider modulus recovers it. Composing the proof with the malicious
+    secret-sharing layer, so that a single protocol carries both guarantees, remains open
+    alongside it.
   \item \textbf{Secret-index array access}, priced by the cost model, before
     ORAM. CirC~\cite{CirC} implements exactly the two cases either side of that
     line and does not implement ORAM at all.

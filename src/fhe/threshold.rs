@@ -30,9 +30,11 @@
 //! The contrast with single-server verifiable FHE is the point worth making:
 //! there, zero-knowledge must cover the **entire evaluation**. Here it is
 //! needed only at the **input boundary** — ciphertexts arriving from outside
-//! still need a proof of well-formedness, because two honest parties will
-//! faithfully compute on the same bad input and agree (§4.4, not implemented;
-//! see [`BOUNDARY_GAP`]). Replication covers everything in between for free.
+//! need a proof of well-formedness, because two honest parties will faithfully
+//! compute on the same bad input and agree. That proof is
+//! [`crate::fhe::boundary_proof`]; what remains unsettled about it is a
+//! parameter question, not its absence, and [`BOUNDARY_GAP`] states it.
+//! Replication covers everything in between for free.
 //!
 //! # What this does *not* buy
 //!
@@ -86,26 +88,42 @@ pub const DKG_WIRING_GAP: &str =
      because simulating one evaluator is faster than three, so the BENCHMARK retains a \
      decrypting party that the protocol no longer requires";
 
-/// Why this module is not yet sufficient for a malicious deployment.
+/// Why this module alone is not sufficient for a malicious deployment, and what
+/// closes it.
 ///
-/// Demonstrated, not merely asserted, by
-/// `a_malformed_input_ciphertext_is_not_caught_by_replication`: adding half a `Δ`
-/// to one coefficient of an input ciphertext --- the mildest tamper that does
-/// anything --- turns a result of `42` into `43`, and two honest co-holders
-/// recomputing the evaluation agree on that `43`, because the evaluation *was*
-/// performed correctly.
+/// Replication secures every *evaluation* step, and cannot vouch for a ciphertext
+/// arriving from outside: both honest co-holders compute on a malformed input
+/// faithfully and agree.
+/// `a_malformed_input_ciphertext_is_not_caught_by_replication` shows it costs
+/// nothing to exploit — adding half a `Δ` to one coefficient turns a result of
+/// `42` into `43`, with every integrity check in this module passing, because the
+/// evaluation *was* performed correctly. The off-by-one is the part worth
+/// noticing: a malformed input need not produce garbage a sanity check would
+/// reject. A real adversary has far more room than half a `Δ`, including noise
+/// large enough that whether the decryption wraps depends on the *model weights*,
+/// which turns a correctness failure into a channel leaking what the protocol
+/// protects.
 ///
-/// The off-by-one is the part worth noticing. A malformed input does not have to
-/// produce garbage that a sanity check would catch; here it produces a plausible
-/// neighbouring answer. And a real adversary has far more room than half a `Δ`,
-/// including noise large enough that whether the decryption wraps depends on the
-/// *model weights* --- which turns a correctness failure at the boundary into a
-/// channel that leaks the thing the protocol exists to protect.
+/// **The proof that closes this exists**: [`crate::fhe::boundary_proof`], a
+/// Schnorr-style Σ-protocol over the ring, Fiat–Shamir'd, using Lyubashevsky
+/// rejection sampling so a released response is *perfectly* hiding. This constant
+/// used to say the proof was still needed, and was left stale when it landed —
+/// which is a documentation hazard worth naming, because a reader (and an author
+/// of this paper's security section) took it at face value.
+///
+/// What is genuinely unsettled is narrower and is stated by
+/// [`crate::fhe::boundary`]: **soundness slack is paid out of the smudging budget,
+/// bit for bit.** A verifier accepting the proof accepts noise up to
+/// `2^slack · B`, that noise grows through the evaluation, and the flooding at
+/// threshold decryption must cover it. The measured 26-bit slack leaves λ = 30 at
+/// the largest modulus a `u128` representation admits, against the 40 an
+/// honest-input analysis reports. That, plus the proof being a tested rather than
+/// a reviewed implementation, is why the attestation stays semi-honest.
 pub const BOUNDARY_GAP: &str =
-    "externally supplied ciphertexts still need a ZK proof of well-formedness: replication \
-     cannot catch a malformed input, because both honest co-holders compute on it faithfully \
-     and agree — demonstrated by `a_malformed_input_ciphertext_is_not_caught_by_replication`, \
-     where a half-delta tamper turns 42 into 43 with every integrity check passing";
+    "the boundary proof of well-formedness EXISTS (fhe::boundary_proof); what is unsettled is \
+     that its soundness slack is paid out of the smudging budget bit for bit, so the measured \
+     26-bit slack leaves lambda = 30 rather than 40, and the implementation is tested rather \
+     than reviewed — see fhe::boundary for the analysis";
 
 // ─── Deterministic sampling ──────────────────────────────────────────────────
 
@@ -1253,13 +1271,18 @@ mod dkg_tests {
         }
     }
 
-    /// **The input-boundary gap, demonstrated rather than asserted.**
+    /// **Why the input boundary needs a proof, demonstrated rather than asserted.**
     ///
-    /// [`BOUNDARY_GAP`] claims that replication cannot catch a malformed input ciphertext,
-    /// because both honest co-holders compute on it faithfully and agree. That has been a
-    /// sentence in a doc comment since the module was written. This makes it a fact you can
-    /// run: a tampered ciphertext yields a wrong plaintext, and every integrity mechanism this
-    /// module has says the computation was performed correctly --- which it was.
+    /// Replication cannot catch a malformed input ciphertext, because both honest co-holders
+    /// compute on it faithfully and agree. That has been a sentence in a doc comment since the
+    /// module was written. This makes it a fact you can run: a tampered ciphertext yields a
+    /// wrong plaintext, and every integrity mechanism *this module* has says the computation
+    /// was performed correctly --- which it was.
+    ///
+    /// This is the attack [`crate::fhe::boundary_proof`] exists to stop, so the test measures
+    /// the exposure of `threshold` **alone**, not of the system with the boundary proof in
+    /// place. Framing it as an open gap would misstate the artifact, and briefly did: the
+    /// constant this test used to cite still said the proof was needed long after it landed.
     ///
     /// The tamper is deliberately the mildest one that works: add half a `Δ` to the constant
     /// term, which is not a large perturbation but is enough to push the rounding in decryption
@@ -1356,7 +1379,7 @@ mod dkg_tests {
         assert_eq!(
             co_holder_a, co_holder_b,
             "recompute-and-compare passes on a malformed input: both honest parties agree, and \
-             the agreed value is wrong. This is `BOUNDARY_GAP`, and it is why the obligation \
+             the agreed value is wrong. This is why the input boundary needs a proof and \
              cannot be discharged by replication"
         );
         println!(
