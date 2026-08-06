@@ -413,58 +413,68 @@
 \newlabel{sec:crossover-nonlin@cref}{{[subsection][3][9]9.3}{[1][34][]34}{}{}{}}
 \@writefile{toc}{\contentsline {paragraph}{We reported three other answers before this one, and we consider the sequence to be the more useful result.}{35}{section*.36}\protected@file@percent }
 \@writefile{toc}{\contentsline {paragraph}{What we can still say.}{35}{section*.37}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{The per-deployment claim, withdrawn and then restored by measurement.}{36}{section*.38}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{The scope of the withdrawal.}{36}{section*.39}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {9.4}The convolution crossover, and a trick that did not need its scheme}{36}{subsection.9.4}\protected@file@percent }
+\newlabel{sec:crossover-conv}{{9.4}{36}{The convolution crossover, and a trick that did not need its scheme}{subsection.9.4}{}}
+\newlabel{sec:crossover-conv@cref}{{[subsection][4][9]9.4}{[1][36][]36}{}{}{}}
+\citation{CHIP}
+\citation{Winograd}
+\citation{LavinGray}
+\@writefile{lot}{\contentsline {table}{\numberline {17}{\ignorespaces One $3\times 3$ stride-1 convolution, three backends, all ending with shares. The direct secret-shared route is omitted for width; it is never better than the Winograd one, being the same computation with more multiplications. The last column is the bandwidth below which the shared route's smaller traffic outweighs its larger compute.}}{37}{table.17}\protected@file@percent }
+\newlabel{tab:convroute}{{17}{37}{One $3\times 3$ stride-1 convolution, three backends, all ending with shares. The direct secret-shared route is omitted for width; it is never better than the Winograd one, being the same computation with more multiplications. The last column is the bandwidth below which the shared route's smaller traffic outweighs its larger compute}{table.17}{}}
+\newlabel{tab:convroute@cref}{{[table][17][]17}{[1][37][]37}{}{}{}}
 \citation{MedMNIST}
 \citation{MNIST}
 \citation{Wilson}
-\@writefile{toc}{\contentsline {paragraph}{The per-deployment claim, withdrawn and then restored by measurement.}{36}{section*.38}\protected@file@percent }
-\@writefile{toc}{\contentsline {paragraph}{The scope of the withdrawal.}{36}{section*.39}\protected@file@percent }
-\@writefile{toc}{\contentsline {section}{\numberline {10}Case study: private medical image diagnosis}{36}{section.10}\protected@file@percent }
-\newlabel{sec:medmnist}{{10}{36}{Case study: private medical image diagnosis}{section.10}{}}
-\newlabel{sec:medmnist@cref}{{[section][10][]10}{[1][36][]36}{}{}{}}
-\@writefile{lot}{\contentsline {table}{\numberline {17}{\ignorespaces Private diagnosis on real biomedical images, image \emph  {and} weights encrypted, only the class index revealed. DermaMNIST is read on balanced accuracy and AUC: its largest class is \SI {66.88}{\percent } of the test set, which published ResNet-18 beats by under seven points. Its RGB input costs nothing extra---an RGB $28\times 28$ convolution needs degree \num {3977} against $n=4096$ and so fits one ciphertext at one multiplication per output channel, which is why its latency matches the grayscale rows.}}{37}{table.17}\protected@file@percent }
-\newlabel{tab:medmnist}{{17}{37}{Private diagnosis on real biomedical images, image \emph {and} weights encrypted, only the class index revealed. DermaMNIST is read on balanced accuracy and AUC: its largest class is \SI {66.88}{\percent } of the test set, which published ResNet-18 beats by under seven points. Its RGB input costs nothing extra---an RGB $28\times 28$ convolution needs degree \num {3977} against $n=4096$ and so fits one ciphertext at one multiplication per output channel, which is why its latency matches the grayscale rows}{table.17}{}}
-\newlabel{tab:medmnist@cref}{{[table][17][]17}{[1][36][]37}{}{}{}}
-\@writefile{toc}{\contentsline {paragraph}{Privacy costs nothing in accuracy, and we show this rather than asserting it.}{37}{section*.40}\protected@file@percent }
-\@writefile{toc}{\contentsline {paragraph}{Accuracy alone misreads a medical classifier.}{37}{section*.41}\protected@file@percent }
-\@writefile{toc}{\contentsline {paragraph}{The ceiling on accuracy is the packing and not the cryptography.}{37}{section*.42}\protected@file@percent }
+\@writefile{lot}{\contentsline {table}{\numberline {18}{\ignorespaces Private diagnosis on real biomedical images, image \emph  {and} weights encrypted, only the class index revealed. DermaMNIST is read on balanced accuracy and AUC: its largest class is \SI {66.88}{\percent } of the test set, which published ResNet-18 beats by under seven points. Its RGB input costs nothing extra---an RGB $28\times 28$ convolution needs degree \num {3977} against $n=4096$ and so fits one ciphertext at one multiplication per output channel, which is why its latency matches the grayscale rows.}}{38}{table.18}\protected@file@percent }
+\newlabel{tab:medmnist}{{18}{38}{Private diagnosis on real biomedical images, image \emph {and} weights encrypted, only the class index revealed. DermaMNIST is read on balanced accuracy and AUC: its largest class is \SI {66.88}{\percent } of the test set, which published ResNet-18 beats by under seven points. Its RGB input costs nothing extra---an RGB $28\times 28$ convolution needs degree \num {3977} against $n=4096$ and so fits one ciphertext at one multiplication per output channel, which is why its latency matches the grayscale rows}{table.18}{}}
+\newlabel{tab:medmnist@cref}{{[table][18][]18}{[1][38][]38}{}{}{}}
+\@writefile{toc}{\contentsline {paragraph}{We report this boundary with a correction attached, because our first version of it was wrong by a factor of twenty.}{38}{section*.40}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {10}Case study: private medical image diagnosis}{38}{section.10}\protected@file@percent }
+\newlabel{sec:medmnist}{{10}{38}{Case study: private medical image diagnosis}{section.10}{}}
+\newlabel{sec:medmnist@cref}{{[section][10][]10}{[1][38][]38}{}{}{}}
+\@writefile{toc}{\contentsline {paragraph}{Privacy costs nothing in accuracy, and we show this rather than asserting it.}{39}{section*.41}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Accuracy alone misreads a medical classifier.}{39}{section*.42}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{The ceiling on accuracy is the packing and not the cryptography.}{39}{section*.43}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {11}What the methodology caught in our own work}{39}{section.11}\protected@file@percent }
+\newlabel{sec:withdrawn}{{11}{39}{What the methodology caught in our own work}{section.11}{}}
+\newlabel{sec:withdrawn@cref}{{[section][11][]11}{[1][39][]39}{}{}{}}
+\@writefile{toc}{\contentsline {paragraph}{A backend for proofs that proved nothing.}{39}{section*.44}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{A break of privacy in bit decomposition.}{39}{section*.45}\protected@file@percent }
 \citation{LTV}
 \citation{YASHE}
 \citation{ABDucas}
 \citation{KirchnerFouque}
 \citation{DucasvanWoerden}
-\@writefile{toc}{\contentsline {section}{\numberline {11}What the methodology caught in our own work}{38}{section.11}\protected@file@percent }
-\newlabel{sec:withdrawn}{{11}{38}{What the methodology caught in our own work}{section.11}{}}
-\newlabel{sec:withdrawn@cref}{{[section][11][]11}{[1][38][]38}{}{}{}}
-\@writefile{toc}{\contentsline {paragraph}{A backend for proofs that proved nothing.}{38}{section*.43}\protected@file@percent }
-\@writefile{toc}{\contentsline {paragraph}{A break of privacy in bit decomposition.}{38}{section*.44}\protected@file@percent }
-\@writefile{toc}{\contentsline {paragraph}{An insecure homomorphic scheme, removed rather than caveated.}{38}{section*.45}\protected@file@percent }
-\@writefile{toc}{\contentsline {paragraph}{A channel of selective failure that passes every functional test.}{38}{section*.46}\protected@file@percent }
-\@writefile{toc}{\contentsline {paragraph}{A crossover withdrawn three times, for three different reasons.}{38}{section*.47}\protected@file@percent }
-\@writefile{toc}{\contentsline {paragraph}{Comparison errors of framing.}{39}{section*.48}\protected@file@percent }
-\@writefile{toc}{\contentsline {paragraph}{Honest negatives retained.}{39}{section*.49}\protected@file@percent }
-\@writefile{toc}{\contentsline {section}{\numberline {12}Threats to validity}{39}{section.12}\protected@file@percent }
-\newlabel{sec:threats}{{12}{39}{Threats to validity}{section.12}{}}
-\newlabel{sec:threats@cref}{{[section][12][]12}{[1][39][]39}{}{}{}}
-\@writefile{toc}{\contentsline {paragraph}{Quality of the implementation.}{39}{section*.50}\protected@file@percent }
-\@writefile{toc}{\contentsline {paragraph}{A single machine.}{39}{section*.51}\protected@file@percent }
-\@writefile{toc}{\contentsline {paragraph}{Run-to-run variance bounds how sharply a boundary can be read.}{39}{section*.52}\protected@file@percent }
-\@writefile{toc}{\contentsline {paragraph}{The simulated network is a model.}{39}{section*.53}\protected@file@percent }
-\@writefile{toc}{\contentsline {paragraph}{The disclosed cryptographic gaps, one of which has since closed.}{40}{section*.54}\protected@file@percent }
-\@writefile{toc}{\contentsline {paragraph}{What the input-boundary proof buys, and what it costs.}{40}{section*.55}\protected@file@percent }
-\@writefile{toc}{\contentsline {paragraph}{What remains open.}{41}{section*.56}\protected@file@percent }
-\newlabel{sec:disclosure}{{12}{41}{A third gap, found while building the pure Falcon route, and closed}{section*.57}{}}
-\newlabel{sec:disclosure@cref}{{[section][12][]12}{[1][41][]41}{}{}{}}
-\@writefile{toc}{\contentsline {paragraph}{A third gap, found while building the pure Falcon route, and closed.}{41}{section*.57}\protected@file@percent }
-\newlabel{sec:pcdisclosure}{{12}{42}{A fourth gap, found by attempting the composability proof, and closed}{section*.58}{}}
-\newlabel{sec:pcdisclosure@cref}{{[section][12][]12}{[1][41][]42}{}{}{}}
-\@writefile{toc}{\contentsline {paragraph}{A fourth gap, found by attempting the composability proof, and closed.}{42}{section*.58}\protected@file@percent }
-\@writefile{toc}{\contentsline {paragraph}{Breadth of the workload.}{42}{section*.59}\protected@file@percent }
-\@writefile{toc}{\contentsline {paragraph}{This is not an adversarial evaluation.}{42}{section*.60}\protected@file@percent }
-\@writefile{toc}{\contentsline {section}{\numberline {13}Open problems}{42}{section.13}\protected@file@percent }
-\newlabel{sec:open}{{13}{42}{Open problems}{section.13}{}}
-\newlabel{sec:open@cref}{{[section][13][]13}{[1][42][]42}{}{}{}}
+\@writefile{toc}{\contentsline {paragraph}{An insecure homomorphic scheme, removed rather than caveated.}{40}{section*.46}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{A channel of selective failure that passes every functional test.}{40}{section*.47}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{A crossover withdrawn three times, for three different reasons.}{40}{section*.48}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Comparison errors of framing.}{40}{section*.49}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Honest negatives retained.}{40}{section*.50}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {12}Threats to validity}{40}{section.12}\protected@file@percent }
+\newlabel{sec:threats}{{12}{40}{Threats to validity}{section.12}{}}
+\newlabel{sec:threats@cref}{{[section][12][]12}{[1][40][]40}{}{}{}}
+\@writefile{toc}{\contentsline {paragraph}{Quality of the implementation.}{41}{section*.51}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{A single machine.}{41}{section*.52}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Run-to-run variance bounds how sharply a boundary can be read.}{41}{section*.53}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{The simulated network is a model.}{41}{section*.54}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{The disclosed cryptographic gaps, one of which has since closed.}{41}{section*.55}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{What the input-boundary proof buys, and what it costs.}{42}{section*.56}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{What remains open.}{42}{section*.57}\protected@file@percent }
+\newlabel{sec:disclosure}{{12}{43}{A third gap, found while building the pure Falcon route, and closed}{section*.58}{}}
+\newlabel{sec:disclosure@cref}{{[section][12][]12}{[1][43][]43}{}{}{}}
+\@writefile{toc}{\contentsline {paragraph}{A third gap, found while building the pure Falcon route, and closed.}{43}{section*.58}\protected@file@percent }
+\newlabel{sec:pcdisclosure}{{12}{43}{A fourth gap, found by attempting the composability proof, and closed}{section*.59}{}}
+\newlabel{sec:pcdisclosure@cref}{{[section][12][]12}{[1][43][]43}{}{}{}}
+\@writefile{toc}{\contentsline {paragraph}{A fourth gap, found by attempting the composability proof, and closed.}{43}{section*.59}\protected@file@percent }
 \citation{CirC}
-\@writefile{toc}{\contentsline {section}{\numberline {14}Conclusion}{43}{section.14}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Breadth of the workload.}{44}{section*.60}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{This is not an adversarial evaluation.}{44}{section*.61}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {13}Open problems}{44}{section.13}\protected@file@percent }
+\newlabel{sec:open}{{13}{44}{Open problems}{section.13}{}}
+\newlabel{sec:open@cref}{{[section][13][]13}{[1][44][]44}{}{}{}}
+\@writefile{toc}{\contentsline {section}{\numberline {14}Conclusion}{44}{section.14}\protected@file@percent }
 \bibstyle{plain}
 \bibdata{references}
 \bibcite{HEStandard}{1}
@@ -508,22 +518,25 @@
 \bibcite{KoggeStone}{39}
 \bibcite{FreeXOR}{40}
 \bibcite{SWIFT}{41}
-\bibcite{MNIST}{42}
-\bibcite{MiniONN}{43}
-\bibcite{LTV}{44}
-\bibcite{Delphi}{45}
-\bibcite{ABY3}{46}
-\bibcite{MoraisDahab}{47}
-\bibcite{CirC}{48}
-\bibcite{CrypTFlow2}{49}
-\bibcite{RotaruWood}{50}
-\bibcite{SEAL}{51}
-\bibcite{NTL}{52}
-\bibcite{TFHErs}{53}
-\bibcite{SecureNN}{54}
-\bibcite{Falcon}{55}
-\bibcite{Wilson}{56}
-\bibcite{MedMNIST}{57}
-\bibcite{Yao}{58}
-\bibcite{HalfGates}{59}
-\gdef \@abspage@last{48}
+\bibcite{LavinGray}{42}
+\bibcite{MNIST}{43}
+\bibcite{MiniONN}{44}
+\bibcite{LTV}{45}
+\bibcite{Delphi}{46}
+\bibcite{ABY3}{47}
+\bibcite{MoraisDahab}{48}
+\bibcite{CirC}{49}
+\bibcite{CrypTFlow2}{50}
+\bibcite{RotaruWood}{51}
+\bibcite{SEAL}{52}
+\bibcite{NTL}{53}
+\bibcite{TFHErs}{54}
+\bibcite{SecureNN}{55}
+\bibcite{Falcon}{56}
+\bibcite{CHIP}{57}
+\bibcite{Wilson}{58}
+\bibcite{Winograd}{59}
+\bibcite{MedMNIST}{60}
+\bibcite{Yao}{61}
+\bibcite{HalfGates}{62}
+\gdef \@abspage@last{49}

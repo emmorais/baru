@@ -837,6 +837,56 @@ decryptions and a combine per scheme switch against one local decryption today.
 `DKG_WIRING_GAP` names it in the code so "DKG landed" cannot be read as "no party
 can decrypt".
 
+### Convolution has a backend crossover too (2026-08-06)
+
+Adopting CHIP's fast convolution (Winograd F(2x2,3x3), `gadgets::winograd`) left
+a correct gadget with no consumer: `gadgets::conv2d` had no callers outside
+tests, since the CNN convolves in FHE. `bench-conv` is the consumer, and it
+turned a dormant optimisation into a measured decision.
+
+Three strategies for one 3x3 layer, all keeping the model secret, all ending
+with **secret shares** (the boundary the following ReLU needs), all checked
+against one plaintext reference. Timing is the **per-layer online cost**: for the
+shared routes the convolution itself, for the homomorphic route the convolution
+plus its scheme switch. See the timing note below — getting this boundary right
+changed the answer by 20x.
+
+| shape | direct kB | winograd kB | fhe kB | wino ms | fhe ms | byte win pays below |
+|---|---|---|---|---|---|---|
+| 2x8x8 -> 3 | 49 | **32** | 1769 | **11** | 31 | shared dominates |
+| 4x12x12 -> 4 | 300 | **172** | 2359 | **21** | 42 | shared dominates |
+| 8x16x16 -> 8 | 2063 | **1060** | 4719 | 90 | **69** | 1424 Mbps |
+| 16x20x20 -> 8 | 6602 | **3284** | 4719 | 231 | **130** | 114 Mbps |
+| 16x28x28 -> 16 | 26478 | 12634 | **9437** | 1022 | **332** | fhe dominates |
+
+**Winograd moves the assignment.** At `16x20x20->8` the direct MPC convolution
+(6602 kB) loses to FHE on bytes while the Winograd one (3284 kB) beats it. And in
+wall clock Winograd is 2.2x the direct route (231 vs 519 ms at that shape),
+matching its 2.25x multiplication ratio almost exactly.
+
+**The conclusion favours secret sharing more than first measured.** The shared
+route dominates outright at small layers, and where neither dominates the
+break-even bandwidths are 1424 and 114 Mbps — above almost any real link. Only
+the largest layer goes to FHE on both axes.
+
+**Three wrong narratives, and the fix.** I wrote this summary three times:
+"bytes decide", then "compute decides and the byte win is irrelevant", then "fhe
+is faster at every shape". Each was true of the data in front of me and falsified
+by the next measurement. The benchmark now **derives** its summary sentence from
+the measured rows — counting which route wins on each axis — so a stale narrative
+cannot survive a changed table.
+
+**The timing bug that caused most of it.** The first published figures had the
+shared route at 5023 ms against FHE's 135 ms, a 37x gap. Almost all of it was my
+own benchmark: it opened all 2592 outputs **one at a time** as verification
+scaffolding, while the homomorphic route decrypts a whole channel per call. In a
+deployment the shared route's output is never opened — it feeds the next layer's
+ReLU as shares. Excluding the scaffolding, and symmetrically excluding FHE's
+per-session `keygen` from its side, moved the shared route 5023 -> 236 ms and the
+comparison from 37x to 1.8x. **95% of what I had reported as a protocol cost was
+scaffolding**, and the asymmetry was invisible because each route's opening looked
+natural in isolation.
+
 ### Per-operation protocol assignment (2026-07-28, from SING)
 
 Reading SING (USENIX Sec'26) exposed a real gap: Baru ranked **whole-program**

@@ -941,6 +941,7 @@ pub mod abstraction;
 pub mod backend_aware;
 pub mod circuit;
 pub mod cnn;
+pub mod conv_route;
 pub mod cohort;
 pub mod cohort_eval;
 pub mod comm;

@@ -5,45 +5,45 @@ The style file: plain.bst
 Database file #1: references.bib
 Warning--empty booktitle in CHIMERA
 Warning--can't use both volume and number fields in CHIMERA
-You've used 59 entries,
+You've used 62 entries,
             2118 wiz_defined-function locations,
-            864 strings with 14318 characters,
-and the built_in function-call counts, 25586 in all, are:
-= -- 2540
-> -- 1121
+            881 strings with 14751 characters,
+and the built_in function-call counts, 26354 in all, are:
+= -- 2607
+> -- 1154
 < -- 42
-+ -- 444
-- -- 382
-* -- 1616
-:= -- 3773
-add.period$ -- 182
-call.type$ -- 59
-change.case$ -- 369
++ -- 457
+- -- 392
+* -- 1650
+:= -- 3903
+add.period$ -- 192
+call.type$ -- 62
+change.case$ -- 382
 chr.to.int$ -- 0
-cite$ -- 61
-duplicate$ -- 1104
-empty$ -- 2094
-format.name$ -- 382
-if$ -- 5705
+cite$ -- 64
+duplicate$ -- 1144
+empty$ -- 2172
+format.name$ -- 392
+if$ -- 5871
 int.to.chr$ -- 0
-int.to.str$ -- 59
-missing$ -- 51
-newline$ -- 302
-num.names$ -- 114
-pop$ -- 507
+int.to.str$ -- 62
+missing$ -- 55
+newline$ -- 318
+num.names$ -- 120
+pop$ -- 532
 preamble$ -- 1
-purify$ -- 310
+purify$ -- 321
 quote$ -- 0
-skip$ -- 940
+skip$ -- 962
 stack$ -- 0
-substring$ -- 1729
-swap$ -- 461
+substring$ -- 1744
+swap$ -- 466
 text.length$ -- 42
 text.prefix$ -- 0
 top$ -- 0
-type$ -- 236
+type$ -- 246
 warning$ -- 2
-while$ -- 247
-width$ -- 61
-write$ -- 650
+while$ -- 253
+width$ -- 64
+write$ -- 682
 (There were 2 warnings)

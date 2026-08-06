@@ -75,6 +75,9 @@ fn main() -> Result<(), Box<dyn Error>> {
     if args.first().map(String::as_str) == Some("bench-compiled-nn") {
         return baru::bench::compiled_nn::run_cli(&args[1..]).map_err(|e| e.into());
     }
+    if args.first().map(String::as_str) == Some("bench-conv") {
+        return baru::bench::conv_route::run_cli(&args[1..]).map_err(|e| e.into());
+    }
     if args.first().map(String::as_str) == Some("bench-backend-aware") {
         return baru::bench::backend_aware::run_cli(&args[1..]).map_err(|e| e.into());
     }

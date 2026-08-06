@@ -249,6 +249,11 @@ Nishat Koti, Mahak Pancholi, Arpita Patra, and Ajith Suresh.
 \newblock {SWIFT}: Super-fast and robust privacy-preserving machine learning.
 \newblock In {\em {USENIX} Security Symposium}, pages 2651--2668, 2021.
 
+\bibitem{LavinGray}
+Andrew Lavin and Scott Gray.
+\newblock Fast algorithms for convolutional neural networks.
+\newblock In {\em CVPR}, 2016.
+
 \bibitem{MNIST}
 Yann LeCun, L{\'e}on Bottou, Yoshua Bengio, and Patrick Haffner.
 \newblock Gradient-based learning applied to document recognition.
@@ -332,11 +337,23 @@ Sameer Wagh, Shruti Tople, Fabrice Benhamouda, Eyal Kushilevitz, Prateek
 \newblock {\em Proceedings on Privacy Enhancing Technologies},
   2021(1):188--208, 2021.
 
+\bibitem{CHIP}
+Huan-Chih Wang and Ja-Ling Wu.
+\newblock {CHIP}: Efficient homomorphic encryption-based {CNN} batch inference
+  using channel-interleaved packing with small rotation key set.
+\newblock In {\em IEEE Computer Security Foundations Symposium (CSF)}, 2026.
+\newblock Cryptology ePrint Archive, Paper 2026/1399.
+
 \bibitem{Wilson}
 Edwin~B. Wilson.
 \newblock Probable inference, the law of succession, and statistical inference.
 \newblock {\em Journal of the American Statistical Association},
   22(158):209--212, 1927.
+
+\bibitem{Winograd}
+Shmuel Winograd.
+\newblock {\em Arithmetic Complexity of Computations}.
+\newblock SIAM, 1980.
 
 \bibitem{MedMNIST}
 Jiancheng Yang, Rui Shi, Donglai Wei, Zequan Liu, Lin Zhao, Bilian Ke,

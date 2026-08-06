@@ -2436,6 +2436,100 @@ preprocessing is charged''---not that Falcon's DReLU fails to repay its
 preprocessing, which these measurements do not show and the construction above
 suggests is false.
 
+\subsection{The convolution crossover, and a trick that did not need its scheme}
+\label{sec:crossover-conv}
+
+The crossover of \S\ref{sec:crossover-nonlin} is about the \emph{nonlinear} surface. The linear
+surface has one too, and we did not know it, because our pipeline convolves homomorphically for a
+reason that was never contested: coefficient packing turns a whole layer into $\mathrm{out}_c$
+ciphertext multiplications, while the obvious secret-shared convolution spends $k^2$ interactive
+multiplications per output pixel and loses without a hearing.
+
+What reopened it is a result from outside. CHIP~\cite{CHIP} packs channels into CKKS slots for
+batch CNN inference and, among other things, reports ``an efficient 2-D convolution that halves the
+number of HE multiplications''. That component is Winograd's minimal filtering
+algorithm~\cite{Winograd,LavinGray}: $F(2,3)$ produces two outputs from a four-element window with
+four multiplications rather than six, and nesting it gives $F(2\times2, 3\times3)$ at \num{16}
+multiplications against \num{36}.
+
+\finding{The trick does not need the scheme it was published with. Its three transforms are
+$B^\top$ on the data, $A^\top$ on the result, and $G$ on the filter; the first two have entries in
+$\{0, \pm 1\}$ and only $G$ is fractional, with halves. Since $G$ acts on the \emph{weights},
+scaling it by two per axis clears them, leaving the output exactly four times the true convolution
+--- an exact power of two that a fixed-point rescale absorbs by shifting two places further. So
+Winograd is plaintext algebra over the ring, it is exact in integers, and it transfers to secret
+sharing unchanged. We adopted it without adopting CKKS.}
+
+We should say why that mattered to us specifically. We had removed our CKKS backends
+(\S\ref{sec:withdrawn-policy}) on the strength of their \emph{comparison} cost, and a result whose
+benefit was inseparable from CKKS would have forced us to weigh re-adopting several megabytes of
+dependency against a convolution speedup. It is not inseparable, and establishing that was worth
+more to us than the speedup.
+
+Adopting it also gave us the honest baseline the comparison needed. A secret-shared convolution
+spending $k^2$ multiplications per pixel is a straw man; one spending \num{16} per $2\times2$ tile
+is not. \cref{tab:convroute} therefore contests three strategies for one $3\times3$ layer. All
+three keep the model secret --- the homomorphic route multiplies ciphertext by ciphertext against
+an encrypted model, so this is not a comparison against plaintext weights. All three end with
+\emph{secret shares} of the output, which is the boundary the following $\ReLU$ needs and which the
+homomorphic route reaches only after a scheme switch. All three are checked against one plaintext
+reference.
+
+\begin{table}[htb]
+\centering
+\small
+\begin{tabular}{@{}lrrrrr@{}}
+\toprule
+layer & winograd kB & fhe kB & winograd ms & fhe ms & byte win pays below \\
+\midrule
+$2\times8\times8 \to 3$ & \textbf{32} & \num{1769} & \textbf{11} & 31 & shared dominates \\
+$4\times12\times12 \to 4$ & \textbf{172} & \num{2359} & \textbf{21} & 42 & shared dominates \\
+$8\times16\times16 \to 8$ & \textbf{1060} & \num{4719} & 90 & \textbf{69} & \SI{1424}{\mega\bit\per\second} \\
+$16\times20\times20 \to 8$ & \textbf{3284} & \num{4719} & 231 & \textbf{130} & \SI{114}{\mega\bit\per\second} \\
+$16\times28\times28 \to 16$ & \num{12634} & \textbf{9437} & \num{1022} & \textbf{332} & fhe dominates \\
+\bottomrule
+\end{tabular}
+\caption{One $3\times3$ stride-1 convolution, three backends, all ending with shares. The direct
+secret-shared route is omitted for width; it is never better than the Winograd one, being the same
+computation with more multiplications. The last column is the bandwidth below which the shared
+route's smaller traffic outweighs its larger compute.}
+\label{tab:convroute}
+\end{table}
+
+Two things follow. The first is that \ib{the fast algorithm changes the assignment, not merely the
+cost}: at $16\times20\times20 \to 8$ the direct shared convolution sends \SI{6602}{\kilo\byte}
+against the homomorphic route's \num{4719} and loses, while the Winograd one sends \num{3284} and
+wins. A layer that belonged to FHE now belongs to secret sharing. Its wall clock is $2.2\times$ the
+direct route's, against a multiplication ratio of $2.25$, which is as close a confirmation as this
+kind of measurement gives.
+
+The second is that the boundary sits further toward secret sharing than we expected. The shared
+route dominates outright on the small layers, and where neither dominates the break-even bandwidths
+are \num{1424} and \SI{114}{\mega\bit\per\second} --- above most real links. Only the largest layer
+we measured goes to the homomorphic route on both axes.
+
+\paragraph{We report this boundary with a correction attached, because our first version of it was
+wrong by a factor of twenty.} The initial measurement put the shared route at
+\SI{5023}{\milli\second} against \SI{135}{\milli\second}, and we drew the obvious conclusion: the
+byte advantage was real and irrelevant, since no plausible link would repay a $37\times$ compute
+penalty. The penalty was ours. Our harness opened all \num{2592} outputs of the shared route
+\emph{one at a time} as verification scaffolding, while the homomorphic route decrypts an entire
+channel per call --- and in a deployment the shared route's output is never opened at all, since it
+passes to the next layer as shares. Charging it for those openings, while charging the homomorphic
+route for a per-session key generation it amortises over every layer of every query, was two
+asymmetries pointing in opposite directions, each of which looked like the natural thing to write.
+Removing both moved the shared route to \SI{236}{\milli\second} and the gap to $1.8\times$:
+\SI{95}{\percent} of what we had reported as protocol cost was scaffolding.
+
+We draw the general point rather than the local one. Bit-exactness gated this comparison and passed
+it --- every route computed the right convolution throughout --- because what differed was not the
+computation but \emph{where each route's measurement began and ended}. That boundary is invisible
+to a correctness check and is not a property of either protocol, which is precisely why it has to
+be stated for each route rather than assumed to be shared. Our benchmark now derives its summary
+sentence from the measured rows instead of asserting one beside them, because we wrote that
+sentence wrongly three times --- ``bytes decide'', then ``compute decides'', then ``the homomorphic
+route is faster everywhere'' --- and each was true of the table in front of us at the time.
+
 %==============================================================================
 \section{Case study: private medical image diagnosis}
 \label{sec:medmnist}
