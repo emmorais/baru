@@ -245,8 +245,7 @@ impl<T: Transport> TransportBackend<T> {
     ) {
         use crate::crypto::falcon_mpc::{
             dabit_id_span, nonzero_mask_id_span, random_dabits_fp, random_dabits_ring,
-            random_nonzero_masks, random_wrap_masks, wrap_mask_id_span, SelectPreproc,
-            WrapPreproc,
+            random_nonzero_masks, random_wrap_masks, wrap_mask_id_span, SelectPreproc, WrapPreproc,
         };
         let span = wrap_mask_id_span(n, nbits)
             + dabit_id_span(n) // β

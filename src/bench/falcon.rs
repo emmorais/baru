@@ -708,8 +708,8 @@ pub fn run_cli(args: &[String]) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
-    use crate::interpreter::transport_backend::FalconPoolSpec;
     use super::*;
+    use crate::interpreter::transport_backend::FalconPoolSpec;
     use crate::interpreter::transport_backend::NonlinMode;
 
     /// **The wrap correction is exact for every mask, including the wrapping ones.**
@@ -850,7 +850,20 @@ mod tests {
         let l = 1i128 << NBITS;
         // Straddle zero, hit 0 and ±1, and include values whose low SHIFT bits vary.
         let vals: Vec<i128> = vec![
-            0, 1, -1, 255, 256, 257, -255, -256, -257, 4095, 4096, -4096, 65535, -65535,
+            0,
+            1,
+            -1,
+            255,
+            256,
+            257,
+            -255,
+            -256,
+            -257,
+            4095,
+            4096,
+            -4096,
+            65535,
+            -65535,
             (1 << (NBITS - 2)) as i128,
             -((1 << (NBITS - 2)) as i128),
         ];
@@ -883,11 +896,16 @@ mod tests {
                 .iter()
                 .map(|&r| {
                     let m = (r & ((1u128 << NBITS) - 1)) as i128;
-                    if m >= l / 2 { m - l } else { m }
+                    if m >= l / 2 {
+                        m - l
+                    } else {
+                        m
+                    }
                 })
                 .collect();
             assert_eq!(
-                got, want,
+                got,
+                want,
                 "{} route disagrees with the plaintext reference",
                 if falcon { "falcon" } else { "a2b" }
             );
@@ -935,7 +953,10 @@ mod tests {
         let l = 1i128 << NBITS;
         let n = 256usize;
         let vals: Vec<i128> = (0..n as i128).map(|i| (i * 37) % 4001 - 2000).collect();
-        let want: Vec<i128> = vals.iter().map(|&v| if v >= 0 { v >> SHIFT } else { 0 }).collect();
+        let want: Vec<i128> = vals
+            .iter()
+            .map(|&v| if v >= 0 { v >> SHIFT } else { 0 })
+            .collect();
 
         let run = |falcon: bool| {
             let vs = vals.clone();
@@ -963,7 +984,11 @@ mod tests {
                 .iter()
                 .map(|&r| {
                     let m = (r & ((1u128 << NBITS) - 1)) as i128;
-                    if m >= l / 2 { m - l } else { m }
+                    if m >= l / 2 {
+                        m - l
+                    } else {
+                        m
+                    }
                 })
                 .collect();
             (got, comm.messages, comm.bytes)
@@ -997,7 +1022,11 @@ mod tests {
         // against the pipeline rather than baked in as an expectation here.
         println!(
             "  → falcon is {} in bytes at deployed widths",
-            if fal_bytes < a2b_bytes { "cheaper" } else { "DEARER" }
+            if fal_bytes < a2b_bytes {
+                "cheaper"
+            } else {
+                "DEARER"
+            }
         );
     }
 
@@ -1120,7 +1149,9 @@ mod tests {
         let l = 1i128 << NBITS;
         // A batch big enough that per-element cost dominates the fixed framing.
         let n = 256usize;
-        let cases: Vec<(i128, i128)> = (0..n as i128).map(|i| (i % 97 - 48, (i * 7) % 89 - 44)).collect();
+        let cases: Vec<(i128, i128)> = (0..n as i128)
+            .map(|i| (i % 97 - 48, (i * 7) % 89 - 44))
+            .collect();
         let want: Vec<u64> = cases.iter().map(|&(a, b)| u64::from(a < b)).collect();
 
         let run = move |warm: bool, size: usize| {
@@ -1143,14 +1174,27 @@ mod tests {
                     let enc = |v: i128| ((v + l) % l) as u128;
                     let pairs: Vec<_> = cs
                         .iter()
-                        .map(|&(a, b)| (be.share_public(enc(a), NBITS), be.share_public(enc(b), NBITS)))
+                        .map(|&(a, b)| {
+                            (
+                                be.share_public(enc(a), NBITS),
+                                be.share_public(enc(b), NBITS),
+                            )
+                        })
                         .collect();
                     let t = std::time::Instant::now();
                     let bits = be.lt_batch(&pairs);
-                    let got: Vec<u64> =
-                        bits.iter().map(|x| (be.reveal(x, None) & 1) as u64).collect();
+                    let got: Vec<u64> = bits
+                        .iter()
+                        .map(|x| (be.reveal(x, None) & 1) as u64)
+                        .collect();
                     let online_ms = t.elapsed().as_secs_f64() * 1e3;
-                    (got, online_ms, offline_ms, be.falcon_comparisons(), be.falcon_pool_stats())
+                    (
+                        got,
+                        online_ms,
+                        offline_ms,
+                        be.falcon_comparisons(),
+                        be.falcon_pool_stats(),
+                    )
                 }
             });
             let (got, online_ms, offline_ms, count, stats) = out[0].clone();
@@ -1161,13 +1205,20 @@ mod tests {
         let (cold_got, cold_ms, _, count, _, cold_bytes) = run(false, 0);
         let _ = &run; // keep the closure available for the bandwidth sweep below
         assert_eq!(cold_got, want, "cold run must be correct");
-        assert_eq!(count, n, "the counter must report the elements actually requested");
+        assert_eq!(
+            count, n,
+            "the counter must report the elements actually requested"
+        );
 
         // Warm: same workload, preprocessing pooled beforehand.
         let (warm_got, warm_ms, off_ms, _, stats, warm_bytes) = run(true, count);
         assert_eq!(warm_got, want, "warm run must agree with cold");
         let (_, served, missed) = stats.expect("warm run must report pool stats");
-        assert_eq!((served, missed), (n, 0), "warm run must be fully served by the pool");
+        assert_eq!(
+            (served, missed),
+            (n, 0),
+            "warm run must be fully served by the pool"
+        );
 
         println!(
             "\n  Falcon at ℓ={NBITS}, n={n} — cold vs warm\n    \
@@ -1236,8 +1287,9 @@ mod tests {
         const NBITS: usize = 20;
         let l = 1i128 << NBITS;
         let n = 128usize;
-        let cases: Vec<(i128, i128)> =
-            (0..n as i128).map(|i| (i % 61 - 30, (i * 11) % 53 - 26)).collect();
+        let cases: Vec<(i128, i128)> = (0..n as i128)
+            .map(|i| (i % 61 - 30, (i * 11) % 53 - 26))
+            .collect();
 
         let measure = move |profile: NetworkProfile, warm: bool| -> f64 {
             let cs = cases.clone();
@@ -1257,7 +1309,12 @@ mod tests {
                     let enc = |v: i128| ((v + l) % l) as u128;
                     let pairs: Vec<_> = cs
                         .iter()
-                        .map(|&(a, b)| (be.share_public(enc(a), NBITS), be.share_public(enc(b), NBITS)))
+                        .map(|&(a, b)| {
+                            (
+                                be.share_public(enc(a), NBITS),
+                                be.share_public(enc(b), NBITS),
+                            )
+                        })
                         .collect();
                     let t = std::time::Instant::now();
                     let bits = be.lt_batch(&pairs);
@@ -1357,7 +1414,10 @@ mod tests {
                         })
                         .collect();
                     let bits = be.lt_batch(&pairs);
-                    let got: Vec<u64> = bits.iter().map(|x| (be.reveal(x, None) & 1) as u64).collect();
+                    let got: Vec<u64> = bits
+                        .iter()
+                        .map(|x| (be.reveal(x, None) & 1) as u64)
+                        .collect();
                     (got, be.falcon_pool_stats(), offline_ms)
                 }
             });

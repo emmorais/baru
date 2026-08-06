@@ -303,12 +303,42 @@ mod tests {
     fn channel_splitting_reproduces_a_convolution_too_wide_to_pack() {
         for (shape, n, want_groups) in [
             // The real case: 16 channels at 13×13 does not fit n = 4096.
-            (ConvShape { in_c: 16, h: 13, w: 13, kh: 3, kw: 3 }, 4096, 2),
+            (
+                ConvShape {
+                    in_c: 16,
+                    h: 13,
+                    w: 13,
+                    kh: 3,
+                    kw: 3,
+                },
+                4096,
+                2,
+            ),
             // Deliberately uneven: group size 3 over 7 channels, so the third
             // group carries one real channel and two zero-padded ones.
-            (ConvShape { in_c: 7, h: 6, w: 6, kh: 3, kw: 3 }, 256, 3),
+            (
+                ConvShape {
+                    in_c: 7,
+                    h: 6,
+                    w: 6,
+                    kh: 3,
+                    kw: 3,
+                },
+                256,
+                3,
+            ),
             // Already fits: must come out as a single group and change nothing.
-            (ConvShape { in_c: 3, h: 5, w: 5, kh: 2, kw: 2 }, 512, 1),
+            (
+                ConvShape {
+                    in_c: 3,
+                    h: 5,
+                    w: 5,
+                    kh: 2,
+                    kw: 2,
+                },
+                512,
+                1,
+            ),
         ] {
             let (gs, ng) = channel_groups(shape, n).expect("must split");
             assert_eq!(ng, want_groups, "group count for {shape:?} at n={n}");
@@ -351,7 +381,13 @@ mod tests {
     /// says so rather than returning an unusable group size.
     #[test]
     fn channel_splitting_refuses_when_one_channel_already_overruns_the_ring() {
-        let shape = ConvShape { in_c: 4, h: 64, w: 64, kh: 3, kw: 3 };
+        let shape = ConvShape {
+            in_c: 4,
+            h: 64,
+            w: 64,
+            kh: 3,
+            kw: 3,
+        };
         let err = channel_groups(shape, 4096).expect_err("must refuse");
         assert!(
             err.contains("the ring must grow"),

@@ -283,7 +283,8 @@ mod tests {
             let ms = m.cost.expect("champions are costed").predict_secs(p) * 1000.0;
             println!(
                 "  {rtt:5}  {:5}   {:<12} {ms:8.1}",
-                mbps.map(|m| format!("{m:.0}")).unwrap_or_else(|| "inf".into()),
+                mbps.map(|m| format!("{m:.0}"))
+                    .unwrap_or_else(|| "inf".into()),
                 m.id
             );
             assert_eq!(
@@ -385,7 +386,10 @@ mod tests {
         let mut failures: Vec<(&str, &str, f64, &str, f64, f64)> = Vec::new();
         for (label, p) in points {
             let picked = registry().champion_meta_for(p);
-            let picked_mode = registry().champion_for(p).mode().expect("entries carry a mode");
+            let picked_mode = registry()
+                .champion_for(p)
+                .mode()
+                .expect("entries carry a mode");
             let mut measured: Vec<(&str, f64)> = Vec::new();
             for (id, mode) in [
                 ("cmp-a2b", NonlinMode::A2b),

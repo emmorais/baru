@@ -1179,7 +1179,6 @@ mod tests {
         }
     }
 
-
     #[test]
     fn mpc_only_matches_plaintext_on_real_protocol() {
         let data = make_layer(6, 3);

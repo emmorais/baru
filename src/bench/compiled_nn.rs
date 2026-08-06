@@ -280,7 +280,11 @@ pub fn run(n: usize, h: usize, c: usize, nbits: usize, rtts: &[u64]) -> Result<R
             let r = gadgets::max_reduce(be, &logits);
             (r, Some(be.interactive_calls()), be.sync_waits())
         };
-        let name = if nonlin == NonlinMode::Gc { "gadget + gc" } else { "gadget" };
+        let name = if nonlin == NonlinMode::Gc {
+            "gadget + gc"
+        } else {
+            "gadget"
+        };
         routes.push(route(name, body, expected, nbits, rtts, None));
     }
 
@@ -294,15 +298,35 @@ pub fn run(n: usize, h: usize, c: usize, nbits: usize, rtts: &[u64]) -> Result<R
     // competing for the same quantity and belong in one table.
     let ladder: Vec<(&str, &Vec<FlatOp>, Batching, NonlinMode)> = vec![
         // The obvious executor: walk the circuit, call the backend per op.
-        ("compiled: serial", &flat_no_cse, Batching::Serial, NonlinMode::A2b),
+        (
+            "compiled: serial",
+            &flat_no_cse,
+            Batching::Serial,
+            NonlinMode::A2b,
+        ),
         // ASAP levelling — the parallelism the schedule finds for free.
-        ("  + ASAP batching", &flat_no_cse, Batching::Level, NonlinMode::A2b),
+        (
+            "  + ASAP batching",
+            &flat_no_cse,
+            Batching::Level,
+            NonlinMode::A2b,
+        ),
         // Common subexpression elimination, in the compile pipeline.
         ("  + CSE", &flat, Batching::Level, NonlinMode::A2b),
         // Rebalancing the dependent reduction.
-        ("  + reassociation", &flat_opt, Batching::Level, NonlinMode::A2b),
+        (
+            "  + reassociation",
+            &flat_opt,
+            Batching::Level,
+            NonlinMode::A2b,
+        ),
         // Assigning the comparison levels to the constant-round backend.
-        ("  + gc comparisons", &flat_opt, Batching::Level, NonlinMode::Gc),
+        (
+            "  + gc comparisons",
+            &flat_opt,
+            Batching::Level,
+            NonlinMode::Gc,
+        ),
     ];
     for (name, prog, batching, nonlin) in ladder {
         let (prog, out_wire, binds, order) =
@@ -588,7 +612,13 @@ mod tests {
             let probe = move |be: &mut TransportBackend<MpcTransport>, me: usize| {
                 let mk = |be: &mut TransportBackend<MpcTransport>, k: u64| -> Vec<ShareRef> {
                     let vals: Vec<Fr> = (0..width)
-                        .map(|i| if me == 0 { residue((i as i64) + k as i64, NBITS) } else { 0 })
+                        .map(|i| {
+                            if me == 0 {
+                                residue((i as i64) + k as i64, NBITS)
+                            } else {
+                                0
+                            }
+                        })
                         .collect();
                     be.share_secret_batch(&vals, NBITS, 0)
                 };
@@ -666,9 +696,15 @@ mod tests {
             .iter()
             .map(|(k, &v)| (k.clone(), be.share_public(residue(v, NBITS), NBITS)))
             .collect();
-        let (_out, st) =
-            run_flat_with(&mut be, &flat, &inputs, &circuit.output_wire, NBITS, Batching::Level)
-                .expect("executes");
+        let (_out, st) = run_flat_with(
+            &mut be,
+            &flat,
+            &inputs,
+            &circuit.output_wire,
+            NBITS,
+            Batching::Level,
+        )
+        .expect("executes");
 
         // Model charge vs executor charge, using the measured per-primitive wait costs
         // (`the_wait_cost_of_each_primitive`: a multiply blocks twice, a comparison nine times).
@@ -683,7 +719,10 @@ mod tests {
         );
         // Every level issues at least one call, and a level can only exceed one by mixing a
         // comparison with a multiply — muxes no longer get a call of their own.
-        assert!(st.batch_calls >= st.rounds, "each level issues at least one call");
+        assert!(
+            st.batch_calls >= st.rounds,
+            "each level issues at least one call"
+        );
         assert!(
             st.mixed_levels <= st.rounds,
             "a level cannot mix more kinds than there are kinds: {} mixed of {} levels",
@@ -717,10 +756,18 @@ mod tests {
             }
             let mut op_level = vec![0usize; flat.len()];
             for (i, op) in flat.iter().enumerate() {
-                let ready = op.inputs().iter().map(|w| *lvl.get(*w).unwrap_or(&0)).max().unwrap_or(0);
+                let ready = op
+                    .inputs()
+                    .iter()
+                    .map(|w| *lvl.get(*w).unwrap_or(&0))
+                    .max()
+                    .unwrap_or(0);
                 let interactive = matches!(
                     op,
-                    FlatOp::IMul { .. } | FlatOp::ICmpSlt { .. } | FlatOp::ICmpUlt { .. } | FlatOp::Mux { .. }
+                    FlatOp::IMul { .. }
+                        | FlatOp::ICmpSlt { .. }
+                        | FlatOp::ICmpUlt { .. }
+                        | FlatOp::Mux { .. }
                 );
                 op_level[i] = if interactive { ready + 1 } else { ready };
                 lvl.insert(op.dst(), op_level[i]);
@@ -794,7 +841,13 @@ mod tests {
         for mode in [NonlinMode::A2b, NonlinMode::Falcon, NonlinMode::Gc] {
             let probe = move |be: &mut TransportBackend<MpcTransport>, me: usize| {
                 let vals: Vec<Fr> = (0..WIDTH)
-                    .map(|i| if me == 0 { residue(i as i64 - 8, NBITS) } else { 0 })
+                    .map(|i| {
+                        if me == 0 {
+                            residue(i as i64 - 8, NBITS)
+                        } else {
+                            0
+                        }
+                    })
                     .collect();
                 let xs = be.share_secret_batch(&vals, NBITS, 0);
                 let ys = be.share_secret_batch(&vals, NBITS, 0);
@@ -835,7 +888,11 @@ mod tests {
         println!(
             "  cheapest in blocks: {} at {} waits; dearest: {} at {} — a {:.1}x spread, which is \
              what a per-subtask assignment has to trade against the byte columns",
-            lo.0, lo.1, hi.0, hi.1, hi.1 as f64 / lo.1.max(1) as f64
+            lo.0,
+            lo.1,
+            hi.0,
+            hi.1,
+            hi.1 as f64 / lo.1.max(1) as f64
         );
         assert!(
             hi.1 > lo.1,
@@ -873,28 +930,45 @@ mod tests {
         // happening again.
         let gadget = pick("gadget + gc");
         let compiled = r.routes.last().expect("compiled route present");
-        assert!(gadget.correct && compiled.correct, "both routes must be exact");
+        assert!(
+            gadget.correct && compiled.correct,
+            "both routes must be exact"
+        );
 
         let (gc, cc) = (gadget.rounds.unwrap(), compiled.rounds.unwrap());
-        println!("  gadget:   {gc:3} calls, {:3} waits, {:3} messages", gadget.waits, gadget.messages);
-        println!("  compiled: {cc:3} calls, {:3} waits, {:3} messages", compiled.waits, compiled.messages);
+        println!(
+            "  gadget:   {gc:3} calls, {:3} waits, {:3} messages",
+            gadget.waits, gadget.messages
+        );
+        println!(
+            "  compiled: {cc:3} calls, {:3} waits, {:3} messages",
+            compiled.waits, compiled.messages
+        );
 
         // Leaner on both of the counters we reached for first.
-        assert!(cc < gc, "compiled should make fewer primitive calls: {cc} vs {gc}");
+        assert!(
+            cc < gc,
+            "compiled should make fewer primitive calls: {cc} vs {gc}"
+        );
         assert!(
             compiled.messages < gadget.messages,
             "compiled should send fewer messages: {} vs {}",
-            compiled.messages, gadget.messages
+            compiled.messages,
+            gadget.messages
         );
 
         // And it does not block less, which is why it does not run faster. A band, so the test
         // is about parity rather than about one machine's noise.
         let ratio = compiled.waits as f64 / gadget.waits as f64;
-        println!("  -> waits ratio {ratio:.2} (calls ratio {:.2})", cc as f64 / gc as f64);
+        println!(
+            "  -> waits ratio {ratio:.2} (calls ratio {:.2})",
+            cc as f64 / gc as f64
+        );
         assert!(
             (0.80..=1.25).contains(&ratio),
             "the routes should be at parity in waits, got {ratio:.2} ({} vs {})",
-            compiled.waits, gadget.waits
+            compiled.waits,
+            gadget.waits
         );
 
         // The mismatched comparison, which this test previously made by accident: measuring the

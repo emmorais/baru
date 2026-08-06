@@ -542,7 +542,8 @@ impl<T: Transport> Mailbox<T> {
         // 2) Poll the transport until a match arrives or we time out. Reaching
         //    here is a synchronization point: the party has nothing to do until
         //    a peer speaks, so this is what a round costs.
-        self.waits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.waits
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
         loop {
             if let Some((from, bytes)) = self.transport.recv() {

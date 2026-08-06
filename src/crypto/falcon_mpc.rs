@@ -1426,8 +1426,7 @@ pub fn random_wrap_masks<T: Transport>(
     // reveal sums them mod `2^128`, so an unreduced component would open to a
     // large number rather than to a bit.
     let dmask: Fr = (1u128 << DELTA_WIRE_BITS) - 1;
-    let (r_z2, r_ring) =
-        random_dabits_ring(count, DELTA_WIRE_BITS as usize, next, me, mbx);
+    let (r_z2, r_ring) = random_dabits_ring(count, DELTA_WIRE_BITS as usize, next, me, mbx);
     next = next.wrapping_add(dabit_id_span(count));
     let pairs: Vec<(PartyShare, PartyShare)> = delta_ring
         .iter()
@@ -1441,7 +1440,11 @@ pub fn random_wrap_masks<T: Transport>(
         .zip(&r_ring)
         .zip(&prod)
         .map(|((d, r), dr)| PartyShare {
-            left: d.left.wrapping_add(r.left).wrapping_sub(dr.left.wrapping_mul(2)) & dmask,
+            left: d
+                .left
+                .wrapping_add(r.left)
+                .wrapping_sub(dr.left.wrapping_mul(2))
+                & dmask,
             right: d
                 .right
                 .wrapping_add(r.right)
@@ -1486,10 +1489,8 @@ pub fn nonzero_mask_id_span(n: usize) -> u64 {
 /// Operation ids one [`random_wrap_masks`] call consumes.
 pub fn wrap_mask_id_span(count: usize, l_bits: u32) -> u64 {
     use crate::crypto::aby3_protocol::A2B_ID_BLOCK;
-    dabit_triple_id_span(count * l_bits as usize)
-        + A2B_ID_BLOCK
-        + dabit_id_span(count)
-        + 2 // the δ-conversion multiplication and its opening
+    dabit_triple_id_span(count * l_bits as usize) + A2B_ID_BLOCK + dabit_id_span(count) + 2
+    // the δ-conversion multiplication and its opening
 }
 
 /// A batch of random bits, shared over `Z₂` **and** over the ring `Z_{2^k}`.
@@ -1569,12 +1570,19 @@ pub fn random_trunc_pairs<T: Transport>(
         return Vec::new();
     }
     assert_full_ring_mask(r_bits, l_bits);
-    assert!(d < l_bits, "random_trunc_pairs: need d < l_bits, got d={d}, l_bits={l_bits}");
+    assert!(
+        d < l_bits,
+        "random_trunc_pairs: need d < l_bits, got d={d}, l_bits={l_bits}"
+    );
     let rb = r_bits as usize;
     // One bit wider than the ring: `truncate_batch` forms `c − r` to get the wrap bit,
     // and that difference needs `l_bits + 1` bits.
     let wide = l_bits + 1;
-    let mask: Fr = if wide >= 128 { Fr::MAX } else { (1u128 << wide) - 1 };
+    let mask: Fr = if wide >= 128 {
+        Fr::MAX
+    } else {
+        (1u128 << wide) - 1
+    };
 
     // `r_bits` bits per element, plus two selectors each: one for the borrow's `Π_SS`
     // lift and one for the wrap's.
@@ -1777,7 +1785,9 @@ mod tests {
             for i in (0..L).rev() {
                 suffix[i] = suffix[i + 1] + w[i];
             }
-            (0..L).fold(Fp::new(1), |acc, i| acc * (u[i] + suffix[i + 1] + Fp::new(1)))
+            (0..L).fold(Fp::new(1), |acc, i| {
+                acc * (u[i] + suffix[i + 1] + Fp::new(1))
+            })
         };
 
         // Group the secrets by the predicate the protocol is entitled to reveal, and count
@@ -1883,7 +1893,10 @@ mod tests {
         );
         assert!((rate - (2.0 / P as f64 - 1.0 / (P * P) as f64)).abs() < 1e-12);
         // 12 attempts at that rate is below 2^-40, which is what the retry budget claims.
-        assert!(rate.powi(12) < 2f64.powi(-40), "the retry budget must reach 2^-40");
+        assert!(
+            rate.powi(12) < 2f64.powi(-40),
+            "the retry budget must reach 2^-40"
+        );
     }
 
     /// **The daBit's defining property**: the bit shared over `Z₂` and the bit
@@ -1990,7 +2003,10 @@ mod tests {
                 .wrapping_add(out[2].1[i].left)
                 & mask;
             assert!(ring <= 1, "bit {i} reconstructed to {ring} in the ring");
-            assert_eq!(z2 as u128, ring, "bit {i} disagrees between Z₂ and the ring");
+            assert_eq!(
+                z2 as u128, ring,
+                "bit {i} disagrees between Z₂ and the ring"
+            );
         }
     }
 
@@ -2056,14 +2072,25 @@ mod tests {
         // constant, or only even values, would satisfy every check above.
         let values: Vec<u128> = (0..COUNT)
             .map(|e| {
-                (out[0][e].0.left.wrapping_add(out[1][e].0.left).wrapping_add(out[2][e].0.left))
+                (out[0][e]
+                    .0
+                    .left
+                    .wrapping_add(out[1][e].0.left)
+                    .wrapping_add(out[2][e].0.left))
                     & mask
             })
             .collect();
         assert!(
-            values.iter().collect::<std::collections::HashSet<_>>().len() > COUNT / 2,
+            values
+                .iter()
+                .collect::<std::collections::HashSet<_>>()
+                .len()
+                > COUNT / 2,
             "16 masks took {} distinct values — this is not randomness",
-            values.iter().collect::<std::collections::HashSet<_>>().len()
+            values
+                .iter()
+                .collect::<std::collections::HashSet<_>>()
+                .len()
         );
         assert!(
             values.iter().any(|v| v & 1 == 1),
@@ -2092,7 +2119,11 @@ mod tests {
             // three parties' entries at position `e`.
             #[allow(clippy::needless_range_loop)]
             for e in 0..COUNT {
-                let x = (out[0][e].0.left.wrapping_add(out[1][e].0.left).wrapping_add(out[2][e].0.left))
+                let x = (out[0][e]
+                    .0
+                    .left
+                    .wrapping_add(out[1][e].0.left)
+                    .wrapping_add(out[2][e].0.left))
                     & mask;
                 // The party's whole view is its two summands; the best it can do
                 // is guess from their sum.
@@ -2198,7 +2229,10 @@ mod tests {
         let out = run3(|me, mbx| random_trunc_pairs(COUNT, D, RB, LB, 3_000, me, mbx));
         let mask: Fr = (1u128 << LB) - 1;
         let rec = |p: &[Vec<TruncPreproc>], e: usize, f: fn(&TruncPreproc) -> Fr| -> Fr {
-            (f(&p[0][e]).wrapping_add(f(&p[1][e])).wrapping_add(f(&p[2][e]))) & mask
+            (f(&p[0][e])
+                .wrapping_add(f(&p[1][e]))
+                .wrapping_add(f(&p[2][e])))
+                & mask
         };
 
         let mut seen = std::collections::HashSet::new();
@@ -2208,14 +2242,22 @@ mod tests {
             let lo = rec(&out, e, |t| t.r_lo.left);
 
             assert!(r < (1u128 << RB), "pair {e}: r = {r} exceeds 2^{RB}");
-            assert!(lo < (1u128 << D), "pair {e}: r_lo = {lo} is not below 2^{D}");
+            assert!(
+                lo < (1u128 << D),
+                "pair {e}: r_lo = {lo} is not below 2^{D}"
+            );
             assert_eq!(
                 r,
                 (hi << D) + lo,
                 "pair {e}: r = {r} but (r>>{D})·2^{D} + r_lo = {}",
                 (hi << D) + lo
             );
-            assert_eq!(hi, r >> D, "pair {e}: r_shifted {hi} != r>>{D} = {}", r >> D);
+            assert_eq!(
+                hi,
+                r >> D,
+                "pair {e}: r_shifted {hi} != r>>{D} = {}",
+                r >> D
+            );
 
             // Replication must be well formed, or the pair is malformed in a way the
             // online protocol cannot detect.
@@ -2277,7 +2319,10 @@ mod tests {
         #[allow(clippy::needless_range_loop)]
         for i in 0..N {
             let m = out[0][i].left + out[1][i].left + out[2][i].left;
-            assert!(!m.is_zero(), "mask {i} is zero — a comparison using it inverts");
+            assert!(
+                !m.is_zero(),
+                "mask {i} is zero — a comparison using it inverts"
+            );
         }
         // And they must be *masks*, i.e. varied — a constant 1 would pass the
         // above while revealing the raw product, which is the leak this fixes.
@@ -2653,7 +2698,10 @@ mod tests {
         let relus = 6 * 24 * 24 + 16 * 8 * 8 + 120 + 84;
         let windows = 6 * 12 * 12 + 16 * 4 * 4;
         let drelus = relus + 3 * windows;
-        assert_eq!(drelus, 8044, "LeNet's DReLU count, as the extrapolation states");
+        assert_eq!(
+            drelus, 8044,
+            "LeNet's DReLU count, as the extrapolation states"
+        );
 
         // Marginal cost between successive sizes: the fixed framing cancels.
         let sizes = [500usize, 1000, 2000, 4000, drelus];
@@ -2670,7 +2718,9 @@ mod tests {
         }
 
         let per: Vec<f64> = marginals.iter().map(|&(_, m)| m).collect();
-        let (lo, hi) = per.iter().fold((f64::MAX, 0.0f64), |(l, h), &v| (l.min(v), h.max(v)));
+        let (lo, hi) = per
+            .iter()
+            .fold((f64::MAX, 0.0f64), |(l, h), &v| (l.min(v), h.max(v)));
         let k = crate::crypto::field::ELEM_BITS as f64;
         let falcon_4kn = 4.0 * L as f64 * k / 8.0;
 
@@ -2888,7 +2938,10 @@ mod tests {
         const L: u32 = 32; // Falcon's ring width
         const FALCON_REPORTED_MB: f64 = 0.74;
 
-        for (label, n) in [("baru schedule (pool→relu)", 4693usize), ("relu→pool", 8044)] {
+        for (label, n) in [
+            ("baru schedule (pool→relu)", 4693usize),
+            ("relu→pool", 8044),
+        ] {
             let (off, on) = measure_drelu_phases(n, L);
             let total_mb = (off.bytes + on.bytes) as f64 / 1e6;
             let online_mb = on.bytes as f64 / 1e6;
@@ -2903,13 +2956,17 @@ mod tests {
                 total_mb / FALCON_REPORTED_MB,
                 online_mb / FALCON_REPORTED_MB,
             );
-            assert!(off.bytes > 0 && on.bytes > 0, "{label}: both phases must be measured");
+            assert!(
+                off.bytes > 0 && on.bytes > 0,
+                "{label}: both phases must be measured"
+            );
             // The offline phase dominates, which is the fact that decides which number is
             // quotable against theirs — and it is why this reports both rather than one.
             assert!(
                 off.bytes > on.bytes,
                 "{label}: preprocessing should dominate; offline {} online {}",
-                off.bytes, on.bytes
+                off.bytes,
+                on.bytes
             );
         }
 
@@ -3152,8 +3209,7 @@ mod tests {
         );
         println!(
             "    → and {:.0}% of the OFFLINE bytes, which is what a cold server pays",
-            100.0 * t_off.bytes as f64
-                / (t_off.bytes + d_off.bytes).max(1) as f64,
+            100.0 * t_off.bytes as f64 / (t_off.bytes + d_off.bytes).max(1) as f64,
         );
         println!(
             "\n    The two Π_SS lifts are already batched (free: both run at ℓ). Batching the\n    \
@@ -3162,7 +3218,10 @@ mod tests {
              d+1 columns must widen to the wrap's ℓ+1. See `truncate_batch`."
         );
 
-        assert!(d_on.messages > 0 && t_on.messages > 0, "both phases must be measured");
+        assert!(
+            d_on.messages > 0 && t_on.messages > 0,
+            "both phases must be measured"
+        );
         // NOT asserted: that the truncation's preprocessing dominates its online phase. It
         // does not, and the first version of this test asserted it did — reasoning by
         // analogy with `Π_DReLU`, where preprocessing is ~91% of bytes. `Π_Trunc` is the
@@ -3172,7 +3231,8 @@ mod tests {
         assert!(
             t_on.bytes > t_off.bytes,
             "the truncation is online-heavy, unlike Π_DReLU: online {} vs offline {}",
-            t_on.bytes, t_off.bytes
+            t_on.bytes,
+            t_off.bytes
         );
     }
 

@@ -188,7 +188,8 @@ pub fn run_flat_with(
             // costs a second block for a level that holds both, and a block is
             // what the latency model charges — see `ExecStats::mixed_levels`.
             if !muls.is_empty() || !muxes.is_empty() {
-                let mut pairs: Vec<(ShareRef, ShareRef)> = Vec::with_capacity(muls.len() + muxes.len());
+                let mut pairs: Vec<(ShareRef, ShareRef)> =
+                    Vec::with_capacity(muls.len() + muxes.len());
                 for &i in &muls {
                     let ins = flat[i].inputs();
                     pairs.push((get(&env, ins[0])?, get(&env, ins[1])?));

@@ -487,7 +487,16 @@ impl CnnModel {
 
         let input: Vec<i64> = (0..D * D).map(|_| rng.gen_range(0i64..16)).collect();
         let model = Self::from_trained_with_kernel(
-            D, 1, KS, kernels, cbias, vec![conv2], hidden, dense_w, dense_b, 4,
+            D,
+            1,
+            KS,
+            kernels,
+            cbias,
+            vec![conv2],
+            hidden,
+            dense_w,
+            dense_b,
+            4,
             std::slice::from_ref(&input),
         );
         (model, input)
@@ -512,7 +521,16 @@ impl CnnModel {
         sample_inputs: &[Vec<i64>],
     ) -> Self {
         Self::from_trained_with_kernel(
-            d, in_c, K, kernels, cbias, extra_conv, hidden, dense_w, dense_b, shift,
+            d,
+            in_c,
+            K,
+            kernels,
+            cbias,
+            extra_conv,
+            hidden,
+            dense_w,
+            dense_b,
+            shift,
             sample_inputs,
         )
     }
@@ -803,7 +821,9 @@ fn weight_polys(s: &Bfv, model: &CnnModel) -> (Vec<Vec<u64>>, usize) {
     for kernel in &model.kernels {
         let (gs, ng) = groups_for(conv1, n);
         for gi in 0..ng {
-            out.push(conv_pack::pack_kernel_group(kernel, conv1, gi, gs, n, t_mask));
+            out.push(conv_pack::pack_kernel_group(
+                kernel, conv1, gi, gs, n, t_mask,
+            ));
         }
         mask_draws += 1; // one opened value per output channel, however many groups
     }
@@ -812,7 +832,9 @@ fn weight_polys(s: &Bfv, model: &CnnModel) -> (Vec<Vec<u64>>, usize) {
         let (gs, ng) = groups_for(shape, n);
         for kernel in &cl.kernels {
             for gi in 0..ng {
-                out.push(conv_pack::pack_kernel_group(kernel, shape, gi, gs, n, t_mask));
+                out.push(conv_pack::pack_kernel_group(
+                    kernel, shape, gi, gs, n, t_mask,
+                ));
             }
             mask_draws += 1;
         }
@@ -1084,11 +1106,13 @@ pub fn conv_shapes(model: &CnnModel) -> Vec<ConvShape> {
 pub fn packing_plan(model: &CnnModel, n: usize) -> Vec<(ConvShape, usize, usize)> {
     conv_shapes(model)
         .into_iter()
-        .map(|shape| match crate::fhe::conv_pack::channel_groups(shape, n) {
-            Ok((gs, ng)) => (shape, gs, ng),
-            // A single channel overruns the ring: no group size helps.
-            Err(_) => (shape, 0, 0),
-        })
+        .map(
+            |shape| match crate::fhe::conv_pack::channel_groups(shape, n) {
+                Ok((gs, ng)) => (shape, gs, ng),
+                // A single channel overruns the ring: no group size helps.
+                Err(_) => (shape, 0, 0),
+            },
+        )
         .collect()
 }
 
@@ -2205,14 +2229,8 @@ pub fn run_cnn_hybrid_in_session_pooled(
     } else {
         (0..c1_ng)
             .map(|gi| {
-                let m = conv_pack::pack_input_group(
-                    input,
-                    conv1_shape,
-                    gi,
-                    c1_gs,
-                    s.params.n,
-                    t_mask,
-                );
+                let m =
+                    conv_pack::pack_input_group(input, conv1_shape, gi, c1_gs, s.params.n, t_mask);
                 s.encrypt_poly_pre(&session.ek, &m)
             })
             .collect()
@@ -2890,7 +2908,10 @@ mod tests {
             c1 + c2 + dense + m.nclasses() * fan
         };
         let (m5, mc) = (macs(&l5), macs(&caffe));
-        println!("  LeNet-5 {m5} MACs, Caffe LeNet {mc} MACs ({:.1}x)", mc as f64 / m5 as f64);
+        println!(
+            "  LeNet-5 {m5} MACs, Caffe LeNet {mc} MACs ({:.1}x)",
+            mc as f64 / m5 as f64
+        );
         assert!(
             mc > 5 * m5,
             "the two nets must be far apart, or conflating them would be harmless: \
@@ -2905,8 +2926,16 @@ mod tests {
         // one ciphertext, so channel splitting is *not* load-bearing for LeNet-5 — a claim
         // worth pinning in both directions.
         let split = |m: &CnnModel| packing_plan(m, 4096)[1].2;
-        println!("  conv1 groups at n=4096: LeNet-5 {}, Caffe {}", split(&l5), split(&caffe));
-        assert_eq!(split(&l5), 1, "LeNet-5's second conv should fit one ciphertext");
+        println!(
+            "  conv1 groups at n=4096: LeNet-5 {}, Caffe {}",
+            split(&l5),
+            split(&caffe)
+        );
+        assert_eq!(
+            split(&l5),
+            1,
+            "LeNet-5's second conv should fit one ciphertext"
+        );
         assert!(
             split(&caffe) > 1,
             "Caffe's second conv needs degree 5667 at n=4096 and must split"
@@ -2941,9 +2970,7 @@ mod tests {
 
         // The packing plan: LeNet's second conv cannot fit one ciphertext, so this is where
         // channel splitting stops being synthetic.
-        for (i, (shape, group_channels, groups)) in
-            packing_plan(&model, 4096).iter().enumerate()
-        {
+        for (i, (shape, group_channels, groups)) in packing_plan(&model, 4096).iter().enumerate() {
             println!(
                 "    conv{i}: in_c {} {}×{} k{}×{} → {groups} group(s) of \
                  {group_channels} channel(s)",
@@ -2983,17 +3010,36 @@ mod tests {
             "LeNet must be exact: encrypted class {} != plaintext {}",
             r.class, r.expected
         );
-        assert_eq!(r.bootstraps, 0, "depth-1 must need no bootstrap, at any depth of network");
+        assert_eq!(
+            r.bootstraps, 0,
+            "depth-1 must need no bootstrap, at any depth of network"
+        );
         // The architecture must actually be LeNet-5's, or the comparison is against a
         // different network — which is exactly what happened on the first attempt at this
         // test (Caffe's 20/50/500, 8× the MACs) and is the failure this pins shut.
         assert_eq!(model.k, 5, "LeNet-5's kernel is 5×5");
-        assert_eq!(model.out_channels(), 6, "LeNet-5's first conv has 6 channels");
+        assert_eq!(
+            model.out_channels(),
+            6,
+            "LeNet-5's first conv has 6 channels"
+        );
         assert_eq!(model.extra_conv.len(), 1, "LeNet-5 has a second conv");
-        assert_eq!(model.extra_conv[0].out_c(), 16, "LeNet-5's second conv has 16 channels");
+        assert_eq!(
+            model.extra_conv[0].out_c(),
+            16,
+            "LeNet-5's second conv has 16 channels"
+        );
         assert_eq!(model.hidden.len(), 2, "LeNet-5 has two hidden dense layers");
-        assert_eq!(model.hidden[0].0.len(), 120, "LeNet-5's first hidden layer is 120 wide");
-        assert_eq!(model.hidden[1].0.len(), 84, "LeNet-5's second hidden layer is 84 wide");
+        assert_eq!(
+            model.hidden[0].0.len(),
+            120,
+            "LeNet-5's first hidden layer is 120 wide"
+        );
+        assert_eq!(
+            model.hidden[1].0.len(),
+            84,
+            "LeNet-5's second hidden layer is 84 wide"
+        );
         assert_eq!(model.nclasses(), 10, "LeNet-5 has 10 classes");
 
         // The comparison count, which is the whole point. Baru pools *before* the
@@ -3033,24 +3079,38 @@ mod tests {
         // (kernel, input side) with `d − (k − 1)` even, as pooling requires.
         for (k, d) in [(3usize, 8usize), (3, 10), (5, 10), (5, 12)] {
             let (model, input) = CnnModel::random_with_kernel(d, 7, k);
-            assert_eq!(model.k, k, "the model must carry the kernel it was built with");
             assert_eq!(
-                model.conv1_shape().kh, k,
+                model.k, k,
+                "the model must carry the kernel it was built with"
+            );
+            assert_eq!(
+                model.conv1_shape().kh,
+                k,
                 "the packing shape must follow the model's kernel"
             );
 
             let r = run_cnn_hybrid(&model, &input, NetworkProfile::INSTANT);
             println!(
                 "  k={k} d={d}: {} → class {} (plaintext {}), {} ct×ct mults, {} bootstraps",
-                model.architecture(), r.class, r.expected, r.conv_mults, r.bootstraps
+                model.architecture(),
+                r.class,
+                r.expected,
+                r.conv_mults,
+                r.bootstraps
             );
             assert!(
                 r.correct,
                 "k={k} d={d}: encrypted class {} != plaintext {}",
                 r.class, r.expected
             );
-            assert_eq!(r.bootstraps, 0, "k={k} d={d}: depth-1 must need no bootstrap");
-            assert!(r.comm.messages > 0, "k={k} d={d}: must use the real MPC protocol");
+            assert_eq!(
+                r.bootstraps, 0,
+                "k={k} d={d}: depth-1 must need no bootstrap"
+            );
+            assert!(
+                r.comm.messages > 0,
+                "k={k} d={d}: must use the real MPC protocol"
+            );
         }
     }
 
@@ -3078,8 +3138,8 @@ mod tests {
         let session = CnnSession::new(&model, false);
         let profile = NetworkProfile::INSTANT;
 
-        let cold = run_cnn_hybrid_in_session(
-            &session, &model, &input, profile, Nonlin::Falcon, false);
+        let cold =
+            run_cnn_hybrid_in_session(&session, &model, &input, profile, Nonlin::Falcon, false);
         assert!(
             cold.falcon_comparisons > 0,
             "the Falcon route must request comparisons, or this test proves nothing"
@@ -3095,7 +3155,14 @@ mod tests {
         );
 
         let warm = run_cnn_hybrid_in_session_pooled(
-            &session, &model, &input, profile, Nonlin::Falcon, false, &cold.falcon_plan);
+            &session,
+            &model,
+            &input,
+            profile,
+            Nonlin::Falcon,
+            false,
+            &cold.falcon_plan,
+        );
         println!(
             "  warm: class {} in {:.1} ms mpc total = {:.1} online + {:.1} offline, \
              served {}, missed {}",
@@ -3108,7 +3175,10 @@ mod tests {
         );
 
         // 1. Same answer. A faster wrong diagnosis is not a result.
-        assert_eq!(warm.class, cold.class, "pooling must not change the diagnosis");
+        assert_eq!(
+            warm.class, cold.class,
+            "pooling must not change the diagnosis"
+        );
         assert_eq!(
             warm.class, cold.expected,
             "both runs must match the plaintext reference"
@@ -3683,9 +3753,8 @@ mod tests {
         // rather than by widening `CnnModel::random`, which has no second conv.
         const WIDE_C: usize = 16;
         let mut rng = StdRng::seed_from_u64(0xC0FFEE);
-        let mut small = |n: usize| -> Vec<i64> {
-            (0..n).map(|_| rng.gen_range(-2i64..=2)).collect()
-        };
+        let mut small =
+            |n: usize| -> Vec<i64> { (0..n).map(|_| rng.gen_range(-2i64..=2)).collect() };
         let d = 28;
         let kernels: Vec<Vec<i64>> = (0..WIDE_C).map(|_| small(K * K)).collect();
         let cbias = vec![0i64; WIDE_C];

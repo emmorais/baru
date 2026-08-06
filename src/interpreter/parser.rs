@@ -729,11 +729,7 @@ fn parse_case_form(tokens: &[String], pos: &mut usize) -> Result<Expr, String> {
                 // `or`s over them is a correct logical disjunction.
                 let mut acc: Option<Expr> = None;
                 for d in items {
-                    let eq = Expr::BinOp(
-                        BinOp::Eq,
-                        Box::new(Expr::Var(tmp.clone())),
-                        Box::new(d),
-                    );
+                    let eq = Expr::BinOp(BinOp::Eq, Box::new(Expr::Var(tmp.clone())), Box::new(d));
                     acc = Some(match acc {
                         None => eq,
                         Some(a) => Expr::BinOp(BinOp::Or, Box::new(a), Box::new(eq)),
@@ -912,9 +908,7 @@ fn parse_application(tokens: &[String], pos: &mut usize) -> Result<Expr, String>
                         if let Expr::Var(n) = *head.clone() {
                             vec![n.clone()]
                         } else {
-                            return Err(
-                                "lambda params must be a list or identifier".to_string()
-                            );
+                            return Err("lambda params must be a list or identifier".to_string());
                         }
                     }
                     // (lambda (f x y ...) ...) — multiple params parsed as a Call
@@ -934,9 +928,7 @@ fn parse_application(tokens: &[String], pos: &mut usize) -> Result<Expr, String>
                         }
                         params
                     }
-                    _ => {
-                        return Err("lambda params must be a list or identifier".to_string())
-                    }
+                    _ => return Err("lambda params must be a list or identifier".to_string()),
                 };
                 let body = if items.len() == 3 {
                     items.into_iter().nth(2).unwrap()
@@ -1238,7 +1230,7 @@ fn parse_atom(tokens: &[String], pos: &mut usize) -> Result<Expr, String> {
         Ok(Expr::Num(n))
     } else {
         Ok(Expr::Var(tok.clone()))
-}
+    }
 }
 
 /// Parse one expression starting at `*pos`.

@@ -837,7 +837,10 @@ fn print_sweep(cells: &[SweepCell], rtts: &[u64], bws: &[f64], protocols: &[Nonl
             if reps > 1 && !ties.is_empty() {
                 println!(
                     "      not separable at {} Mbps — the boundary is a band, not a point",
-                    ties.iter().map(|&b| fmt_bw(b)).collect::<Vec<_>>().join(", "),
+                    ties.iter()
+                        .map(|&b| fmt_bw(b))
+                        .collect::<Vec<_>>()
+                        .join(", "),
                 );
             }
             println!();
@@ -913,8 +916,7 @@ fn print_sweep(cells: &[SweepCell], rtts: &[u64], bws: &[f64], protocols: &[Nonl
             let cheaper_bytes = if xb <= yb { a } else { b };
             let cheaper_msgs = if x.messages <= y.messages { a } else { b };
             let bratio = xb.max(yb) / xb.min(yb).max(1.0);
-            let party_ratio =
-                x.bytes.max(y.bytes) / x.bytes.min(y.bytes).max(1.0);
+            let party_ratio = x.bytes.max(y.bytes) / x.bytes.min(y.bytes).max(1.0);
             let mratio = x.messages.max(y.messages) / x.messages.min(y.messages).max(1.0);
             if (party_ratio / bratio.max(1e-9)) > 1.10 {
                 println!(
@@ -1443,7 +1445,10 @@ mod tests {
         };
 
         // Disjoint: 100..110 entirely below 200..210.
-        assert!(separable(&cell(105.0, 100.0, 110.0, 3), &cell(205.0, 200.0, 210.0, 3)));
+        assert!(separable(
+            &cell(105.0, 100.0, 110.0, 3),
+            &cell(205.0, 200.0, 210.0, 3)
+        ));
 
         // Overlapping, and the medians are 5% apart — exactly the situation that
         // produced this repo's withdrawn crossover claims.
@@ -1454,11 +1459,17 @@ mod tests {
 
         // Touching but not overlapping is still not separable: `<` is strict on
         // purpose, so a shared endpoint reads as a tie.
-        assert!(!separable(&cell(100.0, 90.0, 110.0, 3), &cell(120.0, 110.0, 130.0, 3)));
+        assert!(!separable(
+            &cell(100.0, 90.0, 110.0, 3),
+            &cell(120.0, 110.0, 130.0, 3)
+        ));
 
         // Single run: ranges are points, so this degrades to a bare comparison.
         // Pinned so the degradation is a decision on record, not an accident.
-        assert!(separable(&cell(100.0, 100.0, 100.0, 1), &cell(101.0, 101.0, 101.0, 1)));
+        assert!(separable(
+            &cell(100.0, 100.0, 100.0, 1),
+            &cell(101.0, 101.0, 101.0, 1)
+        ));
     }
 
     /// **The Falcon pool sizes a real diagnosis needs**, measured rather than derived.
@@ -1573,10 +1584,17 @@ mod tests {
             let session = CnnSession::new(&model, true);
             let profile = NetworkProfile::INSTANT;
 
-            let cold = run_cnn_hybrid_in_session(
-                &session, &model, img, profile, Nonlin::Falcon, true);
+            let cold =
+                run_cnn_hybrid_in_session(&session, &model, img, profile, Nonlin::Falcon, true);
             let warm = run_cnn_hybrid_in_session_pooled(
-                &session, &model, img, profile, Nonlin::Falcon, true, &cold.falcon_plan);
+                &session,
+                &model,
+                img,
+                profile,
+                Nonlin::Falcon,
+                true,
+                &cold.falcon_plan,
+            );
 
             let total: usize = cold.falcon_plan.values().map(|p| p.comparisons).sum();
             let truncs: usize = cold.falcon_plan.values().map(|p| p.truncations).sum();
@@ -1585,7 +1603,10 @@ mod tests {
                 cold.falcon_plan.len()
             );
             for (seg, p) in &cold.falcon_plan {
-                println!("    {seg:?}: {} cmp, {} trunc", p.comparisons, p.truncations);
+                println!(
+                    "    {seg:?}: {} cmp, {} trunc",
+                    p.comparisons, p.truncations
+                );
             }
             println!(
                 "    online MPC {:.1} → {:.1} ms ({:.2}x), offline {:.1} ms",
@@ -1595,7 +1616,10 @@ mod tests {
                 warm.phases.falcon_offline_ms,
             );
 
-            assert_eq!(warm.class, cold.class, "{name}: pooling changed the diagnosis");
+            assert_eq!(
+                warm.class, cold.class,
+                "{name}: pooling changed the diagnosis"
+            );
             assert_eq!(
                 warm.phases.falcon_pool_missed, 0,
                 "{name}: {} misses — the online figure would include preprocessing",
@@ -1647,7 +1671,8 @@ mod tests {
         let (c1, _, ng1) = plan[0];
         assert_eq!(c1.in_c, 3, "the first conv sees three channels");
         assert_eq!(
-            ng1, 1,
+            ng1,
+            1,
             "RGB 28×28 must fit ONE ciphertext (degree {} against n={n}) — three \
              channels sum on shared coefficients rather than costing three multiplies",
             c1.required_degree()
@@ -1675,7 +1700,7 @@ mod tests {
             .find(|(n, _)| *n == "organa")
             .expect("organa must be embedded")
             .1()
-            .model();
+        .model();
         let plan = crate::bench::cnn::packing_plan(&model, crate::fhe::bfv::BfvParams::DEFAULT.n);
         assert_eq!(plan.len(), 2, "organa is a two-conv model");
 

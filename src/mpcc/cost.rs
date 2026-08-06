@@ -839,12 +839,18 @@ mod tests {
         let slope = (n * sxy - sx * sy) / (n * sxx - sx * sx);
         let intercept = (sy - slope * sx) / n;
         let measured_ns_per_lane = slope * 1e9;
-        let spec = find("aby3").expect("aby3 is registered").cost.local_ns_per_lane;
+        let spec = find("aby3")
+            .expect("aby3 is registered")
+            .cost
+            .local_ns_per_lane;
         println!(
             "  fitted {measured_ns_per_lane:.1} ns/lane (fixed cost {:.3} ms), spec says {spec:.1}",
             intercept * 1000.0
         );
-        println!("  ratio measured/spec = {:.2}x", measured_ns_per_lane / spec);
+        println!(
+            "  ratio measured/spec = {:.2}x",
+            measured_ns_per_lane / spec
+        );
 
         assert!(
             measured_ns_per_lane > 0.0,

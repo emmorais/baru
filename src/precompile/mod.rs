@@ -122,8 +122,7 @@ impl MeasuredCost {
     /// local arithmetic.
     pub fn predict_secs(&self, profile: crate::bench::comm::NetworkProfile) -> f64 {
         let rtt = 2.0 * profile.one_way_latency.as_secs_f64();
-        let bw = self.bytes as f64
-            / profile.bandwidth_bytes_per_sec.unwrap_or(f64::INFINITY);
+        let bw = self.bytes as f64 / profile.bandwidth_bytes_per_sec.unwrap_or(f64::INFINITY);
         self.local_secs + self.waits as f64 * rtt + bw
     }
 }
@@ -195,7 +194,10 @@ impl<P: ?Sized> Registry<P> {
 
     /// [`Self::champion_for`]'s choice, as metadata — for a benchmark that wants
     /// to report *which* entry a regime selected rather than only run it.
-    pub fn champion_meta_for(&self, profile: crate::bench::comm::NetworkProfile) -> &PrecompileMeta {
+    pub fn champion_meta_for(
+        &self,
+        profile: crate::bench::comm::NetworkProfile,
+    ) -> &PrecompileMeta {
         &self.entries[self.champion_index_for(profile)].0
     }
 
@@ -275,7 +277,12 @@ mod tests {
             id,
             author: "test",
             description: "",
-            cost: Some(MeasuredCost { waits, bytes, local_secs: 0.0, at: "test" }),
+            cost: Some(MeasuredCost {
+                waits,
+                bytes,
+                local_secs: 0.0,
+                at: "test",
+            }),
         }
     }
 
@@ -286,10 +293,12 @@ mod tests {
     /// dispatch, and an entry that has never been admitted is not in the registry at all.
     #[test]
     fn regime_selection_ignores_uncosted_entries() {
-        let p = crate::bench::comm::NetworkProfile::fixed_latency(
-            std::time::Duration::from_millis(10),
+        let p =
+            crate::bench::comm::NetworkProfile::fixed_latency(std::time::Duration::from_millis(10));
+        let mut r = Registry::new(
+            costed("cheap", 1, 1_000_000),
+            Box::new(Fixed(1)) as Box<dyn Dummy>,
         );
-        let mut r = Registry::new(costed("cheap", 1, 1_000_000), Box::new(Fixed(1)) as Box<dyn Dummy>);
         // An uncosted challenger that would win on any real measurement it might have.
         r.register(meta("unmeasured"), Box::new(Fixed(2)));
         assert_eq!(
@@ -298,7 +307,10 @@ mod tests {
             "an uncosted entry must not be selectable, whatever it might cost"
         );
         // Once costed, and only then, it can win.
-        let mut r2 = Registry::new(costed("dear", 100, 1_000_000), Box::new(Fixed(1)) as Box<dyn Dummy>);
+        let mut r2 = Registry::new(
+            costed("dear", 100, 1_000_000),
+            Box::new(Fixed(1)) as Box<dyn Dummy>,
+        );
         r2.register(costed("cheap", 1, 1_000), Box::new(Fixed(2)));
         assert_eq!(r2.champion_meta_for(p).id, "cheap");
         // And `champion()` is untouched by any of it: the explicit default still stands.
@@ -309,12 +321,14 @@ mod tests {
     #[test]
     fn blocking_wins_a_slow_link_and_bytes_win_a_thin_one() {
         // A blocks rarely and sends a lot; B is the reverse.
-        let mut r = Registry::new(costed("blocky", 100, 1_000), Box::new(Fixed(1)) as Box<dyn Dummy>);
+        let mut r = Registry::new(
+            costed("blocky", 100, 1_000),
+            Box::new(Fixed(1)) as Box<dyn Dummy>,
+        );
         r.register(costed("chatty", 1, 10_000_000), Box::new(Fixed(2)));
-        let high_latency = crate::bench::comm::NetworkProfile::fixed_latency(
-            std::time::Duration::from_millis(50),
-        )
-        .with_bandwidth(1e9);
+        let high_latency =
+            crate::bench::comm::NetworkProfile::fixed_latency(std::time::Duration::from_millis(50))
+                .with_bandwidth(1e9);
         let thin = crate::bench::comm::NetworkProfile::fixed_latency(std::time::Duration::ZERO)
             .with_bandwidth(1e6);
         assert_eq!(r.champion_meta_for(high_latency).id, "chatty");

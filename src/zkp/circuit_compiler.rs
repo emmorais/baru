@@ -864,10 +864,7 @@ impl CircuitCompiler {
         // Special case: extract static shift amounts directly from AST
         // so the Shl/Shr opcodes carry the correct literal amount.
         if matches!(op, BinOp::AshLeft | BinOp::AshRight) {
-            let src = Self::expect_wire(
-                self.flatten(left, env, lambdas, flat)?,
-                "shift operand",
-            )?;
+            let src = Self::expect_wire(self.flatten(left, env, lambdas, flat)?, "shift operand")?;
             let amount = if let Expr::Num(n) = right {
                 *n as u32
             } else {
@@ -890,8 +887,7 @@ impl CircuitCompiler {
             return Ok(CVal::Wire(dst));
         }
         let l = Self::expect_wire(self.flatten(left, env, lambdas, flat)?, "left operand")?;
-        let r =
-            Self::expect_wire(self.flatten(right, env, lambdas, flat)?, "right operand")?;
+        let r = Self::expect_wire(self.flatten(right, env, lambdas, flat)?, "right operand")?;
 
         // Q16.16 interception: when either operand is fixed-point,
         // mirror the interpreter — coerce the int side (<<16), rescale
@@ -965,10 +961,7 @@ impl CircuitCompiler {
                 ),
             };
         }
-        let src = Self::expect_wire(
-            self.flatten(inner, env, lambdas, flat)?,
-            "unary operand",
-        )?;
+        let src = Self::expect_wire(self.flatten(inner, env, lambdas, flat)?, "unary operand")?;
         Ok(CVal::Wire(self.flatten_unop(*op, src, flat)?))
     }
 
@@ -984,8 +977,7 @@ impl CircuitCompiler {
         lambdas: &mut LambdaStore,
         flat: &mut Vec<FlatOp>,
     ) -> Result<CVal, String> {
-        let cond_wire =
-            Self::expect_wire(self.flatten(cond, env, lambdas, flat)?, "if condition")?;
+        let cond_wire = Self::expect_wire(self.flatten(cond, env, lambdas, flat)?, "if condition")?;
         if let Some(&cv) = self.flat_known.get(&cond_wire) {
             let taken = if cv != 0 { then_e } else { else_e };
             return self.flatten(taken, env, lambdas, flat);
@@ -1066,9 +1058,7 @@ impl CircuitCompiler {
                 items.insert(0, head);
                 Ok(CVal::List(items))
             }
-            CVal::Wire(_) => {
-                Err("cons: second argument must be a compile-time list".to_string())
-            }
+            CVal::Wire(_) => Err("cons: second argument must be a compile-time list".to_string()),
         }
     }
 

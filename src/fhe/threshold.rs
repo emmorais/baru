@@ -822,9 +822,8 @@ mod dkg_tests {
 
         // Each party samples privately.
         let seeds: [[u8; 32]; 3] = [[1u8; 32], [2u8; 32], [3u8; 32]];
-        let contribs: Vec<DkgContribution> = (0..3)
-            .map(|i| dkg_sample_share(&p, &seeds[i], i))
-            .collect();
+        let contribs: Vec<DkgContribution> =
+            (0..3).map(|i| dkg_sample_share(&p, &seeds[i], i)).collect();
 
         // One polynomial each to the previous party restores the replicated layout.
         let shares: Vec<KeyShare> = (0..3)
@@ -843,9 +842,8 @@ mod dkg_tests {
         }
 
         // Public key: one contribution each, summed.
-        let pk_parts: [Poly; 3] = std::array::from_fn(|i| {
-            dkg_public_contribution(&p, &a, &contribs[i], &[7u8; 32], i)
-        });
+        let pk_parts: [Poly; 3] =
+            std::array::from_fn(|i| dkg_public_contribution(&p, &a, &contribs[i], &[7u8; 32], i));
         let b = dkg_aggregate_public(&p, &pk_parts);
         let pk = public_key_bytes(&b, &a);
 
@@ -870,9 +868,8 @@ mod dkg_tests {
     fn the_distributed_key_stays_small() {
         let p = params();
         let seeds: [[u8; 32]; 3] = [[4u8; 32], [5u8; 32], [6u8; 32]];
-        let contribs: Vec<DkgContribution> = (0..3)
-            .map(|i| dkg_sample_share(&p, &seeds[i], i))
-            .collect();
+        let contribs: Vec<DkgContribution> =
+            (0..3).map(|i| dkg_sample_share(&p, &seeds[i], i)).collect();
         let refs: [&Poly; 3] = [&contribs[0].own, &contribs[1].own, &contribs[2].own];
         let s = dkg_reconstruct_secret(&p, &refs);
 
@@ -911,12 +908,10 @@ mod dkg_tests {
         let a = common_a(&p);
         let mask = p.q_mask();
         let seeds: [[u8; 32]; 3] = [[21u8; 32], [22u8; 32], [23u8; 32]];
-        let contribs: Vec<DkgContribution> = (0..3)
-            .map(|i| dkg_sample_share(&p, &seeds[i], i))
-            .collect();
-        let pk_parts: [Poly; 3] = std::array::from_fn(|i| {
-            dkg_public_contribution(&p, &a, &contribs[i], &[31u8; 32], i)
-        });
+        let contribs: Vec<DkgContribution> =
+            (0..3).map(|i| dkg_sample_share(&p, &seeds[i], i)).collect();
+        let pk_parts: [Poly; 3] =
+            std::array::from_fn(|i| dkg_public_contribution(&p, &a, &contribs[i], &[31u8; 32], i));
         let b = dkg_aggregate_public(&p, &pk_parts);
 
         // Party 0 holds components 0 and 1.
@@ -925,9 +920,7 @@ mod dkg_tests {
             .collect();
         // b + a·k should be -(a·(s-k) + e), i.e. the same relation with secret s₂.
         let a_k = poly_mul_mod(&a, &k, &p);
-        let lhs: Poly = (0..p.n)
-            .map(|i| b[i].wrapping_add(a_k[i]) & mask)
-            .collect();
+        let lhs: Poly = (0..p.n).map(|i| b[i].wrapping_add(a_k[i]) & mask).collect();
         let a_s2 = poly_mul_mod(&a, &contribs[2].own, &p);
 
         // lhs + a·s₂ must be the pure error sum −Σeᵢ, whose sup-norm is at most 3.
@@ -966,14 +959,17 @@ mod dkg_tests {
         let shares: Vec<KeyShare> = (0..3)
             .map(|i| dkg_assemble_share(&contribs[i], &contribs[(i + 1) % 3].own))
             .collect();
-        let pk_parts: [Poly; 3] = std::array::from_fn(|i| {
-            dkg_public_contribution(&p, &a, &contribs[i], &[61u8; 32], i)
-        });
+        let pk_parts: [Poly; 3] =
+            std::array::from_fn(|i| dkg_public_contribution(&p, &a, &contribs[i], &[61u8; 32], i));
         let pk = public_key_bytes(&dkg_aggregate_public(&p, &pk_parts), &a);
 
         for &(x, y) in &[(3u64, 5u64), (123, 456), (1000, 1000)] {
             let ct = bfv.mul(&bfv.encrypt_scalar(&pk, x), &bfv.encrypt_scalar(&pk, y));
-            assert_eq!(ct.key_pow(), 2, "no relinearization, so the product is degree 2");
+            assert_eq!(
+                ct.key_pow(),
+                2,
+                "no relinearization, so the product is degree 2"
+            );
             let partials: [PartialDecryption; 3] = std::array::from_fn(|i| {
                 partial_decrypt_any(&bfv, &ct, &shares[i], &[71u8; 32], i as u64, 0)
             });
@@ -1176,9 +1172,21 @@ mod dkg_tests {
 
         // Correctness of the hoisted path, so a timing test cannot pass on a wrong answer.
         let partials: [PartialDecryption; 3] = std::array::from_fn(|i| {
-            partial_decrypt_with_squared(&bfv, &ct, &shares[i].left, &s2[i], &[104u8; 32], i as u64, 0)
+            partial_decrypt_with_squared(
+                &bfv,
+                &ct,
+                &shares[i].left,
+                &s2[i],
+                &[104u8; 32],
+                i as u64,
+                0,
+            )
         });
-        assert_eq!(combine(&bfv, &ct, &partials)[0], 63, "7*9 under a hoisted s^2");
+        assert_eq!(
+            combine(&bfv, &ct, &partials)[0],
+            63,
+            "7*9 under a hoisted s^2"
+        );
         assert!(
             hoisted_us < naive_us,
             "hoisting a ciphertext-independent term must not be slower: {hoisted_us:.0} vs {naive_us:.0} us"
@@ -1254,8 +1262,8 @@ mod dkg_tests {
             let share0 = y.wrapping_sub(masks[0]) % t_mod;
             let share1 = t_mod - (masks[1] % t_mod);
             let share2 = t_mod - (masks[2] % t_mod);
-            let recovered = ((share0 as u128 + share1 as u128 + share2 as u128)
-                % t_mod as u128) as u64;
+            let recovered =
+                ((share0 as u128 + share1 as u128 + share2 as u128) % t_mod as u128) as u64;
 
             assert_eq!(
                 recovered,
@@ -1341,8 +1349,14 @@ mod dkg_tests {
 
         let good = evaluate(&honest);
         let bad = evaluate(&malformed);
-        println!("  honest input -> {good}, malformed input -> {bad} (expected {})", 21 * 2);
-        assert_eq!(good, 42, "the honest path must be exact, or this test proves nothing");
+        println!(
+            "  honest input -> {good}, malformed input -> {bad} (expected {})",
+            21 * 2
+        );
+        assert_eq!(
+            good, 42,
+            "the honest path must be exact, or this test proves nothing"
+        );
         assert_ne!(
             bad, 42,
             "the tampered input must actually change the result, or the demonstration is vacuous"
@@ -1454,12 +1468,7 @@ pub fn squared_key_share(share: &KeyShare, p: &BfvParams) -> Poly {
     let sq = poly_mul_mod(&share.left, &share.left, p);
     let cross = poly_mul_mod(&share.left, &share.right, p);
     (0..p.n)
-        .map(|i| {
-            sq[i]
-                .wrapping_add(cross[i])
-                .wrapping_add(cross[i])
-                & mask
-        })
+        .map(|i| sq[i].wrapping_add(cross[i]).wrapping_add(cross[i]) & mask)
         .collect()
 }
 
@@ -1505,9 +1514,7 @@ pub fn partial_decrypt_any(
         smudge_bits,
         p,
     );
-    let d: Poly = (0..p.n)
-        .map(|i| acc[i].wrapping_add(e[i]) & mask)
-        .collect();
+    let d: Poly = (0..p.n).map(|i| acc[i].wrapping_add(e[i]) & mask).collect();
     PartialDecryption { d }
 }
 
@@ -1560,8 +1567,6 @@ pub fn partial_decrypt_with_squared(
         p,
     );
     PartialDecryption {
-        d: (0..p.n)
-            .map(|i| acc[i].wrapping_add(e[i]) & mask)
-            .collect(),
+        d: (0..p.n).map(|i| acc[i].wrapping_add(e[i]) & mask).collect(),
     }
 }
