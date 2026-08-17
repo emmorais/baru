@@ -122,7 +122,7 @@ the corrections behind each row are in [`docs/experiments.md`](docs/experiments.
 | Compiler vs expert hand-written network | **0.38×** the interactive calls, **0.49×** the messages | `bench-compiled-nn` |
 | **MPC vs FHE at a matched threat model** (2-party dishonest majority, same exact function, MNIST-shaped MLP) | LAN: **16 ms** MPC vs **211 ms** FHE (**13×**). WAN: **7.0 s** MPC vs **0.21 s** FHE (**33×** the other way) | `bench-2pc-nn`, `bench-heir` |
 | FHE baseline is not a strawman | **0.21–0.49 s** via HEIR→OpenFHE, against Orion's published **0.23 s** MNIST | `bench-heir --shapes 784x32x10` |
-| Depth ceiling is the **activation**, not the crypto | `x²` dies at depth 9 in **both** paradigms (CKKS precision / fixed-point range); **exact ReLU** runs to depth 15 at **46 ms** | `bench-2pc-nn --activation relu\|square` |
+| MPC's advantage **widens with depth**, then FHE stops | LAN ratio **13× → 57×** over depth 3–9; FHE **SIGSEGVs at depth 11** while MPC runs to 13 at **41 ms** | `bench-heir --shapes …`, `bench-2pc-nn` |
 | **Cost of active security** (malicious ABY3, with abort) | comparisons: **2.63×** bytes but only **1.06×** rounds, **1.23×** wall clock on a WAN | `bench-malicious` |
 | **Proving** a Q16.16 quantized neuron (784 inputs) | **32 ms** prove, **4.8 ms** verify, 112 KB proof; constraints linear in width, proof size far sublinear | `bench-zkp-layer` |
 

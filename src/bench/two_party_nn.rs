@@ -135,13 +135,28 @@ pub(crate) fn fixture_with(
     let mut layers = Vec::new();
     for (l, pair) in shape.windows(2).enumerate() {
         let (n_in, n_out) = (pair[0], pair[1]);
+        // **Xavier-scaled**, and that is load-bearing rather than cosmetic. With
+        // unscaled weights (`k * unit / 8`, so |w| up to 0.625) a dot product over
+        // `n_in` inputs amplifies by ~sqrt(n_in)*0.625, and `Square` then squares
+        // it — so magnitudes grow doubly exponentially and the accumulator leaves
+        // the range a `bit_width + 1` masked decomposition can represent by the
+        // fourth hidden layer. Measured: worst accumulator 10^5.5 -> 10^9.0 ->
+        // 10^13.5 -> 10^22.6 across depth, against a 2^32 limit.
+        //
+        // Dividing by sqrt(fan_in) — what He/Xavier initialisation does, and what
+        // training produces — puts the dot product near unit gain, where `x^2` has
+        // its fixed point. Measured flat at 10^3.9 from one hidden layer to eight.
+        // Cost figures are unaffected either way (rounds, bytes and decomposition
+        // counts depend on the program's shape, not on weight magnitudes); what
+        // changes is whether the network is still *correct* at depth.
+        let fan_in = (n_in as f64).sqrt();
         let weights: Vec<Vec<i64>> = (0..n_out)
             .map(|o| {
                 (0..n_in)
                     .map(|i| {
                         // Spread over [-unit/2, unit/2], never all one sign.
                         let k = ((o * 7 + i * 5 + l * 3) % 11) as i64 - 5;
-                        k * unit / 8
+                        ((k * unit / 8) as f64 / fan_in) as i64
                     })
                     .collect()
             })
@@ -775,6 +790,63 @@ mod tests {
         }
         assert!(saw_negative, "the rescale never sees a negative value");
         assert!(saw_clamp, "no ReLU ever clamps, so the mux is untested");
+    }
+
+    /// **The fixture must stay inside the representable range as depth grows**, and
+    /// this is the test that was missing when a depth sweep reported the activation
+    /// as the ceiling.
+    ///
+    /// `Square` amplifies: a dot product over `n_in` inputs has gain ~sqrt(n_in)·|w|,
+    /// and squaring turns that into a doubly exponential growth in magnitude. With
+    /// unscaled weights the accumulator left the range a `bit_width + 1` masked
+    /// decomposition can represent by the *fourth* hidden layer — every protocol
+    /// disagreed with the plaintext reference, and it looked like a property of
+    /// `x^2` rather than of the fixture. Xavier scaling puts the gain near 1, where
+    /// `x^2` has its fixed point.
+    ///
+    /// Asserted on the plaintext forward pass, because the question is numerical:
+    /// no protocol is involved in whether a value fits in 33 bits.
+    #[test]
+    fn the_fixture_stays_in_range_as_depth_grows() {
+        // The precondition `bit_decompose_batch` documents: every value must lie in
+        // [-2^(nbits-1), 2^(nbits-1)) with nbits = bit_width + 1.
+        let limit: i128 = 1i128 << 32;
+        for hidden in 1..=8usize {
+            let mut shape = vec![784usize];
+            shape.extend(std::iter::repeat_n(32usize, hidden));
+            shape.push(10);
+            let net = fixture_with(&shape, 8, Activation::Square);
+            let mut cur: Vec<i128> = input_for(shape[0], 8, 0)
+                .into_iter()
+                .map(i128::from)
+                .collect();
+            for layer in &net.layers {
+                let mut next = Vec::with_capacity(layer.out_dim());
+                for (row, &b) in layer.weights.iter().zip(&layer.bias) {
+                    let acc: i128 = row.iter().zip(&cur).map(|(&w, &x)| i128::from(w) * x).sum();
+                    assert!(
+                        acc.abs() < limit,
+                        "{hidden} hidden layers: accumulator {acc} exceeds the 2^32 a \
+                         33-bit decomposition can represent. The fixture's weights are \
+                         amplifying — check the Xavier scaling in `fixture_with`."
+                    );
+                    let pre = (acc >> net.scale_bits) + i128::from(b);
+                    next.push(match layer.activation {
+                        Activation::Identity => pre,
+                        Activation::Relu => pre.max(0),
+                        Activation::Square => (pre * pre) >> net.scale_bits,
+                    });
+                }
+                cur = next;
+            }
+            // And it must not have collapsed the other way: `x^2` on values below
+            // the unit decays toward zero, which quantisation then erases.
+            assert!(
+                cur.iter().any(|v| *v != 0),
+                "{hidden} hidden layers: every logit is zero — `x^2` has decayed the \
+                 signal away, which is the other failure mode of scaling it wrong"
+            );
+        }
     }
 
     /// The cost is driven by neuron count, not multiplication count — one bit
