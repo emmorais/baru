@@ -2078,6 +2078,42 @@ result and the absolute numbers are not comparable to Orion's 0.23 s MNIST or
 HE-LRM's 24 s DLRM. Scaling up is blocked on `mpcc::lower` being scalar, not on
 either protocol.
 
+#### At MNIST scale, with a baseline that is not a strawman
+
+The comparison above is on toy shapes. Repeated at **MNIST-shaped** networks —
+784 inputs, 10 classes — with `x²` on both arms, both classifications verified,
+CKKS at `HEStd_128_classic`:
+
+| shape | FHE eval | FHE keygen | MPC lowgear LAN | MPC lowgear WAN | MPC semi2k WAN |
+|---|---|---|---|---|---|
+| 784x32x10 | **211.2 ms** | 124.8 ms | **16 ms** (6 warm) | 7 045 ms | 20 386 ms |
+| 784x128x10 | **490.3 ms** | 140.9 ms | **40 ms** (9 warm) | 9 532 ms | 57 929 ms |
+
+**On a LAN, SHE-preprocessed 2-party MPC wins by 13× and 12×. On the WAN profile,
+FHE wins by 33× and 19×.** Both margins narrow as the network widens, because
+CKKS packing amortizes width (32× the MACs for 2.3× the time) while MPC's traffic
+does not.
+
+**The baseline is credible, and that is what makes the claim mean anything.**
+Orion (ASPLOS'25) reports MNIST at **0.23 s** single-threaded; this harness gets
+**0.21–0.49 s** for MNIST-shaped MLPs through HEIR → OpenFHE. Same ballpark as the
+published state of the art, so "MPC beats it by 12–13× on a LAN" is a statement
+about MPC against competent FHE, not against a strawman — which was the entire
+reason for wiring HEIR in rather than using Baru's own BFV.
+
+It is also **far** better than the only published HEIR ML datapoint:
+google/heir#1232 reports 784→512→10 at ~30 s with insecure parameters and ~6 min
+secure. The difference is not our doing — it is the route. That write-up went
+through the numba decorator frontend with a padded 1024×1024 layer; this goes
+through `linalg` MLIR, which is the level HEIR's ML pipeline is actually built
+for. Worth reporting back upstream.
+
+**What is still not comparable to the literature**: these are MLPs with `x²`,
+not CNNs with polynomial ReLU, and depth 3 rather than the depth that forces
+bootstrapping. Orion's 0.23 s is a different network. The honest comparison is of
+*ratios within this harness*, with the absolute numbers offered only as evidence
+that neither arm is incompetent.
+
 #### The depth sweep, and FHE's ceiling arrives before the crossover does
 
 `baru bench-heir --activation square --shapes 6x4x3,6x4x4x3,...` against
@@ -2128,6 +2164,52 @@ CKKS context, OpenFHE 1.5.1, no explicit ring dimension or scaling technique, no
 and a hand-tuned context or HEIR's bootstrapping passes would move it. What is
 *measured* is that the out-of-the-box path stops there, and the deepest network it
 evaluates is four hidden layers.
+
+#### Repeated at MNIST width, the ceiling turns out to be the activation
+
+The sweep above is at width 4. At width 32 — 784 inputs, 10 classes, the same `x²`
+on both arms — the conclusion changes, and **the earlier framing above overclaims**:
+
+| depth | shape | FHE (CKKS, `x²`) | MPC (`x²`) | MPC (exact ReLU) |
+|---|---|---|---|---|
+| 3 | 784x32x10 | **211 ms** ✓ | **16 ms** ✓ | 16 ms ✓ |
+| 5 | 784x32x32x10 | **804 ms** ✓ | **21 ms** ✓ | 21 ms ✓ |
+| 7 | 784x32x32x32x10 | **1 280 ms** ✓ | **26 ms** ✓ | 26 ms ✓ |
+| 9 | +1 hidden layer | ✗ **precision** | ✗ **range** | **31 ms** ✓ |
+| 11 | +2 | ✗ SIGSEGV | ✗ | **36 ms** ✓ |
+| 15 | +4 | — | — | **46 ms** ✓ |
+
+**`x²` fails at depth 9 in *both* paradigms, at the same depth, for the same
+reason.** Squaring doubles the magnitude *exponent* every layer, so dynamic range
+grows doubly exponentially. On the FHE side the gate refused because the CKKS error
+(5.3 × 10⁸) exceeded the reference's top-two class margin (1.9 × 10⁷) — the margin
+reporting added for exactly this. On the MPC side all three protocols disagreed
+with the plaintext fixed-point reference and `run_cli` refused to print a summary,
+because the pre-rescale accumulator leaves the range a `bit_width + 1` masked
+decomposition can represent. Neither failure is cryptographic.
+
+**Diagnosis, by isolation.** Shrinking the fixed-point scale (8 → 6 → 4) does not
+help, and widening the ring is refused by LowGear's own headroom check (36-bit
+values need 26 bits of `KAPPA` headroom in a 60-bit field, leaving 24). But
+**exact ReLU at the identical depth and width passes**, and keeps passing to
+**seven hidden layers (depth 15) at 46 ms**, still bit-exact, still linear
+(rounds 110/128/146/164/182/218, +18 per layer). ReLU is 1-Lipschitz and
+non-expansive; `x²` is neither. That is the whole difference.
+
+**The inversion is the result.** `x²` was chosen because CKKS cannot compare, so it
+was the only activation *both* arms could compute exactly — and it is the activation
+that caps depth, in both. The activation MPC computes natively, exact ReLU, is both
+numerically stable and **inexpressible under CKKS**. So MPC's exactness is not only
+a fidelity advantage over a polynomial approximation: **it is what makes depth
+possible at all.** A CKKS system that wants depth must approximate ReLU, and then
+owns both the approximation error and the bootstrap.
+
+**What this corrects.** The width-4 sweep concluded "FHE has a hard ceiling at
+depth 11 while MPC is linear in depth forever." At realistic width, FHE's ceiling
+is **depth 7**, and the "linear forever" claim is true of the *cost* but only holds
+for *correctness* while values stay in range — which for `x²` they do not. With
+ReLU it holds as stated. Both halves of that sentence needed the width sweep to
+find, and both gates found them rather than a reader having to.
 
 ---
 

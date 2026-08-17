@@ -120,6 +120,9 @@ the corrections behind each row are in [`docs/experiments.md`](docs/experiments.
 | Our NTT vs schoolbook | **40.6× faster** at n=4096 (1.77 ms vs 71.9 ms); it also beat NTL+GMP by 1.8× before that backend was removed | `bench-polymul` |
 | Triples from SHE vs from OT | **384 B/triple** vs 3074 at equal 64-bit width (**8.0×**), and ~28× faster | `bench-triples` |
 | Compiler vs expert hand-written network | **0.38×** the interactive calls, **0.49×** the messages | `bench-compiled-nn` |
+| **MPC vs FHE at a matched threat model** (2-party dishonest majority, same exact function, MNIST-shaped MLP) | LAN: **16 ms** MPC vs **211 ms** FHE (**13×**). WAN: **7.0 s** MPC vs **0.21 s** FHE (**33×** the other way) | `bench-2pc-nn`, `bench-heir` |
+| FHE baseline is not a strawman | **0.21–0.49 s** via HEIR→OpenFHE, against Orion's published **0.23 s** MNIST | `bench-heir --shapes 784x32x10` |
+| Depth ceiling is the **activation**, not the crypto | `x²` dies at depth 9 in **both** paradigms (CKKS precision / fixed-point range); **exact ReLU** runs to depth 15 at **46 ms** | `bench-2pc-nn --activation relu\|square` |
 | **Cost of active security** (malicious ABY3, with abort) | comparisons: **2.63×** bytes but only **1.06×** rounds, **1.23×** wall clock on a WAN | `bench-malicious` |
 | **Proving** a Q16.16 quantized neuron (784 inputs) | **32 ms** prove, **4.8 ms** verify, 112 KB proof; constraints linear in width, proof size far sublinear | `bench-zkp-layer` |
 
