@@ -2084,15 +2084,21 @@ The comparison above is on toy shapes. Repeated at **MNIST-shaped** networks —
 784 inputs, 10 classes — with `x²` on both arms, both classifications verified,
 CKKS at `HEStd_128_classic`:
 
-| shape | FHE eval | FHE keygen | MPC lowgear LAN | MPC lowgear WAN | MPC semi2k WAN |
+| shape | FHE eval | FHE + keygen | MPC LAN warm | MPC LAN cold | MPC WAN cold |
 |---|---|---|---|---|---|
-| 784x32x10 | **211.2 ms** | 124.8 ms | **16 ms** (6 warm) | 7 045 ms | 20 386 ms |
-| 784x128x10 | **490.3 ms** | 140.9 ms | **40 ms** (9 warm) | 9 532 ms | 57 929 ms |
+| 784x32x10 | **212.5 ms** | 322.9 ms | **20.4 ms** | 318.8 ms | ~7.3 s |
+| 784x128x10 | **490.3 ms** | 631.2 ms | ~30 ms | ~0.9 s | ~9.8 s |
 
-**On a LAN, SHE-preprocessed 2-party MPC wins by 13× and 12×. On the WAN profile,
-FHE wins by 33× and 19×.** Both margins narrow as the network widens, because
-CKKS packing amortizes width (32× the MACs for 2.3× the time) while MPC's traffic
-does not.
+**On a LAN with preprocessing hoisted on both sides, MPC wins by ~10–16×; cold
+against cold the two are within ~1.0–1.4× at this depth.** On the WAN profile FHE
+wins by ~20–30×, because MPC pays 110 rounds of latency and FHE is
+non-interactive. Both margins move with depth (see the sweep below) and with width,
+because CKKS packing amortizes width — 32× the MACs for 2.3× the time — while MPC's
+traffic does not.
+
+**The LAN figures include local compute.** An earlier version of this section
+omitted it entirely and reported 13× and 12×; the correction is documented under
+the depth sweep below. The WAN figures are latency-dominated and moved far less.
 
 **The baseline is credible, and that is what makes the claim mean anything.**
 Orion (ASPLOS'25) reports MNIST at **0.23 s** single-threaded; this harness gets
@@ -2165,195 +2171,88 @@ and a hand-tuned context or HEIR's bootstrapping passes would move it. What is
 *measured* is that the out-of-the-box path stops there, and the deepest network it
 evaluates is four hidden layers.
 
-#### Repeated at MNIST width — and the first answer was the fixture's fault
+#### Repeated at MNIST width, with compute charged
 
-The sweep above is at width 4. Repeated at width 32 — 784 inputs, 10 classes, `x²`
-on both arms, with **Xavier-scaled fixture weights**:
+`x²` on both arms, Xavier-scaled weights, every row verified. FHE is HEIR →
+OpenFHE CKKS at `HEStd_128_classic`, depth chosen by HEIR. MPC is LowGear on a LAN
+(0.1 ms RTT, 10 Gbit/s). **Both sides are split warm/cold**: FHE's key generation
+and MPC's correlated randomness are both per-session, query-independent costs, so
+warm-vs-warm and cold-vs-cold are the two honest comparisons.
 
-| depth | shape | FHE (CKKS, `x²`) | MPC lowgear LAN | ratio |
-|---|---|---|---|---|
-| 3 | 784x32x10 | **212.5 ms** ✓ | **16 ms** ✓ | 13× |
-| 5 | 784x32x32x10 | **762.2 ms** ✓ | **21 ms** ✓ | 36× |
-| 7 | 784x32x32x32x10 | **1 230.5 ms** ✓ | **26 ms** ✓ | 47× |
-| 9 | 784x32x32x32x32x10 | **1 775.5 ms** ✓ | **31 ms** ✓ | **57×** |
-| 11 | +1 hidden layer | ✗ **SIGSEGV in keygen** | **36 ms** ✓ | — |
-| 13 | +2 | ✗ | **41 ms** ✓ | — |
+| depth | shape | FHE eval | FHE + keygen | MPC warm | MPC cold | warm | cold |
+|---|---|---|---|---|---|---|---|
+| 3 | 784x32x10 | 212.5 ms | 322.9 ms | **20.4 ms** | 318.8 ms | 10.4× | **1.0×** |
+| 5 | 784x32x32x10 | 762.2 ms | 1 159.9 ms | **26.6 ms** | 454.2 ms | 28.7× | 2.6× |
+| 7 | 784x32x32x32x10 | 1 230.5 ms | 1 681.4 ms | **31.2 ms** | 588.0 ms | 39.5× | 2.9× |
+| 9 | 784x32x32x32x32x10 | 1 775.5 ms | 2 327.2 ms | **37.4 ms** | 723.2 ms | 47.4× | 3.2× |
+| 11 | +1 hidden layer | ✗ **SIGSEGV in keygen** | — | **42 ms** | 858 ms | — | — |
 
-**MPC's LAN advantage widens monotonically with depth — 13× to 57× — and then FHE
-stops working entirely while MPC keeps going linearly** (+18 rounds and +5 ms per
-layer, unbroken from depth 3 to 13). That is the width-4 conclusion, reproduced at
-realistic width and considerably stronger.
+**Warm, MPC wins by 10× at depth 3 rising to 47× at depth 9. Cold, the two are a
+dead tie at depth 3 (1.0×) and MPC pulls to 3.2× by depth 9.** Then FHE stops
+working while MPC continues linearly. The direction — MPC's advantage widening with
+depth — holds on both accountings; the magnitude depends entirely on which one you
+quote.
 
-**Getting here required withdrawing a wrong finding of our own, and the record is
-the useful part.** The first run of this sweep used the *unscaled* fixture, and
-`x²` failed at depth 9 on **both** arms: the FHE gate refused because the CKKS
-error (5.3 × 10⁸) exceeded the reference's top-two class margin (1.9 × 10⁷), and
-every MPC protocol disagreed with the plaintext reference. It was written up as
-"the depth ceiling is the activation, not the crypto", with the inversion that MPC's
-exact ReLU is what makes depth possible — a tidy story, consistent with both
-measurements, and **wrong**.
+**These numbers replace an earlier version that was wrong, and the error is worth
+stating.** `bench-2pc-nn` charged MPC `rounds × RTT + bytes / bandwidth` and **no
+compute term at all**. On the WAN profile that is nearly harmless — 110 rounds at
+50 ms swamps everything — but on a LAN the network term is *microseconds*, and
+compute is the entire cost. Measured at `784x32x10`: modelled network **16 ms**
+against **598 ms** of real local compute. So the published LAN figures understated
+MPC by ~19×, and the ratios (13×–57×) additionally compared a *warm* MPC against a
+*cold* FHE. Both halves flattered MPC. Compute is now measured and split:
 
-The caveat flagged alongside it — that an *untrained* `x²` fixture might be the
-cause — turned out to be the whole cause. Measured in plaintext fixed point, worst
-accumulator against the `2^32` a 33-bit masked decomposition can represent:
+* `offline_micros` times correlated-randomness generation inside the engines, so it
+  can be charged to the cold column only — the same treatment `offline_bytes` and
+  `random_bit_bytes` already had.
+* Per-party compute is the in-process total divided by the party count. The
+  simulator runs every party serially in one process, so this is a **division, not
+  a measurement of one party**; the protocols are symmetric, but it is an
+  approximation and is labelled as one.
+* The first attempt double-counted: `random_bits_batch` timed its whole span
+  including the `mul_batch` calls that trigger the engine's own refill, which times
+  itself. The residual saturated to zero and reported the online phase as free.
+  Fixed by subtracting the nested delta.
+
+Two internal checks say the split is sound. **Online compute is identical across
+protocols** — 14.3 ms (Semi2k) against 14.1 ms (LowGear) at depth 3, 26.2 against
+26.7 at depth 9 — which is exactly right, because the two share the same Beaver
+online phase and differ only in where triples come from. And **offline compute
+separates them by 78×**: 22.8 s against 293 ms at depth 3, the OT-versus-SHE gap of
+§VI.5 appearing in CPU rather than bytes. Semi2k on a LAN is 22.9 s cold, which is
+the honest verdict on OT preprocessing at this scale.
+
+#### The fixture had to be fixed first, and that produced a withdrawn finding
+
+The first run of this sweep used **unscaled** fixture weights, and `x²` failed at
+depth 9 on *both* arms — the FHE gate refused because the CKKS error (5.3 × 10⁸)
+exceeded the reference's top-two class margin (1.9 × 10⁷), and every MPC protocol
+disagreed with the plaintext reference. It was written up as "the depth ceiling is
+the activation, not the crypto", with an inversion in which MPC's exact ReLU is what
+makes depth possible. Consistent with both measurements, and **wrong**.
+
+The caveat flagged beside it — that an *untrained* `x²` fixture might be the cause —
+was the entire cause. A dot product over `n_in` inputs has gain ~`√n_in·|w|`, and
+squaring turns any gain above 1 into doubly exponential growth. Worst accumulator
+against the `2^32` a 33-bit masked decomposition admits:
 
 | hidden layers | 1 | 2 | 3 | 4 | 5 | 6 |
 |---|---|---|---|---|---|---|
 | unscaled `\|w\| ≤ 0.625` | 10^5.5 | 10^6.7 | 10^9.0 | **10^13.5** | 10^22.6 | 10^38.2 |
 | Xavier `\|w\| ~ 1/√fan_in` | 10^3.9 | 10^3.9 | 10^3.9 | 10^3.9 | 10^3.9 | 10^4.0 |
 
-A dot product over `n_in` inputs has gain ~`√n_in·|w|`, and squaring turns any gain
-above 1 into doubly exponential growth. Dividing by `√fan_in` — what He/Xavier
-initialisation does, and what training produces — puts the gain at the fixed point
-where `x²` is stable, **flat from one hidden layer to eight**. The fixture is now
-scaled that way and `the_fixture_stays_in_range_as_depth_grows` asserts it, checking
-both failure directions: the accumulator against `2^32`, and that the logits have
-not decayed to zero (the other way to scale `x²` wrong).
+Dividing by `√fan_in` — what He/Xavier initialisation does, and what training
+produces — puts the gain at the fixed point where `x²` is stable, flat from one
+hidden layer to eight. The fixture is now scaled that way, and
+`the_fixture_stays_in_range_as_depth_grows` asserts both failure directions: the
+accumulator under `2^32`, and the logits not decayed to zero. **No cost figure moved**
+— rounds, bytes and decomposition counts depend on program shape, not weight
+magnitude — only correctness at depth.
 
-**No cost figure moved**, because rounds, bytes and decomposition counts depend on
-the program's shape and not on weight magnitudes. What moved is *correctness at
-depth*, which is exactly what the missing test would have caught.
-
-Two things worth keeping from the wrong version. The claim that MPC's exact ReLU is
-numerically better behaved than `x²` **is still true** — ReLU is 1-Lipschitz and
-non-expansive, and it ran to seven hidden layers on the unscaled fixture where `x²`
-failed at four. It simply is not what limits depth once the weights are sane. And
-the failure was caught by the two gates rather than by a reader: the margin check
-distinguished "CKKS noise flipped a near-tie" from "the computation is wrong", and
-the MPC bit-exactness check refused to print a summary at all.
-
-#### At MNIST scale, with a baseline that is not a strawman
-
-The comparison above is on toy shapes. Repeated at **MNIST-shaped** networks —
-784 inputs, 10 classes — with `x²` on both arms, both classifications verified,
-CKKS at `HEStd_128_classic`:
-
-| shape | FHE eval | FHE keygen | MPC lowgear LAN | MPC lowgear WAN | MPC semi2k WAN |
-|---|---|---|---|---|---|
-| 784x32x10 | **211.2 ms** | 124.8 ms | **16 ms** (6 warm) | 7 045 ms | 20 386 ms |
-| 784x128x10 | **490.3 ms** | 140.9 ms | **40 ms** (9 warm) | 9 532 ms | 57 929 ms |
-
-**On a LAN, SHE-preprocessed 2-party MPC wins by 13× and 12×. On the WAN profile,
-FHE wins by 33× and 19×.** Both margins narrow as the network widens, because
-CKKS packing amortizes width (32× the MACs for 2.3× the time) while MPC's traffic
-does not.
-
-**The baseline is credible, and that is what makes the claim mean anything.**
-Orion (ASPLOS'25) reports MNIST at **0.23 s** single-threaded; this harness gets
-**0.21–0.49 s** for MNIST-shaped MLPs through HEIR → OpenFHE. Same ballpark as the
-published state of the art, so "MPC beats it by 12–13× on a LAN" is a statement
-about MPC against competent FHE, not against a strawman — which was the entire
-reason for wiring HEIR in rather than using Baru's own BFV.
-
-It is also **far** better than the only published HEIR ML datapoint:
-google/heir#1232 reports 784→512→10 at ~30 s with insecure parameters and ~6 min
-secure. The difference is not our doing — it is the route. That write-up went
-through the numba decorator frontend with a padded 1024×1024 layer; this goes
-through `linalg` MLIR, which is the level HEIR's ML pipeline is actually built
-for. Worth reporting back upstream.
-
-**What is still not comparable to the literature**: these are MLPs with `x²`,
-not CNNs with polynomial ReLU, and depth 3 rather than the depth that forces
-bootstrapping. Orion's 0.23 s is a different network. The honest comparison is of
-*ratios within this harness*, with the absolute numbers offered only as evidence
-that neither arm is incompetent.
-
-#### The depth sweep, and FHE's ceiling arrives before the crossover does
-
-`baru bench-heir --activation square --shapes 6x4x3,6x4x4x3,...` against
-`baru bench-2pc-nn` on the same shapes. Every FHE row verified against the
-plaintext reference; every MPC row bit-exact. Depth is chosen by HEIR.
-
-| hidden layers | shape | FHE depth | FHE eval | MPC rounds | MPC lowgear LAN | MPC lowgear WAN |
-|---|---|---|---|---|---|---|
-| 1 | 6x4x3 | 3 | **47.8 ms** | 47 | **3 ms** | 2 680 ms |
-| 2 | 6x4x4x3 | 5 | 164.1 ms | 65 | 5 ms | — |
-| 3 | 6x4x4x4x3 | 7 | 263.5 ms | 83 | 6 ms | — |
-| 4 | 6x4x4x4x4x3 | 9 | **389.7 ms** | 101 | **8 ms** | 5 827 ms |
-| 5 | 6x4x4x4x4x4x3 | 11 | **SIGSEGV in key generation** | 119 | 9 ms | 6 876 ms |
-
-Each added `x²` layer costs **two levels**, and HEIR gets the depth right
-automatically every time. Three results.
-
-**FHE has a hard ceiling, not a bootstrap step.** At depth 11 the run dies with
-**SIGSEGV, inside `f.setup()` — key generation** — after HEIR's MLIR→C++→clang
-pipeline succeeded. Not OOM, not a clean "no secure parameters" abort: a
-segmentation fault in OpenFHE 1.5.1 for a context that sets only
-`SetMultiplicativeDepth` and `SetPlaintextModulus`. **HEIR's default pipeline is
-leveled and places no bootstraps**, so depth is a wall rather than a step. That
-reframes what Orion's automatic bootstrap placement *is*: not an optimization, but
-the thing that makes depth > 9 possible at all — at ~20 s per bootstrap (HE-LRM).
-
-**On a LAN, MPC's advantage widens with depth.** FHE/MPC is 16×, 33×, 44×, 49×
-across the four depths that run. MPC is linear (+18 rounds and +2 ms per layer,
-forever); FHE grows ~110 ms per layer *and* stops.
-
-**On a WAN, FHE wins at every depth it can run — and that is the interesting
-part.** FHE 48–390 ms against MPC 2 680–5 827 ms, an advantage narrowing from 55×
-to 15× as depth grows. Extrapolating the two slopes (~110 ms/layer against
-~900 ms/layer) the crossover is far away — but **FHE's ceiling arrives first**. So
-the honest statement is not "they cross at depth *d*": it is that **on a WAN,
-leveled FHE is faster until it stops working, and the depth where it stops is
-below the depth where MPC would have caught it.** A system that bootstraps to get
-past that ceiling pays ~20 s, which is 3× MPC's WAN total and 2000× its LAN total
-at depth 11 — so **the bootstrap is exactly where MPC wins on both axes at once.**
-
-That is the sharpest form of this repo's zero-bootstrap thesis, arrived at from
-the FHE side: the scheme switch that refreshes a ciphertext costs 160 ms (E11), and
-the alternative is either a ~20 s bootstrap or a segfault.
-
-**Caveat on the ceiling**: depth 11 fails *in this configuration* — HEIR's default
-CKKS context, OpenFHE 1.5.1, no explicit ring dimension or scaling technique, no
-`heir_opt_options`. It is a limit of the default pipeline, not a proof about CKKS,
-and a hand-tuned context or HEIR's bootstrapping passes would move it. What is
-*measured* is that the out-of-the-box path stops there, and the deepest network it
-evaluates is four hidden layers.
-
-#### Repeated at MNIST width, the ceiling turns out to be the activation
-
-The sweep above is at width 4. At width 32 — 784 inputs, 10 classes, the same `x²`
-on both arms — the conclusion changes, and **the earlier framing above overclaims**:
-
-| depth | shape | FHE (CKKS, `x²`) | MPC (`x²`) | MPC (exact ReLU) |
-|---|---|---|---|---|
-| 3 | 784x32x10 | **211 ms** ✓ | **16 ms** ✓ | 16 ms ✓ |
-| 5 | 784x32x32x10 | **804 ms** ✓ | **21 ms** ✓ | 21 ms ✓ |
-| 7 | 784x32x32x32x10 | **1 280 ms** ✓ | **26 ms** ✓ | 26 ms ✓ |
-| 9 | +1 hidden layer | ✗ **precision** | ✗ **range** | **31 ms** ✓ |
-| 11 | +2 | ✗ SIGSEGV | ✗ | **36 ms** ✓ |
-| 15 | +4 | — | — | **46 ms** ✓ |
-
-**`x²` fails at depth 9 in *both* paradigms, at the same depth, for the same
-reason.** Squaring doubles the magnitude *exponent* every layer, so dynamic range
-grows doubly exponentially. On the FHE side the gate refused because the CKKS error
-(5.3 × 10⁸) exceeded the reference's top-two class margin (1.9 × 10⁷) — the margin
-reporting added for exactly this. On the MPC side all three protocols disagreed
-with the plaintext fixed-point reference and `run_cli` refused to print a summary,
-because the pre-rescale accumulator leaves the range a `bit_width + 1` masked
-decomposition can represent. Neither failure is cryptographic.
-
-**Diagnosis, by isolation.** Shrinking the fixed-point scale (8 → 6 → 4) does not
-help, and widening the ring is refused by LowGear's own headroom check (36-bit
-values need 26 bits of `KAPPA` headroom in a 60-bit field, leaving 24). But
-**exact ReLU at the identical depth and width passes**, and keeps passing to
-**seven hidden layers (depth 15) at 46 ms**, still bit-exact, still linear
-(rounds 110/128/146/164/182/218, +18 per layer). ReLU is 1-Lipschitz and
-non-expansive; `x²` is neither. That is the whole difference.
-
-**The inversion is the result.** `x²` was chosen because CKKS cannot compare, so it
-was the only activation *both* arms could compute exactly — and it is the activation
-that caps depth, in both. The activation MPC computes natively, exact ReLU, is both
-numerically stable and **inexpressible under CKKS**. So MPC's exactness is not only
-a fidelity advantage over a polynomial approximation: **it is what makes depth
-possible at all.** A CKKS system that wants depth must approximate ReLU, and then
-owns both the approximation error and the bootstrap.
-
-**What this corrects.** The width-4 sweep concluded "FHE has a hard ceiling at
-depth 11 while MPC is linear in depth forever." At realistic width, FHE's ceiling
-is **depth 7**, and the "linear forever" claim is true of the *cost* but only holds
-for *correctness* while values stay in range — which for `x²` they do not. With
-ReLU it holds as stated. Both halves of that sentence needed the width sweep to
-find, and both gates found them rather than a reader having to.
+Worth keeping from the wrong version: exact ReLU really is better behaved than `x²`
+(1-Lipschitz and non-expansive; it reached seven hidden layers on the unscaled
+fixture where `x²` died at four). It just is not what limits depth once the weights
+are sane. And both gates caught their own arm rather than a reader having to.
 
 ---
 

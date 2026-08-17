@@ -91,6 +91,12 @@ pub struct NnPoint {
     /// Secret×secret multiplications in the program itself (excluding the ones
     /// random-bit generation spends).
     pub muls: u64,
+    /// Local compute, per party, split the same way bytes and rounds are:
+    /// `online` is the evaluation, `offline` is correlated-randomness generation
+    /// that a warm server has already done. Measured, not modelled — and on a LAN
+    /// these dominate.
+    pub online_compute_secs: f64,
+    pub offline_compute_secs: f64,
     /// Warm server: preprocessing already generated when the query arrives.
     pub online_secs: f64,
     /// Cold server: it pays for everything.
@@ -208,6 +214,17 @@ pub(crate) fn argmax_of(logits: &[i64]) -> i64 {
 /// `compile_fhe` yields exactly one output wire, so a classifier has to reduce to
 /// the class rather than expose the logit vector. That is the right shape anyway:
 /// it is what a deployment reveals.
+/// Expose the `Square` source/bindings for compute profiling.
+pub fn debug_src_sq(shape: &[usize], scale_bits: u32) -> String {
+    network_src(&fixture_with(shape, scale_bits, Activation::Square))
+}
+
+/// Bindings for [`debug_src_sq`].
+pub fn debug_bindings_sq(shape: &[usize], scale_bits: u32) -> HashMap<String, i64> {
+    let net = fixture_with(shape, scale_bits, Activation::Square);
+    network_inputs(&net, &input_for(shape[0], scale_bits, 0))
+}
+
 /// Expose the input bindings for phase profiling (`examples/probe_phases.rs`).
 pub fn debug_bindings(shape: &[usize], scale_bits: u32) -> HashMap<String, i64> {
     let net = fixture_with(shape, scale_bits, Activation::Relu);
@@ -381,9 +398,29 @@ pub fn run_with(
 
             let bw = dep.bandwidth_bytes_per_sec;
             let rtt = dep.latency_us / 1e6;
-            let online_secs = m.rounds as f64 * rtt + m.online_bytes as f64 / bw;
-            let total_secs =
-                online_secs + m.random_bit_rounds as f64 * rtt + offline_bytes as f64 / bw;
+
+            // **Local compute, and omitting it was a real error.** Until now this
+            // charged only `rounds x RTT + bytes / bandwidth`. On a WAN that is
+            // fine — 110 rounds at 50 ms swamps everything — but on a LAN the
+            // network term is microseconds and compute is the whole cost: at
+            // `784x32x10` LowGear's modelled 16 ms sat against 598 ms of measured
+            // compute, so the LAN figures understated MPC by ~19x and the
+            // published LAN ratios were wrong in MPC's favour.
+            //
+            // The simulator runs every party serially in one process, so a
+            // deployment's per-party compute is taken as the total divided by the
+            // party count. That is an approximation and is stated as one: parties
+            // do symmetric work in these protocols, but it is a division, not a
+            // measurement of one party.
+            let parties = dep.parties.max(1) as f64;
+            let offline_compute = m.offline_micros as f64 / 1e6 / parties;
+            let online_compute = (m.micros.saturating_sub(m.offline_micros)) as f64 / 1e6 / parties;
+
+            let online_secs = m.rounds as f64 * rtt + m.online_bytes as f64 / bw + online_compute;
+            let total_secs = online_secs
+                + m.random_bit_rounds as f64 * rtt
+                + offline_bytes as f64 / bw
+                + offline_compute;
 
             let class = m.outputs.first().map(|(_, v)| *v).unwrap_or(i64::MIN);
             points.push(NnPoint {
@@ -398,6 +435,8 @@ pub fn run_with(
                 decomps_network: (m.random_bits / bits_per_decomp).saturating_sub(decomps_argmax),
                 decomps_argmax,
                 muls: m.muls,
+                online_compute_secs: online_compute,
+                offline_compute_secs: offline_compute,
                 online_secs,
                 total_secs,
                 correct: class == want,

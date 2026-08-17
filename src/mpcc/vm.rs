@@ -278,6 +278,17 @@ pub struct Counters {
     /// regardless of how many bits it carries. Not part of the program's online
     /// round count, for the same query-independence reason.
     pub random_bit_rounds: u64,
+    /// Microseconds spent in **preprocessing**: correlated-randomness generation
+    /// (OT or SHE triples) and random-bit generation.
+    ///
+    /// Separated from the run's total wall clock for the same reason
+    /// [`Counters::random_bit_bytes`] is separated from `online_bytes`:
+    /// preprocessing is query-independent, so a warm server has already paid it,
+    /// and charging it to the online phase would compare one system's online cost
+    /// against another's total. On a LAN this is the *dominant* term — network
+    /// time is microseconds there — so omitting compute entirely, as an earlier
+    /// version of `bench-2pc-nn` did, understated MPC's real latency by ~19x.
+    pub offline_micros: u128,
     /// Multiplications spent generating random bits — one per bit per tree level.
     ///
     /// Kept out of [`Counters::muls`] deliberately. That field is validated
@@ -399,14 +410,19 @@ pub fn random_bits_batch<E: ShareEngine>(engine: &mut E, n: usize) -> Vec<E::Sha
         return Vec::new();
     }
 
+    let t_offline = std::time::Instant::now();
     // Snapshot the three *online-phase* counters, so everything below can be
-    // reattributed to preprocessing. `triples`, `triples_generated` and
+    // reattributed to preprocessing. `offline_micros` is snapshotted too, because
+    // the `mul_batch` below triggers the engine's own triple generation, which
+    // times *itself* — charging this function's whole span as well would count
+    // that twice, and it did: the residual `micros - offline_micros` saturated to
+    // zero, reporting the online phase as free. `triples`, `triples_generated` and
     // `offline_bytes` are deliberately left to grow: the triples these
     // multiplications consume are real, and charging them triple-generation cost
     // the same way every other triple is charged is the point.
-    let (bytes_before, muls_before, opens_before) = {
+    let (bytes_before, muls_before, opens_before, offline_micros_before) = {
         let c = engine.counters();
-        (c.online_bytes, c.muls, c.opens)
+        (c.online_bytes, c.muls, c.opens, c.offline_micros)
     };
 
     let mut rng = rand::thread_rng();
@@ -468,6 +484,10 @@ pub fn random_bits_batch<E: ShareEngine>(engine: &mut E, n: usize) -> Vec<E::Sha
     counters.random_bit_muls += muls;
     counters.random_bit_rounds += rounds;
     counters.random_bits += n as u64;
+    // Only this function's own work: the engine already charged whatever triple
+    // generation happened inside it.
+    let nested = counters.offline_micros - offline_micros_before;
+    counters.offline_micros += t_offline.elapsed().as_micros().saturating_sub(nested);
     debug_assert_eq!(opens, 0, "random-bit generation should not open anything");
 
     layers.pop().unwrap_or_default()
@@ -709,6 +729,9 @@ pub struct Measured {
     /// Multiplications spent generating random bits — kept out of
     /// [`Measured::muls`] so that stays comparable to `mpcc::cost`'s prediction.
     pub random_bit_muls: u64,
+    /// Microseconds of **preprocessing** compute, out of [`Measured::micros`].
+    /// `micros - offline_micros` is the online phase's local compute.
+    pub offline_micros: u128,
     /// Wall clock, microseconds.  In-process, so this measures local compute
     /// only — there is no network to wait for.
     pub micros: u128,
@@ -819,6 +842,7 @@ pub fn execute<E: ShareEngine>(
         random_bit_bytes: c.random_bit_bytes,
         random_bit_rounds: c.random_bit_rounds,
         random_bit_muls: c.random_bit_muls,
+        offline_micros: c.offline_micros,
         micros: t0.elapsed().as_micros(),
         outputs,
     })

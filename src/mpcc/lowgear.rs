@@ -559,6 +559,10 @@ impl LowGearEngine {
     }
 
     fn refill(&mut self) -> Result<(), String> {
+        // Preprocessing compute, charged apart from the online phase — on a LAN
+        // it is the dominant term, and `bench-2pc-nn` reports it in the cold
+        // column only.
+        let t_offline = std::time::Instant::now();
         let (p0, p1, stats) = self.gen.generate_batch()?;
         self.counters.offline_bytes += stats.bytes as u64;
         self.counters.triples_generated += stats.triples as u64;
@@ -569,6 +573,7 @@ impl LowGearEngine {
                 vec![p0.c[i], p1.c[i]],
             ));
         }
+        self.counters.offline_micros += t_offline.elapsed().as_micros();
         Ok(())
     }
 

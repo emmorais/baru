@@ -162,6 +162,10 @@ impl Semi2kEngine {
 
     /// Generate `self.batch` triples, all their OTs in one extension call.
     fn refill(&mut self) -> Result<(), String> {
+        // Preprocessing compute, charged apart from the online phase — on a LAN
+        // it is the dominant term, and `bench-2pc-nn` reports it in the cold
+        // column only.
+        let t_offline = std::time::Instant::now();
         let mask = self.mask();
         let mut rng = rand::thread_rng();
         let n = self.batch;
@@ -196,6 +200,7 @@ impl Semi2kEngine {
                 .push((vec![a[i].0, a[i].1], vec![b[i].0, b[i].1], vec![c0, c1]));
         }
         self.counters.triples_generated += n as u64;
+        self.counters.offline_micros += t_offline.elapsed().as_micros();
         Ok(())
     }
 
