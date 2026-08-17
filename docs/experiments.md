@@ -1746,6 +1746,131 @@ exactly right, and to cut the other way once MPC gets the better preprocessing.
 **The crossover belongs to the baseline's preprocessing, not to either
 cryptosystem.**
 
+#### Re-measured once random bits became real (2026-08-17)
+
+Until now `ShareEngine::random_bits` **drew bits locally and charged nothing for
+them** — the "fake offline" mode MP-SPDZ uses to isolate an online phase. The
+bits are now *generated*: each party contributes a private bit and the shared bit
+is their XOR (`x ⊕ y = x + y − 2xy`), so a bit costs one Beaver triple, and at
+two parties a whole batch costs one round (`vm::random_bits_batch`). The same
+table, re-run:
+
+| width | dealer (lower bound) | semi2k (OT) | **lowgear (SHE)** | hybrid/bfv |
+|---|---|---|---|---|
+| 64 | 600.6 ms | 709.6 ms | **607.1 ms** | 692.1 ms |
+| 1024 | 603.0 ms | 957.9 ms | **624.3 ms** | 692.1 ms |
+| 4096 | 610.9 ms | 1.75 s | **679.3 ms** | 733.7 ms |
+
+**The conclusion above survives and the mechanism sharpens.** The ranking is
+unchanged, LowGear still beats the hybrid at every width, and dealer is still
+flat. What moved is Semi2k, by exactly the ReLU's bit bill: **+59 triples at
+every width**, which is `nb + KAPPA = 33 + 26` random bits at one triple each.
+At 3136 B/triple that is 185 kB of OT per comparison — against the layer's
+**6.8 kB of online traffic at width 64**, so a single comparison's preprocessing
+is **27× the entire online phase**.
+
+Two things follow, and the second is the one that matters for a paper.
+
+**The cost model was under-charging a random bit by ~400×.** `mpcc::cost`
+charged `random_bits × elem_bytes` — one ring element, 8 bytes — against a real
+cost of one triple, ~3.1 kB. The term is now fitted to the measurement
+(`vm::the_cost_of_a_random_bit_is_a_triple`), and the direction of the error is
+the uncomfortable one: it under-priced *precisely* the phase that decides a
+comparison-heavy workload, and it did so in MPC's favour. Any assignment or
+crossover this model produced for a program containing comparisons was biased
+toward MPC.
+
+**At narrow widths the OT-preprocessed comparison is now a tie rather than a
+win.** `bench-layer --widths 1,8` gives semi2k 693.3 / 695.2 ms against the
+hybrid's 692.1 — **0.2% and 0.4% apart**, inside the run-to-run spread §7.3
+records. The benchmark's derived summary reports "from width 1 onward" because it
+tests a threshold; the honest reading is that the two are indistinguishable below
+width 64 and FHE pulls clearly ahead by width 1024 (38%). The published crossover
+of *width 64* is therefore still the right number to quote, and it is now the
+boundary of a **tie region** rather than of a Semi2k win.
+
+`spdz2k` deliberately still deals its bits, and that is disclosed rather than
+fixed: the XOR construction is only sound if each contribution really is a bit,
+which a malicious party can violate without any MAC detecting it. Its comparison
+costs are consequently a lower bound and are not commensurable with the two
+measured engines — which is why `RUNNABLE` excludes it and no sweep quotes it.
+
+---
+
+### VI.6 A whole classifier at a matched threat model (2026-08-17)
+
+`baru bench-2pc-nn`. Every private-inference figure elsewhere in this document
+comes from the **3-party honest-majority** path. That is not FHE's threat model:
+single-server FHE assumes one server and nothing about collusion, so a 3-party
+honest-majority system beating it on latency is a consequence of assuming away
+the hard part — and it is why every hybrid inference system in the literature
+(Gazelle, Delphi, Cheetah) is 2-party. This runs a whole classifier under
+**2-party dishonest-majority** MPC, where the comparison is commensurable.
+Input, every weight and every bias secret; only the class index revealed;
+bit-exact against `QuantizedNetwork::forward` before any cost is quoted.
+
+LAN (0.1 ms RTT, 10 Gbit/s), Q8 fixed point, 32-bit values:
+
+| shape | rounds | muls | decomps | online | offline (semi2k) | offline (lowgear) | warm | cold (semi2k) | cold (lowgear) |
+|---|---|---|---|---|---|---|---|---|---|
+| 16x8x4 | 56 | 7 119 | 23 | 112.9 KiB | 25.9 MiB | 1.6 MiB | 3 ms | 25 ms | **5 ms** |
+| 16x8x8x4 | 74 | 12 023 | 39 | 190.2 KiB | 43.8 MiB | 2.7 MiB | 4 ms | 41 ms | **7 ms** |
+| 16x8x8x8x4 | 92 | 16 927 | 55 | 267.5 KiB | 61.7 MiB | 3.8 MiB | 5 ms | 57 ms | **9 ms** |
+| 784x32x10 | 110 | 50 523 | 83 | 995.0 KiB | 169.3 MiB | 10.3 MiB | 6 ms | 149 ms | **16 ms** |
+
+Four results, and the last one is the paper's.
+
+**The layers are 1.7% of the multiplications.** At `16x8x8x8x4` the network's own
+arithmetic is 288 multiplications of 16 927; the other 98.3% is *inside* the bit
+decompositions that the rescales and ReLUs need. Cost tracks **neuron count**,
+not multiplication count — 52 of the 55 decompositions are the network's
+nonlinear surface and only 3 are the argmax. This is the fixed-point rescale
+being as expensive as the nonlinearity, which `mpcc::ir` flags in a comment
+(*"the classic MPC gotcha that Baru's Q16.16 rescale runs into"*) and which is
+now measured.
+
+**Round depth dominates in every regime measured**, not just on a WAN: 95.5% of
+the online phase is round latency even on a 10 Gbit/s LAN (92 rounds × 0.05 ms
+against 267 KiB of traffic), and 100.0% on the WAN profile. So the online cost of
+2-party fixed-point inference is set by *depth*, and depth is set by the
+nonlinearity count.
+
+**Rounds are a function of depth alone.** `128x64x10`, `256x64x10` and
+`784x32x10` all cost **110 rounds** — width buys bytes and multiplications and
+nothing else, because every decomposition at one dependence level batches into
+one. Pinned by `rounds_are_set_by_depth_not_width`.
+
+**Cost is linear in depth, with no discontinuity** — and this is the 2-party
+restatement of the repo's zero-bootstrap thesis. Each added 8-neuron layer costs
+exactly **+18 rounds and +16 decompositions**, forever. Pinned as a *second
+difference of zero* rather than as those constants, so the claim survives a
+change to the decomposition's internals.
+
+That last point is where the interesting comparison lives, and it reframes the
+axis. §7.1 and the FHE/MPC literature study the crossover in layer **width**. At
+a matched threat model the decisive axis is **depth**, because depth is what
+exhausts an FHE level budget and forces a bootstrap. HE-LRM (Garimella, Ebel, De
+Micheli & Reagen, arXiv 2506.18150 — the Orion group) reports a single CKKS
+bootstrap taking **75% of a 24.22 s inference**, and ~20 s on a single-threaded
+CPU. MPC pays +18 rounds; FHE pays either nothing or ~20 s, depending on whether
+the layer crossed a level boundary. A step function against a straight line is a
+more interesting comparison than two straight lines.
+
+**Preprocessing route decides the cold number, by 16×.** LowGear's SHE triples
+put `784x32x10` at 16 ms cold against Semi2k's 149 ms — the same conclusion §VI.5
+reached at a single layer, now at whole-network scale. Quoting "2-party MPC is
+slow because preprocessing" is a statement about OT, not about MPC.
+
+**Scope, stated.** Wall clock is computed from measured counts through a network
+profile, not measured on a socket — the same status as `bench-layer`, and
+`bench-net` validates the model to 13.6% worst case. `dealer` is printed as a
+lower bound and marked, not as an option. Shapes run to at least `784x64x10`; the
+practical ceiling is `mpcc::lower` being **scalar**, so compilation takes ~50–60 s
+at 784 inputs while the protocol run itself is milliseconds. That is a limitation
+of the IR, not of the protocols, and the roadmap already names SIMD-vectorized
+instructions as the open item. **No FHE arm yet** — that is the next stage, and
+until it exists none of these numbers should be quoted against an FHE system.
+
 ---
 
 ## Part VIII — The cost of active security

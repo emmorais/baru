@@ -77,7 +77,13 @@ pub fn share_input<T: Transport>(
     } else {
         let mut components: Vec<Fr> = Vec::new();
         while components.len() < 2 {
-            if let Some((_from, m)) = mbx.recv_matching(
+            // From the owner and nobody else. The two components are taken in
+            // arrival order, so a third party that races one in would have its
+            // value adopted as this party's share — and because the MACs are then
+            // computed over the corrupted share, the run stays internally
+            // consistent while reconstructing a value the owner never chose.
+            if let Some((_from, m)) = mbx.recv_matching_from(
+                owner,
                 TIMEOUT_MS,
                 |m| matches!(m, MpcMsg::InputShare { share_id: sid, .. } if *sid == share_id),
             ) {
@@ -252,11 +258,17 @@ pub fn reveal<T: Transport>(
     fn collect<T: Transport>(mbx: &Mailbox<T>, share_id: u64, start: Fr) -> Fr {
         let mut sum = start;
         let mut received = 0usize;
+        // One contribution per peer, and the peers must be *distinct*. Counting
+        // messages rather than senders let a single party supply both, which is
+        // enough to control what the reveal opens to: the honest peer's share is
+        // then never added and the adversary picks the reconstructed value.
+        let mut heard: Vec<PartyId> = Vec::new();
         while received < N - 1 {
-            if let Some((_from, m)) = mbx.recv_matching(
-                TIMEOUT_MS,
-                |m| matches!(m, MpcMsg::RevealShare { share_id: sid, .. } if *sid == share_id),
-            ) {
+            if let Some((from, m)) = mbx.recv_where_from(TIMEOUT_MS, |f, m| {
+                !heard.contains(&f)
+                    && matches!(m, MpcMsg::RevealShare { share_id: sid, .. } if *sid == share_id)
+            }) {
+                heard.push(from);
                 if let MpcMsg::RevealShare { value: v, .. } = m {
                     sum = sum.wrapping_add(v);
                     received += 1;
@@ -348,8 +360,11 @@ pub fn reveal_batch_party<T: Transport>(
         }),
     );
     let (_, msg) = mbx
-        .recv_matching(
+        .recv_matching_from(
+            (me + N - 1) % N,
             TIMEOUT_MS,
+            // The party that holds the component we lack is our predecessor, and
+            // only it may supply it. Unbound, any peer could answer in its place.
             |m| matches!(m, MpcMsg::RevealShareBatch { base_id: b, .. } if *b == base_id),
         )
         .unwrap_or_else(|| panic!("reveal_batch_party: timeout for base_id={base_id}"));
@@ -435,8 +450,11 @@ pub fn reveal_components_packed_party<T: Transport>(
         }),
     );
     let (_, msg) = mbx
-        .recv_matching(
+        .recv_matching_from(
+            (me + N - 1) % N,
             TIMEOUT_MS,
+            // The party that holds the component we lack is our predecessor, and
+            // only it may supply it. Unbound, any peer could answer in its place.
             |m| matches!(m, MpcMsg::RevealPackedBatch { base_id: b, .. } if *b == base_id),
         )
         .unwrap_or_else(|| panic!("reveal_components_packed_party: timeout id={base_id}"));
@@ -475,8 +493,11 @@ pub fn reveal_components_batch_party<T: Transport>(
         }),
     );
     let (_, msg) = mbx
-        .recv_matching(
+        .recv_matching_from(
+            (me + N - 1) % N,
             TIMEOUT_MS,
+            // The party that holds the component we lack is our predecessor, and
+            // only it may supply it. Unbound, any peer could answer in its place.
             |m| matches!(m, MpcMsg::RevealShareBatch { base_id: b, .. } if *b == base_id),
         )
         .unwrap_or_else(|| panic!("reveal_components_batch_party: timeout id={base_id}"));
@@ -616,8 +637,11 @@ pub fn dot_batch_party_at<T: Transport>(
         }),
     );
     let (_, msg) = mbx
-        .recv_matching(
+        .recv_matching_from(
+            (me + 1) % N,
             TIMEOUT_MS,
+            // Resharing is a ring: we send our z to the predecessor and the
+            // successor sends us theirs. Only that party may.
             |m| matches!(m, MpcMsg::TaggedZBatch { base_op_id: b, .. } if *b == base_op_id),
         )
         .unwrap_or_else(|| panic!("dot_batch_party: timeout on z for op_id={base_op_id}"));
@@ -725,8 +749,11 @@ pub fn mul_batch_party_at<T: Transport>(
         }),
     );
     let (_, msg) = mbx
-        .recv_matching(
+        .recv_matching_from(
+            (me + 1) % N,
             TIMEOUT_MS,
+            // Resharing is a ring: we send our z to the predecessor and the
+            // successor sends us theirs. Only that party may.
             |m| matches!(m, MpcMsg::TaggedZBatch { base_op_id: b, .. } if *b == base_op_id),
         )
         .unwrap_or_else(|| panic!("mul_batch_party: timeout on z for op_id={base_op_id}"));
@@ -1474,7 +1501,11 @@ mod tests {
                 } else {
                     0
                 };
-                let sh = share_input(fr, 0, me, 0, &mbx);
+                // `(value, share_id, owner, me)`. This call had `owner` and `me`
+                // transposed and worked anyway, because nothing checked which party
+                // an `InputShare` came from; binding the receive to the owner is
+                // what surfaced it.
+                let sh = share_input(fr, 0, 0, me, &mbx);
                 let bits = a2b_party(&sh, nbits, 1_000, me, &mbx);
                 bits.iter()
                     .enumerate()

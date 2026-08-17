@@ -383,7 +383,11 @@ mod tests {
     fn signed(v: u128) -> i64 {
         let m = 1i128 << NBITS;
         let x = (v as i128) & (m - 1);
-        if x >= m / 2 { (x - m) as i64 } else { x as i64 }
+        if x >= m / 2 {
+            (x - m) as i64
+        } else {
+            x as i64
+        }
     }
 
     /// Deterministic small tensors, values kept small so the 4x scale cannot overflow.
@@ -408,18 +412,33 @@ mod tests {
     /// whose out-of-range lanes must be discarded and not written back.
     #[test]
     fn the_fast_convolution_is_exact_up_to_its_scale() {
-        for &(c, h, w, oc) in &[(1usize, 5usize, 5usize, 1usize), (2, 6, 6, 3), (3, 7, 5, 2), (1, 4, 4, 1)] {
+        for &(c, h, w, oc) in &[
+            (1usize, 5usize, 5usize, 1usize),
+            (2, 6, 6, 3),
+            (3, 7, 5, 2),
+            (1, 4, 4, 1),
+        ] {
             let (img, ker, bias) = fixture(c, h, w, oc);
             let in_shape = Chw { c, h, w };
             let (want, want_shape) = conv2d_ref(&img, in_shape, &ker, &bias, 3, 3, 1);
 
             let mut be = Aby3Simulator::new();
-            let sin: Vec<_> = img.iter().map(|&v| be.share_public(residue(v), NBITS)).collect();
+            let sin: Vec<_> = img
+                .iter()
+                .map(|&v| be.share_public(residue(v), NBITS))
+                .collect();
             let sw: Vec<Vec<_>> = ker
                 .iter()
-                .map(|k| k.iter().map(|&v| be.share_public(residue(v), NBITS)).collect())
+                .map(|k| {
+                    k.iter()
+                        .map(|&v| be.share_public(residue(v), NBITS))
+                        .collect()
+                })
                 .collect();
-            let sb: Vec<_> = bias.iter().map(|&v| be.share_public(residue(v), NBITS)).collect();
+            let sb: Vec<_> = bias
+                .iter()
+                .map(|&v| be.share_public(residue(v), NBITS))
+                .collect();
 
             let (got, got_shape) = conv2d_winograd(&mut be, &sin, in_shape, &sw, &sb);
             assert_eq!(got_shape, want_shape, "shape must match the direct method");
@@ -471,7 +490,12 @@ mod tests {
         // And an odd output side, where a padded tile costs real multiplications. The ratio must
         // degrade rather than be reported as 2.25 anyway.
         let odd = winograd_cost(Chw { c: 1, h: 7, w: 7 }, 1, 5, 5);
-        println!("  odd side 5x5: direct {} muls, winograd {} ({:.2}x)", odd.direct, odd.winograd, odd.ratio());
+        println!(
+            "  odd side 5x5: direct {} muls, winograd {} ({:.2}x)",
+            odd.direct,
+            odd.winograd,
+            odd.ratio()
+        );
         assert_eq!(odd.winograd, 9 * 16, "3x3 tiles cover a 5x5 output");
         assert!(
             odd.ratio() < 2.25,
@@ -508,13 +532,14 @@ mod tests {
             let (outs, comm) = run_parties(NetworkProfile::INSTANT, move |me| {
                 let (img, ker, bias) = (img.clone(), ker.clone(), bias.clone());
                 move |be: &mut TransportBackend<MpcTransport>| {
-                    let sh = |be: &mut TransportBackend<MpcTransport>, v: &[i64]| -> Vec<ShareRef> {
-                        let vals: Vec<crate::crypto::types::Fr> = v
-                            .iter()
-                            .map(|&t| if me == 0 { residue(t) } else { 0 })
-                            .collect();
-                        be.share_secret_batch(&vals, NBITS, 0)
-                    };
+                    let sh =
+                        |be: &mut TransportBackend<MpcTransport>, v: &[i64]| -> Vec<ShareRef> {
+                            let vals: Vec<crate::crypto::types::Fr> = v
+                                .iter()
+                                .map(|&t| if me == 0 { residue(t) } else { 0 })
+                                .collect();
+                            be.share_secret_batch(&vals, NBITS, 0)
+                        };
                     let sin = sh(be, &img);
                     let sw: Vec<Vec<ShareRef>> = ker.iter().map(|k| sh(be, k)).collect();
                     let sb = sh(be, &bias);
@@ -536,7 +561,10 @@ mod tests {
         let (gb, gw, gv) = run(true);
         let scale = 1i64 << WINOGRAD_OUTPUT_SCALE_LOG2;
         println!("  direct   : {db:8} bytes, {dw} waits, out[0] = {dv}");
-        println!("  winograd : {gb:8} bytes, {gw} waits, out[0] = {gv} (= {} x {scale})", gv / scale);
+        println!(
+            "  winograd : {gb:8} bytes, {gw} waits, out[0] = {gv} (= {} x {scale})",
+            gv / scale
+        );
         println!(
             "  predicted {} -> {} muls ({:.2}x); measured bytes {:.2}x",
             predicted.direct,
@@ -565,7 +593,11 @@ mod tests {
             (per_mul * dm) / (per_mul * gm),
             db as f64 / gb as f64
         );
-        assert_eq!(gv, dv * scale, "both routes must compute the same convolution");
+        assert_eq!(
+            gv,
+            dv * scale,
+            "both routes must compute the same convolution"
+        );
         assert!(gb < db, "winograd must send fewer bytes: {gb} vs {db}");
         assert!(
             (per_mul - 16.0).abs() < 0.5,

@@ -280,6 +280,7 @@ Benchmarks (`baru bench-<name>`; all accept `--json`, most accept
 | `bench-triples` | Beaver triples from SHE (LowGear) vs from OT (Semi2k) |
 | `bench-ot`, `bench-psi` | OT (base vs IKNP), DH-PSI |
 | `bench-layer`, `bench-net` | the MPC↔FHE crossover; the cost model against a real socket |
+| `bench-2pc-nn` | a whole private classifier at a **matched threat model** — 2-party dishonest majority, the setting where a comparison against single-server FHE is commensurable. Reports warm *and* cold |
 | `bench-circuit`, `bench-backend-aware`, `bench-compiled-nn` | circuit generation, per-backend rewriting, compiled vs hand-written |
 | `bench-abstraction`, `bench-gc-compare`, `bench-mixed-layer` | the abstraction tax; garbled vs arithmetic nonlinearities; mixed protocols |
 | `bench-cohort`, `bench-cohort-eval` | cohort-conditioned private evaluation over the encrypted store |

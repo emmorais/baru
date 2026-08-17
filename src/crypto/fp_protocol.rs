@@ -144,7 +144,10 @@ pub fn mul_batch<T: Transport>(
         }),
     );
     let (_, msg) = mbx
-        .recv_matching(
+        // Ring resharing: we send our z to the predecessor, the successor sends
+        // ours. Only that party may answer.
+        .recv_matching_from(
+            (me + 1) % N,
             TIMEOUT_MS,
             |m| matches!(m, MpcMsg::TaggedFpBatch { base_op_id: b, .. } if *b == base_op_id),
         )
@@ -183,7 +186,9 @@ pub fn reveal_batch<T: Transport>(
         }),
     );
     let (_, msg) = mbx
-        .recv_matching(
+        // The component we lack is our predecessor's, and only it may supply it.
+        .recv_matching_from(
+            (me + N - 1) % N,
             TIMEOUT_MS,
             |m| matches!(m, MpcMsg::TaggedFpBatch { base_op_id: b, .. } if *b == base_op_id),
         )

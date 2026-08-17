@@ -241,6 +241,9 @@ impl ShareEngine for Semi2kEngine {
     fn counters(&self) -> &Counters {
         &self.counters
     }
+    fn counters_mut(&mut self) -> &mut Counters {
+        &mut self.counters
+    }
 
     fn input(&mut self, value: u64, _party: usize) -> Additive {
         self.charge(1);
@@ -293,16 +296,13 @@ impl ShareEngine for Semi2kEngine {
     }
 
     fn random_bits(&mut self, n: usize) -> Vec<Additive> {
-        // Same simplification as `DealerEngine`: counted as preprocessing, drawn
-        // locally rather than executed. See `crate::mpcc::vm`.
-        self.counters.random_bits += n as u64;
-        let mut rng = rand::thread_rng();
-        (0..n)
-            .map(|_| {
-                let bit = u64::from(rng.gen::<bool>());
-                self.split(bit)
-            })
-            .collect()
+        // Generated, not dealt: each party contributes a private bit and the
+        // shared bit is their XOR, one `mul_batch` for the whole batch. That
+        // consumes `n` real OT-generated triples, so a comparison's
+        // preprocessing is now measured by the same route its multiplications
+        // are. See `vm::random_bits_batch` for why the traffic is charged to
+        // `random_bit_bytes` rather than to the online column.
+        super::vm::random_bits_batch(self, n)
     }
 }
 

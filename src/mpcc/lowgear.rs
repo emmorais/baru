@@ -613,6 +613,9 @@ impl ShareEngine for LowGearEngine {
     fn counters(&self) -> &Counters {
         &self.counters
     }
+    fn counters_mut(&mut self) -> &mut Counters {
+        &mut self.counters
+    }
 
     fn input(&mut self, value: u64, _party: usize) -> Additive {
         self.charge(1);
@@ -673,12 +676,12 @@ impl ShareEngine for LowGearEngine {
     /// the value width and there were none. The wide parameters give ~61 bits,
     /// so bit-decomposition, comparison and therefore a whole private layer now
     /// run on this engine.
+    ///
+    /// Generated rather than dealt (`vm::random_bits_batch`): each party
+    /// contributes a private bit and the shared bit is their XOR, which costs
+    /// `n` real SHE-generated triples and one round for the whole batch.
     fn random_bits(&mut self, n: usize) -> Vec<Additive> {
-        self.counters.random_bits += n as u64;
-        let mut rng = rand::thread_rng();
-        (0..n)
-            .map(|_| self.split(u64::from(rng.gen::<bool>())))
-            .collect()
+        super::vm::random_bits_batch(self, n)
     }
 }
 

@@ -561,8 +561,30 @@ pub fn estimate(
         Some(ot) => ot.triple_bytes(share_bits),
         None => spec.cost.offline_elems_per_triple * elem_bytes,
     };
-    let offline_bytes = (acc.triples + acc.and_triples) * triple_bytes
-        + (acc.edabits + acc.dabits + acc.random_bits) * elem_bytes;
+    // A random bit is **generated**, not dealt.  `vm::random_bits_batch` has each
+    // party contribute a private bit and XOR-reduces them as a balanced tree, and
+    // `x ⊕ y = x + y − 2xy`, so one bit costs `⌈log₂(parties)⌉` multiplications —
+    // and therefore that many Beaver triples — plus the input sharing.
+    //
+    // This term used to be `acc.random_bits * elem_bytes`: one ring element per
+    // bit.  That under-charged it by ~400× at two parties, where a bit really
+    // costs one triple (≈3.2 kB of OT at 64-bit shares) rather than 8 bytes —
+    // and it under-charged *exactly* the phase that decides a comparison-heavy
+    // workload, since a 32-bit comparison draws `nb + KAPPA = 59` of them. The
+    // measurement it is now fitted to is `the_cost_of_a_random_bit_is_a_triple`
+    // in `mpcc::vm`.
+    let bit_levels = f64::from(ceil_log2(dep.parties as u32).max(1));
+    let random_bit_triples = acc.random_bits * bit_levels * spec.cost.triples_per_mul;
+    let random_bit_bytes = acc.random_bits
+        * (dep.parties as f64 * spec.cost.open_elems.total(dep.parties) * elem_bytes
+            + bit_levels
+                * spec.cost.mul_elems.total(dep.parties)
+                * elem_bytes
+                * spec.cost.auth_overhead);
+
+    let offline_bytes = (acc.triples + acc.and_triples + random_bit_triples) * triple_bytes
+        + (acc.edabits + acc.dabits) * elem_bytes
+        + random_bit_bytes;
 
     let latency_secs = rounds as f64 * dep.latency_us / 1e6;
     let bandwidth_secs = acc.bytes / dep.bandwidth_bytes_per_sec;

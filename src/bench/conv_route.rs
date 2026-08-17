@@ -105,7 +105,9 @@ impl Layer {
         // Small values: the shared routes carry a 4x scale and the homomorphic
         // one a plaintext modulus, and an overflow in either would be measured as
         // a wrong answer rather than as the arithmetic bug it is.
-        let img: Vec<i64> = (0..in_c * h * w).map(|i| ((i * 7) % 9) as i64 - 4).collect();
+        let img: Vec<i64> = (0..in_c * h * w)
+            .map(|i| ((i * 7) % 9) as i64 - 4)
+            .collect();
         let weights: Vec<Vec<i64>> = (0..out_c)
             .map(|o| {
                 (0..in_c * k * k)
@@ -150,11 +152,7 @@ fn measure_shared(
         } else {
             NetworkProfile::fixed_latency(std::time::Duration::from_micros(rtt * 500))
         };
-        let (img, weights, bias) = (
-            layer.img.clone(),
-            layer.weights.clone(),
-            layer.bias.clone(),
-        );
+        let (img, weights, bias) = (layer.img.clone(), layer.weights.clone(), layer.bias.clone());
         let in_shape = layer.in_shape;
         let t = Instant::now();
         let (outs, c) = run_parties(profile, move |me| {
@@ -290,7 +288,12 @@ fn measure_fhe(layer: &Layer, _nbits: usize, rtts: &[u64]) -> RoutePoint {
             let mut prod: Option<crate::fhe::bfv::BfvCt> = None;
             for (gi, cxg) in cxt.iter().enumerate() {
                 let wpoly = conv_pack::pack_kernel_group(
-                    &layer.weights[oc], shape, gi, group_size, params.n, t_mask,
+                    &layer.weights[oc],
+                    shape,
+                    gi,
+                    group_size,
+                    params.n,
+                    t_mask,
                 );
                 let cw = bfv.encrypt_poly_pre(&ek, &wpoly);
                 let p = bfv.mul_pre(cxg, &cw);
@@ -398,7 +401,8 @@ options:
 ";
 
 pub fn run_cli(args: &[String]) -> Result<(), String> {
-    let (mut in_c, mut size, mut out_c, mut nbits, mut json) = (8usize, 16usize, 8usize, 32usize, false);
+    let (mut in_c, mut size, mut out_c, mut nbits, mut json) =
+        (8usize, 16usize, 8usize, 32usize, false);
     let mut it = args.iter();
     while let Some(a) = it.next() {
         let mut num = |what: &str| -> Result<usize, String> {
@@ -423,7 +427,10 @@ pub fn run_cli(args: &[String]) -> Result<(), String> {
 
     let r = run(in_c, size, size, out_c, nbits, &[0])?;
     if json {
-        println!("{}", serde_json::to_string_pretty(&r).map_err(|e| e.to_string())?);
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&r).map_err(|e| e.to_string())?
+        );
         return Ok(());
     }
     println!(
@@ -431,7 +438,10 @@ pub fn run_cli(args: &[String]) -> Result<(), String> {
         r.in_c, r.h, r.w, r.out_c, r.nbits
     );
     println!("all routes keep the model secret and end with shares of the output\n");
-    println!("  {:<30}{:>10}{:>12}{:>8}{:>10}", "route", "muls", "bytes", "waits", "ms");
+    println!(
+        "  {:<30}{:>10}{:>12}{:>8}{:>10}",
+        "route", "muls", "bytes", "waits", "ms"
+    );
     for p in &r.routes {
         println!(
             "  {:<30}{:>10}{:>12}{:>8}{:>10.0}",
@@ -442,9 +452,16 @@ pub fn run_cli(args: &[String]) -> Result<(), String> {
             p.ms_by_rtt.first().map(|x| x.1).unwrap_or(0.0)
         );
     }
-    let bad: Vec<&str> = r.routes.iter().filter(|p| !p.correct).map(|p| p.route.as_str()).collect();
+    let bad: Vec<&str> = r
+        .routes
+        .iter()
+        .filter(|p| !p.correct)
+        .map(|p| p.route.as_str())
+        .collect();
     if !bad.is_empty() {
-        return Err(format!("routes disagree with the plaintext reference: {bad:?}"));
+        return Err(format!(
+            "routes disagree with the plaintext reference: {bad:?}"
+        ));
     }
     println!("\n  all routes reproduce the plaintext reference");
     println!(
@@ -494,7 +511,11 @@ mod tests {
         ] {
             let r = run(ic, side, side, oc, 32, &[0]).expect("runs");
             let by = |name: &str| -> f64 {
-                r.routes.iter().find(|p| p.route.starts_with(name)).expect("route").bytes as f64
+                r.routes
+                    .iter()
+                    .find(|p| p.route.starts_with(name))
+                    .expect("route")
+                    .bytes as f64
                     / 1000.0
             };
             let (d, w, f) = (by("mpc: direct"), by("mpc: winograd"), by("fhe"));
@@ -544,7 +565,11 @@ mod tests {
                 breakevens.push((b * 100.0).round() / 100.0);
             }
             for p in &r.routes {
-                assert!(p.correct, "route `{}` wrong at {ic}x{side}x{side}->{oc}", p.route);
+                assert!(
+                    p.correct,
+                    "route `{}` wrong at {ic}x{side}x{side}->{oc}",
+                    p.route
+                );
             }
         }
         // A summary computed from the rows rather than asserted alongside them. Three
@@ -626,7 +651,11 @@ mod tests {
             );
         }
         for p in &r.routes {
-            assert!(p.correct, "route `{}` disagrees with the plaintext reference", p.route);
+            assert!(
+                p.correct,
+                "route `{}` disagrees with the plaintext reference",
+                p.route
+            );
         }
     }
 }

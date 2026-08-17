@@ -20,26 +20,40 @@
 //! * **Online communication is real.**  Bytes and rounds are counted from the
 //!   messages the protocol would have sent, at the point it would have sent
 //!   them.
-//! * **Preprocessing is *not* real.**  Beaver triples and random bits are drawn
-//!   locally and merely *counted* — the same "fake offline" mode MP-SPDZ uses to
-//!   measure an online phase.  So [`Measured::triples`] is trustworthy and
-//!   offline *time* is not measured at all.
+//! * **Preprocessing is real where the engine makes it real.**  Beaver triples
+//!   come from the engine: [`crate::mpcc::semi2k`] generates them over real
+//!   IKNP correlated OT and [`crate::mpcc::lowgear`] over real BGV slot-OLE, so
+//!   their `offline_bytes` is a measurement.  [`crate::mpcc::sim`]'s
+//!   `DealerEngine` deals them for free *by definition* — a trusted dealer is
+//!   the online lower bound, not a threat model.  Random bits are built from
+//!   the same triples by [`random_bits_batch`].  Offline **time** is still not
+//!   measured anywhere.
 //!
-//! That is exactly the split the roadmap needs: P1 calibrates the online half of
-//! the cost model against these numbers; the offline half stays an estimate
-//! until real preprocessing lands in P3.
+//! That is the split the roadmap needs: P1 calibrates the online half of the
+//! cost model against these numbers, and the offline half is measured in bytes
+//! for the two engines that generate their own material.
 //!
 //! ## Coverage
 //!
 //! The linear and multiplicative core (`Input`, `Add`, `Sub`, `Neg`, `MulC`,
-//! `AddC`, `ShlC`, `Mul`, `Mux`, `Open`, `Output`) runs.  Comparisons, bit
-//! decomposition, truncation and division do **not**: they need random-bit and
-//! edaBit machinery that is roadmap phase P2, and executing them by peeking at
-//! the plaintext would produce communication counts that are quietly fictional.
-//! They return an error naming the phase instead.
+//! `AddC`, `ShlC`, `Mul`, `Mux`, `Open`, `Output`) runs, and so do the
+//! comparison-shaped instructions — `LtS`, `LtU`, `EqZ` and `TruncPr` — on top
+//! of [`bit_decompose_batch`], which is generic over [`ShareEngine`] and
+//! therefore available to *every* protocol rather than to a chosen one.  A
+//! batch of them costs one decomposition's rounds, not one per value.
+//!
+//! What does **not** run: secret `Div` (needs a restoring long-division circuit
+//! on top of the comparison machinery), the raw bit-level ops `Xor`, `Not`,
+//! `And`, `BitDecomp`, `BitComp` and `PopCount` (no binary-domain engine
+//! implements [`ShareEngine`] — see `protocols.rs`, where every binary row is
+//! `Planned`), and `Convert` (cross-domain conversion, which needs two engines
+//! at once and real daBits).  Each is refused by name rather than approximated,
+//! because executing one by peeking at the plaintext would produce
+//! communication counts that are quietly fictional.
 
 use std::collections::HashMap;
 
+use rand::Rng;
 use serde::Serialize;
 
 use super::ir::{Op, Program, Reg};
@@ -240,7 +254,39 @@ pub struct Counters {
     /// multiplication needs no triples). Non-zero only for `Semi2kEngine`, which
     /// runs real OT — and that is what lets `mpcc::ot_cost`'s derivation be checked
     /// against a measurement instead of trusted.
+    ///
+    /// **Triple generation only.** Preprocessing that runs *on top of* the engine
+    /// — random-bit generation — is counted separately in
+    /// [`Counters::random_bit_bytes`], because `bench-layer` divides this field by
+    /// [`Counters::triples_generated`] to get a bytes-per-triple figure and
+    /// anything else landing here would silently corrupt it.
     pub offline_bytes: u64,
+    /// Bytes moved **generating random bits**, via [`random_bits_batch`].
+    ///
+    /// Offline, but not triple generation: this is the input sharing plus the
+    /// Beaver openings of the XOR tree. Kept apart from
+    /// [`Counters::offline_bytes`] so that field stays a clean per-triple
+    /// measurement, and kept out of [`Counters::online_bytes`] because random
+    /// bits are **query-independent** — a deployment generates them before the
+    /// query arrives, exactly as Falcon's preprocessing does (survey §7.3).
+    ///
+    /// The triples these consume *are* counted in [`Counters::triples`], so
+    /// their share of triple-generation cost is charged the same way every other
+    /// triple's is. Only the bit protocol's own traffic is here.
+    pub random_bit_bytes: u64,
+    /// Rounds spent generating random bits — `⌈log₂(parties)⌉` per batch,
+    /// regardless of how many bits it carries. Not part of the program's online
+    /// round count, for the same query-independence reason.
+    pub random_bit_rounds: u64,
+    /// Multiplications spent generating random bits — one per bit per tree level.
+    ///
+    /// Kept out of [`Counters::muls`] deliberately. That field is validated
+    /// against `mpcc::cost`'s independent `bit_decompose_muls` formula, which
+    /// counts the multiplications *the program's* algorithm needs; folding
+    /// preprocessing into it would make the two disagree by the size of the
+    /// preprocessing rather than by a modelling error, and destroy a check that
+    /// exists to catch modelling errors.
+    pub random_bit_muls: u64,
 }
 
 /// The four things that actually differ between secret-sharing protocols.
@@ -256,6 +302,10 @@ pub trait ShareEngine {
     fn modulus(&self) -> Modulus;
     fn parties(&self) -> usize;
     fn counters(&self) -> &Counters;
+    /// Needed by [`random_bits_batch`], which reattributes the traffic it spends
+    /// from the online column to the preprocessing one. Without it every engine
+    /// would have to repeat that bookkeeping.
+    fn counters_mut(&mut self) -> &mut Counters;
 
     /// `party`'s private input becomes a sharing.  Input distribution is
     /// charged as communication; the driver charges its round.
@@ -275,10 +325,16 @@ pub trait ShareEngine {
 
     /// `n` shared uniform bits, each a sharing of 0 or 1.
     ///
-    /// Preprocessing: drawn locally and counted, never executed — see the
-    /// module docs.  Everything above the sharing layer (comparison,
-    /// truncation, bit decomposition) is built from these, so this is the one
-    /// extra primitive a protocol has to supply to become fully featured.
+    /// Everything above the sharing layer (comparison, truncation, bit
+    /// decomposition) is built from these, so this is the one extra primitive a
+    /// protocol has to supply to become fully featured.
+    ///
+    /// Engines with a real threat model implement this by delegating to
+    /// [`random_bits_batch`], which *runs* a protocol.  `DealerEngine` draws
+    /// them locally, which is not a simplification but its definition — a
+    /// trusted dealer supplying correlated randomness for free is the online
+    /// lower bound.  `Spdz2kEngine` also draws locally, and that **is** a gap:
+    /// see its own documentation.
     fn random_bits(&mut self, n: usize) -> Vec<Self::Share>;
 }
 
@@ -292,6 +348,130 @@ pub const KAPPA: u32 = 26;
 
 /// The bits of each input, LSB first, and the rounds the decomposition took.
 pub type Decomposed<E> = (Vec<Vec<<E as ShareEngine>::Share>>, u64);
+
+/// `n` shared uniform random bits, **generated by running a protocol** rather
+/// than drawn locally and counted.
+///
+/// # Why this is one generic function and not one per engine
+///
+/// The construction needs nothing an engine does not already provide, so
+/// writing it per protocol would be three copies of the same identity. Each
+/// party contributes a private random bit `b_p`, and the shared bit is their
+/// XOR. Over a ring or a field,
+///
+/// ```text
+/// x ⊕ y  =  x + y − 2xy
+/// ```
+///
+/// so one XOR is one multiplication, and the whole batch of `n` bits at one
+/// tree level is **one `mul_batch`** — one round no matter how many bits. The
+/// parties' contributions are XOR-reduced as a balanced tree, so a batch costs
+/// `⌈log₂(parties)⌉` rounds: **one** at the two parties that
+/// [`crate::mpcc::semi2k`] and [`crate::mpcc::lowgear`] are gated to.
+///
+/// Uniformity needs only *one* honest contributor: `b_p` is uniform and
+/// independent of everything else, so `⊕_p b_p` is uniform to anyone missing
+/// even a single `b_p`. That is why this is sound at a dishonest majority, and
+/// it is the same argument the zero-sum masking terms elsewhere in the repo use.
+///
+/// # Where the cost lands, and why not in the online column
+///
+/// Random bits are **query-independent** — a deployment generates them before
+/// the query arrives. Charging them to `online_bytes` would make the online
+/// figure mean something else, and comparing that against an FHE total is
+/// precisely the error survey §7.3 records making three times. So the traffic
+/// this spends is moved to [`Counters::random_bit_bytes`] and its rounds to
+/// [`Counters::random_bit_rounds`]; a caller that wants the total adds them.
+///
+/// The triples consumed are left in [`Counters::triples`], so they are charged
+/// triple-generation cost exactly like every other triple.
+///
+/// # Security caveat, stated
+///
+/// This is sound against a **semi-honest** adversary. A malicious party can
+/// contribute a value that is not a bit, and nothing here detects it — the
+/// result is then not a sharing of 0 or 1 and
+/// [`bit_decompose_batch`] silently returns garbage. Validating it costs one
+/// batched `b·(b−1) = 0` check plus an opening; until that exists,
+/// [`crate::mpcc::spdz2k`] deliberately does **not** call this.
+pub fn random_bits_batch<E: ShareEngine>(engine: &mut E, n: usize) -> Vec<E::Share> {
+    if n == 0 {
+        return Vec::new();
+    }
+
+    // Snapshot the three *online-phase* counters, so everything below can be
+    // reattributed to preprocessing. `triples`, `triples_generated` and
+    // `offline_bytes` are deliberately left to grow: the triples these
+    // multiplications consume are real, and charging them triple-generation cost
+    // the same way every other triple is charged is the point.
+    let (bytes_before, muls_before, opens_before) = {
+        let c = engine.counters();
+        (c.online_bytes, c.muls, c.opens)
+    };
+
+    let mut rng = rand::thread_rng();
+    let mut layers: Vec<Vec<E::Share>> = Vec::with_capacity(engine.parties());
+    for p in 0..engine.parties() {
+        let mut layer = Vec::with_capacity(n);
+        for _ in 0..n {
+            layer.push(engine.input(u64::from(rng.gen::<bool>()), p));
+        }
+        layers.push(layer);
+    }
+
+    let mut rounds = 0u64;
+    while layers.len() > 1 {
+        // Every pair at this level is independent, so they share one round.
+        let mut pairs: Vec<(E::Share, E::Share)> = Vec::new();
+        let mut lhs: Vec<Vec<E::Share>> = Vec::new();
+        let mut rhs: Vec<Vec<E::Share>> = Vec::new();
+        let mut odd: Option<Vec<E::Share>> = None;
+        for chunk in layers.chunks(2) {
+            if let [a, b] = chunk {
+                for (x, y) in a.iter().zip(b.iter()) {
+                    pairs.push((x.clone(), y.clone()));
+                }
+                lhs.push(a.clone());
+                rhs.push(b.clone());
+            } else {
+                odd = Some(chunk[0].clone());
+            }
+        }
+
+        let prods = engine.mul_batch(&pairs);
+        rounds += 1;
+
+        let mut next: Vec<Vec<E::Share>> = Vec::with_capacity(lhs.len() + 1);
+        let mut k = 0usize;
+        for (a, b) in lhs.iter().zip(rhs.iter()) {
+            let mut combined = Vec::with_capacity(n);
+            for (x, y) in a.iter().zip(b.iter()) {
+                let sum = engine.add(x, y);
+                let twice = engine.mul_const(&prods[k], 2);
+                combined.push(engine.sub(&sum, &twice));
+                k += 1;
+            }
+            next.push(combined);
+        }
+        next.extend(odd);
+        layers = next;
+    }
+
+    let counters = engine.counters_mut();
+    let bytes = counters.online_bytes.saturating_sub(bytes_before);
+    let muls = counters.muls.saturating_sub(muls_before);
+    let opens = counters.opens.saturating_sub(opens_before);
+    counters.online_bytes = bytes_before;
+    counters.muls = muls_before;
+    counters.opens = opens_before;
+    counters.random_bit_bytes += bytes;
+    counters.random_bit_muls += muls;
+    counters.random_bit_rounds += rounds;
+    counters.random_bits += n as u64;
+    debug_assert_eq!(opens, 0, "random-bit generation should not open anything");
+
+    layers.pop().unwrap_or_default()
+}
 
 /// Bit-decompose several shared values at once, LSB first.
 ///
@@ -520,6 +700,15 @@ pub struct Measured {
     pub offline_bytes: u64,
     /// Triples generated (batched), the denominator offline cost amortizes over.
     pub triples_generated: u64,
+    /// Bytes and rounds spent *generating* the random bits, which is
+    /// query-independent preprocessing and so is reported apart from
+    /// [`Measured::online_bytes`] and [`Measured::rounds`].  Zero on
+    /// `DealerEngine`, by definition — see [`Counters::random_bit_bytes`].
+    pub random_bit_bytes: u64,
+    pub random_bit_rounds: u64,
+    /// Multiplications spent generating random bits — kept out of
+    /// [`Measured::muls`] so that stays comparable to `mpcc::cost`'s prediction.
+    pub random_bit_muls: u64,
     /// Wall clock, microseconds.  In-process, so this measures local compute
     /// only — there is no network to wait for.
     pub micros: u128,
@@ -620,6 +809,9 @@ pub fn execute<E: ShareEngine>(
         random_bits: c.random_bits,
         offline_bytes: c.offline_bytes,
         triples_generated: c.triples_generated,
+        random_bit_bytes: c.random_bit_bytes,
+        random_bit_rounds: c.random_bit_rounds,
+        random_bit_muls: c.random_bit_muls,
         micros: t0.elapsed().as_micros(),
         outputs,
     })
@@ -876,10 +1068,27 @@ fn exec_round<E: ShareEngine>(
                     shares.insert(*dst, b[nbits as usize - 1].clone());
                 }
                 BitUse::Truncate { dst, shift } => {
-                    // Logical right shift: recompose the bits above `shift`,
-                    // discarding the rest.  Free once the bits exist — which is
+                    // **Arithmetic** right shift: recompose the bits above
+                    // `shift`, then restore the sign.  Free once the bits exist —
                     // the mirror image of a garbled circuit, where the shift is
                     // free and the bits are what you already have.
+                    //
+                    // The sign term is what this used to be missing, and it was
+                    // wrong on every negative input. `b` holds `nbits = bit_width
+                    // + 1` two's-complement bits, so
+                    //
+                    //     x = −2^bit_width·b[bit_width] + Σ_{j<bit_width} 2^j·b[j]
+                    //
+                    // and `floor(x / 2^s)` — which is what an arithmetic shift
+                    // means, and what Rust's `>>` and the interpreter's
+                    // `share_ashr16` both compute — is
+                    //
+                    //     −2^(bit_width−s)·b[bit_width] + Σ_{s≤j<bit_width} 2^(j−s)·b[j].
+                    //
+                    // Recomposing only the sum left the sign bit contributing
+                    // `+2^(bit_width−s)` instead of `−2^(bit_width−s)`, so `−1 >> 3`
+                    // came out as `2^29 − 1`. Positive values were unaffected,
+                    // which is why the one existing test (`x = 1000`) passed.
                     let one = engine.constant(1);
                     let mut acc = engine.sub(&one, &one); // a shared zero
                     let lo = *shift as usize;
@@ -887,6 +1096,10 @@ fn exec_round<E: ShareEngine>(
                         let term = engine.mul_const(bit, 1u64 << (j - lo));
                         acc = engine.add(&acc, &term);
                     }
+                    let sign = &b[prog.bit_width as usize];
+                    let sign_weight = 1u64 << prog.bit_width.saturating_sub(*shift);
+                    let sign_term = engine.mul_const(sign, sign_weight);
+                    acc = engine.sub(&acc, &sign_term);
                     shares.insert(*dst, acc);
                 }
                 BitUse::Zero(dst) => {
@@ -910,11 +1123,39 @@ fn exec_round<E: ShareEngine>(
     Ok(simple_rounds.max(composite_rounds))
 }
 
+/// Refuse an instruction by name, with the reason *that* instruction is refused.
+///
+/// This used to name secret division for every unsupported op, which was
+/// misleading for the six that have nothing to do with division: the reason a
+/// `Xor` cannot run is that no binary-domain engine exists, and no amount of
+/// long-division circuitry would change that.
 fn unsupported(op: &Op) -> String {
+    let why = match op {
+        Op::Div => {
+            "secret division needs a restoring long-division circuit on top of the \
+             comparison machinery — roadmap phase P3 (docs/mpc-compiler-roadmap.md)"
+        }
+        Op::Xor
+        | Op::Not
+        | Op::And
+        | Op::BitDecomp { .. }
+        | Op::BitComp { .. }
+        | Op::PopCount { .. } => {
+            "this is a binary-domain instruction and no binary protocol implements \
+             `ShareEngine` — every binary row in `mpcc::protocols` is `Planned`.  \
+             Comparisons on an arithmetic engine do not go through it: they use \
+             `bit_decompose_batch`, which needs only `random_bits` and `mul_batch`"
+        }
+        Op::Convert => {
+            "cross-domain conversion needs two engines live at once and real daBits; \
+             `mpcc::cost` prices it (`assign` charges crossings as `Convert` on the \
+             arithmetic protocol) and `mpcc::mixed` executes MPC<->FHE crossings, but \
+             no arithmetic<->binary conversion is executed anywhere"
+        }
+        _ => "no execution arm is implemented for it",
+    };
     format!(
-        "mpcc vm: `{}` is not executable yet.  Secret division needs a restoring \
-         long-division circuit on top of the comparison machinery — roadmap phase \
-         P3 (docs/mpc-compiler-roadmap.md).  Costing it works today \
+        "mpcc vm: `{}` is not executable — {why}.  Costing it works today \
          (`baru mpcc compare`); only running it does not.",
         op.mnemonic()
     )
@@ -950,5 +1191,87 @@ mod tests {
         assert_eq!(Modulus::Ring { k: 64 }.element_bytes(), 8);
         assert_eq!(Modulus::Ring { k: 32 }.element_bytes(), 4);
         assert_eq!(Modulus::MERSENNE61.element_bytes(), 8);
+    }
+
+    /// The bits must actually be bits, and the XOR of one contribution per party
+    /// must be uniform — which for a *sampled* value can only be checked as a
+    /// sanity bound, so this asserts both values occur over a large batch rather
+    /// than asserting a distribution.
+    #[test]
+    fn generated_random_bits_are_bits_and_take_both_values() {
+        let mut e = crate::mpcc::semi2k::Semi2kEngine::new(2, 64).expect("two-party ring engine");
+        let bits = random_bits_batch(&mut e, 512);
+        assert_eq!(bits.len(), 512);
+        let opened = e.open_batch(&bits);
+        assert!(
+            opened.iter().all(|&b| b == 0 || b == 1),
+            "every generated value must open to 0 or 1"
+        );
+        let ones = opened.iter().filter(|&&b| b == 1).count();
+        assert!(
+            ones > 100 && ones < 412,
+            "512 uniform bits should not be this lopsided: {ones} ones"
+        );
+    }
+
+    /// **The cost of a random bit is a Beaver triple.**
+    ///
+    /// This is the measurement the offline term in `mpcc::cost` is fitted to, and
+    /// the reason that term changed: it used to charge one ring element (8 bytes)
+    /// per bit, against a real cost of one triple — ~3.1 kB of OT traffic at
+    /// 64-bit shares, some **400x** more. Pinning the structure here is what stops
+    /// the model drifting back.
+    ///
+    /// The byte figure decomposes exactly, which is the check that the counter is
+    /// measuring the protocol and not something incidental. At `p` parties a batch
+    /// of `n` bits sends, per party: `n * p` input shares (one per party per bit)
+    /// plus `2 * n` elements for the Beaver openings at each of the
+    /// `ceil(log2 p)` tree levels. At `p = 2` that is `n * (2 + 2) = 4n`
+    /// elements.
+    #[test]
+    fn the_cost_of_a_random_bit_is_a_triple() {
+        let n = 64usize;
+        let mut e = crate::mpcc::semi2k::Semi2kEngine::new(2, 64).expect("two-party ring engine");
+        let before = e.counters().triples;
+        let _ = random_bits_batch(&mut e, n);
+        let c = e.counters();
+
+        assert_eq!(
+            c.triples - before,
+            n as u64,
+            "one triple per bit at two parties (one XOR tree level)"
+        );
+        assert_eq!(c.random_bits, n as u64);
+        assert_eq!(
+            c.random_bit_muls, n as u64,
+            "one multiplication per bit per tree level"
+        );
+        assert_eq!(
+            c.random_bit_rounds, 1,
+            "the whole batch is one round, however many bits it carries"
+        );
+        assert_eq!(
+            c.random_bit_bytes,
+            (4 * n as u64) * Modulus::Ring { k: 64 }.element_bytes(),
+            "2 input shares + 2 Beaver elements per bit, at 8 bytes an element"
+        );
+
+        // And none of it is charged to the online phase, because random bits are
+        // query-independent — a deployment generates them before the query
+        // arrives. Charging them online and then comparing against an FHE total
+        // is the error survey §7.3 records making three times.
+        assert_eq!(c.online_bytes, 0, "generation is preprocessing, not online");
+        assert_eq!(c.muls, 0, "and its multiplications are not the program's");
+    }
+
+    /// The tree is balanced, so party count enters logarithmically: three parties
+    /// cost two rounds and two multiplications per bit, not three.
+    #[test]
+    fn more_parties_cost_log_rounds_not_linear() {
+        let mut e = crate::mpcc::sim::ShamirEngine::new(3).expect("three-party Shamir");
+        let _ = random_bits_batch(&mut e, 16);
+        let c = e.counters();
+        assert_eq!(c.random_bit_rounds, 2, "ceil(log2 3) = 2 levels");
+        assert_eq!(c.random_bit_muls, 32, "16 bits x 2 levels");
     }
 }

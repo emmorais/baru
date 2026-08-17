@@ -282,6 +282,9 @@ impl ShareEngine for Spdz2kEngine {
     fn counters(&self) -> &Counters {
         &self.counters
     }
+    fn counters_mut(&mut self) -> &mut Counters {
+        &mut self.counters
+    }
 
     fn input(&mut self, value: u64, _party: usize) -> AuthShare {
         // Authenticated shares are twice the size of plain ones, which is the
@@ -416,6 +419,23 @@ impl ShareEngine for Spdz2kEngine {
         out
     }
 
+    /// Dealt locally, and **this is a disclosed gap, not a definition** — unlike
+    /// `DealerEngine`, this engine claims a threat model that a dealer violates.
+    ///
+    /// It deliberately does *not* delegate to `vm::random_bits_batch`. That
+    /// construction XORs one party-supplied bit per party, and a **malicious**
+    /// party can supply a value that is not a bit: the result is then not a
+    /// sharing of 0 or 1, `bit_decompose_batch` returns garbage, and no MAC
+    /// detects it because the MACs are computed over the corrupted value and the
+    /// run stays internally consistent. Authenticating a non-bit is not the same
+    /// as proving it is a bit.
+    ///
+    /// Closing it costs one batched `b·(b−1)` multiplication plus an opening
+    /// checked against zero, which this engine's deferred [`Self::mac_check`]
+    /// verdict is already the right place to host. Until then the bits here are
+    /// dealt, so **this engine's comparison costs are a lower bound** and are not
+    /// commensurable with Semi2k's or LowGear's measured ones. `RUNNABLE` does
+    /// not include `spdz2k`, so no sweep quotes them.
     fn random_bits(&mut self, n: usize) -> Vec<AuthShare> {
         let mut rng = rand::thread_rng();
         (0..n)

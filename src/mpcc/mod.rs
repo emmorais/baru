@@ -1396,6 +1396,20 @@ mod tests {
             ("(== x y)", &[("x", 5), ("y", 5)]),
             ("(== x y)", &[("x", 5), ("y", 6)]),
             ("(ash-right x 3)", &[("x", 1000)]),
+            // Negative shifts, which this list carried only a positive case for
+            // until 2026-08-17 — and that omission hid a real bug: the VM
+            // recomposed the bits above the shift *without the sign term*, so
+            // `-1 >> 3` returned `2^29 - 1`. Positive inputs were unaffected,
+            // which is exactly why one positive case passed for so long. Half of
+            // a fixed-point network's pre-activations are negative, so this is
+            // the difference between a working private inference and a wrong one.
+            ("(ash-right x 3)", &[("x", -1000)]),
+            ("(ash-right x 3)", &[("x", -1)]),
+            // Floor, not truncation-toward-zero: `-9 >> 3 == -2`.
+            ("(ash-right x 3)", &[("x", -9)]),
+            // A rescale of a *computed* negative value, which is the shape a
+            // fixed-point layer actually produces.
+            ("(ash-right (* x y) 8)", &[("x", -300), ("y", 7)]),
         ];
         for (src, ins) in cases {
             for parties in [3usize, 5] {
