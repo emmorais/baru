@@ -5,10 +5,27 @@
 Draft, 2026-08-01. Target venue: PoPETs (SoK track) — see
 [§12 on framing](#12-on-framing-survey-sok-or-measurement-study).
 
-> **LaTeX version:** [`../paper-survey/`](../paper-survey/) — 16 pages, builds
+> **LaTeX version:** [`../paper-survey/`](../paper-survey/) — 53 pages, builds
 > clean with `pdflatex && bibtex && pdflatex && pdflatex`. This markdown file is
 > the working draft; the LaTeX is the submission artifact. Keep them in sync or
 > retire one.
+>
+> **They have diverged, as of 2026-08-17, and the LaTeX is ahead.** It carries two
+> sections this draft does not: **§9.2** — MPC versus FHE at a *matched* threat
+> model (two parties, dishonest majority) against HEIR → OpenFHE as an external
+> baseline, with the depth sweep and both warm and cold accountings — and **§8.5**,
+> on gating an external baseline the way we gate our own engines. It also carries
+> two new threats-to-validity entries: that the two arms of §9.2 are not timed the
+> same way, and that omitting local compute was an error we made and corrected. The
+> measured record for all of it is
+> [`experiments.md`](experiments.md) §VI.6–VI.7 and
+> [`paper-outline.md`](paper-outline.md) rows E47–E53.
+>
+> **Recommendation: retire this file rather than re-sync it.** Two prose copies of
+> one argument is precisely the staleness hazard E43 records being caught by —
+> a document asserting something that the work had already superseded — and the
+> LaTeX is the artifact that gets submitted. `experiments.md` is the canonical
+> measured record and does not duplicate prose.
 
 ---
 

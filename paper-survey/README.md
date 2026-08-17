@@ -8,11 +8,15 @@ measured in a single harness. The prose draft this was written from is
 
 - `main.tex` — the paper (standard `article` class; only widely-available
   packages: `amsmath`, `booktabs`, `siunitx`, `hyperref`, `cleveref`, …).
-- `references.bib` — bibliography, 51 entries. Seeded from
+- `foundations.tex` — **§3–4, the mathematical and protocol foundations**,
+  `\input` from `main.tex`. Kept in its own file because it is long and largely
+  self-contained; `pdflatex main` picks it up with no extra step.
+- `references.bib` — bibliography, 70 entries. Seeded from
   [`../paper/references.bib`](../paper/references.bib) and extended with the
-  ~20 entries this paper needs (Falcon, SecureNN, Chida, Eerikson, Overdrive,
+  entries this paper needs (Falcon, SecureNN, Chida, Eerikson, Overdrive,
   SPDZ2k, MP-SPDZ, IKNP, Chou–Orlandi, KOS, Binius, HyCC, Silph, SING, CirC,
-  SEAL, NTL, TFHE-rs, Wilson, ABY).
+  SEAL, NTL, TFHE-rs, Wilson, ABY; and for the external-baseline comparison,
+  HEIR, Orion, HE-LRM, Fhelipe, OpenFHE, Beyond Latency).
 
 ## Build
 
@@ -20,8 +24,10 @@ measured in a single harness. The prose draft this was written from is
 pdflatex main && bibtex main && pdflatex main && pdflatex main
 ```
 
-or `latexmk -pdf main.tex`. Builds clean: 16 pages, no warnings, no overfull
-boxes, all 42 citations resolved.
+or `latexmk -pdf main.tex`. Builds clean: **71 pages**, no undefined references
+or citations. Roughly a third of that is the foundations of §3–4, which carry
+**26 proofs**; they are written to be cut rather than skimmed, so a venue with a
+page limit should remove whole subsections rather than compress them.
 
 The document deliberately avoids venue-specific classes so it compiles
 anywhere. To target a venue, swap the first line for that venue's

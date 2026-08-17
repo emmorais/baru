@@ -1,5 +1,10 @@
 \begin{thebibliography}{10}
 
+\bibitem{OpenFHE}
+Ahmad Al~Badawi et~al.
+\newblock {OpenFHE}: Open-source fully homomorphic encryption library, 2022.
+\newblock \url{https://github.com/openfheorg/openfhe-development}.
+
 \bibitem{HEStandard}
 Martin Albrecht et~al.
 \newblock Homomorphic encryption security standard.
@@ -9,6 +14,13 @@ Martin Albrecht et~al.
 Martin~R. Albrecht, Shi Bai, and L{\'e}o Ducas.
 \newblock A subfield lattice attack on overstretched {NTRU} assumptions.
 \newblock In {\em CRYPTO}, pages 153--178, 2016.
+
+\bibitem{HEIR}
+Asra Ali, Jaeho Choi, Bryant Gipson, Shruthi Gorantala, Jeremy Kun, Wouter
+  Legiest, Lawrence Lim, Alexander Viand, Meron~Zerihun Demissie, and Hongren
+  Zheng.
+\newblock {HEIR}: A universal compiler for homomorphic encryption, 2025.
+\newblock \url{https://github.com/google/heir}.
 
 \bibitem{AsharovMHE}
 Gilad Asharov, Abhishek Jain, Adriana L{\'o}pez-Alt, Eran Tromer, Vinod
@@ -159,6 +171,13 @@ L{\'e}o Ducas and Wessel P.~J. van Woerden.
 \newblock {NTRU} fatigue: How stretched is overstretched?
 \newblock In {\em ASIACRYPT}, pages 3--32, 2021.
 
+\bibitem{Orion}
+Austin Ebel, Karthik Garimella, and Brandon Reagen.
+\newblock Orion: A fully homomorphic encryption framework for deep learning.
+\newblock In {\em Proceedings of the 30th ACM International Conference on
+  Architectural Support for Programming Languages and Operating Systems
+  (ASPLOS)}, volume~2, pages 734--749, 2025.
+
 \bibitem{Eerikson}
 Hendrik Eerikson, Marcel Keller, Claudio Orlandi, Pille Pullonen, Joonas Puura,
   and Mark Simkin.
@@ -185,11 +204,21 @@ Matthias Felleisen and Daniel~P. Friedman.
 \newblock In {\em Formal Description of Programming Concepts III}, pages
   193--217. North-Holland, 1986.
 
+\bibitem{HELRM}
+Karthik Garimella, Austin Ebel, Gabrielle De~Micheli, and Brandon Reagen.
+\newblock {HE-LRM}: Encrypted deep learning recommendation models using fully
+  homomorphic encryption, 2025.
+
 \bibitem{Gentry}
 Craig Gentry.
 \newblock Fully homomorphic encryption using ideal lattices.
 \newblock In {\em 41st ACM Symposium on Theory of Computing (STOC)}, pages
   169--178, 2009.
+
+\bibitem{BeyondLatency}
+Pengzhi Huang, Kiwan Maeng, and G.~Edward Suh.
+\newblock Beyond latency: A system-level characterization of {MPC} and {FHE}
+  for privacy-preserving machine learning, 2026.
 
 \bibitem{Cheetah}
 Zhicong Huang, Wen jie Lu, Cheng Hong, and Jiansheng Ding.
@@ -248,6 +277,14 @@ Vladimir Kolesnikov and Thomas Schneider.
 Nishat Koti, Mahak Pancholi, Arpita Patra, and Ajith Suresh.
 \newblock {SWIFT}: Super-fast and robust privacy-preserving machine learning.
 \newblock In {\em {USENIX} Security Symposium}, pages 2651--2668, 2021.
+
+\bibitem{Fhelipe}
+Aleksandar Krastev, Nikola Samardzic, Simon Langowski, Srinivas Devadas, and
+  Daniel Sanchez.
+\newblock A tensor compiler with automatic data packing for simple and
+  efficient fully homomorphic encryption.
+\newblock In {\em Proceedings of the ACM on Programming Languages (PLDI)},
+  volume~8, pages 126--150, 2024.
 
 \bibitem{LavinGray}
 Andrew Lavin and Scott Gray.

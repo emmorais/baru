@@ -1,0 +1,1330 @@
+\section{Mathematical groundwork}
+\label{sec:math}
+
+This section fixes notation and collects the mathematics the rest of the survey
+uses. We have written it to be self-contained for a reader who knows
+undergraduate algebra and probability but not cryptography, because the
+comparison this paper makes is between paradigms whose costs are determined by
+quite different mathematical objects---a carry chain in one case, the growth of a
+noise term in another---and a reader cannot weigh our measurements without both.
+Where a statement is standard we give it with a proof anyway when the proof is
+short and the constant matters to us later; where the proof is long or the result
+is purely cited, we say so and give the reference.
+
+\subsection{Notation}
+\label{sec:math:notation}
+
+\begin{notation}
+\label{not:basic}
+We write $\N$, $\Z$, $\Q$, $\Rr$ and $\Cc$ for the naturals, integers,
+rationals, reals and complex numbers. For $m \in \N$ we write $\Z_m$ for the
+ring of integers modulo $m$; we use $\Z_{2^k}$ for the machine-word rings and
+$\Z_p$ or $\mathbb{F}_p$ for prime fields, writing the latter as a field when we
+rely on invertibility. For a finite set $S$ we write $s \gets S$ for a draw from
+the uniform distribution on $S$, and $s \gets D$ for a draw from a distribution
+$D$. Vectors are lower-case bold, $\mathbf{a}$, and matrices upper-case bold,
+$\mathbf{A}$. For $x \in \Rr$ we write $\floorr{x}$, $\ceil{x}$ and $\rnd{x}$
+for rounding down, up, and to the nearest integer with ties resolved upward.
+For $a \in \Z$ and odd or even modulus $m$ we write $[a]_m$ for the
+representative of $a + m\Z$ in the \ib{centred} interval
+$[-m/2, m/2)$, and $a \bmod m$ for the representative in $[0,m)$; the
+distinction matters in Section~\ref{sec:math:fixed}, because a fixed-point value
+is a centred representative while a machine word is the other one.
+The security parameter is $\lambda$, the statistical parameter is $\kappa$, and
+$\log$ is base two unless written otherwise. We write $\abs{S}$ for the
+cardinality of a set and $\norm{\cdot}_\infty$ for the maximum-absolute-value
+norm on a vector or on the coefficient vector of a polynomial. Parties are
+$P_0,\dots,P_{n-1}$ and indices into parties are always modulo $n$, so that
+$P_{i+1}$ makes sense for $i = n-1$.
+\end{notation}
+
+We reserve $\shr{x}$ for a secret sharing of $x$ in whichever scheme is in force,
+and $\mathsf{ct}$ for a ciphertext. Overloading $\shr{\cdot}$ is deliberate: one
+of the points of this survey is that a program can be written once against an
+abstract sharing and executed under several concrete ones, and the notation
+should not pretend otherwise. Where the concrete scheme matters we subscript it.
+
+\subsection{Asymptotics, negligible functions and the two kinds of security}
+\label{sec:math:negl}
+
+Cryptographic statements are asymptotic: they say that an adversary's advantage
+shrinks faster than any inverse polynomial in a parameter the honest parties may
+increase. Making this precise is what lets us distinguish claims that are
+\emph{unconditional} from claims that rest on a computational assumption, and the
+distinction runs right through our comparison, because secret sharing with an
+honest majority is information-theoretic while homomorphic encryption is not.
+
+\begin{definition}
+\label{def:negl}
+A function $\varepsilon : \N \to \Rr_{\ge 0}$ is \ib{negligible} when for every
+$c \in \N$ there is an $n_0$ such that $\varepsilon(n) < n^{-c}$ for all
+$n > n_0$. We write $\negl(n)$ for an unspecified negligible function and
+$\poly(n)$ for an unspecified positive polynomial. A function is
+\ib{overwhelming} when it is $1 - \negl(n)$.
+\end{definition}
+
+\begin{proposition}
+\label{prop:negl-closure}
+Negligible functions are closed under addition and under multiplication by a
+polynomial: if $\varepsilon_1,\varepsilon_2$ are negligible and $p$ is a
+polynomial, then $\varepsilon_1 + \varepsilon_2$ and $p \cdot \varepsilon_1$ are
+negligible.
+\end{proposition}
+
+\begin{proof}
+Fix $c$. Choose $n_1$ with $\varepsilon_1(n) < n^{-(c+1)}$ for $n > n_1$ and
+$n_2$ likewise for $\varepsilon_2$. For $n > \max(n_1,n_2,2)$ we have
+$\varepsilon_1(n)+\varepsilon_2(n) < 2n^{-(c+1)} \le n^{-c}$, which proves the
+first claim. For the second, let $p$ have degree $d$ and leading behaviour
+bounded by $p(n) \le n^{d+1}$ for large $n$; choose $n_3$ with
+$\varepsilon_1(n) < n^{-(c+d+1)}$ for $n > n_3$, so that
+$p(n)\varepsilon_1(n) < n^{d+1}n^{-(c+d+1)} = n^{-c}$.
+\end{proof}
+
+Proposition~\ref{prop:negl-closure} is the reason a protocol may invoke a
+subprotocol polynomially many times without losing security, and it is used
+implicitly in every hybrid argument below.
+
+\begin{definition}
+\label{def:sd}
+The \ib{statistical distance} between distributions $D_0,D_1$ over a countable
+set $S$ is
+\[
+  \SD(D_0,D_1) \;=\; \tfrac{1}{2}\sum_{s \in S}\abs{\Pr[D_0 = s] - \Pr[D_1 = s]}
+  \;=\; \max_{T \subseteq S}\;\bigl(\Pr[D_0 \in T] - \Pr[D_1 \in T]\bigr).
+\]
+Two families of distributions are \ib{statistically indistinguishable} when their
+statistical distance is negligible in $\lambda$, and \ib{perfectly
+indistinguishable} when it is zero.
+\end{definition}
+
+The two expressions in Definition~\ref{def:sd} agree because the maximising $T$
+is $\{s : \Pr[D_0=s] > \Pr[D_1=s]\}$, and the positive and negative parts of the
+difference each sum to the same value since both distributions have total mass
+one. The second form is the operational one: it says that statistical distance is
+exactly the advantage of the best possible distinguisher, \emph{including
+computationally unbounded ones}. This is why a statistical guarantee needs no
+assumption, and why we quote $\kappa$ separately from $\lambda$ throughout.
+
+\begin{definition}
+\label{def:ci}
+Distribution ensembles $\{D_0(\lambda)\}$ and $\{D_1(\lambda)\}$ are
+\ib{computationally indistinguishable}, written $D_0 \approx_c D_1$, when for
+every probabilistic polynomial-time distinguisher $\mathcal{D}$,
+\[
+  \abs{\Pr[\mathcal{D}(1^\lambda, D_0(\lambda)) = 1] -
+       \Pr[\mathcal{D}(1^\lambda, D_1(\lambda)) = 1]} \;=\; \negl(\lambda).
+\]
+\end{definition}
+
+Statistical indistinguishability implies computational indistinguishability, and
+the converse fails; the gap is where all of lattice cryptography lives.
+
+\begin{lemma}[Hybrid argument]
+\label{lem:hybrid}
+Let $D_0,D_1,\dots,D_m$ be distribution ensembles with $m = \poly(\lambda)$, and
+suppose $D_{j-1} \approx_c D_j$ for every $j$. Then $D_0 \approx_c D_m$.
+\end{lemma}
+
+\begin{proof}
+Let $\mathcal{D}$ be a distinguisher and write
+$p_j = \Pr[\mathcal{D}(D_j)=1]$. By the triangle inequality,
+$\abs{p_0 - p_m} \le \sum_{j=1}^{m}\abs{p_{j-1}-p_j}$. Each term is negligible by
+hypothesis, and there are polynomially many of them, so the sum is negligible by
+Proposition~\ref{prop:negl-closure}.
+\end{proof}
+
+Lemma~\ref{lem:hybrid} is the workhorse of every simulation proof in this survey:
+a simulator is exhibited by replacing one real message at a time with a simulated
+one and arguing that each replacement is undetectable.
+
+We will need one further probabilistic tool, for the arguments in which a mask
+drawn from a wide interval hides a value drawn from a narrow one. It complements
+Theorem~\ref{thm:mask}, which treats masking over a whole ring; the lemma below
+treats masking by an interval, which is the situation in threshold decryption of a
+lattice ciphertext (Section~\ref{sec:prelim:fhe}) and in the masked openings of
+Section~\ref{sec:math:bitdec}.
+
+\begin{lemma}[Smudging]
+\label{lem:smudge}
+Let $B, B' \in \N$ with $B' \ge 2^{\kappa} B$, let $e$ be any fixed integer with
+$\abs{e} \le B$, and let $E \gets [-B',B']$ be uniform. Then
+\[
+  \SD\bigl(E,\; E + e\bigr) \;\le\; \frac{\abs{e}}{2B'+1} \;\le\; 2^{-\kappa}.
+\]
+Consequently, for any two integers $e_0,e_1$ of magnitude at most $B$, the
+distributions $E+e_0$ and $E+e_1$ are at statistical distance at most
+$2^{-\kappa+1}$.
+\end{lemma}
+
+\begin{proof}
+Both $E$ and $E+e$ are uniform on integer intervals of the same cardinality
+$2B'+1$, namely $[-B',B']$ and $[-B'+e, B'+e]$. Two uniform distributions on
+finite sets $S_0, S_1$ of equal cardinality $N$ have statistical distance
+$\abs{S_0 \setminus S_1}/N$: each point of $S_0\setminus S_1$ contributes
+$1/N$ to the sum in Definition~\ref{def:sd} and each point of
+$S_1 \setminus S_0$ contributes the same amount, and the factor $\tfrac12$
+halves the total. Shifting an interval of length $2B'+1$ by $e$ leaves
+$\abs{e}$ points uncovered at one end, so
+$\SD(E, E+e) = \abs{e}/(2B'+1) \le B/(2\cdot 2^{\kappa}B) \le 2^{-\kappa}$. The
+final claim follows from the triangle inequality applied through $E$.
+\end{proof}
+
+\begin{remark}
+\label{rem:smudge-cost}
+Lemma~\ref{lem:smudge} is cheap to state and expensive to use. It says that
+hiding a $B$-bounded quantity statistically costs $\kappa$ \emph{additional} bits
+of range in the mask, and in a lattice ciphertext that range is subtracted from
+the noise budget that also has to accommodate the evaluation. This is the exact
+mechanism by which the soundness slack of a proof about a ciphertext is paid for
+out of the depth available for computing on it, and we report the measured
+consequence in Section~\ref{sec:threats}.
+\end{remark}
+
+\subsection{Algebraic structures, and why the choice of ring is not cosmetic}
+\label{sec:math:algebra}
+
+Two ambient structures appear throughout: the ring $\Z_{2^k}$ of machine words
+and the field $\mathbb{F}_p$ of integers modulo a prime. They are not
+interchangeable, and the differences propagate all the way into our cost
+measurements, so we set them out explicitly.
+
+\begin{definition}
+\label{def:ringfield}
+A \ib{commutative ring} $(\Ring,+,\cdot)$ is an abelian group under $+$ with an
+associative, commutative multiplication distributing over $+$ and possessing an
+identity $1$. An element $u \in \Ring$ is a \ib{unit} when $uv = 1$ for some
+$v$, and a \ib{zero divisor} when $u \ne 0$ and $uv = 0$ for some $v \ne 0$. A
+\ib{field} is a commutative ring in which every nonzero element is a unit.
+\end{definition}
+
+\begin{proposition}
+\label{prop:units}
+In $\Z_m$, an element $a$ is a unit if and only if $\gcd(a,m)=1$. In particular
+$\Z_{2^k}$ has exactly $2^{k-1}$ units, namely the odd residues, and every even
+nonzero residue is a zero divisor; $\Z_p$ for $p$ prime is a field.
+\end{proposition}
+
+\begin{proof}
+If $\gcd(a,m)=1$ then by B\'ezout there are $u,v$ with $au+mv=1$, so $au \equiv 1
+\pmod m$. Conversely if $au \equiv 1 \pmod m$ then $au - 1 = mv$ for some $v$, so
+any common divisor of $a$ and $m$ divides $1$. For $m = 2^k$ the condition
+$\gcd(a,2^k)=1$ says exactly that $a$ is odd, and there are $2^{k-1}$ odd
+residues; if $a = 2^s b$ with $1 \le s < k$ then $a \cdot 2^{k-s} \equiv 0$, so
+$a$ is a zero divisor. For $m = p$ prime, every $a \in \{1,\dots,p-1\}$ is
+coprime to $p$.
+\end{proof}
+
+Proposition~\ref{prop:units} has three consequences that recur in this survey,
+and we state them together because each is a place where a textbook protocol has
+to be modified before it can run over machine words.
+
+\begin{itemize}
+  \item \textbf{Shamir sharing does not transfer.} Reconstruction interpolates a
+  polynomial by Lagrange's formula, whose coefficients are differences of
+  evaluation points inverted. Over $\Z_{2^k}$ those differences are frequently
+  even and therefore not invertible, so the scheme is not well defined for
+  arbitrary evaluation points. This is why our ring-based layer uses
+  \emph{replicated} rather than threshold sharing
+  (Definition~\ref{def:sharings}), and why the field-based engines in our
+  compiler use a Mersenne prime instead.
+  \item \textbf{Statistical masking must respect the power-of-two structure.} A
+  mask uniform on $\Z_{2^k}$ hides perfectly (Theorem~\ref{thm:mask}), but a mask
+  uniform on a subinterval does not, and the failure is not visible to any
+  correctness test. We shipped exactly that bug and describe it in
+  Section~\ref{sec:disclosure}.
+  \item \textbf{Truncation is natural.} Division by $2^d$ with rounding is a shift
+  on a machine word, and fixed-point arithmetic wants precisely that operation.
+  Over $\mathbb{F}_p$ the corresponding operation needs a comparison against
+  $p/2$ to recover the sign, which is why the field engines pay for a wider
+  statistical margin. Section~\ref{sec:math:fixed} makes the trade quantitative.
+\end{itemize}
+
+\begin{theorem}[Chinese remainder]
+\label{thm:crt}
+Let $m = m_1 m_2 \cdots m_r$ with the $m_i$ pairwise coprime. Then the map
+$x \mapsto (x \bmod m_1, \dots, x \bmod m_r)$ is a ring isomorphism
+$\Z_m \cong \Z_{m_1} \times \cdots \times \Z_{m_r}$.
+\end{theorem}
+
+\begin{proof}
+The map is a ring homomorphism because reduction modulo each $m_i$ is. It is
+injective: if $x \equiv y$ modulo every $m_i$ then each $m_i$ divides $x-y$, and
+since the $m_i$ are pairwise coprime their product does, so $x = y$ in $\Z_m$.
+Both sides have cardinality $m$, so an injective map between them is bijective.
+\end{proof}
+
+Theorem~\ref{thm:crt} is used in two distinct ways below, and conflating them is a
+common source of confusion. In the \emph{implementation} of lattice arithmetic it
+is a representation device: a large modulus $q$ is stored as a residue system over
+machine-word primes, which is what makes a number-theoretic transform practical
+(Section~\ref{sec:math:ntt}). In the \emph{plaintext} space of a homomorphic
+scheme it is a parallelism device: the plaintext ring factors into independent
+slots, so one ciphertext carries many independent values
+(Section~\ref{sec:math:packing}). The first is invisible to the protocol; the
+second changes its asymptotics.
+
+\begin{definition}
+\label{def:polyring}
+For a commutative ring $\Ring$ we write $\Ring[X]$ for the ring of polynomials
+with coefficients in $\Ring$. For $N \in \N$ the \ib{negacyclic} quotient is
+$\Ring[X]/(X^N+1)$, and the \ib{cyclic} quotient is $\Ring[X]/(X^N-1)$. We write
+$\Ring = \Z[X]/(X^N+1)$ and $\Rq = \Z_q[X]/(X^N+1)$ for the rings used by the
+homomorphic schemes of Section~\ref{sec:prelim:fhe}, with $N$ a power of two.
+\end{definition}
+
+For $N$ a power of two, $X^N+1$ is the $2N$-th cyclotomic polynomial and is
+irreducible over $\Q$, so $\Q[X]/(X^N+1)$ is a field and $\Ring$ is the ring of
+integers of a cyclotomic number field. Two properties of the negacyclic quotient
+are used constantly. First, reduction is free: $X^N \equiv -1$, so a product of
+two degree-$(N-1)$ polynomials is reduced by subtracting the high half from the
+low half rather than by long division. Second, multiplication is a \ib{negacyclic
+convolution},
+\begin{equation}
+\label{eq:negconv}
+  (a \cdot b)_k \;=\; \sum_{i+j=k} a_i b_j \;-\; \sum_{i+j=k+N} a_i b_j ,
+\end{equation}
+which is the identity that makes coefficient packing work
+(Section~\ref{sec:math:packing}) and which our convolution benchmark exploits.
+
+\subsection{Fast polynomial multiplication}
+\label{sec:math:ntt}
+
+Homomorphic evaluation is dominated by multiplication in $\Rq$, so the cost of
+Equation~\eqref{eq:negconv} determines the cost of everything above it. Done
+directly it is $\Theta(N^2)$ coefficient products. The number-theoretic transform
+reduces it to $\Theta(N \log N)$, and since we report a $40.6\times$ speed-up
+from implementing it, we give the construction.
+
+\begin{definition}
+\label{def:ntt}
+Let $q$ be a prime with $q \equiv 1 \pmod{2N}$, let $\psi \in \Z_q$ be a
+primitive $2N$-th root of unity, and put $\omega = \psi^2$, a primitive $N$-th
+root. The \ib{negacyclic number-theoretic transform} of
+$\mathbf{a} = (a_0,\dots,a_{N-1})$ is
+\[
+  \widehat{a}_j \;=\; \sum_{i=0}^{N-1} a_i\, \psi^{i}\, \omega^{ij}
+  \qquad (0 \le j < N),
+\]
+that is, the $N$-point discrete transform applied to the sequence
+$(a_i \psi^i)_i$.
+\end{definition}
+
+\begin{theorem}
+\label{thm:ntt}
+With the notation of Definition~\ref{def:ntt}, for all $a,b \in \Rq$ the
+negacyclic product satisfies
+$\widehat{(a\cdot b)}_j = \widehat{a}_j\,\widehat{b}_j$ for every $j$, and the
+transform is invertible with
+$a_i = N^{-1}\psi^{-i}\sum_j \widehat{a}_j \omega^{-ij}$.
+Hence a negacyclic product costs two forward transforms, $N$ coefficient
+products and one inverse transform.
+\end{theorem}
+
+\begin{proof}
+Write $A(X) = \sum_i a_i X^i$ and let $c = a\cdot b$ in
+$\Z_q[X]/(X^N+1)$. Because $\psi^N = -1$, the map $X \mapsto \psi$ sends
+$X^N+1$ to $0$, so evaluation at $\psi\omega^{j}$ is a ring homomorphism from
+$\Z_q[X]/(X^N+1)$ to $\Z_q$ for each $j$: indeed
+$(\psi\omega^j)^N = \psi^N \omega^{jN} = -1$. Now
+$\widehat{a}_j = \sum_i a_i \psi^i \omega^{ij} = A(\psi\omega^{j})$, so
+$\widehat{c}_j = C(\psi\omega^j) = A(\psi\omega^j)B(\psi\omega^j) =
+\widehat{a}_j\widehat{b}_j$, which is the first claim. The points
+$\{\psi\omega^j\}_{j<N}$ are distinct and are exactly the $N$ roots of $X^N+1$ in
+$\Z_q$, which exist because $q \equiv 1 \pmod {2N}$; a polynomial of degree less
+than $N$ is determined by its values at $N$ distinct points, so the transform is
+a bijection, and the stated inversion formula follows from the orthogonality
+relation $\sum_{j} \omega^{j(i-i')} = N\,[i = i']$ in $\Z_q$.
+\end{proof}
+
+\begin{remark}
+\label{rem:ntt-eng}
+Theorem~\ref{thm:ntt} is a statement about $\Z_q$ for prime $q$. Deployed
+parameters use a composite $q$, and the standard resolution is
+Theorem~\ref{thm:crt}: represent $\Z_q$ as a residue number system over
+machine-word primes each satisfying $q_i \equiv 1 \pmod{2N}$, and transform
+independently in each. What remains after that is the cost of a single butterfly,
+and the engineering lesson we report is that this cost is dominated by modular
+reduction rather than by memory traffic, which is why a Shoup-preconditioned
+multiply is worth more than a better loop order.
+\end{remark}
+
+\subsection{Fixed-point representation and its two error terms}
+\label{sec:math:fixed}
+
+Neither secret sharing over $\Z_{2^k}$ nor an integer homomorphic scheme offers
+real arithmetic, and the networks we evaluate are specified over the reals. The
+bridge is fixed point, and because two of our findings are about the cost of the
+rescaling it forces, we set out its arithmetic precisely.
+
+\begin{definition}
+\label{def:fixed}
+Fix a \ib{scale} $f \in \N$. The \ib{fixed-point encoding} of $x \in \Rr$ at
+scale $f$ is $\lfloor x \cdot 2^{f} \rceil \in \Z$, and a stored integer $X$
+decodes to $X \cdot 2^{-f}$. We say $X$ \ib{represents} $x$ with error
+$\abs{X 2^{-f} - x} \le 2^{-f-1}$.
+\end{definition}
+
+Addition of encodings at a common scale is exact and needs no adjustment.
+Multiplication does not preserve the scale: if $X$ and $Y$ encode $x$ and $y$ at
+scale $f$ then $XY$ encodes $xy$ at scale $2f$, so a \ib{rescale} by $2^{-f}$ is
+required before the value can be added to another scale-$f$ quantity. Two error
+terms therefore accumulate, and they behave differently.
+
+\begin{proposition}
+\label{prop:fixed-error}
+Let $X_i$ encode $x_i$ and $W_i$ encode $w_i$ at scale $f$, for
+$i = 1,\dots,n$, with $\abs{x_i},\abs{w_i} \le M$. Let
+$S = \rnd{2^{-f}\sum_i W_i X_i}$ be the rescaled inner product. Then
+\[
+  \abs{S\,2^{-f} - \textstyle\sum_i w_i x_i}
+  \;\le\; \underbrace{n\,M\,2^{-f}}_{\text{input rounding}}
+  \;+\; \underbrace{2^{-f-1}}_{\text{one rescale}}
+  \;+\; O(n 2^{-2f}).
+\]
+\end{proposition}
+
+\begin{proof}
+Write $X_i = 2^f x_i + \delta_i$ and $W_i = 2^f w_i + \epsilon_i$ with
+$\abs{\delta_i},\abs{\epsilon_i} \le \tfrac12$. Expanding the product pairs each
+encoded value with the \emph{other} factor's rounding error,
+\[
+  W_i X_i \;=\; 2^{2f} w_i x_i \;+\; 2^{f}\bigl(w_i \delta_i + x_i \epsilon_i\bigr)
+  \;+\; \delta_i \epsilon_i .
+\]
+Summing over $i$ and multiplying by $2^{-f}$,
+\[
+  2^{-f}\sum_i W_iX_i \;=\; 2^{f}\sum_i w_ix_i
+  \;+\; \sum_i \bigl(w_i\delta_i + x_i\epsilon_i\bigr)
+  \;+\; 2^{-f}\sum_i \delta_i\epsilon_i .
+\]
+The second term is at most $n M$ in absolute value, since
+$\abs{w_i},\abs{x_i} \le M$ and each error is at most $\tfrac12$; the third is at
+most $n2^{-f}/4$. The final rounding to an integer contributes at most
+$\tfrac12$. Dividing throughout by $2^{f}$ gives the claim.
+\end{proof}
+
+Proposition~\ref{prop:fixed-error} is the reason the two paradigms diverge on
+nonlinearity cost, and it is worth stating why explicitly. The dominant term is
+input rounding, which is inherited from quantisation and is paid once per value
+regardless of protocol. The rescale term is a single half-unit, negligible in
+accuracy---and yet, in a secret-sharing protocol, the rescale is the expensive
+operation, because a right shift of a \emph{secret} value is not a local
+operation over $\Z_{2^k}$: the shares of $X$ do not shift independently, since
+the sum of the shifted shares differs from the shift of the sum by the carries
+lost at the boundary. Section~\ref{sec:math:bitdec} gives the protocol and its
+round cost. In a homomorphic scheme, by contrast, the rescale is either free
+(BFV/BGV at integer scale, where the plaintext modulus absorbs it) or a native
+operation on the modulus chain (CKKS, where it is exactly modulus switching).
+This asymmetry, and not the multiplication count, is what our measurements keep
+finding.
+
+\begin{remark}
+\label{rem:x2}
+An activation choice interacts with the same arithmetic. For a comparison-free
+scheme the natural nonlinearity is $x \mapsto x^2$, which is exact in both
+paradigms. But squaring a scale-$f$ encoding produces a scale-$2f$ value, so it
+forces a rescale of its own, and in a secret-sharing protocol that rescale costs
+exactly what a comparison would have cost. It also has a dynamic-range
+consequence: if a layer's linear map has gain $g$, then the magnitude of the
+activations obeys $M_{\ell+1} \approx g^2 M_\ell^2$, which for $g M > 1$ grows
+doubly exponentially in depth and overflows any fixed word length after a few
+layers. Scaling weights so that $gM \approx 1$---which is what standard
+initialisation does---puts the recursion at its fixed point. We report both the
+failure and the fix in Section~\ref{sec:matched}.
+\end{remark}
+
+\subsection{Communication complexity and the cost model}
+\label{sec:math:cost}
+
+Our comparisons are quoted in wall-clock time computed from measured counts, so
+the model that performs that conversion is part of the foundations rather than a
+detail of the harness.
+
+\begin{definition}
+\label{def:roundsbytes}
+Fix a protocol execution. Its \ib{communication} is the total number of bytes a
+single party sends, and its \ib{round complexity} is the length of the longest
+chain of messages in which each depends on the previous one. Formally, orient the
+message graph by causal dependence; the round complexity is the height of that
+directed acyclic graph.
+\end{definition}
+
+\begin{definition}
+\label{def:netmodel}
+For a link with one-way latency $L$ and per-party bandwidth $B$, the
+\ib{modelled latency} of an execution with $R$ rounds, $C$ bytes of
+communication and $T$ seconds of local computation is
+\[
+  \mathrm{Time} \;=\; R \cdot L \;+\; C / B \;+\; T .
+\]
+\end{definition}
+
+Definition~\ref{def:netmodel} is a lower bound made into an estimate. It is a
+lower bound because a party cannot receive a causally dependent message sooner
+than $L$ after sending its predecessor, and cannot transfer $C$ bytes faster than
+$B$; it becomes an estimate by assuming perfect overlap within a round and no
+overlap between rounds. We validate it against a socket to within
+\SI{13.6}{\percent} worst case (Section~\ref{sec:method:net}), and we record in
+Section~\ref{sec:threats} the one place where dropping $T$ made a local-area
+comparison wrong by a factor of nineteen.
+
+\begin{proposition}
+\label{prop:asap}
+Let a program be a directed acyclic graph of operations in which each operation
+is either \ib{local} or \ib{interactive}, and suppose every set of interactive
+operations that are mutually independent can be executed in a single round.
+Schedule each operation at the earliest level permitted by its dependences. Then
+the number of rounds equals the maximum number of interactive operations on any
+directed path, and no schedule achieves fewer.
+\end{proposition}
+
+\begin{proof}
+Write $d(v)$ for the maximum number of interactive operations on a path ending at
+$v$, so that $d$ is computed by the recurrence $d(v) = \max_{u \to v} d(u) + [v
+\text{ interactive}]$. Assign $v$ to level $d(v)$. Two interactive operations at
+the same level cannot be connected by a path, since a path between them would
+strictly increase $d$; hence each level's interactive operations are mutually
+independent and by hypothesis occupy one round, giving $\max_v d(v)$ rounds.
+Conversely, along a path carrying $m$ interactive operations, each must complete
+before the next begins, so any schedule uses at least $m$ rounds.
+\end{proof}
+
+Proposition~\ref{prop:asap} is why we report \emph{dependence depth} rather than
+operation counts as the predictor of latency, and why batching a layer's
+comparisons is worth more than reducing their number: a layer of $n$ independent
+comparisons costs one comparison's rounds. It also explains a structural feature
+of the assignment problem in Section~\ref{sec:assign}: because a level costs the
+maximum over its members rather than the sum, the objective is not separable
+across operations, and an integer-linear formulation of it is not faithful.
+
+\section{Foundations of the protocols}
+\label{sec:found}
+
+Section~\ref{sec:math} fixed the mathematics; this section builds the protocol
+machinery on it. Section~\ref{sec:prelim} then presents the specific
+constructions our artifact implements, in the form it implements them. The
+division is that everything here holds for any implementation, whereas
+Section~\ref{sec:prelim} records our choices.
+
+\subsection{The real/ideal paradigm}
+\label{sec:found:sim}
+
+Definition~\ref{def:corruption} named the corruption models; we now give the
+security definition itself, because our composability argument
+(Theorem~\ref{thm:uc}) quantifies over it and a reader cannot check that argument
+against an informal notion.
+
+\begin{definition}
+\label{def:functionality}
+An \ib{ideal functionality} $\Fun$ for $n$ parties is a probabilistic
+interactive machine that receives an input $x_i$ from each $P_i$, computes
+$(y_1,\dots,y_n) \gets \Fun(x_1,\dots,x_n)$, and delivers $y_i$ to $P_i$. A
+functionality may additionally be given a \ib{leakage} function $\mathcal{L}$,
+whose value is delivered to the adversary; a functionality with no leakage
+function is \ib{leakage-free}.
+\end{definition}
+
+Making leakage explicit in the functionality is not pedantry. A protocol that
+opens an intermediate value is not insecure if the functionality says the value is
+opened; it is insecure if the functionality does not. Our own broken truncation
+(Section~\ref{sec:disclosure}) is exactly a case where the protocol opened
+slightly more than the functionality we had written down, and stating the
+functionality with its leakage clause is what made the discrepancy visible.
+
+\begin{definition}
+\label{def:realideal}
+Let $\Prot$ be an $n$-party protocol and $\Fun$ a functionality. For an adversary
+$\Adv$ corrupting a set $I \subseteq \{P_0,\dots,P_{n-1}\}$ with $\abs{I} \le t$,
+let $\real_{\Prot,\Adv,I}(\mathbf{x},\lambda)$ denote the joint distribution of
+$\Adv$'s view and the honest parties' outputs in an execution of $\Prot$ on
+inputs $\mathbf{x}$. For a simulator $\Sm$, let
+$\ideal_{\Fun,\Sm,I}(\mathbf{x},\lambda)$ denote the same joint distribution in
+an ideal execution where the parties hand their inputs to $\Fun$ and $\Sm$ plays
+the corrupted parties given only $\{x_i\}_{i \in I}$, $\{y_i\}_{i\in I}$ and any
+leakage. We say $\Prot$ \ib{securely realises} $\Fun$ against $t$ static
+corruptions when for every such $\Adv$ there exists a probabilistic
+polynomial-time $\Sm$ with
+\[
+  \bigl\{\real_{\Prot,\Adv,I}(\mathbf{x},\lambda)\bigr\}
+  \;\approx\;
+  \bigl\{\ideal_{\Fun,\Sm,I}(\mathbf{x},\lambda)\bigr\}
+\]
+for all $\mathbf{x}$ and all admissible $I$, where $\approx$ is perfect,
+statistical or computational indistinguishability as specified.
+\end{definition}
+
+Three features of Definition~\ref{def:realideal} matter to us. It is a
+\emph{joint} distribution over the adversary's view and the honest outputs, so a
+protocol cannot be excused for letting the adversary influence the result while
+learning nothing. The simulator is given the corrupted parties' outputs, which is
+what makes simulation possible at all: whatever the adversary sees must be
+reconstructible from what it is entitled to know. And corruption here is
+\ib{static}, fixed before the execution; \ib{adaptive} corruption, where the
+adversary chooses whom to corrupt as it goes, is strictly harder and we do not
+claim it.
+
+\begin{remark}
+\label{rem:god}
+Definition~\ref{def:realideal} says nothing about whether honest parties obtain
+output. Three increasingly strong guarantees are distinguished in the literature:
+\ib{security with abort}, where honest parties may halt without output;
+\ib{fairness}, where the adversary obtains output only if honest parties do; and
+\ib{guaranteed output delivery}. With a dishonest majority the last two are
+unachievable in general---Cleve's impossibility result for coin flipping applies
+already to two parties---so a dishonest-majority protocol offering abort is not
+making a weak choice but the only available one. Our artifact offers abort in an
+honest-majority setting, where the stronger guarantees are achievable and we do
+not achieve them; we say so rather than imply otherwise.
+\end{remark}
+
+\subsection{Secret sharing}
+\label{sec:found:ss}
+
+\begin{definition}
+\label{def:ss}
+Let $\Ring$ be a finite commutative ring and let $\mathcal{A}$ be a monotone
+collection of subsets of $\{0,\dots,n-1\}$, the \ib{authorised sets}. A
+\ib{secret-sharing scheme} is a pair of algorithms $(\mathsf{Share},
+\mathsf{Rec})$ where $\mathsf{Share}(x)$ outputs $(s_0,\dots,s_{n-1})$ and
+$\mathsf{Rec}$ maps the shares held by any authorised set back to $x$. It is
+\ib{correct} when $\mathsf{Rec}$ succeeds for every authorised set, and
+\ib{perfectly private} when for every unauthorised set $U \notin \mathcal{A}$ and
+every pair of secrets $x,x'$, the distributions of $\{s_i\}_{i \in U}$ under
+$\mathsf{Share}(x)$ and $\mathsf{Share}(x')$ are identical. It is \ib{linear}
+when $\mathsf{Share}(x)+\mathsf{Share}(y)$ is a valid sharing of $x+y$ under
+componentwise addition.
+\end{definition}
+
+Linearity is the property that makes secret sharing useful for computation:
+addition and multiplication by a public constant are local, so only multiplication
+of two secrets needs interaction, and the entire cost structure of the paradigm
+follows from that split.
+
+\begin{proposition}
+\label{prop:additive-priv}
+Additive sharing over $\Ring$, in which $s_0,\dots,s_{n-2}$ are uniform and
+$s_{n-1} = x - \sum_{i<n-1} s_i$, is correct for the single authorised set
+$\{0,\dots,n-1\}$ and perfectly private against every proper subset.
+\end{proposition}
+
+\begin{proof}
+Correctness is immediate. For privacy, let $U$ be a proper subset, so that
+$U$ omits at least one index. There are two cases. If $n-1 \notin U$, then
+$\{s_i\}_{i \in U}$ is a subset of the independent uniform values
+$s_0,\dots,s_{n-2}$, whose joint distribution does not involve $x$ at all. If
+$n-1 \in U$, pick $j \le n-2$ with $j \notin U$, which exists because $U$ is
+proper. Condition on $\{s_i\}_{i \in U \setminus \{n-1\}}$, all of which are
+uniform and independent of $x$. Then
+$s_{n-1} = x - \sum_{i \le n-2} s_i$ contains the term $-s_j$ with $s_j$ uniform,
+unobserved and independent of everything conditioned on, so $s_{n-1}$ is uniform
+on $\Ring$ and independent of $x$. In both cases the observed tuple is
+distributed identically for every secret. We remark that this argument uses only
+that $\Ring$ is an abelian group under addition, so it holds over $\Z_{2^k}$
+despite Proposition~\ref{prop:units}---which is exactly why additive and
+replicated sharing transfer to machine words while Shamir sharing does not.
+\end{proof}
+
+\begin{proposition}
+\label{prop:rep-priv}
+Replicated sharing among three parties (Definition~\ref{def:sharings}), in which
+$P_i$ holds $(x_i,x_{i+1})$ for an additive sharing $x_0+x_1+x_2 = x$, is correct
+for any two parties and perfectly private against any one.
+\end{proposition}
+
+\begin{proof}
+Any two parties jointly hold all three additive shares: $P_i$ and $P_{i+1}$ hold
+$\{x_i,x_{i+1}\}$ and $\{x_{i+1},x_{i+2}\}$, whose union is all of them, so
+reconstruction succeeds. A single party $P_i$ holds $(x_i,x_{i+1})$ and is missing
+$x_{i+2}$, which is uniform and independent of the pair it holds; by the argument
+of Proposition~\ref{prop:additive-priv} the observed pair is identically
+distributed for every secret.
+\end{proof}
+
+\begin{definition}
+\label{def:shamir}
+Let $\mathbb{F}$ be a finite field with $\abs{\mathbb{F}} > n$ and fix distinct
+nonzero evaluation points $\alpha_0,\dots,\alpha_{n-1}$. \ib{Shamir sharing} of
+$x$ with threshold $t$ samples a uniform polynomial $p$ of degree at most $t$
+subject to $p(0)=x$ and sets $s_i = p(\alpha_i)$. The authorised sets are those
+of size at least $t+1$.
+\end{definition}
+
+\begin{proposition}
+\label{prop:shamir}
+Shamir sharing is correct and perfectly private, and it is linear.
+\end{proposition}
+
+\begin{proof}
+Correctness is Lagrange interpolation: given $t+1$ points, the unique polynomial
+of degree at most $t$ through them is
+$p(X) = \sum_{j} s_{i_j} \prod_{l \ne j} \frac{X - \alpha_{i_l}}{\alpha_{i_j} -
+\alpha_{i_l}}$, and $x = p(0)$. This is where a field is needed: the denominators
+are differences of distinct evaluation points and must be invertible, which
+Proposition~\ref{prop:units} shows can fail over $\Z_{2^k}$. For privacy, fix an
+unauthorised set of size $t$ and any candidate secret $x'$; the $t$ observed
+values together with $p(0)=x'$ determine $t+1$ conditions on a polynomial with
+$t+1$ free coefficients, so exactly one polynomial is consistent, and the map
+from the sampling randomness to the observed shares is a bijection for every
+$x'$. Linearity holds because the sum of two polynomials of degree at most $t$
+has degree at most $t$ and evaluates pointwise.
+\end{proof}
+
+\begin{remark}
+\label{rem:degree}
+Multiplying two Shamir sharings pointwise yields a sharing of the product on a
+polynomial of degree up to $2t$, which is not a valid degree-$t$ sharing. The
+standard repair, \ib{degree reduction}, has each party reshare its product and
+the parties take a fixed linear combination; it costs one round and is why a
+Shamir multiplication is interactive even with an honest majority. Replicated
+sharing avoids the degree problem entirely at the cost of storing two shares per
+party, which is the trade Definition~\ref{def:sharings} makes.
+\end{remark}
+
+\subsection{Multiplication: from correlated randomness, and from triples}
+\label{sec:found:mul}
+
+\begin{definition}
+\label{def:beaver}
+A \ib{Beaver triple} over $\Ring$ is a sharing $(\shr{a},\shr{b},\shr{c})$ with
+$a,b$ uniform and $c = ab$.
+\end{definition}
+
+\begin{theorem}
+\label{thm:beaver}
+Given a Beaver triple and sharings $\shr{x},\shr{y}$, the protocol that opens
+$d = x - a$ and $e = y - b$ and outputs
+$\shr{z} = \shr{c} + d\shr{b} + e\shr{a} + de$
+is correct, uses one round and two openings, and leaks nothing: the opened values
+are uniform and independent of $x,y$.
+\end{theorem}
+
+\begin{proof}
+For correctness, expand using $c = ab$:
+\[
+  c + db + ea + de = ab + (x-a)b + (y-b)a + (x-a)(y-b)
+  = ab + xb - ab + ya - ab + xy - xb - ya + ab = xy .
+\]
+Each term on the left is either a sharing scaled by a public value or a public
+constant, so the combination is local and the result is a valid sharing by
+linearity. For privacy, $a$ is uniform and independent of $x$, so $d = x-a$ is
+uniform on $\Ring$ and independent of $x$; likewise $e$. A simulator therefore
+samples $d,e$ uniformly, which is exactly the real distribution, and the
+simulation is perfect. Both openings are independent and occupy one round.
+\end{proof}
+
+Theorem~\ref{thm:beaver} explains the shape of the dishonest-majority cost we
+measure: the online phase is two openings and is cheap, and the entire expense is
+producing $(\shr{a},\shr{b},\shr{c})$, which needs either oblivious transfer or a
+homomorphic scheme. Section~\ref{sec:prelim:mpc} gives the honest-majority
+alternative, Theorem~\ref{thm:mul}, in which correlated randomness from a pairwise
+pseudorandom function replaces the triple and the multiplication needs no
+preprocessing at all. That contrast---preprocessing volume against threat
+model---is the mechanism behind the crossover of
+Section~\ref{sec:crossover-fhe}.
+
+\begin{proposition}
+\label{prop:bits-from-mul}
+Let each party $P_i$ contribute a uniform bit $b_i \in \{0,1\}$ as a private
+input. Then $b = \bigoplus_i b_i$ is a uniform bit unknown to any proper subset
+of the parties, and it can be computed from the $\shr{b_i}$ by
+$\ceil{\log n}$ rounds of multiplication using the identity
+$u \oplus v = u + v - 2uv$ over $\Ring$ with $u,v \in \{0,1\}$.
+\end{proposition}
+
+\begin{proof}
+The identity holds by inspection on the four cases. Uniformity: conditioned on
+any proper subset of the $b_i$, at least one $b_j$ remains uniform and
+independent, and exclusive-or with a uniform independent bit yields a uniform
+bit. Balanced binary reduction of $n$ terms has depth $\ceil{\log n}$, and all
+exclusive-ors at one level are independent, so by Proposition~\ref{prop:asap}
+each level costs one round.
+\end{proof}
+
+Proposition~\ref{prop:bits-from-mul} is how our engines obtain shared random bits
+without a trusted dealer, and it prices them: one multiplication per bit per
+level, hence one Beaver triple per bit at two parties. We record in
+Section~\ref{sec:disclosure} that treating these bits as free---the usual
+``fake offline'' simplification---understated the cost of a comparison by a large
+factor, because a comparison consumes tens of them.
+
+\subsection{Comparison, bit decomposition and truncation}
+\label{sec:math:bitdec}
+
+Every nonlinearity we evaluate reduces to the sign of a shared value:
+$\ReLU(x) = x \cdot [x > 0]$, a maximum is a mux on a comparison, and an argmax
+is a fold of maxima. Over $\Z_{2^k}$ the sign is the top bit, so the primitive is
+bit decomposition, and its cost dominates our secret-sharing measurements.
+
+\begin{definition}
+\label{def:bitdec}
+Given $\shr{x}$ with $x$ known to lie in $[-2^{\ell-1},2^{\ell-1})$, a
+\ib{bit-decomposition} protocol outputs sharings $\shr{x_0},\dots,\shr{x_{\ell-1}}$
+of the two's-complement bits of $x$.
+\end{definition}
+
+The construction we use is the masked-opening one. Draw $\ell + \kappa$ shared
+random bits $r_j$ (Proposition~\ref{prop:bits-from-mul}), form
+$\shr{r} = \sum_j 2^j \shr{r_j}$ locally, open
+$c = x + 2^{\ell-1} + r$, and recover the bits of $u = x + 2^{\ell-1}$ as the
+binary difference $c - r$ computed on the shared bits of $r$ against the public
+bits of $c$. Two facts make this work, and we prove both because the constants are
+ones we quote.
+
+\begin{lemma}
+\label{lem:mask-bits}
+With $r = \sum_{j<\ell+\kappa} 2^j r_j$ for independent uniform bits $r_j$, and
+$u \in [0,2^{\ell})$, the opened value $c = u + r$ has statistical distance at most
+$2^{-\kappa}$ from a distribution independent of $u$.
+\end{lemma}
+
+\begin{proof}
+$r$ is uniform on $[0,2^{\ell+\kappa})$. By the argument of
+Lemma~\ref{lem:smudge} applied to integer intervals, shifting a uniform interval
+of cardinality $2^{\ell+\kappa}$ by $u \le 2^{\ell}-1$ leaves at most $u$ points
+uncovered at each end, so
+$\SD(r, r+u) \le u/2^{\ell+\kappa} < 2^{\ell}/2^{\ell+\kappa} = 2^{-\kappa}$.
+Taking $T$ as in Definition~\ref{def:sd} gives the claim for any distinguisher.
+\end{proof}
+
+\begin{remark}
+\label{rem:kappa-cost}
+Lemma~\ref{lem:mask-bits} is why a comparison at $\ell$ bits consumes
+$\ell + \kappa$ random bits rather than $\ell$, and therefore why the arithmetic
+domain must be at least $\ell + \kappa + 1$ bits wide: the masked sum must not
+wrap. With $\ell = 33$ and $\kappa = 26$ this is $60$ bits, which is precisely the
+constraint that forces the field of our somewhat-homomorphic preprocessing engine
+to be $61$ bits and hence forces its ciphertext modulus to be large. A reader
+tracking why those parameters are what they are should start here.
+\end{remark}
+
+\begin{theorem}[Parallel-prefix borrow]
+\label{thm:kogge}
+Let $c$ be public and let the bits $r_j$ of $r$ be shared. The bits of
+$u = c - r$ can be computed in $\ceil{\log \ell}$ rounds of shared
+multiplication, independently of $\ell$'s value beyond that logarithm.
+\end{theorem}
+
+\begin{proof}
+Write the borrow-out of position $j$ as $\beta_j$, with $\beta_{-1}=0$ and
+\[
+  \beta_j \;=\; g_j \;\vee\; (p_j \wedge \beta_{j-1}), \qquad
+  g_j = \lnot c_j \wedge r_j, \qquad p_j = \lnot(c_j \oplus r_j),
+\]
+and the difference bit $u_j = c_j \oplus r_j \oplus \beta_{j-1}$. Because $c$ is
+\emph{public}, $g_j$ and $p_j$ are local: each collapses to $r_j$ or $1-r_j$
+according to the public bit $c_j$, so no interaction is needed to form them.
+Define the associative operator
+$(g,p)\circ(g',p') = (g \vee (p \wedge g'),\; p \wedge p')$, whose associativity
+is checked by expanding both bracketings. Then $\beta_j$ is the first component
+of $(g_j,p_j)\circ\cdots\circ(g_0,p_0)$, and a balanced prefix network
+(Kogge--Stone) computes all $\ell$ prefixes in $\ceil{\log \ell}$ levels. It
+remains to observe that $g_j p_j = 0$ always---if $c_j = 0$ then $g_j = r_j$ and
+$p_j = 1-r_j$, and if $c_j = 1$ then $g_j = 0$---so the disjunction in $\circ$ may
+be replaced by addition, making each application two shared multiplications. All
+applications at one level are independent, so by Proposition~\ref{prop:asap} each
+level is one round.
+\end{proof}
+
+\begin{corolary}
+\label{cor:cmp-cost}
+A comparison of two $\ell$-bit shared values costs one opening, $\ell+\kappa$
+shared random bits, and $\ceil{\log(\ell+1)}$ rounds of multiplication; a batch
+of any number of independent comparisons costs the same number of rounds as one.
+\end{corolary}
+
+\begin{proof}
+Compare $x$ against $y$ by decomposing $x-y$ and taking the sign bit, which is
+the top bit of the two's-complement representation; the counts are those of
+Lemma~\ref{lem:mask-bits} and Theorem~\ref{thm:kogge} with $\ell+1$ bits to
+accommodate the difference. The batching claim is Proposition~\ref{prop:asap}
+applied to a set of mutually independent decompositions.
+\end{proof}
+
+Corollary~\ref{cor:cmp-cost} is the single most consequential statement in this
+section for our measurements. It says that the nonlinear surface of a network
+costs \emph{rounds proportional to depth and not to width}, which is why our
+latency figures scale with the number of layers and are almost independent of the
+number of neurons per layer, and why the dominant term in a comparison's cost is
+the random bits rather than the prefix network.
+
+\begin{proposition}[Truncation]
+\label{prop:trunc}
+Let $\shr{x}$ be given with the bits of $x$ available as $\shr{x_j}$, and let
+$d < \ell$. Then $\shr{\floorr{x/2^{d}}}$ is obtained locally as
+\[
+  \shr{\floorr{x/2^{d}}} \;=\; \sum_{j=d}^{\ell-1} 2^{\,j-d}\,\shr{x_j}
+  \;-\; 2^{\,\ell-d}\,\shr{x_{\ell-1}} ,
+\]
+that is, by recomposing the high bits and then correcting the sign; no
+interaction is required beyond the decomposition.
+\end{proposition}
+
+\begin{proof}
+In two's complement over $\ell$ bits,
+$x = -2^{\ell-1}x_{\ell-1} + \sum_{j<\ell-1}2^j x_j$. An arithmetic shift right by
+$d$ is floor division by $2^d$, and
+$\floorr{x/2^d} = -2^{\ell-1-d}x_{\ell-1} + \sum_{d \le j < \ell-1} 2^{j-d}x_j$,
+because discarding the low $d$ bits of a two's-complement representation is
+exactly flooring. The displayed expression recomposes
+$\sum_{d \le j < \ell} 2^{j-d} x_j$, which includes $+2^{\ell-1-d}x_{\ell-1}$,
+and then subtracts $2^{\ell-d} x_{\ell-1} = 2\cdot 2^{\ell-1-d}x_{\ell-1}$, which
+converts that term to $-2^{\ell-1-d}x_{\ell-1}$. All operations are additions and public scalings, so
+they are local.
+\end{proof}
+
+\begin{remark}
+\label{rem:trunc-sign}
+The sign correction in Proposition~\ref{prop:trunc} is easy to omit, and omitting
+it yields a \emph{logical} rather than arithmetic shift: the result is correct for
+non-negative inputs and wrong for every negative one. Since roughly half of a
+network's pre-activations are negative, the error is not subtle in effect---but it
+is invisible to a test suite whose fixtures happen to be positive. We shipped that
+omission and describe it in Section~\ref{sec:disclosure}.
+\end{remark}
+
+\subsection{Oblivious transfer and its extensions}
+\label{sec:found:ot}
+
+Dishonest-majority preprocessing rests on oblivious transfer, so we define it and
+give the two constructions whose costs we measure.
+
+\begin{definition}
+\label{def:ot}
+The functionality $\Fun_{\mathrm{OT}}$ takes messages $(m_0,m_1)$ from a sender
+and a bit $b$ from a receiver, and delivers $m_b$ to the receiver and nothing to
+the sender. In \ib{random OT} the sender has no input and receives uniform
+$(m_0,m_1)$ as output; in \ib{correlated OT} with correlation $\Delta$ the sender
+inputs $\Delta$, receives uniform $m_0$, and the receiver obtains
+$m_b = m_0 + b\Delta$.
+\end{definition}
+
+\begin{proposition}[Gilboa]
+\label{prop:gilboa}
+Let $P_0$ hold $x \in \Z_{2^k}$ and $P_1$ hold $y \in \Z_{2^k}$. Using $k$
+correlated OTs in which $P_0$ is the receiver with choice bits the binary digits
+of $x$ and $P_1$ offers correlation $2^{i}y$ on the $i$-th transfer, the parties
+obtain an additive sharing of $xy$.
+\end{proposition}
+
+\begin{proof}
+On transfer $i$, $P_1$ holds a uniform $r_i$ and $P_0$ obtains
+$r_i + x_i 2^{i} y$ where $x_i$ is the $i$-th bit of $x$. Summing,
+$P_0$ holds $\sum_i r_i + y\sum_i x_i 2^i = \sum_i r_i + xy$ and $P_1$ holds
+$-\sum_i r_i$; the two sum to $xy$. Privacy is inherited from the OT: $P_0$ sees
+only its selected outputs, which are uniform given the unselected ones, and $P_1$
+learns nothing about the choice bits.
+\end{proof}
+
+Proposition~\ref{prop:gilboa} prices a Beaver triple over $\Z_{2^k}$ at $2k$
+correlated OTs, since a triple needs the two cross terms $a_0b_1$ and $a_1b_0$.
+With $k=64$ and a per-OT cost of $\kappa$ bits plus a correction, this is the
+$\sim\!3$ kilobytes per triple that our measurements confirm to within one per
+cent, and it is the quantity against which somewhat-homomorphic preprocessing
+competes.
+
+\begin{remark}
+\label{rem:iknp}
+Base oblivious transfer costs public-key operations, so a protocol needing
+millions of them uses an \ib{extension}: a small number of base OTs are turned
+into arbitrarily many by symmetric-key work, at the cost of a correlation the
+receiver's choices induce across the outputs. The construction transposes a
+matrix of pseudorandom columns so that the sender learns, for each row, one of
+two values determined by a global secret $\Delta$, and hashing breaks the
+correlation. A malicious receiver can use inconsistent choice bits across
+columns, which leaks bits of $\Delta$; a consistency check based on a random
+linear combination over $\mathbb{F}_{2^{128}}$ closes this at $O(1)$ additional
+communication. Our layer implements the extension and the check, and we report
+that the extension is $27\times$ cheaper per transfer than the base protocol at
+batch size $8192$.
+\end{remark}
+
+\subsection{Garbling schemes}
+\label{sec:found:gc}
+
+Definitions~\ref{def:garbling}--\ref{def:freexor} and
+Theorem~\ref{thm:halfgates} give the constructions we implement; here we give the
+security notions they must satisfy, because the cheapest optimisations are
+exactly the ones that strengthen the assumption.
+
+\begin{definition}
+\label{def:gc-security}
+A garbling scheme $(\Gb,\En,\Ev,\De)$ is \ib{correct} when
+$\De(d,\Ev(F,\En(e,x))) = f(x)$ for all $x$. It is \ib{private} when there is a
+simulator that, given $f$ and $f(x)$, produces $(F,\En(e,x),d)$ indistinguishable
+from a real garbling; \ib{oblivious} when a simulator given only $f$ produces
+$(F,\En(e,x))$ indistinguishably, that is, the evaluator learns not even the
+output; and \ib{authentic} when no adversary given $(F,\En(e,x))$ can produce an
+output label that decodes to anything other than $f(x)$.
+\end{definition}
+
+Privacy is what a semi-honest evaluator requires. Authenticity is what makes a
+malicious evaluator unable to forge a result, and it is why the garbled-circuit
+route can be given active security cheaply on the evaluator's side. Obliviousness
+matters in our setting because the garbled output is kept as a sharing rather than
+decoded, which is exactly how a garbled comparison composes with an arithmetic
+protocol.
+
+\begin{remark}
+\label{rem:freexor-assumption}
+Free exclusive-or replaces a garbled table by a wire-label offset, so that an
+XOR gate costs nothing. The price is the assumption: security of the scheme now
+requires the hash to be \ib{circular correlation robust}, because labels related
+by the global offset $R$ are hashed together, whereas the plain construction needs
+only a pseudorandom function. Half-gates then reduce an AND gate from three
+ciphertexts to two while remaining compatible with free exclusive-or. The lesson
+we take from this for our cost comparison is that the garbled route's headline
+figure of two ciphertexts per AND is not assumption-free, and a fair comparison
+against an arithmetic protocol whose security is information-theoretic should say
+so.
+\end{remark}
+
+\subsection{Lattices, LWE and the hardness assumptions}
+\label{sec:found:lattice}
+
+Definition~\ref{def:lattice} introduces lattices and Definition~\ref{def:rlwe}
+the ring problem our schemes rest on. Here we state the assumptions in the form
+that parameter selection uses, since our security claims about the homomorphic
+layer are exactly claims about these.
+
+\begin{definition}
+\label{def:lwe}
+Let $n,q \in \N$ and let $\chi$ be a distribution over $\Z$ concentrated on small
+values. The \ib{search LWE} problem is: given samples
+$(\mathbf{a}_i, \langle \mathbf{a}_i,\mathbf{s}\rangle + e_i \bmod q)$ with
+$\mathbf{a}_i \gets \Z_q^n$, $e_i \gets \chi$ and a fixed secret
+$\mathbf{s} \in \Z_q^n$, recover $\mathbf{s}$. The \ib{decision LWE} problem is
+to distinguish such samples from uniform samples over $\Z_q^n \times \Z_q$.
+\end{definition}
+
+\begin{definition}
+\label{def:rlwe-restated}
+The \ib{ring} variant replaces $\Z_q^n$ by $\Rq = \Z_q[X]/(X^N+1)$: samples are
+$(a_i, a_i s + e_i)$ with $a_i \gets \Rq$, $s \in \Rq$ fixed and $e_i$ drawn
+coefficientwise from $\chi$. A single ring sample carries $N$ scalar samples, so
+the public key is smaller by a factor of $N$ and multiplication becomes a ring
+product rather than a matrix--vector product.
+\end{definition}
+
+The assumptions we rely on are that decision LWE and decision ring-LWE are hard
+for suitable parameters. Two facts about them shape our practice rather than our
+proofs. First, search-to-decision and worst-case-to-average-case reductions are
+known, which is why these problems are used at all; we cite rather than reprove
+them. Second, and this is what a parameter table actually depends on, the
+\emph{concrete} hardness is estimated by running the best known attacks---lattice
+reduction with a sieving or enumeration subroutine, plus algebraic and hybrid
+attacks---and reading off the estimated cost. Concrete security is therefore a
+moving target, and the honest way to state a parameter set is to name the estimator
+and its version. We do that in Section~\ref{sec:prelim:fhe} and we do not claim
+security beyond what the standard tables assert.
+
+\begin{remark}
+\label{rem:ntru-lesson}
+The distinction between ``a problem is hard'' and ``these parameters are hard'' is
+not academic for us. We implemented a scheme whose security rested on a variant
+assumption, and the variant admitted a subfield-lattice attack for the parameter
+shape we had chosen; the construction was removed rather than reparameterised. We
+report the episode in Section~\ref{sec:withdrawn}, because a survey that lists
+only the primitives that survived gives a misleading picture of how the choice is
+made.
+\end{remark}
+
+\subsection{Homomorphic encryption: noise, depth and the operations that manage them}
+\label{sec:found:fhe}
+
+Definition~\ref{def:bfvbgv} gives the two integer schemes we implement. This
+subsection derives the noise arithmetic, because every structural claim we make
+about homomorphic evaluation---why depth is bounded, why a bootstrap is needed,
+why a scheme switch can replace one---is a statement about the growth of a single
+quantity.
+
+Let $\mathsf{ct} = (c_0,c_1) \in \Rq^2$ be an encryption of $m$ under secret $s$,
+with the invariant, for the BFV encoding,
+\begin{equation}
+\label{eq:bfv-inv}
+  c_0 + c_1 s \;=\; \Delta m + e \pmod q, \qquad \Delta = \floorr{q/t},
+\end{equation}
+where $t$ is the plaintext modulus and $e$ is the noise. Decryption computes
+$c_0 + c_1 s$, divides by $\Delta$ and rounds.
+
+\begin{proposition}
+\label{prop:bfv-dec}
+Decryption of Equation~\eqref{eq:bfv-inv} is correct provided
+$\norm{e}_\infty < \Delta/2$.
+\end{proposition}
+
+\begin{proof}
+We have $c_0 + c_1 s = \Delta m + e$ over $\Rq$, and lifting to centred
+representatives, $\rnd{(\Delta m + e)/\Delta} = m + \rnd{e/\Delta} = m$ whenever
+every coefficient of $e$ has magnitude below $\Delta/2$, since then
+$\abs{e_i/\Delta} < 1/2$ and rounds to zero. If any coefficient exceeds the bound
+the corresponding plaintext coefficient is off by at least one, and because
+plaintexts are taken modulo $t$ the error is not detectable from the ciphertext.
+\end{proof}
+
+Proposition~\ref{prop:bfv-dec} is the entire budget. Everything homomorphic
+evaluation does either consumes it or restores it.
+
+\begin{proposition}
+\label{prop:noise-growth}
+Let $\mathsf{ct}_1,\mathsf{ct}_2$ encrypt $m_1,m_2$ with noise bounded by
+$B_1,B_2$. Then
+\begin{enumerate}
+  \item addition yields noise at most $B_1+B_2$;
+  \item multiplication by a plaintext of infinity-norm $\gamma$ and Hamming-weight
+  at most $h$ yields noise at most $\gamma h B_1$;
+  \item ciphertext multiplication yields a degree-two ciphertext whose noise is
+  bounded by approximately $t N (B_1 + B_2) + \text{(terms independent of } B_i)$,
+  that is, it grows \emph{multiplicatively} in the plaintext modulus and the ring
+  dimension.
+\end{enumerate}
+\end{proposition}
+
+\begin{proof}
+For (1), add the invariants: $(c_0+c_0') + (c_1+c_1')s = \Delta(m_1+m_2) + (e_1+e_2)$,
+and the triangle inequality bounds the sum. For (2), multiply the invariant by the
+plaintext $p$; each output coefficient is a sum of at most $h$ products of a
+coefficient of $p$ with one of $e_1$, whence the bound $\gamma h B_1$ by
+Equation~\eqref{eq:negconv} and the triangle inequality. For (3), multiply the two
+invariants:
+\[
+  (c_0 + c_1 s)(c'_0 + c'_1 s) = \Delta^2 m_1 m_2 + \Delta(m_1 e_2 + m_2 e_1) +
+  e_1 e_2 ,
+\]
+whose left side expands to a quadratic in $s$, that is, a degree-two ciphertext
+$(d_0,d_1,d_2)$ with $d_0 + d_1 s + d_2 s^2$ equal to the right side. Dividing by
+$\Delta$ to restore the invariant scale introduces the factor $t$, and the
+convolution of two degree-$(N-1)$ polynomials contributes up to $N$ terms per
+coefficient, giving the stated shape. The dominant term is
+$\Delta(m_1e_2 + m_2e_1)/\Delta = m_1e_2+m_2e_1$, bounded by $tN(B_1+B_2)/2$ since
+plaintext coefficients are bounded by $t/2$.
+\end{proof}
+
+Three consequences follow, and they are the structural facts our measurements
+keep meeting.
+
+\begin{corolary}
+\label{cor:depth}
+With fresh noise $B_0$ and the multiplicative growth of
+Proposition~\ref{prop:noise-growth}(3), the number of sequential ciphertext
+multiplications before decryption fails---the \ib{multiplicative depth}---is
+$O(\log_{tN}(\Delta/B_0))$, and is therefore \emph{logarithmic} in the ciphertext
+modulus and \emph{linear} in $\log q$ for fixed $t,N$.
+\end{corolary}
+
+\begin{proof}
+Each multiplication multiplies the noise bound by approximately $tN$, so after $L$
+of them the bound is roughly $B_0 (tN)^{L}$. Decryption requires this to stay
+below $\Delta/2 \approx q/2t$, giving $L \le \log_{tN}(q/(2tB_0))$.
+\end{proof}
+
+\begin{remark}
+\label{rem:relin}
+A ciphertext multiplication raises the degree in $s$ from one to two, so a second
+multiplication would raise it to four and decryption would need $s^4$.
+\ib{Relinearisation} restores degree one using an evaluation key that encrypts
+$s^2$ under $s$; it costs a key-switching operation and adds noise. A scheme that
+declines to relinearise is confined to \emph{one} ciphertext multiplication, and
+that is exactly the regime our depth-one homomorphic layer occupies: it has no
+evaluation keys at all, which removes their generation, their storage and their
+noise, at the price of being unable to multiply twice. Whether that price is
+payable is the question our scheme-switching result answers.
+\end{remark}
+
+\begin{remark}
+\label{rem:modswitch}
+\ib{Modulus switching} rescales a ciphertext from modulus $q$ to $q' < q$,
+dividing both the ciphertext and its noise by approximately $q/q'$. It does not
+improve the \emph{ratio} of noise to modulus by itself, but in BGV it is used to
+keep that ratio constant after each multiplication, which converts multiplicative
+noise growth into a linear consumption of a precomputed \ib{modulus chain}
+$q_L > q_{L-1} > \cdots > q_0$. The number of links is the depth budget, and this
+is why a levelled scheme's parameters are chosen from the depth of the circuit
+before evaluation begins.
+\end{remark}
+
+\begin{definition}
+\label{def:bootstrap}
+\ib{Bootstrapping} is homomorphic evaluation of the decryption circuit, taking a
+ciphertext whose noise is near the bound to a fresh ciphertext of the same
+plaintext with noise near $B_0$. A scheme with bootstrapping is \ib{fully}
+homomorphic; one without is \ib{levelled}.
+\end{definition}
+
+Bootstrapping is what makes unbounded depth possible and is, by a wide margin, the
+most expensive operation in the paradigm: it requires evaluating a nontrivial
+arithmetic circuit under the encryption it is repairing, at parameters chosen to
+accommodate that circuit. The measurements we cite from the literature put a
+single CKKS bootstrap at seconds to tens of seconds on a CPU, dominating the
+inference that contains it. That cost, and the fact that a levelled pipeline which
+declines to pay it simply stops at its depth bound, is the discontinuity our
+comparison in Section~\ref{sec:matched} is organised around.
+
+\begin{remark}
+\label{rem:switch-as-bootstrap}
+Definition~\ref{def:bootstrap} refreshes noise by computing decryption
+homomorphically. A scheme switch achieves the same effect by a different route:
+the ciphertext is decrypted \emph{under a sharing}, so the plaintext is never
+exposed, and re-encrypted fresh. The cost is a round of interaction with parties
+who hold the key in shares, rather than a homomorphic evaluation of decryption.
+Whether this is a better trade is precisely a measurement question, and it is the
+one our hybrid result answers: the switch is milliseconds where the bootstrap is
+seconds, and the price is that the parties must be online.
+\end{remark}
+
+\subsection{Packing: two encodings and the operations they admit}
+\label{sec:math:packing}
+
+A ciphertext holds a ring element with $N$ coefficients, and using it to carry one
+scalar wastes a factor of $N$. There are two ways to fill it, they support
+different operations, and choosing between them changes the asymptotics of a
+layer, so we set them out together.
+
+\begin{definition}
+\label{def:coefpack}
+\ib{Coefficient packing} encodes a vector $\mathbf{a} \in \Z_t^N$ as the
+polynomial $\sum_i a_i X^i$. \ib{Slot packing} fixes a plaintext modulus $t$ with
+$t \equiv 1 \pmod{2N}$, so that $X^N+1$ splits into distinct linear factors over
+$\Z_t$, and encodes $\mathbf{a}$ as the unique polynomial with
+$a(\zeta_j) = a_j$ at the $N$ roots $\zeta_j$; by Theorem~\ref{thm:crt} this is a
+ring isomorphism $\Z_t[X]/(X^N+1) \cong \Z_t^N$.
+\end{definition}
+
+\begin{proposition}
+\label{prop:packing-ops}
+Under coefficient packing, the product of two encodings is the negacyclic
+convolution of the vectors, Equation~\eqref{eq:negconv}. Under slot packing, the
+product is the componentwise product. Consequently a single ciphertext
+multiplication computes, respectively, all $N$ shifted inner products of two
+vectors, or $N$ independent scalar products.
+\end{proposition}
+
+\begin{proof}
+The first claim is Definition~\ref{def:polyring} and
+Equation~\eqref{eq:negconv}. The second is that evaluation at each $\zeta_j$ is a
+ring homomorphism, so $(ab)(\zeta_j) = a(\zeta_j)b(\zeta_j)$, which is exactly
+componentwise multiplication of the slot vectors; the isomorphism of
+Theorem~\ref{thm:crt} makes the correspondence bijective.
+\end{proof}
+
+Proposition~\ref{prop:packing-ops} is the reason the two encodings suit different
+layers. A convolution is a shifted inner product, so coefficient packing computes
+a whole convolutional layer in one ciphertext multiplication with no rotations at
+all: the $k^2$ taps of a kernel land in the coefficients of a single product, and
+the desired outputs are read off at a stride. A matrix--vector product, by
+contrast, needs sums \emph{across} positions, which coefficient packing does not
+provide and slot packing provides only through rotations.
+
+\begin{definition}
+\label{def:rotation}
+A \ib{rotation} by $k$ maps the slot vector $(a_0,\dots,a_{N-1})$ to its cyclic
+shift. Homomorphically it is realised by the Galois automorphism
+$X \mapsto X^{g}$ for a suitable $g$, followed by a key switch under a
+\ib{Galois key}, and costs one key-switching operation.
+\end{definition}
+
+\begin{proposition}
+\label{prop:hs-matvec}
+A matrix--vector product with an $N \times N$ plaintext matrix on a slot-packed
+ciphertext can be computed with $N$ plaintext multiplications and $N-1$ rotations
+by summing the \ib{diagonals} of the matrix, and with
+$O(\sqrt{N})$ rotations by the baby-step giant-step decomposition.
+\end{proposition}
+
+\begin{proof}
+Write $\mathbf{y} = \mathbf{A}\mathbf{x}$ and let $\mathbf{d}_k$ be the $k$-th
+generalised diagonal, $d_{k,i} = A_{i,\,i+k \bmod N}$. Then
+$y_i = \sum_k d_{k,i} x_{i+k}$, so
+$\mathbf{y} = \sum_{k} \mathbf{d}_k \odot \mathrm{rot}_k(\mathbf{x})$, a sum of
+$N$ componentwise products of a plaintext with a rotation. For the second bound,
+write $k = k_1 \sqrt{N} + k_2$ and factor
+$\mathrm{rot}_k = \mathrm{rot}_{k_1\sqrt N} \circ \mathrm{rot}_{k_2}$: precompute
+the $\sqrt N$ inner rotations once, and apply $\sqrt N$ outer rotations to the
+accumulated partial sums, giving $2\sqrt N$ rotations in total. Correctness is the
+associativity of the shift action.
+\end{proof}
+
+Proposition~\ref{prop:hs-matvec} is the technique the compilers we compare against
+implement and optimise. We record it here because it makes the comparison legible:
+when we report that a homomorphic layer costs a fixed number of ciphertext
+operations while a secret-sharing layer costs traffic proportional to width, the
+homomorphic side's flatness is exactly this packing, and it is also why the
+homomorphic side's advantage grows with width in our measurements.
+
+\begin{remark}
+\label{rem:ckks}
+CKKS encodes \emph{approximate} complex or real vectors rather than exact
+integers, using the canonical embedding: a vector is scaled by a factor $\Delta$,
+rounded into the ring, and the rounding error is absorbed as additional noise.
+Its distinguishing operation is \ib{rescaling}, which divides a ciphertext by
+$\Delta$ after a multiplication and is implemented as modulus switching; the
+consequence is that CKKS's ``noise'' and its ``precision'' are the same quantity,
+and depth is consumed by the scale management rather than tracked separately. Two
+properties matter for our comparison. The scheme has no comparison operation and
+cannot compute a sign, so a nonlinearity must be a polynomial, which is why the
+only activation both paradigms evaluate exactly is a monomial
+(Remark~\ref{rem:x2}). And precision degrades along the modulus chain, so a
+classification margin narrower than the accumulated error is not recoverable---a
+failure mode that presents as a wrong label rather than as an error signal, which
+is why our harness compares against a plaintext reference before quoting any
+timing.
+\end{remark}
+
+\begin{remark}
+\label{rem:threshold}
+In a \ib{threshold} homomorphic scheme the secret key is shared and decryption is
+a protocol. The subtlety is that a partial decryption reveals a noise term that
+depends on the key share, so partial decryptions must be flooded by noise drawn
+from a range at least $2^{\kappa}$ times the bound---Lemma~\ref{lem:smudge}---and
+that flooding is subtracted from the same budget as the evaluation. The practical
+consequence, which we report as a disclosed gap rather than a solved problem, is
+that a statistical security level for the decryption and a depth budget for the
+computation are drawn on the same account.
+\end{remark}
+
+\subsection{Succinct proofs}
+\label{sec:found:zk}
+
+Section~\ref{sec:prelim:zk} describes the system we implement; we give the
+definitions here so that the claims in that section are checkable.
+
+\begin{definition}
+\label{def:argument}
+Let $R$ be a relation and $L = \{x : \exists w,\ (x,w) \in R\}$. An
+\ib{interactive argument} for $R$ is a pair $(P,V)$ of interactive machines with
+$V$ polynomial-time, satisfying \ib{completeness}---for $(x,w) \in R$, $V$ accepts
+with probability $1 - \negl$---and \ib{computational soundness}: for $x \notin L$
+and every polynomial-time $P^*$, $V$ accepts with negligible probability. It is
+an \ib{argument of knowledge} when there is a polynomial-time extractor that,
+given oracle access to a prover convincing $V$ with noticeable probability,
+outputs a witness. It is \ib{zero-knowledge} when there is a simulator producing
+accepting transcripts indistinguishable from real ones without a witness.
+\end{definition}
+
+\begin{definition}
+\label{def:snark}
+A \ib{SNARK} is a non-interactive argument of knowledge whose proof length and
+verification time are $o(\abs{w})$, typically polylogarithmic in the circuit size.
+\end{definition}
+
+Two points of principle bear on how we report our zero-knowledge measurements.
+First, soundness in Definition~\ref{def:argument} is \emph{computational}: an
+unbounded prover can cheat, which is the price of succinctness, and it is why
+these objects are called arguments rather than proofs. Second, non-interactivity
+is normally obtained by the Fiat--Shamir transform, replacing the verifier's
+random challenges with a hash of the transcript; the transform is provable in the
+random-oracle model and its concrete instantiation is an assumption, so a proof
+system's security cannot be quoted independently of the hash it is instantiated
+with.
+
+\begin{remark}
+\label{rem:zk-lesson}
+The gap between ``a proof verifies'' and ``a proof proves the intended statement''
+is where our own zero-knowledge error lived: a backend can be complete and
+internally consistent while the constraint system it emits fails to bind the
+witness to the computation one intended, and no amount of successful verification
+detects it. We describe the episode in Section~\ref{sec:withdrawn}. The
+methodological consequence we draw is that a proof system needs a negative
+test---a witness that should fail and does---and that reporting only successful
+verifications is not evidence.
+\end{remark}

@@ -51,6 +51,12 @@
   shaded={bgcolor=\color{rgb}{0.95,0.95,0.95}}]{lemma}
 \declaretheorem[style=mystyle, name=Corolary, numberwithin=section,
   shaded={bgcolor=\color{rgb}{1,1,1}}]{corolary}
+\declaretheorem[style=mystyle, name=Proposition, numberwithin=section,
+  shaded={bgcolor=\color{rgb}{0.97,0.97,0.97}}]{proposition}
+\declaretheorem[style=mystyle, name=Remark, numberwithin=section,
+  shaded={bgcolor=\color{rgb}{1,1,1}}]{remark}
+\declaretheorem[style=mystyle, name=Notation, numberwithin=section,
+  shaded={bgcolor=\color{rgb}{1,1,1}}]{notation}
 
 \renewcommand{\thefigure}{\thesection.\arabic{figure}}
 
@@ -75,6 +81,40 @@
 \newcommand{\Baru}{\textsc{Baru}}
 % A finding worth pulling out of the prose.
 \newcommand{\finding}[1]{\medskip\noindent\fbox{\parbox{0.97\linewidth}{\textbf{Finding.} #1}}\medskip}
+
+% ---- Macros for the foundations (Sections 3-4) ----
+\newcommand{\N}{\mathbb{N}}
+\newcommand{\Q}{\mathbb{Q}}
+\newcommand{\Rr}{\mathbb{R}}
+\newcommand{\Cc}{\mathbb{C}}
+\newcommand{\Ring}{\mathcal{R}}
+\newcommand{\Rq}{\Ring_q}
+\newcommand{\negl}{\mathrm{negl}}
+\newcommand{\poly}{\mathrm{poly}}
+\newcommand{\Adv}{\mathcal{A}}
+\newcommand{\Sm}{\mathcal{S}}
+\newcommand{\Env}{\mathcal{Z}}
+\newcommand{\Fun}{\mathcal{F}}
+\newcommand{\Prot}{\Pi}
+\newcommand{\view}{\mathrm{view}}
+\newcommand{\real}{\mathrm{REAL}}
+\newcommand{\ideal}{\mathrm{IDEAL}}
+\newcommand{\SD}{\Delta}
+\newcommand{\Enc}{\mathsf{Enc}}
+\newcommand{\Dec}{\mathsf{Dec}}
+\newcommand{\KeyGen}{\mathsf{KeyGen}}
+\newcommand{\Eval}{\mathsf{Eval}}
+\newcommand{\Gb}{\mathsf{Gb}}
+\newcommand{\Ev}{\mathsf{Ev}}
+\newcommand{\En}{\mathsf{En}}
+\newcommand{\De}{\mathsf{De}}
+\newcommand{\shr}[1]{[\![#1]\!]}
+\newcommand{\abs}[1]{\left\lvert #1 \right\rvert}
+\newcommand{\norm}[1]{\left\lVert #1 \right\rVert}
+\newcommand{\ceil}[1]{\left\lceil #1 \right\rceil}
+\newcommand{\floorr}[1]{\left\lfloor #1 \right\rfloor}
+\newcommand{\rnd}[1]{\left\lfloor #1 \right\rceil}
+\DeclareMathOperator*{\argmax}{arg\,max}
 
 \lstset{basicstyle=\ttfamily\small,columns=fullflexible,keepspaces=true,
         breaklines=true,frame=none,xleftmargin=1em}
@@ -113,7 +153,12 @@ Several widely repeated intuitions survive re-measurement; several do not. Among
 the results that only a single-harness study can produce: the FHE-versus-MPC
 crossover is a property of \emph{the baseline's preprocessing} rather than of
 either cryptosystem, and disappears once MPC is given somewhat-homomorphic
-preprocessing; active security on the nonlinear surface of private inference
+preprocessing; at a \emph{matched} corruption model---two parties, dishonest
+majority---and against an external baseline competitive with the published state of
+the art, MPC's advantage over FHE widens with network depth, from $10\times$ to
+$47\times$ with preprocessing hoisted on both sides and from a dead tie to
+$3.2\times$ without, until the levelled homomorphic pipeline stops working
+altogether at the depth where it would have to bootstrap; active security on the nonlinear surface of private inference
 costs $2.63\times$ bytes but only $1.06\times$ rounds---and $9.70\times$ bytes once
 the semi-honest baseline it is measured against is allowed to pack, which only the
 unverified side can do. We also report our own
@@ -173,8 +218,21 @@ stronger evidence than our external ones, and where we compare against a publish
 number we say so explicitly and treat the comparison accordingly.
 
 \paragraph{Organization.} In Section~\ref{sec:scope} we delimit the scope of the
-survey. In Section~\ref{sec:prelim} we give the cryptographic preliminaries, that is,
-the definitions, theorems and algorithms on which the remainder depends. In
+survey. Sections~\ref{sec:math} to~\ref{sec:prelim} are the foundations, and we have
+made them deliberately self-contained: Section~\ref{sec:math} fixes notation and
+develops the mathematics---negligible functions and the two indistinguishability
+notions, the algebra of the rings we compute in and why the choice between a
+power-of-two modulus and a prime is not cosmetic, fast polynomial multiplication,
+fixed-point error analysis, and the cost model that converts our measured counts into
+latency. Section~\ref{sec:found} builds the protocol machinery on it, with the
+real/ideal definition our composability argument quantifies over, secret sharing and
+its multiplication protocols, the comparison and truncation primitives whose cost
+dominates our secret-sharing measurements, oblivious transfer, garbling, the noise
+arithmetic of homomorphic encryption, packing, and succinct proofs. A reader who knows
+this material can begin at Section~\ref{sec:prelim}, which gives the cryptographic
+preliminaries in the specific form our artifact implements them---and we remark that
+several of our results turn on the difference between that form and the textbook one.
+In
 Section~\ref{sec:background} we organize the four paradigms by what each one is
 expensive in. In Section~\ref{sec:artifact} we describe our artifact and the abstract
 machine at its centre, and in Section~\ref{sec:paradigms} we survey and measure each
@@ -233,6 +291,9 @@ requires dense linear algebra, where the packing techniques of homomorphic encry
 effective; it requires comparisons, where secret sharing and garbled circuits compete; and
 it admits verifiable computation, where succinct proofs apply. We remark that some of our
 results are specific to this workload, and where that is the case we say so.
+
+%==============================================================================
+\input{foundations}
 
 %==============================================================================
 \section{Cryptographic preliminaries}
@@ -372,11 +433,13 @@ then $\sum_i z_i = xy$, and $(z_0,z_1,z_2)$ is an additive sharing of $xy$ that 
 nothing beyond it.
 \end{theorem}
 
-\emph{Proof.} Summing the three expressions collects each of the nine products $x_iy_j$
+\begin{proof}
+Summing the three expressions collects each of the nine products $x_iy_j$
 exactly once, because the index pairs $(i,i)$, $(i,i+1)$ and $(i+1,i)$ enumerate all of
 $\{0,1,2\}^2$ as $i$ ranges over the three parties, and the $\alpha_i$ cancel by construction.
 Moreover, each $z_i$ is masked by $\alpha_i$, which depends on a key that party $i$ does not
-hold in full, hence no party learns a cross term that it should not learn. $\Box$
+hold in full, hence no party learns a cross term that it should not learn.
+\end{proof}
 
 The zero-sum randomness is obtained without communication. Party $i$ holds PRF keys $k_i$
 and $k_{i-1}$ shared with its two neighbours and computes
@@ -802,7 +865,8 @@ party's inputs and outputs, produces a view computationally indistinguishable fr
 one.
 \end{theorem}
 
-\emph{Proof.} We construct $\mathcal{S}$ command by command; in every case it holds the
+\begin{proof}
+We construct $\mathcal{S}$ command by command; in every case it holds the
 corrupted party's two replicated components and must produce the messages that party receives.
 
 For $\mathsf{input}$ and for the linear commands there are no messages, since a replicated
@@ -830,7 +894,8 @@ component consistent with it.
 
 Indistinguishability follows by a standard hybrid over the PRF calls, of which there are
 polynomially many, replacing each in turn by a uniform value. No step rewinds $\mathcal{Z}$ or
-$\mathcal{A}$. $\Box$
+$\mathcal{A}$.
+\end{proof}
 
 \begin{corolary}
 \label{cor:mal}
@@ -869,14 +934,16 @@ opening and used only once. Consequently each opening is simulatable from the co
 command's output.
 \end{lemma}
 
-\emph{Proof.} By enumeration; the sites are finitely many and Table~\ref{tab:openings} lists
+\begin{proof}
+By enumeration; the sites are finitely many and Table~\ref{tab:openings} lists
 them. The three interesting cases are as follows. In $\Pi_{\mathrm{WA}}$ the opened value is
 $a + x$ for a preprocessed $x$ that is uniform on the whole ring, so the opening is uniform.
 In $\Pi_{\mathrm{Trunc}}$ the same holds, which is the reason the mask must cover the ring and
 the overflow be corrected rather than avoided. In $\Pi_{\mathrm{PC}}$ the opened value is
 $m \cdot \prod_i c_i$; the $c_i$ carry no randomness of their own, hence the mask $m$ must be a
 uniform unit \emph{and must remain secret}, which is what forces the zero test on $m$ to open
-$m \cdot s$ rather than $m$. $\Box$
+$m \cdot s$ rather than $m$.
+\end{proof}
 
 \begin{table}[htb]
 \centering
@@ -2051,11 +2118,49 @@ we verify at $5\times5$ in Section~\ref{sec:medmnist}. We remark that PEGASUS~\c
 CHIMERA~\cite{CHIMERA} address switching \emph{between homomorphic schemes} rather than between
 homomorphic encryption and secret sharing, which is a different problem from ours.
 
+\paragraph{Compilers for homomorphic deep learning, and how we use one.}
+A second line builds \emph{compilers} rather than protocols.
+Fhelipe~\cite{Fhelipe} automates data packing; Orion~\cite{Orion} accepts PyTorch
+networks, contributes single-shot multiplexed packing and automatic bootstrap
+placement, and reports the fastest published CKKS inference figures we are aware
+of, including \SI{0.23}{\second} on MNIST and the first high-resolution
+homomorphic object detection; HE-LRM~\cite{HELRM} extends Orion to recommendation
+models with encrypted embedding lookups, and reports a single bootstrap consuming
+\SI{75}{\percent} of a \SI{24.22}{\second} inference---the discontinuity our
+no-bootstrap hybrid exists to avoid. HEIR~\cite{HEIR} is different in kind: it is
+MLIR-based compiler \emph{infrastructure} spanning BGV, BFV, CKKS and CGGI with
+exits to OpenFHE, Lattigo, tfhe-rs and several hardware accelerators, and its paper
+claims generality rather than performance.
+
+We use HEIR in Section~\ref{sec:matched} as a \emph{baseline generator}: it supplies
+a homomorphic arm running on tuned C++ rather than on our own arithmetic, which is
+the confound our own threats section concedes. We note two practical findings from
+doing so, because they are not in its documentation. Its Python front end compiles
+through Numba and cannot express a dense layer at all---tensor subscripting,
+matrix multiplication and reductions are each rejected---so the route that works is
+to emit \texttt{linalg} MLIR directly, which is the level its machine-learning
+pipeline targets and which the PyTorch route reaches by way of torch-mlir. And its
+emitted code sets the multiplicative depth and the plaintext modulus but never the
+security level, so the level in force is the backend library's default; we read it
+back out of the generated code rather than assume it.
+
 Our contribution relative to this line is not a faster hybrid. It is that the hybrid route,
 the pure homomorphic route, the pure secret-sharing route and the garbled route are all present in
 a single artifact over a single transport. It means that the question of what the hybrid actually
 buys, and of where the crossover lies, can be answered by measurement rather than by comparing
 numbers taken from four papers with four experimental setups.
+
+\paragraph{System-level comparisons of the paradigms.} Huang, Maeng and
+Suh~\cite{BeyondLatency} characterise secret sharing against homomorphic
+encryption for private inference across latency, throughput, memory, energy and
+monetary cost, and report the shape we reproduce in Section~\ref{sec:matched}:
+secret sharing wins on latency over a fast link, homomorphic encryption wins on
+throughput and is insensitive to the network, and the offline phase dominates
+secret sharing's real cost. Their study assembles systems from the literature,
+which is precisely the citation-assembly problem of Section~\ref{sec:intro}; ours
+holds the computed function, the machine and the accounting fixed and varies only
+the paradigm. The two are complementary, and that their conclusions agree is
+evidence for both.
 
 \subsection{Homomorphic encryption schemes and libraries}
 \label{sec:related:he}
@@ -2123,6 +2228,7 @@ report for secret sharing in this survey is the real wire protocol, with three p
 exchange serialized messages.
 
 \subsection{A validated network model}
+\label{sec:method:net}
 \label{sec:netmodel}
 
 Our cost model charges $\text{rounds} \times \text{RTT} + \text{bytes}/\text{bandwidth}$,
@@ -2156,6 +2262,7 @@ we ran it twice, before and after two optimizations, with both passes agreeing o
 means that those optimizations are \emph{exact} and not merely close.
 
 \subsection{Machine-checked security attestations}
+\label{sec:method:attest}
 \label{sec:attest}
 
 Every engine attests the security level that it actually implements, in a single auditable
@@ -2169,6 +2276,28 @@ We consider this the most transferable idea in the artifact. Security level is
 the dimension most often lost when numbers move between papers, and making it a
 machine-checked property of running code---rather than prose in a limitations
 section---is cheap to implement and hard to get wrong by accident.
+
+\subsection{Gating an external baseline the way we gate our own}
+\label{sec:method:external}
+
+Section~\ref{sec:method:attest} describes machine-checked attestations for our own
+engines: each states what it implements and asking for more is an error. When we
+adopted an external baseline (Section~\ref{sec:matched}) we extended the same
+discipline to it, because the failure mode is documented rather than hypothetical.
+A community write-up of a homomorphic MNIST perceptron through HEIR reports roughly
+\SI{30}{\second} at a \emph{security level of ``not set''} and roughly six minutes
+at the secure ring dimension---a factor of twelve sitting between an insecure and a
+secure baseline. An insecure baseline is worse than no baseline: it manufactures a
+speed-up out of a parameter choice.
+
+Our harness therefore refuses to report a latency unless three conditions hold: the
+run declares one of the standard security levels, with the \emph{provenance} of that
+level recorded; the homomorphic evaluation reproduces the plaintext classification;
+and both arms computed the same function. The third is checked first and is the one
+we would not have thought to add: a mismatch between arms otherwise presents as a
+classification disagreement, which reads as approximation error. It caught a real
+wiring fault of ours, in which the reference network used \ReLU{} while the
+homomorphic arm was told to evaluate $x^2$.
 
 \subsection{Recording withdrawn results---and deleting the component}
 \label{sec:withdrawn-policy}
@@ -2254,7 +2383,137 @@ about the literature which is otherwise puzzling, namely that \emph{every hybrid
 system combining homomorphic encryption and secret sharing is two-party}. Gazelle, Delphi and
 Cheetah are situated precisely in the regime in which the model says that the hybrid pays.
 
+\subsection{MPC versus FHE at a matched threat model, against an external baseline}
+\label{sec:matched}
+
+Every private-inference figure in \S\ref{sec:crossover-fhe} and in the wider
+literature we compare against shares a weakness: the homomorphic arm is
+\emph{our} homomorphic encryption. \S\ref{sec:intro} concedes that our
+absolute figures are not competitive with tuned implementations, and the natural
+objection to ``secret sharing beat homomorphic encryption'' is that it beat an
+implementation written by the same hands. This subsection removes that objection
+in the one direction that matters, and tightens the threat model at the same time.
+
+\paragraph{The comparison is only meaningful at a matched corruption model.}
+Single-server homomorphic encryption assumes one server and nothing whatever
+about non-collusion. A three-party honest majority assumes two of three parties
+remain honest and do not collude. A three-party system beating single-server
+homomorphic encryption on latency is therefore not a result: it is a consequence
+of assuming away the hard part, and it is why every hybrid inference system in the
+literature is two-party (\S\ref{sec:crossover-fhe}). We therefore run the
+comparison under \textbf{two-party dishonest-majority} secret sharing, where one
+of two parties may be corrupt---the regime Gazelle, Delphi and
+Cheetah~\cite{Gazelle,Delphi,Cheetah} occupy.
+
+One asymmetry survives the matching and we do not measure it away. The two
+settings share a corruption model but not an \emph{interaction} model: homomorphic
+encryption lets the client upload a ciphertext and go offline, whereas two-party
+computation needs it online for the whole evaluation and needs multi-gigabyte
+correlated randomness besides. Huang, Maeng and Suh~\cite{BeyondLatency} report
+that this is where the real monetary and energy cost of secret sharing lives, and
+nothing below contradicts them.
+
+\paragraph{The external baseline.} We drive
+HEIR~\cite{HEIR}---Google's MLIR-based homomorphic-encryption compiler---to
+OpenFHE~\cite{OpenFHE}, so the homomorphic arm runs on tuned C++ rather than on
+our own number-theoretic transform. HEIR is compiler \emph{infrastructure}: its
+paper claims generality and reports no private-machine-learning evaluation, so
+this is a baseline generator and not a target. Two properties make the resulting
+number quotable rather than decorative.
+
+First, it is competitive with the published state of the art.
+Orion~\cite{Orion} reports MNIST at \SI{0.23}{\second} single-threaded; our
+harness obtains \SI{0.21}{\second} to \SI{0.49}{\second} for MNIST-shaped
+multilayer perceptrons through HEIR. Whatever else follows, it is not a comparison
+against a strawman.
+
+Second, we refuse to quote a figure that fails any of three checks, each
+of which fired at least once during this work. \textbf{(i)} The security level
+must be a real one. HEIR's emitted C++ sets only the multiplicative depth and
+the plaintext modulus and never calls \texttt{SetSecurityLevel}, so the level in
+force is OpenFHE's default; we read it back out of the generated code and report
+it \emph{with its provenance}, because ``128-bit because someone chose it'' and
+``128-bit because nobody chose anything'' are different claims. \textbf{(ii)} The
+homomorphic arm must reproduce the plaintext classification, or a cheap
+approximation that gets the answer wrong would look fast. \textbf{(iii)} Both arms
+must compute the \emph{same function}, checked before either of the other two,
+because a mismatch otherwise presents as a classification disagreement and is
+read as approximation error.
+
+\paragraph{The activation is forced, and it costs the secret-sharing arm nothing.}
+CKKS cannot compare, so an exact \ReLU{} is not expressible on the homomorphic
+arm at all. The only activation both paradigms evaluate exactly is $x^2$, which is
+also what Orion uses for its MNIST networks. A worry about that choice turned out
+to be unfounded: $x^2$ costs the secret-sharing arm \emph{exactly} what \ReLU{}
+costs---identical rounds, multiplications, decompositions and bytes. Over plain
+integers $x^2$ would be one multiplication against \ReLU{}'s masked-opening bit
+decomposition, but in fixed point squaring doubles the scale, and the rescale that
+corrects it \emph{is} the decomposition the comparison was. Two per neuron either
+way. So the switch does not flatter secret sharing, and every finding measured
+with \ReLU{} carries over unchanged.
+
+\paragraph{Result.} Table~\ref{tab:matched} sweeps depth on MNIST-shaped networks.
+Both arms are split warm and cold: HEIR's key generation and our correlated
+randomness are both per-session, query-independent costs, so warm-against-warm and
+cold-against-cold are the two honest comparisons and we give both.
+
+\begin{table}[t]
+\centering
+\small
+\begin{tabular}{@{}rlrrrrrr@{}}
+\toprule
+depth & shape & FHE eval & FHE${+}$keygen & MPC warm & MPC cold & warm & cold \\
+\midrule
+3 & 784-32-10       & \SI{212.5}{\milli\second}  & \SI{322.9}{\milli\second}  & \textbf{\SI{20.4}{\milli\second}} & \SI{318.8}{\milli\second} & $10.4\times$ & $1.0\times$ \\
+5 & 784-32-32-10    & \SI{762.2}{\milli\second}  & \SI{1159.9}{\milli\second} & \textbf{\SI{26.6}{\milli\second}} & \SI{454.2}{\milli\second} & $28.7\times$ & $2.6\times$ \\
+7 & 784-32-32-32-10 & \SI{1230.5}{\milli\second} & \SI{1681.4}{\milli\second} & \textbf{\SI{31.2}{\milli\second}} & \SI{588.0}{\milli\second} & $39.5\times$ & $2.9\times$ \\
+9 & 784-32$^4$-10   & \SI{1775.5}{\milli\second} & \SI{2327.2}{\milli\second} & \textbf{\SI{37.4}{\milli\second}} & \SI{723.2}{\milli\second} & $47.4\times$ & $3.2\times$ \\
+11 & 784-32$^5$-10  & \multicolumn{2}{c}{\emph{segmentation fault in key generation}} & \SI{42}{\milli\second} & \SI{858}{\milli\second} & --- & --- \\
+\bottomrule
+\end{tabular}
+\caption{Two-party dishonest-majority secret sharing (LowGear, SHE preprocessing)
+against HEIR${\to}$OpenFHE CKKS at \texttt{HEStd\_128\_classic}, LAN. Same
+network, same weights, $x^2$ activation, every row verified against the plaintext
+reference before any timing is quoted. Depth is chosen by HEIR.}
+\label{tab:matched}
+\end{table}
+
+\finding{Warm against warm, secret sharing wins by $10.4\times$ at depth 3 rising
+to $47.4\times$ at depth 9. Cold against cold the two are a \emph{dead tie} at
+depth 3 and secret sharing reaches $3.2\times$ by depth 9. The direction---its
+advantage widening with depth---holds on both accountings; the magnitude depends
+entirely on which one is quoted.}
+
+Beyond depth 9 the homomorphic arm stops working. HEIR's default pipeline is
+\emph{levelled} and places no bootstraps, so depth is a ceiling rather than a
+step: at depth 11 OpenFHE segmentation-faults inside key generation, after HEIR's
+MLIR-to-C++ pipeline has succeeded. Secret sharing continues linearly, at
+eighteen additional rounds and roughly \SI{5}{\milli\second} per layer, unbroken.
+
+\finding{Automatic bootstrap placement, which Orion~\cite{Orion} contributes and
+which HEIR's default pipeline lacks, is therefore not an optimisation but the
+thing that makes depth possible at all---at roughly \SI{20}{\second} per
+bootstrap~\cite{HELRM}. That is where secret sharing wins on both axes at once,
+and it is the same discontinuity our no-bootstrap hybrid
+(\S\ref{sec:hybrid}) is built to avoid.}
+
+On the wide-area profile the ordering reverses: the homomorphic arm is
+non-interactive and network-insensitive, at \SI{0.2}{\second} to
+\SI{1.8}{\second} against \SI{7}{\second} to \SI{10}{\second} for secret sharing,
+which pays 110 to 164 rounds of latency. This is the shape
+Huang, Maeng and Suh~\cite{BeyondLatency} report, reproduced here in one harness
+with both arms measured and the computed function held identical.
+
+\paragraph{What this comparison is not.} These are multilayer perceptrons with
+$x^2$, not convolutional networks with polynomial \ReLU{}, and the depths reached
+are those a levelled scheme handles without bootstrapping. Orion's
+\SI{0.23}{\second} is a different network. The result is the set of \emph{ratios
+within one harness}; the absolute figures are offered only as evidence that
+neither arm is incompetent. \S\ref{sec:threats} states the accounting asymmetry
+that remains.
+
 \subsection{Protocol assignment can be derived, not annotated}
+\label{sec:assign}
 
 Given the measured costs of each backend, a search over the assignments of protocols to
 kinds of operation returns $\bt{mul}\to\text{fhe}$ and $\bt{cmp-lt}\to\text{binary}$ for an
@@ -2683,6 +2942,35 @@ was measured as a $1.68\times$ \emph{loss} and not built.
 \label{sec:threats}
 
 In this section we state the threats to the validity of our results.
+
+\paragraph{The two arms of Section~\ref{sec:matched} are not timed the same way.}
+This is the sharpest threat to that comparison and we state it plainly. The
+homomorphic arm's latency is elapsed wall clock. The secret-sharing arm's is
+composed: round latency and bandwidth come from measured counts put through the
+network model, and local compute is measured but \emph{divided by the party count},
+because our virtual machine runs every party serially in one process. The
+protocols are symmetric, so the division is defensible, but it is a division and
+not a measurement of one party. Two consequences follow. On the wide-area profile,
+where round latency dominates by two orders of magnitude, the composition is
+harmless. On a local-area network it is the whole number, and the local-area
+figures should be read as accurate to a factor rather than to a percentage. A
+genuinely socketed two-party arm, with parties in separate processes, is the
+experiment that would remove this threat, and we have not run it.
+
+\paragraph{Omitting local compute is an error we made and corrected.} The
+local-area figures of Section~\ref{sec:matched} originally charged secret sharing
+only round latency and bandwidth, with no compute term at all---inherited from a
+harness that reported only wide-area numbers, where the omission is invisible. At
+784-32-10 the modelled \SI{16}{\milli\second} sat against \SI{598}{\milli\second}
+of measured compute, so the local-area figures understated secret sharing by
+roughly $19\times$, and the ratios we first computed additionally compared a
+\emph{warm} secret-sharing arm against a \emph{cold} homomorphic one. Both halves
+flattered secret sharing. Compute is now measured and split warm from cold on both
+sides. We record the error because it is the third instance in this work of a first
+metric flattering the paradigm we implemented---correlated randomness charged as
+free, compute charged as free, and warm compared against cold---and the common
+cause is not a coding mistake but a habit: asking whether a number reproduces
+rather than what it omits.
 
 \paragraph{Quality of the implementation.} Our code is research Rust and not tuned C++.
 Consequently the absolute figures are not competitive, and the ratios measured inside the harness
