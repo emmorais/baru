@@ -121,7 +121,19 @@ pub struct NnReport {
 /// Weights are small and mixed-sign so that ReLU actually fires and the rescale
 /// actually sees negative values — a network whose pre-activations happen to be
 /// positive would not have caught the sign-extension bug in `vm`'s `TruncPr`.
-fn fixture(shape: &[usize], scale_bits: u32) -> QuantizedNetwork {
+pub(crate) fn fixture_for(shape: &[usize], scale_bits: u32) -> QuantizedNetwork {
+    fixture_with(shape, scale_bits, Activation::Relu)
+}
+
+/// [`fixture_for`] with an explicit hidden-layer activation.
+///
+/// `Square` exists so the FHE arm can compute the *same exact function* — CKKS
+/// cannot compare, so `Relu` is not expressible there. See `bench-heir`.
+pub(crate) fn fixture_with(
+    shape: &[usize],
+    scale_bits: u32,
+    hidden: Activation,
+) -> QuantizedNetwork {
     let unit = 1i64 << scale_bits;
     let mut layers = Vec::new();
     for (l, pair) in shape.windows(2).enumerate() {
@@ -145,7 +157,7 @@ fn fixture(shape: &[usize], scale_bits: u32) -> QuantizedNetwork {
         let activation = if l + 2 == shape.len() {
             Activation::Identity
         } else {
-            Activation::Relu
+            hidden
         };
         layers.push(QuantizedLayer {
             weights,
@@ -156,14 +168,19 @@ fn fixture(shape: &[usize], scale_bits: u32) -> QuantizedNetwork {
     QuantizedNetwork { scale_bits, layers }
 }
 
-fn fixture_input(n: usize, scale_bits: u32) -> Vec<i64> {
+/// Input `k` of the fixture, at the given width. `k` shifts the pattern so a
+/// caller can ask for several distinct inputs — the FHE arm classifies a handful
+/// to check its ReLU approximation on more than one point.
+pub(crate) fn input_for(n: usize, scale_bits: u32, k: usize) -> Vec<i64> {
     let unit = 1i64 << scale_bits;
-    (0..n).map(|i| ((i % 9) as i64 - 4) * unit / 4).collect()
+    (0..n)
+        .map(|i| (((i + k * 3) % 9) as i64 - 4) * unit / 4)
+        .collect()
 }
 
 /// First-max-wins argmax, the tie-break the generated circuit implements
 /// (`>` is strict, so an equal later logit does not displace the incumbent).
-fn argmax_ref(logits: &[i64]) -> i64 {
+pub(crate) fn argmax_of(logits: &[i64]) -> i64 {
     let mut best = 0usize;
     for (i, v) in logits.iter().enumerate().skip(1) {
         if *v > logits[best] {
@@ -207,6 +224,19 @@ fn network_src(net: &QuantizedNetwork) -> String {
                     let p = format!("p{l}_{o}");
                     binds.push(format!("({p} {pre})"));
                     binds.push(format!("({name} (* {p} (> {p} 0)))"));
+                }
+                // `x^2`, and note the second `ash-right`: squaring doubles the
+                // fixed-point scale, so the product must be rescaled back. That
+                // rescale is a bit decomposition — the same one the comparison
+                // was — which is why the FHE-friendly activation is not cheaper
+                // here. See `ml::Activation::Square`.
+                Activation::Square => {
+                    let p = format!("p{l}_{o}");
+                    binds.push(format!("({p} {pre})"));
+                    binds.push(format!(
+                        "({name} (ash-right (* {p} {p}) {}))",
+                        net.scale_bits
+                    ));
                 }
             }
             next.push(name);
@@ -256,6 +286,17 @@ pub fn run(
     bit_width: u32,
     scale_bits: u32,
 ) -> Result<NnReport, String> {
+    run_with(shapes, dep, bit_width, scale_bits, Activation::Relu)
+}
+
+/// [`run`] with an explicit hidden-layer activation.
+pub fn run_with(
+    shapes: &[Vec<usize>],
+    dep: &Deployment,
+    bit_width: u32,
+    scale_bits: u32,
+    hidden: Activation,
+) -> Result<NnReport, String> {
     // One decomposition draws this many random bits; used to report the count
     // rather than hardcoding 59 and drifting if either constant moves.
     let bits_per_decomp = u64::from(bit_width + 1 + KAPPA);
@@ -274,9 +315,9 @@ pub fn run(
             .map(|d| d.to_string())
             .collect::<Vec<_>>()
             .join("x");
-        let net = fixture(shape, scale_bits);
-        let input = fixture_input(shape[0], scale_bits);
-        let want = argmax_ref(&net.forward(&input));
+        let net = fixture_with(shape, scale_bits, hidden);
+        let input = input_for(shape[0], scale_bits, 0);
+        let want = argmax_of(&net.forward(&input));
         let src = network_src(&net);
         let inputs = network_inputs(&net, &input);
         // Derived from the shape, not from the counters, so the two can be
@@ -372,6 +413,9 @@ const USAGE: &str = "usage: baru bench-2pc-nn [options]
   --parties N          computing parties (default 2 — the matched threat model)
   --bits N             value bit width (default 32)
   --scale N            fixed-point scale bits (default 8)
+  --activation A       hidden-layer activation: `relu` (exact, MPC-only) or
+                       `square` (x^2, which a CKKS arm can also compute exactly
+                       -- see bench-heir). Both cost 2 decompositions/neuron
   --lan                LAN profile instead of WAN
   --json               emit the report as JSON
   -h, --help           this message
@@ -395,6 +439,7 @@ pub fn run_cli(args: &[String]) -> Result<(), String> {
     let mut parties = 2usize;
     let mut bit_width = 32u32;
     let mut scale_bits = 8u32;
+    let mut hidden = Activation::Relu;
     let mut lan = false;
     let mut json = false;
 
@@ -431,6 +476,17 @@ pub fn run_cli(args: &[String]) -> Result<(), String> {
                     .and_then(|v| v.parse().ok())
                     .ok_or_else(|| format!("--scale needs a number\n\n{USAGE}"))?;
             }
+            "--activation" => {
+                hidden = match it.next().map(String::as_str) {
+                    Some("relu") => Activation::Relu,
+                    Some("square") => Activation::Square,
+                    other => {
+                        return Err(format!(
+                            "--activation takes `relu` or `square`, got {other:?}\n\n{USAGE}"
+                        ))
+                    }
+                };
+            }
             other => return Err(format!("unknown arg {other}\n\n{USAGE}")),
         }
     }
@@ -440,7 +496,7 @@ pub fn run_cli(args: &[String]) -> Result<(), String> {
     } else {
         Deployment::wan(parties)
     };
-    let r = run(&shapes, &dep, bit_width, scale_bits)?;
+    let r = run_with(&shapes, &dep, bit_width, scale_bits, hidden)?;
 
     if json {
         println!(
@@ -451,8 +507,14 @@ pub fn run_cli(args: &[String]) -> Result<(), String> {
     }
 
     println!(
-        "One private classifier end to end — {} parties, {}, Q{} fixed point",
-        r.parties, r.network, r.scale_bits
+        "One private classifier end to end — {} parties, {}, Q{} fixed point, {} hidden",
+        r.parties,
+        r.network,
+        r.scale_bits,
+        match hidden {
+            Activation::Square => "x^2",
+            _ => "relu",
+        }
     );
     println!("Input, weights and biases all secret; only the class index is revealed.\n");
     println!(
@@ -616,9 +678,9 @@ mod tests {
             // A single layer, no hidden ReLU at all — the degenerate case.
             vec![5, 3],
         ] {
-            let net = fixture(&shape, 8);
-            let input = fixture_input(shape[0], 8);
-            let want = argmax_ref(&net.forward(&input));
+            let net = fixture_for(&shape, 8);
+            let input = input_for(shape[0], 8, 0);
+            let want = argmax_of(&net.forward(&input));
             let src = network_src(&net);
             let inputs = network_inputs(&net, &input);
 
@@ -671,8 +733,8 @@ mod tests {
     /// extension, and one whose ReLUs never clamped would not test the mux.
     #[test]
     fn the_fixture_has_negative_pre_activations_and_clamping_relus() {
-        let net = fixture(&[8, 4, 3], 8);
-        let input = fixture_input(8, 8);
+        let net = fixture_for(&[8, 4, 3], 8);
+        let input = input_for(8, 8, 0);
         let mut cur = input;
         let mut saw_negative = false;
         let mut saw_clamp = false;
@@ -697,6 +759,10 @@ mod tests {
                     saw_clamp |= pre.iter().any(|&v| v < 0);
                     pre.into_iter().map(|v| v.max(0)).collect()
                 }
+                Activation::Square => pre
+                    .into_iter()
+                    .map(|v| ((v as i128 * v as i128) >> net.scale_bits) as i64)
+                    .collect(),
             };
         }
         assert!(saw_negative, "the rescale never sees a negative value");
@@ -823,6 +889,49 @@ mod tests {
     ///
     /// This is what makes the previous test's claim about depth non-trivial — if
     /// width also bought rounds, "linear in depth" would not isolate anything.
+    /// **`x²` costs the MPC arm exactly what ReLU costs — not approximately,
+    /// identically.** Same rounds, same multiplications, same decompositions,
+    /// same bytes.
+    ///
+    /// This matters twice over. It is the *reason* the FHE comparison is possible
+    /// at all: CKKS cannot compare, so an exact ReLU is not expressible on a CKKS
+    /// arm, and `x²` is the activation both paradigms can compute exactly. Had it
+    /// been cheaper for MPC, switching to it would have quietly improved the MPC
+    /// arm and made the comparison flattering; because it is free, every finding
+    /// measured with ReLU carries over unchanged.
+    ///
+    /// And it is counterintuitive, which is why it is pinned. Over plain integers
+    /// `x²` *would* be one multiplication against ReLU's masked-opening bit
+    /// decomposition. In **fixed point** it is not: squaring doubles the scale, so
+    /// the product needs a rescale, and a rescale is the same decomposition the
+    /// comparison was. Two per neuron either way — dot-rescale plus one more.
+    #[test]
+    #[ignore]
+    fn the_fhe_friendly_activation_costs_the_mpc_arm_nothing() {
+        on_a_deep_stack(|| {
+            let dep = Deployment::lan(2);
+            let shapes = vec![vec![16usize, 8, 4], vec![16, 8, 8, 8, 4]];
+            let relu = run_with(&shapes, &dep, 32, 8, Activation::Relu).unwrap();
+            let square = run_with(&shapes, &dep, 32, 8, Activation::Square).unwrap();
+            assert_eq!(relu.points.len(), square.points.len());
+            for (r, q) in relu.points.iter().zip(&square.points) {
+                assert_eq!(r.protocol, q.protocol);
+                assert_eq!(r.shape, q.shape);
+                assert!(r.correct && q.correct, "both must classify exactly");
+                assert_eq!(r.rounds, q.rounds, "{} rounds differ", r.shape);
+                assert_eq!(r.muls, q.muls, "{} multiplications differ", r.shape);
+                assert_eq!(
+                    r.decompositions, q.decompositions,
+                    "{} decompositions differ — the rescale after squaring should cost \
+                     exactly what the comparison did",
+                    r.shape
+                );
+                assert_eq!(r.online_bytes, q.online_bytes, "{} bytes differ", r.shape);
+                assert_eq!(r.offline_bytes, q.offline_bytes);
+            }
+        });
+    }
+
     #[test]
     #[ignore]
     fn rounds_are_set_by_depth_not_width() {

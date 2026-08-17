@@ -176,3 +176,59 @@ encrypted pipeline ever reveals.
 `bench-medmnist` reports the same quantities on the embedded subset. The two
 implementations were cross-checked by embedding a whole test set and confirming
 they agree to the digit.
+
+---
+
+## `heir_baseline.py` — the FHE baseline driver (not a generator)
+
+The other script here is different in kind: it generates nothing and is not
+consumed by a committed file. It is a **driver** that `baru bench-heir` invokes as
+a subprocess, reading one request JSON on stdin and writing one report JSON on
+stdout. The contract is documented in its own header; `src/bench/heir.rs` is the
+other end of it.
+
+| what | value |
+|---|---|
+| consumed by | `baru bench-heir` |
+| path override | `BARU_HEIR_PY` (defaults to `tools/heir_baseline.py`) |
+| exercise the contract, no HEIR needed | `baru bench-heir --shape 6x4x3 --self-test` |
+| real measurement | `pip install "heir-py[python,openfhe]"`, then `baru bench-heir --shape 16x8x4` |
+
+**Python ≥ 3.10 is required for the real path** — `heir-py` publishes
+`cp310-abi3` wheels only. This script itself runs on 3.9 so that `--self-test`
+works anywhere.
+
+### Why it refuses things
+
+Two gates, both in `src/bench/heir.rs`, and both there because the failure mode
+is documented rather than hypothetical.
+
+**Security parameters.** [google/heir#1232](https://github.com/google/heir/issues/1232)
+reports an MNIST MLP at ~30 s and 3 GB with `HEStd_NotSet` — OpenFHE's "do not
+check" mode — and **~6 min and 26 GB** at the secure ring dimension. A 12×
+factor sits between the insecure and the secure baseline, and the insecure one is
+what a casual run produces. So a latency is refused unless the run reports one of
+`HEStd_128_classic` / `HEStd_192_classic` / `HEStd_256_classic`. An insecure
+baseline is worse than no baseline: it manufactures a speedup out of a parameter
+choice.
+
+**The activation, and it is a modelling decision.** CKKS cannot compare, so an
+exact ReLU is not expressible on the FHE arm at all, while Baru's MPC arm computes
+it exactly. The two arms therefore cannot be made to compute the same function by
+tuning a parameter, and the driver refuses to choose:
+
+* `activation: "square"` gives **both** arms `x²` — exact on each side, and what
+  Orion does for its MNIST networks. This is the route taken. It costs the MPC arm
+  *nothing*: measured identical to ReLU on rounds, multiplications,
+  decompositions and bytes, because squaring doubles the fixed-point scale and the
+  rescale that fixes that is the same decomposition the comparison was.
+* `activation: "relu_poly"` keeps the MPC arm's exact ReLU and approximates it on
+  the FHE arm. Not implemented: it needs a minimax polynomial over a justified
+  input range, which is a decision and not a default.
+
+Underneath that, a latency is still refused unless the FHE arm reproduces the
+plaintext classification — otherwise a too-coarse approximation looks fast.
+
+`--self-test` evaluates in plaintext and honestly reports `HEStd_NotSet`, so it
+round-trips the contract *and* is rejected. That is deliberate: it is the fixture
+that proves the security gate fires.

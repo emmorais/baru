@@ -1995,6 +1995,7 @@ impl Participant {
                         match layer.activation {
                             crate::ml::Activation::Relu => "relu",
                             crate::ml::Activation::Identity => "identity",
+                            crate::ml::Activation::Square => "square",
                         }
                         .to_string(),
                     );

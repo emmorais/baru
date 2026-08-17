@@ -1873,6 +1873,124 @@ until it exists none of these numbers should be quoted against an FHE system.
 
 ---
 
+### VI.7 The FHE arm: HEIR as a baseline, and two gates (2026-08-17)
+
+`baru bench-heir`. **No FHE latency has been measured yet, and this section says
+so rather than implying otherwise.** What exists is the harness and its gates,
+tested end to end; the measurement needs an environment the development machine
+does not have.
+
+**Why HEIR is a baseline and not a target.** HEIR is compiler *infrastructure*.
+Its paper (arXiv:2508.11095) claims generality — "support all mainstream
+techniques… integrate with all major software libraries and hardware
+accelerators" — and reports no private-ML performance evaluation. Beating its
+numbers would not be a result. What it buys is an FHE arm running on **tuned C++**
+(OpenFHE, Lattigo) instead of on Baru's hand-written NTT, which removes the
+confound §1 of the survey concedes — *"absolute figures here are not competitive
+with tuned implementations"* — in the one direction that matters, because the
+objection to "MPC beat our FHE" is that our FHE was ours. It also replaces
+`bench-layer`'s FHE column, which is not an FHE run at all but a per-operation
+constant from `mpcc::fhe_cost` extrapolated through a network profile.
+
+**Both arms run the same network.** `bench-2pc-nn`'s fixture is now the single
+source of truth (`fixture_for` / `input_for` / `argmax_of`), and the FHE arm
+receives it dequantized by the fixed-point scale. A test asserts the float
+evaluation reproduces the *quantized* classification, so the two arms are
+comparable by construction rather than by coincidence.
+
+**Gate 1 — security parameters.** google/heir#1232 reports an MNIST MLP at
+**~30 s and 3 GB with `HEStd_NotSet`** — OpenFHE's "do not check" mode, i.e. no
+security level at all — and **~6 min and 26 GB** at the secure ring dimension. A
+**12× factor** sits between an insecure and a secure baseline, and the insecure
+one is what a casual run produces. `HeirReport::gate` refuses to let a latency be
+quoted unless the run reports `HEStd_{128,192,256}_classic`. This extends
+`crypto::attestations`' discipline — every engine states what it implements, and
+asking for more is an error — to an *external* baseline. **An insecure baseline is
+worse than no baseline**: it manufactures a speedup out of a parameter choice.
+
+**Gate 2, and the harder problem it exposed — an exact ReLU is not expressible on
+the FHE arm at all.** CKKS cannot compare. The MPC arm computes ReLU exactly. So
+the two arms cannot be made to compute the same function by tuning a parameter,
+and the two available choices measure *different things*:
+
+* **Both arms compute `x²`.** Exact on each side, and what Orion does for its
+  MNIST networks. **This is the route taken**, and the worry about it turned out
+  to be unfounded — see the measurement below.
+* **Keep the exact ReLU and approximate it on the FHE arm.** Then the polynomial
+  degree needs justifying and the accuracy it costs needs reporting — Orion
+  measures 2.1% accuracy for 1.77× speed on that axis. Not implemented; `x²` made
+  it unnecessary.
+
+`Refusal::DifferentNetwork` refuses to choose, and is checked **before** every
+other condition: "the two arms computed different functions" is a stronger
+objection than any disagreement in their outputs, and a class disagreement is
+exactly how it would otherwise present — misread as approximation error. Beneath
+it, `Refusal::Disagrees` still requires the FHE arm to reproduce the plaintext
+classification, because timing an approximation that gets the answer wrong is not
+a comparison.
+
+#### `x²` costs the MPC arm nothing, measured
+
+The worry was that switching to `x²` would quietly improve the MPC arm and make
+the comparison flattering: over plain integers `x²` is one multiplication where
+ReLU needs a masked-opening bit decomposition. **In fixed point it is not.**
+Squaring a `Q(s)` value doubles its scale, so the product needs a rescale — and a
+rescale is the same bit decomposition the comparison was. Two per neuron either
+way.
+
+`bench-2pc-nn --activation relu` against `--activation square`, LAN, both
+bit-exact against their own plaintext reference:
+
+| shape | rounds | muls | decomps | online | offline (semi2k) | cold (semi2k) |
+|---|---|---|---|---|---|---|
+| 16x8x4 | 56 | 7 119 | 23 | 112.9 KiB | 25.9 MiB | 25 ms |
+| 16x8x8x8x4 | 92 | 16 927 | 55 | 267.5 KiB | 61.7 MiB | 57 ms |
+
+**Both activations produce these numbers identically** — not approximately, digit
+for digit, on every column and every protocol. Pinned by
+`the_fhe_friendly_activation_costs_the_mpc_arm_nothing`.
+
+Two consequences. The comparison against a CKKS arm is now available **at zero
+cost to the MPC side**, so every finding in §VI.6 carries over unchanged rather
+than needing re-measurement. And the result is worth reporting on its own: the
+"FHE-friendly" activation, chosen in the FHE literature precisely because it
+avoids a comparison, buys a *fixed-point* MPC implementation nothing at all. What
+would make it cheaper is folding the doubled scale into the next layer's rescale
+(shift by `2s` there instead of `s`), which removes the extra decomposition at the
+cost of wider intermediates. Not done; the measured equality is reported instead.
+
+**What is tested, and what is not.** `heir-py` 2026.8.1 was installed (Python
+3.12 via Homebrew) and imports; its `compile` signature was verified by
+introspection and matches what the driver targets. **The wheel still cannot
+evaluate anything**: `heir.compile()` resolves an OpenFHE **C++ install** —
+headers under `/usr/local/include/openfhe`, or the `OPENFHE_INCLUDE_DIR` /
+`OPENFHE_LIB_DIR` / `OPENFHE_LINK_LIBS` variables — and otherwise falls through
+to a config requiring HEIR built with Bazel (`"Could not build development
+config. Did you run bazel?"`). HEIR emits C++ and compiles it per program, so the
+headers are a hard requirement; the PyPI `openfhe` wheel is Python bindings and
+does not satisfy it. The `heir.backends.cleartext` backend is not a shortcut
+either — measured here, its `eval` forwards straight to the original Python
+function and says so in a warning, exercising none of the compiler. A measurement
+therefore needs OpenFHE built from source, or a Bazel build of HEIR (~30 min
+clean). Tested instead:
+the request/report contract through a **real subprocess** (the driver's
+`--self-test` mode evaluates in plaintext and honestly reports `HEStd_NotSet`, so
+it round-trips the contract *and* is rejected — it is the fixture that proves the
+gate fires); the security gate against five insecure level strings and the three
+secure ones; the class-agreement gate on a mismatch; that `latency_ms` excludes
+key generation, which E45 records having wrongly charged to the query and reported
+a 37× gap that was 1.8×; that the dequantization divides the scale out of weights
+*and* bias exactly once; and that an absent driver produces an actionable message
+naming `BARU_HEIR_PY` rather than a panic.
+
+**Until a secure HEIR run exists, no number here may be quoted against §VI.6.**
+The next step is an environment with Python ≥3.10 and
+`pip install "heir-py[python,openfhe]"`, and then a **depth sweep** — because
+§VI.6's finding is that depth, not width, is the decisive axis, and depth is what
+forces the bootstrap that dominates FHE latency.
+
+---
+
 ## Part VIII — The cost of active security
 
 *Command:* `baru bench-malicious --n 64 --bits 32`. Both legs run the same

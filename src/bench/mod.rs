@@ -950,6 +950,7 @@ pub mod deep_nn;
 pub mod falcon;
 pub mod fhe_innerprod;
 pub mod gc_compare;
+pub mod heir;
 pub mod hybrid_nn;
 pub mod layer;
 pub mod malicious;
