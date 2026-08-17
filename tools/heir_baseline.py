@@ -52,10 +52,14 @@ Requirements for the real path
 This file itself runs on 3.9 so that ``--self-test`` works anywhere.
 """
 
+import io
 import json
+import os
+import re
 import statistics
 import sys
 import time
+from contextlib import redirect_stderr, redirect_stdout
 
 # The only security levels that count as secure. `HEStd_NotSet` is OpenFHE's
 # "do not check" mode and is the trap google/heir#1232 fell into.
@@ -66,20 +70,27 @@ def relu(v):
     return v if v > 0.0 else 0.0
 
 
-def forward_plain(layers, x):
-    """Float reference forward pass — the same arithmetic CKKS approximates."""
+def forward_plain(layers, x, activation="relu"):
+    """Float reference forward pass — the same arithmetic CKKS approximates.
+
+    `activation` overrides the per-layer tag for hidden layers, so `--self-test`
+    evaluates the *same* function the FHE arm would and can therefore be used to
+    tell a genuine FHE error apart from a float-versus-fixed-point divergence.
+    """
     cur = list(x)
     for layer in layers:
         pre = [
             sum(w * v for w, v in zip(row, cur)) + b
             for row, b in zip(layer["weights"], layer["bias"])
         ]
-        if layer["activation"] == "relu":
-            cur = [relu(v) for v in pre]
-        elif layer["activation"] == "identity":
+        if layer["activation"] == "identity":
             cur = pre
+        elif activation == "square":
+            cur = [v * v for v in pre]
+        elif activation == "relu":
+            cur = [relu(v) for v in pre]
         else:
-            raise ValueError("unknown activation %r" % (layer["activation"],))
+            raise ValueError("unknown activation %r" % (activation,))
     return cur
 
 
@@ -102,7 +113,8 @@ def fail(msg, **extra):
 
 def self_test(req):
     """Plaintext evaluation, honestly labelled as not a measurement."""
-    classes = [argmax(forward_plain(req["layers"], x)) for x in req["inputs"]]
+    act = req.get("activation", "relu")
+    classes = [argmax(forward_plain(req["layers"], x, act)) for x in req["inputs"]]
     json.dump(
         {
             "ok": True,
@@ -114,10 +126,10 @@ def self_test(req):
             # Honest, and therefore rejected by the caller's security gate. That
             # rejection is the point of this mode.
             "security_level": "HEStd_NotSet",
-            # `forward_plain` computes an exact ReLU, so this is what the run
-            # actually evaluated — echoed back so the caller's activation check
-            # has something real to compare and does not silently skip.
-            "activation": "relu",
+            # What the run actually evaluated — echoed back so the caller's
+            # activation check has something real to compare against and does not
+            # silently skip.
+            "activation": act,
             "activation_degree": 0,
             "keygen_ms": 0.0,
             "encrypt_ms": 0.0,
@@ -133,45 +145,174 @@ def self_test(req):
     return 0
 
 
-def build_source(layers, in_dim, activation):
-    """Emit the network as a `Secret`-annotated Python function, as text.
+# OpenFHE's own default when `SetSecurityLevel` is not called. Verified in the
+# installed headers (`pke/scheme/gen-cryptocontext-params-defaults.h`:
+# `constexpr SecurityLevel securityLevel = HEStd_128_classic;`) rather than
+# assumed -- and it matters, because HEIR's emitted C++ sets only the
+# multiplicative depth and the plaintext modulus, never the security level.
+OPENFHE_DEFAULT_LEVEL = "HEStd_128_classic"
 
-    HEIR's Python frontend compiles a *type-annotated function* — the documented
-    entry point is a decorator over `Secret[...]` arguments, not a Torch module.
-    (The Torch path in HEIR's ML pipeline goes torch-mlir -> linalg MLIR text and
-    enters through `compile(mlir_str=...)`, a different door.) Weights are
-    plaintext, so they are inlined as literals and only the input is secret.
+
+def configure_openfhe_env():
+    """Derive the OPENFHE_* variables HEIR needs from a single prefix.
+
+    HEIR resolves OpenFHE by scanning `/usr/local` and `/usr`, or by reading
+    `OPENFHE_INCLUDE_DIR` / `OPENFHE_LIB_DIR` / `OPENFHE_LINK_LIBS`. A build
+    installed anywhere else needs those three set, which is fiddly enough to be
+    worth doing here from `BARU_OPENFHE_PREFIX` instead of asking every caller to
+    export four variables in the right shape.
     """
-    lines = ["def _net(x: Secret[Tensor[[%d], F32]]):" % in_dim]
-    cur = ["x[%d]" % i for i in range(in_dim)]
+    prefix = os.environ.get("BARU_OPENFHE_PREFIX")
+    if not prefix or os.environ.get("OPENFHE_INCLUDE_DIR"):
+        return
+    inc = os.path.join(prefix, "include", "openfhe")
+    lib = os.path.join(prefix, "lib")
+    if not os.path.isdir(inc):
+        return
+    os.environ["OPENFHE_INCLUDE_DIR"] = ":".join([
+        inc,
+        os.path.join(inc, "core"),
+        os.path.join(inc, "pke"),
+        os.path.join(inc, "binfhe"),
+        os.path.join(prefix, "include"),
+    ])
+    os.environ["OPENFHE_LIB_DIR"] = lib
+    os.environ.setdefault(
+        "OPENFHE_LINK_LIBS", "OPENFHEpke:OPENFHEcore:OPENFHEbinfhe:omp"
+    )
+    # The emitted C++ is linked with `-L$OPENFHE_LIB_DIR` only, so libomp has to
+    # be reachable from there. A symlink is the least surprising way to do that.
+    omp = os.environ.get(
+        "BARU_LIBOMP_DYLIB", "/opt/homebrew/opt/libomp/lib/libomp.dylib"
+    )
+    link = os.path.join(lib, "libomp.dylib")
+    if os.path.exists(omp) and not os.path.exists(link):
+        try:
+            os.symlink(omp, link)
+        except OSError as e:
+            sys.stderr.write(
+                "could not link libomp into the OpenFHE lib dir: %r\n" % (e,)
+            )
+    existing = os.environ.get("DYLD_LIBRARY_PATH", "")
+    os.environ["DYLD_LIBRARY_PATH"] = ":".join(
+        [q for q in [lib, os.path.dirname(omp), existing] if q]
+    )
+
+
+def emitted_params(debug_output):
+    """Read the parameters HEIR actually compiled in, out of its emitted C++.
+
+    There is no Python-side accessor: the compiled object exposes only
+    `compilation_result`, `eval`, `setup`, `decrypt_result` and `original`, and
+    `compilation_result` carries no crypto parameters. So the ground truth is the
+    generated `.cpp`, which `debug=True` leaves on disk and names on stderr.
+
+    Returns `(security_level, source, depth, plaintext_modulus)`.
+    """
+    level, source, depth, ptmod = None, "unknown", None, None
+    for path in re.findall(r"(\S+\.cpp)", debug_output):
+        if not os.path.exists(path) or path.endswith("_bindings.cpp"):
+            continue
+        with open(path) as fh:
+            cpp = fh.read()
+        m = re.search(r"SetSecurityLevel\(\s*([A-Za-z0-9_]+)\s*\)", cpp)
+        if m:
+            level, source = m.group(1), "set by HEIR"
+        else:
+            # HEIR does not call SetSecurityLevel, so OpenFHE's own default
+            # applies. Reported as such rather than silently as a measurement.
+            level, source = OPENFHE_DEFAULT_LEVEL, "OpenFHE default (HEIR sets none)"
+        m = re.search(r"SetMultiplicativeDepth\(\s*(\d+)\s*\)", cpp)
+        depth = int(m.group(1)) if m else None
+        m = re.search(r"SetPlaintextModulus\(\s*(\d+)\s*\)", cpp)
+        ptmod = int(m.group(1)) if m else None
+        break
+    return level, source, depth, ptmod
+
+
+def _dense_1d(vals):
+    return "[" + ", ".join("%.9e" % v for v in vals) + "]"
+
+
+def _dense_2d(rows):
+    return "[" + ", ".join(_dense_1d(r) for r in rows) + "]"
+
+
+def build_mlir(layers, activation, name="net"):
+    """Emit the network as `linalg` MLIR on tensors with a secret input.
+
+    **Why MLIR and not the decorator.** HEIR's Python frontend runs the function
+    through numba, and its supported surface does not include what a dense layer
+    needs: measured on 2026.8.1, tensor subscripting (`x[0]`) raises
+    "Unsupported IR Element: getitem", `@` raises "Extension handling for
+    non-integer (e.g., floats, tensors) types is not yet supported", and
+    `np.sum` / `np.matmul` are unsupported. Elementwise tensor ops (`x * x`) do
+    work. So a matvec is not expressible there at all.
+
+    `linalg` on tensors is the level HEIR's ML pipeline actually targets -- the
+    Torch route reaches it via torch-mlir -- and `compile(mlir_str=...)` is the
+    door to it. Writing the MLIR directly skips the torch-mlir dependency
+    entirely.
+
+    Conventions that took measurement to pin down: the argument attribute is
+    `{secret.secret}`, the generated encryptor is named after the *argument*
+    (`encrypt_arg_0`, with an underscore), and `arith.addf`/`arith.mulf` are
+    elementwise on shaped types so the bias add and the squaring need no loop.
+    """
+    lines = ["module {"]
+    in_dim = len(layers[0]["weights"][0])
+    out_dim = len(layers[-1]["weights"])
+    lines.append(
+        "  func.func @%s(%%arg0: tensor<%dxf32> {secret.secret}) -> tensor<%dxf32> {"
+        % (name, in_dim, out_dim)
+    )
+    lines.append("    %zero = arith.constant 0.0 : f32")
+    cur, cur_dim = "%arg0", in_dim
     for li, layer in enumerate(layers):
-        for oi, (row, b) in enumerate(zip(layer["weights"], layer["bias"])):
-            terms = [
-                "%.17g * %s" % (w, v) for w, v in zip(row, cur) if w != 0.0
-            ]
-            body = " + ".join(terms) if terms else "0.0"
-            lines.append("    p%d_%d = %s + %.17g" % (li, oi, body, b))
-        names = []
-        for oi in range(len(layer["weights"])):
-            pre = "p%d_%d" % (li, oi)
-            if layer["activation"] == "identity":
-                names.append(pre)
-            elif activation == "square":
-                lines.append("    h%d_%d = %s * %s" % (li, oi, pre, pre))
-                names.append("h%d_%d" % (li, oi))
-            else:
-                raise ValueError("unsupported activation %r" % (activation,))
-        cur = names
-    # One output: the logit vector, returned as a tuple so the caller can argmax.
-    lines.append("    return (%s,)" % ", ".join(cur))
+        n_out = len(layer["weights"])
+        lines.append(
+            "    %%w%d = arith.constant dense<%s> : tensor<%dx%dxf32>"
+            % (li, _dense_2d(layer["weights"]), n_out, cur_dim)
+        )
+        lines.append(
+            "    %%b%d = arith.constant dense<%s> : tensor<%dxf32>"
+            % (li, _dense_1d(layer["bias"]), n_out)
+        )
+        lines.append("    %%e%d = tensor.empty() : tensor<%dxf32>" % (li, n_out))
+        lines.append(
+            "    %%f%d = linalg.fill ins(%%zero : f32) outs(%%e%d : tensor<%dxf32>)"
+            " -> tensor<%dxf32>" % (li, li, n_out, n_out)
+        )
+        lines.append(
+            "    %%m%d = linalg.matvec ins(%%w%d, %s : tensor<%dx%dxf32>,"
+            " tensor<%dxf32>) outs(%%f%d : tensor<%dxf32>) -> tensor<%dxf32>"
+            % (li, li, cur, n_out, cur_dim, cur_dim, li, n_out, n_out)
+        )
+        lines.append(
+            "    %%p%d = arith.addf %%m%d, %%b%d : tensor<%dxf32>" % (li, li, li, n_out)
+        )
+        if layer["activation"] == "identity":
+            cur = "%%p%d" % li
+        elif activation == "square":
+            lines.append(
+                "    %%h%d = arith.mulf %%p%d, %%p%d : tensor<%dxf32>"
+                % (li, li, li, n_out)
+            )
+            cur = "%%h%d" % li
+        else:
+            raise ValueError("unsupported activation %r" % (activation,))
+        cur_dim = n_out
+    lines.append("    return %s : tensor<%dxf32>" % (cur, cur_dim))
+    lines.append("  }")
+    lines.append("}")
     return "\n".join(lines)
 
 
 def run_heir(req):
+    configure_openfhe_env()
     try:
         import heir
         from heir import compile as heir_compile
-        from heir.mlir import F32, Secret, Tensor
     except ImportError as e:
         return fail(
             "heir is not importable (%s). Install it with:\n"
@@ -181,6 +322,11 @@ def run_heir(req):
             "request/report contract without it."
             % (e, sys.version_info[0], sys.version_info[1])
         )
+
+    try:
+        import numpy as np
+    except ImportError as e:
+        return fail("numpy is required for the FHE arm: %r" % (e,))
 
     scheme = req.get("scheme", "ckks")
     activation = req.get("activation", "square")
@@ -210,9 +356,8 @@ def run_heir(req):
             "both arms."
         )
 
-    in_dim = len(layers[0]["weights"][0])
     try:
-        src = build_source(layers, in_dim, activation)
+        src = build_mlir(layers, activation)
     except ValueError as e:
         return fail(str(e))
 
@@ -236,38 +381,44 @@ def run_heir(req):
     except Exception as e:  # noqa: BLE001 - optional, and the message is useful
         sys.stderr.write("could not construct the OpenFHE backend: %r\n" % (e,))
 
-    ns = {"Secret": Secret, "Tensor": Tensor, "F32": F32}
-    try:
-        exec(compile(src, "<heir-net>", "exec"), ns)  # noqa: S102
-    except Exception as e:  # noqa: BLE001
-        return fail("the generated network does not compile as Python: %r" % (e,))
+    # `debug=True` is what leaves the emitted C++ on disk and names it, which is
+    # the only way to read back the crypto parameters HEIR actually compiled in
+    # (see `emitted_params`). Its chatter is captured rather than printed, because
+    # stdout is the report channel.
+    kwargs = {"mlir_str": src, "scheme": scheme, "debug": True}
+    if opts:
+        kwargs["heir_opt_options"] = opts
+    if backend is not None:
+        kwargs["backend"] = backend
 
+    chatter = io.StringIO()
     t0 = time.perf_counter()
     try:
-        kwargs = {"scheme": scheme, "heir_opt_options": opts} if opts else {"scheme": scheme}
-        if backend is not None:
-            kwargs["backend"] = backend
-        fn = heir_compile(**kwargs)(ns["_net"])
+        with redirect_stdout(chatter), redirect_stderr(chatter):
+            fn = heir_compile(**kwargs)
     except Exception as e:  # noqa: BLE001 - the message is the useful artifact
         return fail(
-            "heir.compile failed: %r\n"
-            "The generated function was:\n%s" % (e, src)
+            "heir.compile failed: %r\nGenerated MLIR:\n%s\nHEIR output:\n%s"
+            % (e, src, chatter.getvalue()[-3000:])
         )
     compile_ms = (time.perf_counter() - t0) * 1e3
+    level, level_source, depth, ptmod = emitted_params(chatter.getvalue())
 
     try:
         t0 = time.perf_counter()
-        fn.setup()
+        with redirect_stdout(chatter), redirect_stderr(chatter):
+            fn.setup()
         keygen_ms = (time.perf_counter() - t0) * 1e3
     except Exception as e:  # noqa: BLE001
         return fail("key setup failed: %r" % (e,))
 
     repeats = max(1, int(req.get("repeats", 1)))
     enc_ms, eval_ms, dec_ms, classes, ct_bytes = [], [], [], [], 0
+    all_logits, ref_logits = [], []
     for x in req["inputs"]:
         try:
             t0 = time.perf_counter()
-            ct = fn.encrypt_x(x)
+            ct = fn.encrypt_arg_0(np.asarray(x, dtype=np.float32))
             enc_ms.append((time.perf_counter() - t0) * 1e3)
 
             best = None
@@ -284,18 +435,18 @@ def run_heir(req):
         except Exception as e:  # noqa: BLE001
             return fail("homomorphic evaluation failed: %r" % (e,))
 
-        classes.append(argmax(list(logits)))
+        vec = [float(v) for v in np.asarray(logits).reshape(-1)]
+        classes.append(argmax(vec))
+        all_logits.append(vec)
+        # The float reference for the same input, so a disagreement can be read as
+        # a margin rather than guessed at: a near-tie flipped by CKKS noise is a
+        # different finding from a wrong computation.
+        ref_logits.append(forward_plain(layers, x, activation))
         try:
             ct_bytes = max(ct_bytes, len(bytes(ct)))
         except Exception:  # noqa: BLE001 - size is nice to have, not load-bearing
             pass
 
-    # Whatever HEIR actually used, not what was asked for. If it does not report
-    # a security level the caller refuses the number, which is the correct
-    # outcome for an unverified configuration.
-    params = getattr(fn, "parameters", None)
-    level = getattr(params, "security_level", None)
-    ring = getattr(params, "ring_dim", None) or getattr(params, "ring_dimension", 0) or 0
 
     json.dump(
         {
@@ -304,8 +455,11 @@ def run_heir(req):
             "heir_version": getattr(heir, "__version__", "unknown"),
             "scheme": scheme,
             "backend": req.get("backend", "openfhe"),
-            "ring_dim": int(ring),
+            "ring_dim": 0,
             "security_level": str(level) if level else "HEStd_NotSet",
+            "security_level_source": level_source,
+            "multiplicative_depth": depth,
+            "plaintext_modulus": ptmod,
             "activation": activation,
             "activation_degree": 2 if activation == "square" else 0,
             "heir_opt_options": opts,
@@ -316,6 +470,8 @@ def run_heir(req):
             "decrypt_ms": statistics.median(dec_ms),
             "ciphertext_bytes": ct_bytes,
             "classes": classes,
+            "logits": all_logits,
+            "reference_logits": ref_logits,
             "notes": "eval_ms is the min over %d repeats then the median over "
             "inputs; keygen excluded. activation=%s" % (repeats, activation),
         },

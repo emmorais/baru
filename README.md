@@ -281,7 +281,7 @@ Benchmarks (`baru bench-<name>`; all accept `--json`, most accept
 | `bench-ot`, `bench-psi` | OT (base vs IKNP), DH-PSI |
 | `bench-layer`, `bench-net` | the MPC↔FHE crossover; the cost model against a real socket |
 | `bench-2pc-nn` | a whole private classifier at a **matched threat model** — 2-party dishonest majority, the setting where a comparison against single-server FHE is commensurable. Reports warm *and* cold |
-| `bench-heir` | drives [HEIR](https://github.com/google/heir) → OpenFHE as the FHE arm of that comparison, so the baseline is tuned C++ rather than our own NTT. Refuses to quote a latency at insecure parameters, or one whose classification disagrees. Needs Python ≥3.10; `--self-test` exercises the contract without it |
+| `bench-heir` | drives [HEIR](https://github.com/google/heir) → OpenFHE as the FHE arm of that comparison, so the baseline is tuned C++ rather than our own NTT. Sweeps **depth**, the axis that decides whether FHE must bootstrap. Refuses to quote a latency at insecure parameters, on a disagreeing classification, or when the two arms computed different functions. Needs Python ≥3.10 and an OpenFHE build — see [`tools/README.md`](tools/README.md); `--self-test` exercises the contract without either |
 | `bench-circuit`, `bench-backend-aware`, `bench-compiled-nn` | circuit generation, per-backend rewriting, compiled vs hand-written |
 | `bench-abstraction`, `bench-gc-compare`, `bench-mixed-layer` | the abstraction tax; garbled vs arithmetic nonlinearities; mixed protocols |
 | `bench-cohort`, `bench-cohort-eval` | cohort-conditioned private evaluation over the encrypted store |

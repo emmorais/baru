@@ -71,43 +71,42 @@
 //! actionable message rather than a panic, and the tests probe-and-skip so CI
 //! stays hermetic (CI installs no Python).
 //!
-//! # Status, and the real blocker
+//! # Status: measured, and what it took
 //!
-//! **No FHE numbers have been measured yet**, and the reason is worth recording
-//! because it is not the obvious one.
+//! **This produces a real, gated FHE measurement.** Getting there needed three
+//! things the documentation does not say, each found by measurement:
 //!
-//! `heir-py` 2026.8.1 installs and imports fine (Python >= 3.10 — it ships
-//! `cp310-abi3` wheels only, so a 3.9 interpreter fails at `pip` time). The
-//! signature was verified by introspection and matches what this module targets:
+//! 1. **`heir-py` alone cannot evaluate anything.** `heir.compile()` resolves an
+//!    OpenFHE *C++ install* — headers under `/usr/local/include/openfhe` or the
+//!    `OPENFHE_INCLUDE_DIR` / `OPENFHE_LIB_DIR` / `OPENFHE_LINK_LIBS` variables —
+//!    and otherwise fails with `"Could not build development config. Did you run
+//!    bazel?"`. HEIR emits C++ and compiles it per program, so the headers are a
+//!    hard requirement. The PyPI `openfhe` wheel does not satisfy it (Python
+//!    bindings, not a toolchain), there is no Homebrew formula, and
+//!    `heir.backends.cleartext` is not a shortcut — its `eval` forwards straight
+//!    to the original Python function and says so in a warning. OpenFHE was built
+//!    from source; `BARU_OPENFHE_PREFIX` points the driver at it.
+//! 2. **The decorator frontend is not the ML path.** It runs the function through
+//!    numba, and a dense layer is not expressible there: measured on 2026.8.1,
+//!    `x[0]` raises "Unsupported IR Element: getitem", `@` raises "Extension
+//!    handling for non-integer (e.g., floats, tensors) types is not yet
+//!    supported", and `np.sum`/`np.matmul` are unsupported. Elementwise tensor
+//!    ops do work. The driver therefore emits **`linalg` MLIR** and uses
+//!    `compile(mlir_str=...)` — the level HEIR's ML pipeline actually targets,
+//!    which the Torch route reaches via torch-mlir. Going direct skips torch
+//!    entirely.
+//! 3. **HEIR never sets a security level.** Its emitted C++ calls only
+//!    `SetMultiplicativeDepth` and `SetPlaintextModulus`, so the level in force is
+//!    OpenFHE's own default, which its headers pin at `HEStd_128_classic`
+//!    (`gen-cryptocontext-params-defaults.h`). The driver reads the emitted C++
+//!    and reports the level *and its source*, because "128-bit because someone
+//!    chose it" and "128-bit because nobody chose anything" are different claims.
+//!    This also corrects the framing around google/heir#1232: the `HEStd_NotSet`
+//!    there was a **user's explicit choice**, not HEIR's default — so the gate
+//!    catches a real mistake, but not one a casual run makes.
 //!
-//! ```text
-//! compile(mlir_str=None, scheme="bgv", backend=None, config=None,
-//!         debug=False, heir_opt_options=None)
-//! ```
-//!
-//! **But the wheel cannot evaluate anything on its own.** `heir.compile()` calls
-//! `openfhe_config.resolve_config()`, which looks for an OpenFHE **C++ install**
-//! — headers under `/usr/local/include/openfhe` or `/usr/include/openfhe`, or the
-//! `OPENFHE_INCLUDE_DIR` / `OPENFHE_LIB_DIR` / `OPENFHE_LINK_LIBS` environment
-//! variables — and otherwise falls through to a *development* config that needs
-//! HEIR itself built with Bazel, failing with `"Could not build development
-//! config. Did you run bazel?"`. HEIR emits C++ and compiles it per program, so
-//! the headers are a hard requirement, not a convenience. The PyPI `openfhe`
-//! wheel does not satisfy it: it is Python bindings, not an installed toolchain.
-//!
-//! There is also a `heir.backends.cleartext` backend, and it is **not** a
-//! shortcut: measured here, `eval` simply forwards to the original Python
-//! function and prints a warning saying so. It exercises none of the compiler.
-//!
-//! So a measurement needs one of: OpenFHE built from source and installed (then
-//! the `OPENFHE_*` variables), or a Bazel build of HEIR (~30 min clean, per its
-//! README).
-//!
-//! What *is* tested: the request/report contract through a real subprocess (the
-//! script's `--self-test` mode), the security gate firing on `HEStd_NotSet`, the
-//! class-agreement gate on a mismatch, the different-activation gate, and the
-//! actionable error when the script is absent. Until a secure run exists, **no
-//! number from here may be quoted against `bench-2pc-nn`**.
+//! Requires `BARU_PYTHON` (>= 3.10, `heir-py` ships `cp310-abi3` wheels only) and
+//! `BARU_OPENFHE_PREFIX`. Without them the command explains what is missing.
 
 use std::io::Write;
 use std::process::{Command, Stdio};
@@ -169,6 +168,22 @@ pub struct HeirReport {
     pub ring_dim: u64,
     #[serde(default)]
     pub security_level: String,
+    /// Where the level came from: set by HEIR, or OpenFHE's own default.
+    ///
+    /// This distinction is load-bearing. HEIR's emitted C++ sets only
+    /// `SetMultiplicativeDepth` and `SetPlaintextModulus` — it never calls
+    /// `SetSecurityLevel` — so the level in force is OpenFHE's default, which its
+    /// headers pin at `HEStd_128_classic`. Reported rather than silently folded
+    /// into the level, because "128-bit because someone chose it" and "128-bit
+    /// because nobody chose anything" are different claims.
+    #[serde(default)]
+    pub security_level_source: String,
+    /// The multiplicative depth HEIR compiled in — the number that decides
+    /// whether a deeper network needs a bootstrap.
+    #[serde(default)]
+    pub multiplicative_depth: Option<u32>,
+    #[serde(default)]
+    pub plaintext_modulus: Option<u64>,
     /// The activation the FHE arm actually used, echoed back so
     /// [`HeirReport::gate_with`] can check both arms computed the same function.
     #[serde(default)]
@@ -190,6 +205,14 @@ pub struct HeirReport {
     pub ciphertext_bytes: u64,
     #[serde(default)]
     pub classes: Vec<i64>,
+    /// The decrypted logit vector per input, and the float reference for the same
+    /// input. Carried so a classification disagreement can be read as a **margin**
+    /// rather than guessed at: a near-tie flipped by CKKS noise is a different
+    /// finding from a wrong computation, and only the numbers distinguish them.
+    #[serde(default)]
+    pub logits: Vec<Vec<f64>>,
+    #[serde(default)]
+    pub reference_logits: Vec<Vec<f64>>,
     #[serde(default)]
     pub notes: String,
 }
@@ -233,23 +256,20 @@ impl std::fmt::Display for Refusal {
                 f,
                 "the FHE arm classified {got:?} against the plaintext reference's \
                  {want:?}. CKKS approximates ReLU by a polynomial, so a disagreement \
-                 means the degree is too low — raise `--degree`. Timing an \
+                 means the approximation or the CKKS precision is insufficient. \
+                 Timing an \
                  approximation that gets the answer wrong against an exact protocol is \
                  not a comparison."
             ),
             Refusal::DifferentNetwork { mpc, fhe } => write!(
                 f,
                 "the two arms compute DIFFERENT FUNCTIONS: the MPC arm's activation is \
-                 `{mpc}` and the FHE arm's is `{fhe}`. CKKS cannot compare, so an exact \
-                 ReLU is not expressible on the FHE arm at all — which leaves two \
-                 honest options, and this refuses to pick between them because they \
-                 measure different things. (a) Give BOTH arms `x^2`: exact on each \
-                 side, what Orion does for its MNIST networks, and it removes the \
-                 activation's bit decomposition from the MPC arm entirely — so it also \
-                 changes E48's finding rather than just enabling a comparison. \
-                 (b) Keep the MPC arm's exact ReLU and let the FHE arm approximate it \
-                 with a minimax polynomial, then justify the degree and report the \
-                 accuracy it costs. Neither is a default."
+                 `{mpc}` and the FHE arm's is `{fhe}`. No agreement in their outputs \
+                 can make that comparable. CKKS cannot compare, so an exact ReLU is \
+                 not expressible on the FHE arm — run both arms on `square`, which \
+                 each computes exactly and which is measured to cost the MPC arm \
+                 exactly what ReLU costs, or approximate ReLU on the FHE arm and \
+                 justify the degree."
             ),
         }
     }
@@ -392,7 +412,11 @@ pub fn invoke_at(script: &str, req: &HeirRequest, extra: &[&str]) -> Result<Heir
     }
     let body = serde_json::to_vec(req).map_err(|e| e.to_string())?;
 
-    let mut child = Command::new("python3")
+    // `BARU_PYTHON` because `heir-py` needs >= 3.10 while `python3` on PATH is
+    // often the system interpreter — on the development machine, 3.9. Pointing at
+    // a venv is the normal case, not the exotic one.
+    let python = std::env::var("BARU_PYTHON").unwrap_or_else(|_| "python3".to_string());
+    let mut child = Command::new(&python)
         .arg(script)
         .args(extra)
         .stdin(Stdio::piped())
@@ -401,10 +425,11 @@ pub fn invoke_at(script: &str, req: &HeirRequest, extra: &[&str]) -> Result<Heir
         .spawn()
         .map_err(|e| {
             format!(
-                "cannot run `python3 {script}`: {e}\nHEIR is optional; `bench-2pc-nn` \
+                "cannot run `{python} {script}`: {e}\nHEIR is optional; `bench-2pc-nn` \
                  measures the MPC side without it. For the FHE arm you need Python \
                  >= 3.10 and `pip install \"heir-py[python,openfhe]\"` — heir-py \
-                 publishes cp310-abi3 wheels only."
+                 publishes cp310-abi3 wheels only. Point BARU_PYTHON at that \
+                 interpreter and BARU_OPENFHE_PREFIX at an OpenFHE install."
             )
         })?;
     child
@@ -416,6 +441,27 @@ pub fn invoke_at(script: &str, req: &HeirRequest, extra: &[&str]) -> Result<Heir
     let out = child.wait_with_output().map_err(|e| e.to_string())?;
 
     let text = String::from_utf8_lossy(&out.stdout);
+    // A hard crash — OpenFHE aborting, or the process being killed for memory —
+    // leaves stdout empty, and "EOF while parsing" is a useless way to say that.
+    // Report the exit status instead, since a signal is the whole diagnosis.
+    if text.trim().is_empty() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let how = match out.status.code() {
+            Some(c) => format!("exit code {c}"),
+            None => "killed by a signal".to_string(),
+        };
+        return Err(format!(
+            "the HEIR driver produced no report and terminated with {how}. That is a \
+             crash rather than a refusal — OpenFHE aborting because it cannot find \
+             secure parameters, or the process being killed for memory, both look like \
+             this. stderr was:\n{}",
+            if stderr.trim().is_empty() {
+                "(empty)"
+            } else {
+                stderr.trim()
+            }
+        ));
+    }
     serde_json::from_str::<HeirReport>(text.trim()).map_err(|e| {
         format!(
             "could not parse the HEIR driver's report: {e}\nstdout: {}\nstderr: {}",
@@ -429,7 +475,9 @@ pub fn invoke_at(script: &str, req: &HeirRequest, extra: &[&str]) -> Result<Heir
 
 const USAGE: &str = "usage: baru bench-heir [options]
 
-  --shape A            network shape, `x`-separated dims (default 16x8x4)
+  --shapes A,B         network shapes, `x`-separated dims (default 16x8x4).
+                       Several sweeps DEPTH, which is the axis that decides
+                       whether FHE must bootstrap
   --scheme S           FHE scheme (default ckks)
   --backend B          HEIR exit backend (default openfhe)
   --activation A       how the FHE arm handles a nonlinearity: `square`
@@ -452,7 +500,7 @@ A latency is REFUSED unless the run reports a real security level and reproduces
 the plaintext classification — see this module's docs for why both matter.";
 
 pub fn run_cli(args: &[String]) -> Result<(), String> {
-    let mut shape = vec![16usize, 8, 4];
+    let mut shapes = vec![vec![16usize, 8, 4]];
     let mut scheme = "ckks".to_string();
     let mut backend = "openfhe".to_string();
     let mut activation = "square".to_string();
@@ -471,16 +519,20 @@ pub fn run_cli(args: &[String]) -> Result<(), String> {
             }
             "--json" => json = true,
             "--self-test" => self_test = true,
-            "--shape" => {
+            "--shape" | "--shapes" => {
                 let v = it
                     .next()
-                    .ok_or_else(|| format!("--shape needs a value\n\n{USAGE}"))?;
-                shape = v
-                    .split('x')
-                    .map(|d| {
-                        d.trim()
-                            .parse::<usize>()
-                            .map_err(|_| format!("bad dimension `{d}` in `{v}`"))
+                    .ok_or_else(|| format!("--shapes needs a value\n\n{USAGE}"))?;
+                shapes = v
+                    .split(',')
+                    .map(|one| {
+                        one.split('x')
+                            .map(|d| {
+                                d.trim()
+                                    .parse::<usize>()
+                                    .map_err(|_| format!("bad dimension `{d}` in `{one}`"))
+                            })
+                            .collect::<Result<Vec<usize>, String>>()
                     })
                     .collect::<Result<_, _>>()?;
             }
@@ -508,122 +560,182 @@ pub fn run_cli(args: &[String]) -> Result<(), String> {
             other => return Err(format!("unknown arg {other}\n\n{USAGE}")),
         }
     }
-    if shape.len() < 2 {
-        return Err(format!(
-            "shape needs at least an input and an output\n\n{USAGE}"
-        ));
-    }
-
-    // The same network and the same inputs `bench-2pc-nn` measures, so the two
-    // arms are comparable by construction rather than by coincidence.
-    let net = super::two_party_nn::fixture_for(&shape, scale_bits);
-    let inputs: Vec<Vec<i64>> = (0..n_inputs)
-        .map(|k| super::two_party_nn::input_for(shape[0], scale_bits, k))
-        .collect();
-    let expected: Vec<i64> = inputs
-        .iter()
-        .map(|x| super::two_party_nn::argmax_of(&net.forward(x)))
-        .collect();
-
-    let req = request_for(&net, &inputs, &scheme, &backend, &activation, repeats);
-    let extra: Vec<&str> = if self_test {
-        vec!["--self-test"]
-    } else {
-        vec![]
+    let hidden = match activation.as_str() {
+        "square" => crate::ml::Activation::Square,
+        "relu" | "relu_poly" => crate::ml::Activation::Relu,
+        other => return Err(format!("unknown --activation `{other}`\n\n{USAGE}")),
     };
-    let report = invoke(&req, &extra)?;
 
-    if json {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&report).map_err(|e| e.to_string())?
-        );
-    }
-
-    let label = shape
-        .iter()
-        .map(|d| d.to_string())
-        .collect::<Vec<_>>()
-        .join("x");
-    println!("HEIR as an FHE baseline — {label}, {scheme}/{backend}, activation {activation}");
+    println!("HEIR as an FHE baseline — {scheme}/{backend}, activation {activation}");
     println!(
-        "  heir {}   ring dim {}   security {}",
-        if report.heir_version.is_empty() {
-            "?"
-        } else {
-            &report.heir_version
-        },
-        report.ring_dim,
-        if report.security_level.is_empty() {
-            "(none reported)"
-        } else {
-            &report.security_level
-        }
+        "{:>18} {:>6} {:>10} {:>10} {:>10} {:>10}  status",
+        "shape", "depth", "keygen", "encrypt", "eval", "decrypt"
     );
 
-    // The MPC arm (`bench-2pc-nn`) computes an exact ReLU. Passing that in is what
-    // makes a mismatch surface as "different functions" rather than as a class
-    // disagreement misread as approximation error.
-    match report.gate_with(&expected, Some("relu")) {
-        Ok(()) => {
-            println!(
-                "\n  keygen {:.1} ms (per session, excluded below)\n  \
-                 encrypt {:.1} + eval {:.1} + decrypt {:.1} = {:.1} ms per inference\n  \
-                 ciphertext {} B",
-                report.keygen_ms,
-                report.encrypt_ms,
-                report.eval_ms,
-                report.decrypt_ms,
-                report.latency_ms(),
-                report.ciphertext_bytes
-            );
-            println!(
-                "  classification matches the plaintext reference on all {} inputs",
-                expected.len()
-            );
-            if !report.notes.is_empty() {
-                println!("  note: {}", report.notes);
-            }
-            println!(
-                "\nCompare against `baru bench-2pc-nn --shapes {label}`. Both arms compute the\n\
-                 same function on the same weights; the MPC arm is EXACT and 2-party\n\
-                 dishonest-majority, this arm is single-server. Same corruption model,\n\
-                 different interaction model — FHE lets the client go offline and 2PC\n\
-                 does not."
-            );
-            Ok(())
+    let mut any_quotable = false;
+    // (label, depth, per-inference latency) — NaN latency means it did not produce
+    // a quotable figure, which for a depth sweep is itself the result.
+    let mut rows: Vec<(String, Option<u32>, f64)> = Vec::new();
+
+    for shape in &shapes {
+        if shape.len() < 2 {
+            return Err(format!(
+                "shape needs at least an input and an output\n\n{USAGE}"
+            ));
         }
-        Err(why) => {
-            // Not an error when the user explicitly asked for the plaintext mode:
-            // the refusal *is* the expected outcome, and demonstrating it is the
-            // reason the mode exists.
-            if self_test && why == Refusal::Simulated {
-                println!("\n  REFUSED, as intended: {why}");
+        let label = shape
+            .iter()
+            .map(|d| d.to_string())
+            .collect::<Vec<_>>()
+            .join("x");
+
+        // The same network and inputs `bench-2pc-nn` measures, built with the
+        // *requested* activation — otherwise the reference would be a ReLU
+        // network's classification while the FHE arm evaluated x^2, which is what
+        // the `DifferentNetwork` gate exists to catch.
+        let net = super::two_party_nn::fixture_with(shape, scale_bits, hidden);
+        let inputs: Vec<Vec<i64>> = (0..n_inputs)
+            .map(|k| super::two_party_nn::input_for(shape[0], scale_bits, k))
+            .collect();
+        let expected: Vec<i64> = inputs
+            .iter()
+            .map(|x| super::two_party_nn::argmax_of(&net.forward(x)))
+            .collect();
+
+        let req = request_for(&net, &inputs, &scheme, &backend, &activation, repeats);
+        let extra: Vec<&str> = if self_test {
+            vec!["--self-test"]
+        } else {
+            vec![]
+        };
+
+        // A failure is a row, not the end of the sweep: the depth at which the FHE
+        // arm stops working is the finding, so everything measured before it has to
+        // survive.
+        let report = match invoke(&req, &extra) {
+            Ok(r) => r,
+            Err(e) => {
                 println!(
-                    "  the contract round-tripped and the classification was reproduced on \
-                     all {} inputs,\n  which is what --self-test is for. Install HEIR for a \
-                     real measurement.",
-                    expected.len()
+                    "{label:>18} {:>6} {:>10} {:>10} {:>10} {:>10}  FAILED",
+                    "-", "-", "-", "-", "-"
                 );
-                return Ok(());
+                println!("    {}", e.lines().next().unwrap_or("(no detail)"));
+                rows.push((label, None, f64::NAN));
+                continue;
             }
-            // Print the refusal with real newlines — `main` renders a returned
-            // error through `Debug`, which escapes them, and these messages are
-            // the whole point of the gate.
-            println!("\n  REFUSED: {why}");
-            Err(match why {
-                Refusal::Failed(_) => "the HEIR driver could not run — see above".into(),
-                Refusal::Insecure(l) => format!("insecure security level `{l}` — see above"),
-                Refusal::Disagrees { .. } => {
-                    "the FHE arm computed a different classification — see above".to_string()
+        };
+
+        if json {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&report).map_err(|e| e.to_string())?
+            );
+        }
+
+        let depth_col = report
+            .multiplicative_depth
+            .map(|d| d.to_string())
+            .unwrap_or_else(|| "?".into());
+
+        match report.gate_with(&expected, Some(&activation)) {
+            Ok(()) => {
+                any_quotable = true;
+                println!(
+                    "{label:>18} {depth_col:>6} {:>9.1}ms {:>9.1}ms {:>9.1}ms {:>9.1}ms  ✓ {} verified, {}",
+                    report.keygen_ms,
+                    report.encrypt_ms,
+                    report.eval_ms,
+                    report.decrypt_ms,
+                    expected.len(),
+                    report.security_level
+                );
+                rows.push((label, report.multiplicative_depth, report.latency_ms()));
+            }
+            Err(why) => {
+                println!(
+                    "{label:>18} {depth_col:>6} {:>10} {:>10} {:>10} {:>10}  REFUSED",
+                    "-", "-", "-", "-"
+                );
+                println!("    {why}");
+                if let Refusal::Disagrees { .. } = &why {
+                    for (i, (got, want)) in report
+                        .logits
+                        .iter()
+                        .zip(&report.reference_logits)
+                        .enumerate()
+                    {
+                        let mut sorted = want.clone();
+                        sorted
+                            .sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+                        let margin = if sorted.len() >= 2 {
+                            sorted[0] - sorted[1]
+                        } else {
+                            f64::INFINITY
+                        };
+                        let err = got
+                            .iter()
+                            .zip(want)
+                            .map(|(g, w)| (g - w).abs())
+                            .fold(0.0f64, f64::max);
+                        println!(
+                            "    input {i}: reference top-two margin {margin:.4}, worst CKKS error \
+                             {err:.4} — {}",
+                            if err > margin {
+                                "noise can flip the class"
+                            } else {
+                                "not just noise"
+                            }
+                        );
+                    }
                 }
-                Refusal::Simulated => "plaintext run, not a measurement".into(),
-                Refusal::DifferentNetwork { .. } => {
-                    "the two arms compute different functions — see above".to_string()
-                }
-            })
+                rows.push((label, report.multiplicative_depth, f64::NAN));
+            }
         }
     }
+
+    // Derive the depth story from the rows rather than asserting one beside them.
+    let ran: Vec<&(String, Option<u32>, f64)> = rows.iter().filter(|r| r.2.is_finite()).collect();
+    if ran.len() >= 2 {
+        let (first, last) = (ran[0], ran[ran.len() - 1]);
+        println!(
+            "\n  latency grew {:.1}x from {} to {} as multiplicative depth went {} -> {}",
+            last.2 / first.2,
+            first.0,
+            last.0,
+            first.1.map(|d| d.to_string()).unwrap_or_else(|| "?".into()),
+            last.1.map(|d| d.to_string()).unwrap_or_else(|| "?".into()),
+        );
+    }
+    if !ran.is_empty() && rows.len() > ran.len() {
+        println!(
+            "  and then the FHE arm STOPPED WORKING. HEIR's default pipeline is LEVELED — it\n  \
+             places no bootstraps — so depth is a hard CEILING, not a step. Automatic bootstrap\n  \
+             placement is exactly what Orion (ASPLOS'25) contributes, at ~20 s per bootstrap\n  \
+             (HE-LRM, arXiv 2506.18150), which is where MPC wins on both axes at once."
+        );
+    } else if ran.len() >= 2 {
+        println!("  with no bootstrap needed at any depth measured.");
+    }
+    if !any_quotable && !self_test {
+        return Err("no shape produced a quotable measurement — see the rows above".into());
+    }
+    println!(
+        "\nCompare against `baru bench-2pc-nn --activation {activation} --shapes {}`.\n\
+         Both arms compute the same function on the same weights; the MPC arm is EXACT and\n\
+         2-party dishonest-majority, this arm is single-server. Same corruption model,\n\
+         different interaction model — FHE lets the client go offline and 2PC does not.\n\
+         `eval` excludes keygen, a per-session cost; ciphertext transfer is NOT included.",
+        shapes
+            .iter()
+            .map(|s| s
+                .iter()
+                .map(|d| d.to_string())
+                .collect::<Vec<_>>()
+                .join("x"))
+            .collect::<Vec<_>>()
+            .join(",")
+    );
+    Ok(())
 }
 
 #[cfg(test)]
@@ -640,6 +752,9 @@ mod tests {
             backend: "openfhe".into(),
             ring_dim: 32768,
             security_level: "HEStd_128_classic".into(),
+            security_level_source: "set by HEIR".into(),
+            multiplicative_depth: Some(3),
+            plaintext_modulus: None,
             activation: "relu".into(),
             activation_degree: 0,
             keygen_ms: 100.0,
@@ -648,6 +763,8 @@ mod tests {
             decrypt_ms: 2.0,
             ciphertext_bytes: 1 << 18,
             classes,
+            logits: Vec::new(),
+            reference_logits: Vec::new(),
             notes: String::new(),
         }
     }
@@ -754,7 +871,8 @@ mod tests {
     /// report that as approximation error rather than as the bug it is.
     #[test]
     fn the_request_dequantizes_weights_and_bias_consistently() {
-        let net = super::super::two_party_nn::fixture_for(&[4, 3, 2], 8);
+        let net =
+            super::super::two_party_nn::fixture_with(&[4, 3, 2], 8, crate::ml::Activation::Relu);
         let inputs = vec![super::super::two_party_nn::input_for(4, 8, 0)];
         let req = request_for(&net, &inputs, "ckks", "openfhe", "square", 1);
         let scale = 256.0;
@@ -773,7 +891,8 @@ mod tests {
     /// not a panic — the `db::barudb` convention.
     #[test]
     fn a_missing_driver_says_what_to_do() {
-        let net = super::super::two_party_nn::fixture_for(&[4, 3, 2], 8);
+        let net =
+            super::super::two_party_nn::fixture_with(&[4, 3, 2], 8, crate::ml::Activation::Relu);
         let inputs = vec![super::super::two_party_nn::input_for(4, 8, 0)];
         let req = request_for(&net, &inputs, "ckks", "openfhe", "square", 1);
         let err = invoke_at("/nonexistent/heir_baseline.py", &req, &[]).unwrap_err();
@@ -794,28 +913,53 @@ mod tests {
             return;
         }
         let shape = [6usize, 4, 3];
-        let net = super::super::two_party_nn::fixture_for(&shape, 8);
         let inputs: Vec<Vec<i64>> = (0..3)
             .map(|k| super::super::two_party_nn::input_for(shape[0], 8, k))
             .collect();
-        let expected: Vec<i64> = inputs
-            .iter()
-            .map(|x| super::super::two_party_nn::argmax_of(&net.forward(x)))
-            .collect();
 
-        let req = request_for(&net, &inputs, "ckks", "openfhe", "square", 1);
-        let r = invoke(&req, &["--self-test"]).expect("the self-test path should run");
-        assert!(r.ok, "self-test reported a failure: {:?}", r.error);
-        assert!(r.simulated);
+        // Both activations, because the fixture and the request have to *agree* —
+        // and an earlier version of this test did not, which is exactly the bug
+        // that reached `run_cli`: it built a ReLU network and asked the driver for
+        // `x^2`, so the two arms computed different functions and the class gate
+        // reported it as a disagreement rather than as the wiring error it was.
+        for (act, name) in [
+            (crate::ml::Activation::Relu, "relu"),
+            (crate::ml::Activation::Square, "square"),
+        ] {
+            let net = super::super::two_party_nn::fixture_with(&shape, 8, act);
+            let expected: Vec<i64> = inputs
+                .iter()
+                .map(|x| super::super::two_party_nn::argmax_of(&net.forward(x)))
+                .collect();
 
-        // The float reference must reproduce the fixed-point classification, or
-        // the two arms are not computing the same network and no FHE measurement
-        // would mean anything.
-        assert_eq!(
-            r.classes, expected,
-            "the float evaluation disagrees with the quantized one — the arms differ"
-        );
-        // And it is still refused, which is the gate working.
-        assert_eq!(r.gate(&expected), Err(Refusal::Simulated));
+            let req = request_for(&net, &inputs, "ckks", "openfhe", name, 1);
+            let r = invoke(&req, &["--self-test"]).expect("the self-test path runs");
+            assert!(r.ok, "self-test reported a failure: {:?}", r.error);
+            assert!(r.simulated);
+            assert_eq!(
+                r.activation, name,
+                "the driver must echo the activation back"
+            );
+
+            // The float evaluation must reproduce the fixed-point classification,
+            // or the two arms are not computing the same network and no FHE
+            // measurement would mean anything.
+            assert_eq!(
+                r.classes, expected,
+                "{name}: float and fixed-point disagree — the arms differ"
+            );
+            // Consistent pair: only the plaintext-ness is refused.
+            assert_eq!(r.gate_with(&expected, Some(name)), Err(Refusal::Simulated));
+            // Mismatched pair: refused for the stronger reason, ahead of it.
+            let other = if name == "relu" { "square" } else { "relu" };
+            assert_eq!(
+                r.gate_with(&expected, Some(other)),
+                Err(Refusal::DifferentNetwork {
+                    mpc: other.to_string(),
+                    fhe: name.to_string()
+                }),
+                "{name}: a mismatched activation must outrank every other refusal"
+            );
+        }
     }
 }

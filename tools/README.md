@@ -192,11 +192,55 @@ other end of it.
 | consumed by | `baru bench-heir` |
 | path override | `BARU_HEIR_PY` (defaults to `tools/heir_baseline.py`) |
 | exercise the contract, no HEIR needed | `baru bench-heir --shape 6x4x3 --self-test` |
-| real measurement | `pip install "heir-py[python,openfhe]"`, then `baru bench-heir --shape 16x8x4` |
+| real measurement | see the setup below, then `baru bench-heir --shape 16x8x4 --activation square` |
+| interpreter override | `BARU_PYTHON` (must be >= 3.10) |
+| OpenFHE install | `BARU_OPENFHE_PREFIX` — the driver derives the four `OPENFHE_*` variables from it |
 
 **Python ≥ 3.10 is required for the real path** — `heir-py` publishes
 `cp310-abi3` wheels only. This script itself runs on 3.9 so that `--self-test`
 works anywhere.
+
+### Setting up the real path
+
+`heir-py` alone cannot evaluate anything: `heir.compile()` needs an OpenFHE **C++
+install** (it emits C++ and compiles it per program) and otherwise dies with
+*"Could not build development config. Did you run bazel?"*. The PyPI `openfhe`
+wheel does not satisfy it — that is Python bindings, not a toolchain — and there
+is no Homebrew formula.
+
+```sh
+brew install python@3.12 libomp        # Apple clang ships no omp.h
+python3.12 -m venv venv && ./venv/bin/pip install "heir-py[python,openfhe]" "numpy<2.4"
+
+git clone --depth 1 https://github.com/openfheorg/openfhe-development.git ofhe
+cmake -S ofhe -B ofhe/build -DCMAKE_INSTALL_PREFIX=$PWD/ofhe-install \
+  -DBUILD_UNITTESTS=OFF -DBUILD_EXAMPLES=OFF -DBUILD_BENCHMARKS=OFF \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_CXX_FLAGS=-I/opt/homebrew/opt/libomp/include \
+  -DCMAKE_C_FLAGS=-I/opt/homebrew/opt/libomp/include
+cmake --build ofhe/build -j8 && cmake --install ofhe/build
+
+export BARU_PYTHON=$PWD/venv/bin/python
+export BARU_OPENFHE_PREFIX=$PWD/ofhe-install
+```
+
+The driver derives `OPENFHE_INCLUDE_DIR`, `OPENFHE_LIB_DIR`, `OPENFHE_LINK_LIBS`
+and `DYLD_LIBRARY_PATH` from the prefix, and symlinks libomp into the OpenFHE lib
+dir — the emitted C++ is linked with `-L$OPENFHE_LIB_DIR` only, so `-lomp` has to
+resolve from there.
+
+**`numpy<2.4` is load-bearing**: numba 0.62 refuses newer numpy, and the frontend
+imports numba even on the MLIR path.
+
+### It emits MLIR, not a decorated function
+
+HEIR's Python decorator runs the function through numba, and a dense layer is not
+expressible there — measured on 2026.8.1, `x[0]` is "Unsupported IR Element:
+getitem", `@` is "Extension handling for non-integer types is not yet supported",
+and `np.sum`/`np.matmul` are unsupported. Elementwise tensor ops do work. So the
+driver emits **`linalg` MLIR** and calls `compile(mlir_str=...)`, which is the
+level HEIR's ML pipeline actually targets (the Torch route reaches it via
+torch-mlir; going direct skips torch entirely).
 
 ### Why it refuses things
 

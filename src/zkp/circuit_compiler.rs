@@ -359,6 +359,8 @@ pub enum CVal {
 
 /// Maps variable names to compile-time values.
 type Env = HashMap<String, CVal>;
+/// A stored lambda: its parameter names and its body.
+type Lambda = (Vec<String>, Expr);
 
 /// Maps lambda names to their parameter lists and body, for inlining
 /// named functions bound in let/letrec.
@@ -648,13 +650,25 @@ impl CircuitCompiler {
         private_vars: &[String],
     ) -> Result<CompiledCircuit, String> {
         // Classify user-named variables as witnesses or public inputs.
+        //
+        // The membership tests go through sets rather than `Vec::contains`. The
+        // vectors have to stay vectors — witness *order* is the witness index, so
+        // it is part of the ABI — but scanning them per variable made this
+        // quadratic, and a private-inference program has one variable per weight:
+        // a 784x32 layer alone declares 25 088 of them. Measured on `784x256x10`,
+        // flattening took **36.7 s**, and this loop was most of it.
         let all_vars = self.extract_variables(expr);
+        let private: std::collections::HashSet<&String> = private_vars.iter().collect();
+        let mut known_witnesses: std::collections::HashSet<Wire> =
+            self.witnesses.iter().cloned().collect();
+        let mut known_public: std::collections::HashSet<Wire> =
+            self.public_inputs.iter().cloned().collect();
         for var in &all_vars {
-            if private_vars.contains(var) {
-                if !self.witnesses.contains(var) {
+            if private.contains(var) {
+                if known_witnesses.insert(var.clone()) {
                     self.witnesses.push(var.clone());
                 }
-            } else if !self.public_inputs.contains(var) {
+            } else if known_public.insert(var.clone()) {
                 self.public_inputs.push(var.clone());
             }
         }
@@ -715,8 +729,14 @@ impl CircuitCompiler {
         let all_vars = self.extract_variables(expr);
         // All variables are potential inputs; classification is deferred to
         // the caller (fhe-eval supplies them as plain or cipher maps).
+        //
+        // Deduped through a set, not `Vec::contains` — see the note in `compile`.
+        // This is the path `mpcc::compile` takes, so it is the one a private
+        // network with a variable per weight actually hits.
+        let mut known: std::collections::HashSet<Wire> =
+            self.public_inputs.iter().cloned().collect();
         for v in &all_vars {
-            if !self.public_inputs.contains(v) {
+            if known.insert(v.clone()) {
                 self.public_inputs.push(v.clone());
             }
         }
@@ -804,25 +824,59 @@ impl CircuitCompiler {
         lambdas: &mut LambdaStore,
         flat: &mut Vec<FlatOp>,
     ) -> Result<CVal, String> {
-        let mut child_env = env.clone();
-        let mut child_lam = lambdas.clone();
-        for (name, rhs) in bindings {
-            // If the RHS is a lambda, store it for later inlining
-            // instead of collapsing it to a sentinel wire.
-            // Only fixed-arity lambdas can be inlined; a variadic one is
-            // left to `flatten`, which refuses it with a reason.
-            if let Expr::Lambda(params, None, lam_body) = rhs {
-                child_lam.insert(name.clone(), (params.clone(), *lam_body.clone()));
-            } else {
-                let val = self.flatten(rhs, &mut child_env, &mut child_lam, flat)?;
-                child_env.insert(name.clone(), val);
+        // **Scoped, not cloned.** This used to `env.clone()` and `lambdas.clone()`
+        // per `let`, which is quadratic on the shape that matters: the parser
+        // desugars `let*` into one *nested* `let` per binding, so a program with
+        // `n` bindings performed `n` full clones of an environment holding every
+        // variable in scope. A private network has one variable per weight, so
+        // `784x256x10` cloned a ~203 000-entry map about 530 times — ~10^8 inserts,
+        // and most of the flattening time.
+        //
+        // Instead, shadow in place and restore on the way out. Bindings are still
+        // evaluated in the environment that already contains the earlier ones, so
+        // the `let*` semantics this always had are unchanged; saves are replayed in
+        // reverse so that binding the same name twice restores the pre-`let` value.
+        let mut saved_env: Vec<(String, Option<CVal>)> = Vec::with_capacity(bindings.len());
+        let mut saved_lam: Vec<(String, Option<Lambda>)> = Vec::new();
+
+        let mut run = |me: &mut Self| -> Result<CVal, String> {
+            for (name, rhs) in bindings {
+                // If the RHS is a lambda, store it for later inlining
+                // instead of collapsing it to a sentinel wire.
+                // Only fixed-arity lambdas can be inlined; a variadic one is
+                // left to `flatten`, which refuses it with a reason.
+                if let Expr::Lambda(params, None, lam_body) = rhs {
+                    let prev = lambdas.insert(name.clone(), (params.clone(), *lam_body.clone()));
+                    saved_lam.push((name.clone(), prev));
+                } else {
+                    let val = me.flatten(rhs, env, lambdas, flat)?;
+                    let prev = env.insert(name.clone(), val);
+                    saved_env.push((name.clone(), prev));
+                }
             }
+            let mut result = CVal::Wire(me.emit_const(0, flat));
+            for e in body {
+                result = me.flatten(e, env, lambdas, flat)?;
+            }
+            Ok(result)
+        };
+        let result = run(self);
+
+        // Restore on every path, including the error one — a `let` that failed
+        // half-way must not leave its bindings visible to an outer scope.
+        for (name, prev) in saved_env.into_iter().rev() {
+            match prev {
+                Some(v) => env.insert(name, v),
+                None => env.remove(&name),
+            };
         }
-        let mut result = CVal::Wire(self.emit_const(0, flat));
-        for e in body {
-            result = self.flatten(e, &mut child_env, &mut child_lam, flat)?;
+        for (name, prev) in saved_lam.into_iter().rev() {
+            match prev {
+                Some(v) => lambdas.insert(name, v),
+                None => lambdas.remove(&name),
+            };
         }
-        Ok(result)
+        result
     }
 
     /// A sequence: every subexpression flattened, the last one's value returned.

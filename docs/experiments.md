@@ -1864,12 +1864,64 @@ slow because preprocessing" is a statement about OT, not about MPC.
 **Scope, stated.** Wall clock is computed from measured counts through a network
 profile, not measured on a socket — the same status as `bench-layer`, and
 `bench-net` validates the model to 13.6% worst case. `dealer` is printed as a
-lower bound and marked, not as an option. Shapes run to at least `784x64x10`; the
-practical ceiling is `mpcc::lower` being **scalar**, so compilation takes ~50–60 s
-at 784 inputs while the protocol run itself is milliseconds. That is a limitation
-of the IR, not of the protocols, and the roadmap already names SIMD-vectorized
-instructions as the open item. **No FHE arm yet** — that is the next stage, and
-until it exists none of these numbers should be quoted against an FHE system.
+lower bound and marked, not as an option.
+
+**A correction, and it was my own diagnosis that was wrong.** This section
+originally said "the practical ceiling is `mpcc::lower` being **scalar**, so
+compilation takes ~50–60 s at 784 inputs while the protocol run itself is
+milliseconds", and named IR vectorization as the fix. **Both halves were false,
+and neither had been measured.** Profiling the phases at `784x32x10`:
+
+| phase | time |
+|---|---|
+| generate source | 72 ms |
+| parse | 11 ms |
+| flatten (`CircuitCompiler`) | 681 ms |
+| lower (`mpcc::lower`) | 28 ms |
+| schedule | 1 ms |
+| **execute, dealer** | 435 ms |
+| **execute, semi2k** | **45.8 s** |
+| execute, lowgear | 1.02 s |
+
+So compilation was **0.8 s**, not 50; `mpcc::lower` — the thing blamed — was
+**28 ms of it**; and the 50–60 s was **Semi2k generating 55 420 real IKNP-OT
+triples**. LowGear does the same work in 1.02 s, **45× faster**, which is the
+per-triple SHE-versus-OT gap of §VI.5 showing up as wall clock at scale.
+
+#### Three quadratics, all in the one dimension the repo never tested
+
+Profiling further found that flatten *and* execute were both superlinear. All
+three causes were quadratic in the **number of variables** — which is exactly the
+dimension a private network grows in, one variable per weight, and therefore the
+one dimension a repo full of small test programs never exercised.
+
+| where | what it did | effect at `784x256x10` |
+|---|---|---|
+| `CircuitCompiler::{compile, compile_fhe}` | deduped variables with `Vec::contains` on a growing `Vec` | flatten 36.7 s → 9.3 s (**3.9×**) |
+| `CircuitCompiler::flatten_let` | `env.clone()` per `let` — and the parser desugars `let*` into one **nested** `let` per binding, so ~530 clones of a 203 000-entry map | 9.3 s → **0.68 s** (**14×**; 54× overall, and now linear) |
+| `vm::execute` | found each input's owning party with `prog.code.iter().find(..)` — 203 000 inputs against 611 694 instructions, ~10¹¹ operations | execute 73.2 s → **0.32 s** (**232×**) |
+
+End to end at `784x256x10`: **112.6 s → 5.25 s, 21×**, and every phase is now
+linear in width (doubling the hidden layer roughly doubles each). Guarded by
+`the_pipeline_stays_near_linear_in_width`, which asserts a growth *ratio* under 3×
+rather than an absolute budget — a reintroduced quadratic shows as ~4×.
+
+The lesson is the one this document keeps relearning: **the bottleneck was named
+without being profiled.** "Vectorize the IR" was a plausible story that survived
+because nobody timed the phases, and the actual fixes were a `HashSet`, a scope
+restore, and a one-pass index — none of them in the IR at all.
+
+**The ceiling moved accordingly.** `784x128x10` — an MNIST-shaped MLP — now runs
+bit-exact at **40 ms cold on LowGear** (524 ms on Semi2k, 9 ms warm). SIMD
+vectorization remains a legitimate future item for *communication* batching, but it
+is no longer what stands between this benchmark and a realistic network.
+
+**One earlier finding needs qualifying at this scale.** "The layers are 1.7% of
+the multiplications" holds for the tiny shapes it was measured on; at
+`784x128x10` the layers are **55.0%** (101 632 of 184 827), because MACs grow with
+width while decompositions grow with neuron count. The benchmark derives the split
+per row, so it reports the right number for whatever it ran — but the 1.7% figure
+is a small-network statement, not a general one.
 
 ---
 
@@ -1959,35 +2011,123 @@ would make it cheaper is folding the doubled scale into the next layer's rescale
 (shift by `2s` there instead of `s`), which removes the extra decomposition at the
 cost of wider intermediates. Not done; the measured equality is reported instead.
 
-**What is tested, and what is not.** `heir-py` 2026.8.1 was installed (Python
-3.12 via Homebrew) and imports; its `compile` signature was verified by
-introspection and matches what the driver targets. **The wheel still cannot
-evaluate anything**: `heir.compile()` resolves an OpenFHE **C++ install** —
-headers under `/usr/local/include/openfhe`, or the `OPENFHE_INCLUDE_DIR` /
-`OPENFHE_LIB_DIR` / `OPENFHE_LINK_LIBS` variables — and otherwise falls through
-to a config requiring HEIR built with Bazel (`"Could not build development
-config. Did you run bazel?"`). HEIR emits C++ and compiles it per program, so the
-headers are a hard requirement; the PyPI `openfhe` wheel is Python bindings and
-does not satisfy it. The `heir.backends.cleartext` backend is not a shortcut
-either — measured here, its `eval` forwards straight to the original Python
-function and says so in a warning, exercising none of the compiler. A measurement
-therefore needs OpenFHE built from source, or a Bazel build of HEIR (~30 min
-clean). Tested instead:
-the request/report contract through a **real subprocess** (the driver's
-`--self-test` mode evaluates in plaintext and honestly reports `HEStd_NotSet`, so
-it round-trips the contract *and* is rejected — it is the fixture that proves the
-gate fires); the security gate against five insecure level strings and the three
-secure ones; the class-agreement gate on a mismatch; that `latency_ms` excludes
-key generation, which E45 records having wrongly charged to the query and reported
-a 37× gap that was 1.8×; that the dequantization divides the scale out of weights
-*and* bias exactly once; and that an absent driver produces an actionable message
-naming `BARU_HEIR_PY` rather than a panic.
+**What it took to get a number, all three found by measurement.**
 
-**Until a secure HEIR run exists, no number here may be quoted against §VI.6.**
-The next step is an environment with Python ≥3.10 and
-`pip install "heir-py[python,openfhe]"`, and then a **depth sweep** — because
-§VI.6's finding is that depth, not width, is the decisive axis, and depth is what
-forces the bootstrap that dominates FHE latency.
+1. *`heir-py` alone cannot evaluate anything.* `heir.compile()` resolves an OpenFHE
+   **C++ install** — headers under `/usr/local/include/openfhe`, or the
+   `OPENFHE_INCLUDE_DIR` / `OPENFHE_LIB_DIR` / `OPENFHE_LINK_LIBS` variables — and
+   otherwise fails with *"Could not build development config. Did you run
+   bazel?"*. HEIR emits C++ and compiles it per program, so headers are a hard
+   requirement. The PyPI `openfhe` wheel does not satisfy it (Python bindings, not
+   a toolchain), there is no Homebrew formula, and `heir.backends.cleartext` is not
+   a shortcut — its `eval` forwards straight to the original Python function and
+   says so in a warning. OpenFHE 1.5.1 was therefore built from source (needed
+   `brew install libomp`; Apple clang does not ship `omp.h`, and the emitted C++ is
+   linked with `-L$OPENFHE_LIB_DIR` only, so libomp has to be reachable from
+   there).
+2. *The decorator frontend is not the ML path.* It runs the function through
+   numba, and a dense layer is not expressible there: on 2026.8.1, `x[0]` raises
+   "Unsupported IR Element: getitem", `@` raises "Extension handling for
+   non-integer (e.g., floats, tensors) types is not yet supported", and
+   `np.sum`/`np.matmul` are unsupported. Elementwise tensor ops *do* work. So the
+   driver emits **`linalg` MLIR** and uses `compile(mlir_str=...)` — the level
+   HEIR's ML pipeline actually targets, which the Torch route reaches via
+   torch-mlir. Going direct skips torch entirely. Conventions that took
+   measurement to pin: the attribute is `{secret.secret}`, the generated encryptor
+   is named after the *argument* (`encrypt_arg_0`), and `arith.addf`/`arith.mulf`
+   are elementwise on shaped types.
+3. *HEIR never sets a security level.* Its emitted C++ calls only
+   `SetMultiplicativeDepth` and `SetPlaintextModulus`, so the level in force is
+   OpenFHE's default, which its headers pin at `HEStd_128_classic`. **This corrects
+   the framing above**: the `HEStd_NotSet` in google/heir#1232 was a *user's
+   explicit choice*, not HEIR's default, so the gate catches a real mistake but not
+   one a casual run makes. The driver reads the emitted C++ and reports the level
+   *and its source*.
+
+#### The first head-to-head at a matched threat model
+
+Both arms compute the **same exact function** — `x²` activation, same weights,
+same inputs — and both classifications were verified against the plaintext
+fixed-point reference before any timing was quoted. HEIR → OpenFHE CKKS at
+`HEStd_128_classic`, multiplicative depth **3, chosen by HEIR**; keygen excluded
+as a per-session cost.
+
+| shape | FHE (HEIR/OpenFHE) | MPC lowgear, LAN | MPC semi2k, LAN | MPC lowgear, WAN | MPC semi2k, WAN |
+|---|---|---|---|---|---|
+| 6x4x3 | **58.9 ms** | **3 ms** | 15 ms | 2 680 ms | 3 820 ms |
+| 16x8x4 | **80.1 ms** | **5 ms** | 25 ms | 3 243 ms | 5 283 ms |
+
+**The crossover is a network crossover, and it is large in both directions.** On a
+LAN, SHE-preprocessed 2-party MPC beats HEIR/OpenFHE by **16–20×**; OT-preprocessed
+MPC still beats it by **3–4×**. On the WAN profile (50 ms one-way) FHE wins by
+**41–45×**, because MPC pays 47–56 rounds of pure latency while FHE is
+non-interactive and network-insensitive. That is the shape Huang, Maeng & Suh
+report in *Beyond Latency*, now reproduced in one harness with both arms measured
+and the function held identical.
+
+**Caveats, and they matter.** (i) The two wall clocks are not measured the same
+way: FHE's is a real elapsed time, MPC's is **computed** from measured counts
+through the network profile, so the MPC column inherits the model's 13.6%
+worst-case error and has no compute term for a real socket. (ii) FHE's figure
+excludes the ciphertext upload/download, which on a WAN is not free — the pybind
+wrapper does not expose ciphertext size, and that is reported as unavailable
+rather than as zero. (iii) OpenFHE was built with OpenMP, so its evaluation may use
+multiple cores, while the MPC counts are core-agnostic. (iv) These networks are
+tiny — `16x8x4` is 160 MACs against LeNet-5's 281 640 — so the *ratios* are the
+result and the absolute numbers are not comparable to Orion's 0.23 s MNIST or
+HE-LRM's 24 s DLRM. Scaling up is blocked on `mpcc::lower` being scalar, not on
+either protocol.
+
+#### The depth sweep, and FHE's ceiling arrives before the crossover does
+
+`baru bench-heir --activation square --shapes 6x4x3,6x4x4x3,...` against
+`baru bench-2pc-nn` on the same shapes. Every FHE row verified against the
+plaintext reference; every MPC row bit-exact. Depth is chosen by HEIR.
+
+| hidden layers | shape | FHE depth | FHE eval | MPC rounds | MPC lowgear LAN | MPC lowgear WAN |
+|---|---|---|---|---|---|---|
+| 1 | 6x4x3 | 3 | **47.8 ms** | 47 | **3 ms** | 2 680 ms |
+| 2 | 6x4x4x3 | 5 | 164.1 ms | 65 | 5 ms | — |
+| 3 | 6x4x4x4x3 | 7 | 263.5 ms | 83 | 6 ms | — |
+| 4 | 6x4x4x4x4x3 | 9 | **389.7 ms** | 101 | **8 ms** | 5 827 ms |
+| 5 | 6x4x4x4x4x4x3 | 11 | **SIGSEGV in key generation** | 119 | 9 ms | 6 876 ms |
+
+Each added `x²` layer costs **two levels**, and HEIR gets the depth right
+automatically every time. Three results.
+
+**FHE has a hard ceiling, not a bootstrap step.** At depth 11 the run dies with
+**SIGSEGV, inside `f.setup()` — key generation** — after HEIR's MLIR→C++→clang
+pipeline succeeded. Not OOM, not a clean "no secure parameters" abort: a
+segmentation fault in OpenFHE 1.5.1 for a context that sets only
+`SetMultiplicativeDepth` and `SetPlaintextModulus`. **HEIR's default pipeline is
+leveled and places no bootstraps**, so depth is a wall rather than a step. That
+reframes what Orion's automatic bootstrap placement *is*: not an optimization, but
+the thing that makes depth > 9 possible at all — at ~20 s per bootstrap (HE-LRM).
+
+**On a LAN, MPC's advantage widens with depth.** FHE/MPC is 16×, 33×, 44×, 49×
+across the four depths that run. MPC is linear (+18 rounds and +2 ms per layer,
+forever); FHE grows ~110 ms per layer *and* stops.
+
+**On a WAN, FHE wins at every depth it can run — and that is the interesting
+part.** FHE 48–390 ms against MPC 2 680–5 827 ms, an advantage narrowing from 55×
+to 15× as depth grows. Extrapolating the two slopes (~110 ms/layer against
+~900 ms/layer) the crossover is far away — but **FHE's ceiling arrives first**. So
+the honest statement is not "they cross at depth *d*": it is that **on a WAN,
+leveled FHE is faster until it stops working, and the depth where it stops is
+below the depth where MPC would have caught it.** A system that bootstraps to get
+past that ceiling pays ~20 s, which is 3× MPC's WAN total and 2000× its LAN total
+at depth 11 — so **the bootstrap is exactly where MPC wins on both axes at once.**
+
+That is the sharpest form of this repo's zero-bootstrap thesis, arrived at from
+the FHE side: the scheme switch that refreshes a ciphertext costs 160 ms (E11), and
+the alternative is either a ~20 s bootstrap or a segfault.
+
+**Caveat on the ceiling**: depth 11 fails *in this configuration* — HEIR's default
+CKKS context, OpenFHE 1.5.1, no explicit ring dimension or scaling technique, no
+`heir_opt_options`. It is a limit of the default pipeline, not a proof about CKKS,
+and a hand-tuned context or HEIR's bootstrapping passes would move it. What is
+*measured* is that the out-of-the-box path stops there, and the deepest network it
+evaluates is four hidden layers.
 
 ---
 

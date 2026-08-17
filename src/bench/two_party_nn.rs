@@ -121,11 +121,8 @@ pub struct NnReport {
 /// Weights are small and mixed-sign so that ReLU actually fires and the rescale
 /// actually sees negative values — a network whose pre-activations happen to be
 /// positive would not have caught the sign-extension bug in `vm`'s `TruncPr`.
-pub(crate) fn fixture_for(shape: &[usize], scale_bits: u32) -> QuantizedNetwork {
-    fixture_with(shape, scale_bits, Activation::Relu)
-}
-
-/// [`fixture_for`] with an explicit hidden-layer activation.
+/// A deterministic integer network of the given shape, with an explicit
+/// hidden-layer activation.
 ///
 /// `Square` exists so the FHE arm can compute the *same exact function* — CKKS
 /// cannot compare, so `Relu` is not expressible there. See `bench-heir`.
@@ -196,6 +193,17 @@ pub(crate) fn argmax_of(logits: &[i64]) -> i64 {
 /// `compile_fhe` yields exactly one output wire, so a classifier has to reduce to
 /// the class rather than expose the logit vector. That is the right shape anyway:
 /// it is what a deployment reveals.
+/// Expose the input bindings for phase profiling (`examples/probe_phases.rs`).
+pub fn debug_bindings(shape: &[usize], scale_bits: u32) -> HashMap<String, i64> {
+    let net = fixture_with(shape, scale_bits, Activation::Relu);
+    network_inputs(&net, &input_for(shape[0], scale_bits, 0))
+}
+
+/// Expose the generated source for phase profiling (`examples/probe_phases.rs`).
+pub fn debug_src(shape: &[usize], scale_bits: u32) -> String {
+    network_src(&fixture_with(shape, scale_bits, Activation::Relu))
+}
+
 fn network_src(net: &QuantizedNetwork) -> String {
     let mut binds: Vec<String> = Vec::new();
     // Names of the current activation vector.
@@ -678,7 +686,7 @@ mod tests {
             // A single layer, no hidden ReLU at all — the degenerate case.
             vec![5, 3],
         ] {
-            let net = fixture_for(&shape, 8);
+            let net = fixture_with(&shape, 8, Activation::Relu);
             let input = input_for(shape[0], 8, 0);
             let want = argmax_of(&net.forward(&input));
             let src = network_src(&net);
@@ -733,7 +741,7 @@ mod tests {
     /// extension, and one whose ReLUs never clamped would not test the mux.
     #[test]
     fn the_fixture_has_negative_pre_activations_and_clamping_relus() {
-        let net = fixture_for(&[8, 4, 3], 8);
+        let net = fixture_with(&[8, 4, 3], 8, Activation::Relu);
         let input = input_for(8, 8, 0);
         let mut cur = input;
         let mut saw_negative = false;
@@ -905,6 +913,51 @@ mod tests {
     /// decomposition. In **fixed point** it is not: squaring doubles the scale, so
     /// the product needs a rescale, and a rescale is the same decomposition the
     /// comparison was. Two per neuron either way — dot-rescale plus one more.
+    /// **The pipeline must stay near-linear in network width.** Three separate
+    /// quadratics used to make a realistic network unrunnable, and every one of
+    /// them was quadratic in the *number of variables* — which is the dimension a
+    /// private network grows in, one variable per weight, and therefore the one
+    /// dimension the repo's small test programs never exercised:
+    ///
+    /// | where | what it did | 784x256x10 |
+    /// |---|---|---|
+    /// | `CircuitCompiler::compile_fhe` | deduped variables with `Vec::contains` | part of 36.7 s |
+    /// | `CircuitCompiler::flatten_let` | cloned the whole env per `let`, and `let*` desugars to one nested `let` per binding | 36.7 s -> 0.68 s |
+    /// | `vm::execute` | found each input's owning party with `prog.code.iter().find(..)` | 73.2 s -> 0.32 s |
+    ///
+    /// Asserted as a *growth ratio* with a generous bound rather than an absolute
+    /// budget, because the point is the asymptotics, not the constant: doubling the
+    /// hidden width doubles the work, so anything under 3x is linear-with-noise and
+    /// a reintroduced quadratic would show as ~4x. `dealer` is used because it is
+    /// the engine without real preprocessing, so the measurement is the pipeline
+    /// rather than OT or SHE throughput.
+    #[test]
+    #[ignore]
+    fn the_pipeline_stays_near_linear_in_width() {
+        on_a_deep_stack(|| {
+            let dep = Deployment::lan(2);
+            let time_one = |shape: Vec<usize>| -> f64 {
+                let t = std::time::Instant::now();
+                let r = run_with(&[shape], &dep, 32, 8, Activation::Relu).unwrap();
+                assert!(
+                    r.points.iter().any(|p| p.protocol == "dealer" && p.correct),
+                    "the dealer row must be bit-exact or the timing is meaningless"
+                );
+                t.elapsed().as_secs_f64()
+            };
+            // 784 inputs is MNIST's, and the width is what doubles.
+            let narrow = time_one(vec![784usize, 32, 10]);
+            let wide = time_one(vec![784usize, 64, 10]);
+            let ratio = wide / narrow.max(1e-9);
+            assert!(
+                ratio < 3.0,
+                "doubling the hidden width should roughly double the work, not square \
+                 it: {narrow:.2}s -> {wide:.2}s is {ratio:.1}x. A ratio near 4x means one \
+                 of the quadratics in this test's docs has come back."
+            );
+        });
+    }
+
     #[test]
     #[ignore]
     fn the_fhe_friendly_activation_costs_the_mpc_arm_nothing() {
