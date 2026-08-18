@@ -227,8 +227,14 @@ pub fn debug_bindings_sq(shape: &[usize], scale_bits: u32) -> HashMap<String, i6
 
 /// Expose the input bindings for phase profiling (`examples/probe_phases.rs`).
 pub fn debug_bindings(shape: &[usize], scale_bits: u32) -> HashMap<String, i64> {
+    debug_bindings_k(shape, scale_bits, 0)
+}
+
+/// [`debug_bindings`] for the `k`-th input of the fixture's input family, so that a
+/// probe can sweep inputs rather than draw a conclusion from one of them.
+pub fn debug_bindings_k(shape: &[usize], scale_bits: u32, k: usize) -> HashMap<String, i64> {
     let net = fixture_with(shape, scale_bits, Activation::Relu);
-    network_inputs(&net, &input_for(shape[0], scale_bits, 0))
+    network_inputs(&net, &input_for(shape[0], scale_bits, k))
 }
 
 /// Expose the generated source for phase profiling (`examples/probe_phases.rs`).
@@ -246,12 +252,12 @@ fn network_src(net: &QuantizedNetwork) -> String {
     for (l, layer) in net.layers.iter().enumerate() {
         let mut next = Vec::new();
         for o in 0..layer.out_dim() {
-            let dot = cur
-                .iter()
-                .enumerate()
-                .map(|(i, x)| format!("(* w{l}_{o}_{i} {x})"))
-                .reduce(|a, b| format!("(+ {a} {b})"))
-                .expect("a layer has at least one input");
+            let dot = crate::bench::depth::sum_tree(
+                cur.iter()
+                    .enumerate()
+                    .map(|(i, x)| format!("(* w{l}_{o}_{i} {x})"))
+                    .collect(),
+            );
             // `QuantizedNetwork::forward` rescales *then* adds the bias, so the
             // bias lives at output scale. Match it exactly or the reference is
             // measuring a different network.
@@ -284,20 +290,7 @@ fn network_src(net: &QuantizedNetwork) -> String {
         cur = next;
     }
 
-    // Argmax fold: carry (best, idx) and select with the comparison bit.
-    let mut best = cur[0].clone();
-    let mut idx = "0".to_string();
-    for (i, l) in cur.iter().enumerate().skip(1) {
-        let c = format!("c{i}");
-        binds.push(format!("({c} (> {l} {best}))"));
-        let nb = format!("m{i}");
-        binds.push(format!("({nb} (+ {best} (* {c} (- {l} {best}))))"));
-        let ni = format!("k{i}");
-        binds.push(format!("({ni} (+ {idx} (* {c} (- {i} {idx}))))"));
-        best = nb;
-        idx = ni;
-    }
-
+    let idx = crate::bench::depth::argmax_pairwise(&mut binds, &cur, "g");
     format!("(let* ({}) {idx})", binds.join(" "))
 }
 

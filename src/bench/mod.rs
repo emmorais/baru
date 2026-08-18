@@ -948,6 +948,7 @@ pub mod compiled_nn;
 pub mod conv_nn;
 pub mod conv_route;
 pub mod deep_nn;
+pub mod depth;
 pub mod falcon;
 pub mod fhe_innerprod;
 pub mod gc_compare;

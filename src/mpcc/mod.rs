@@ -36,6 +36,7 @@
 
 pub mod assign;
 pub mod cost;
+pub mod dist;
 pub mod exec;
 pub mod fhe_cost;
 pub mod ir;
@@ -157,6 +158,24 @@ pub fn run_protocol(
                 }
             };
             let mut e = DealerEngine::new(parties, bits)?;
+            execute(prog, sched, &mut e, id, inputs)
+        }
+        // The dealer engine again, rescaling with truncation pairs rather than a
+        // bit decomposition. Present as a separate protocol id so that the two can
+        // be run over the same program and their answers compared directly, which
+        // is how the accuracy cost of stochastic rounding is measured rather than
+        // assumed. See `vm::ShareEngine::trunc_pair_mode`.
+        "dealer-tp" => {
+            let bits = match prog.domain {
+                Domain::Ring { k } => k,
+                other => {
+                    return Err(format!(
+                        "dealer computes mod 2^k, but the program was lowered for {}",
+                        other
+                    ))
+                }
+            };
+            let mut e = DealerEngine::new(parties, bits)?.with_trunc_pairs(true);
             execute(prog, sched, &mut e, id, inputs)
         }
         "shamir" => {

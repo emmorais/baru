@@ -1925,6 +1925,77 @@ is a small-network statement, not a general one.
 
 ---
 
+### VI.8 Where the crossover against Orion must be, from Orion's own table (2026-08-17)
+
+`bench-2pc-cnn` runs LeNet-5 through two-party MPC. The obvious next question is
+whether MPC overtakes the state of the art in FHE deep learning, and Orion's
+evaluation table (ASPLOS'25, Table 2) answers the *mechanism* more sharply than
+our own measurements do. Reproduced here because every claim below reads off it:
+
+| model | params (M) | FLOPs (M) | act. | depth | **boots** | time (s) |
+|---|---|---|---|---|---|---|
+| MLP (MNIST) | 0.12 | 0.12 | x² | 5 | **0** | **0.29** |
+| LoLA (MNIST) | 0.10 | 0.13 | x² | 5 | **0** | **0.23** |
+| LeNet (MNIST) | 1.66 | 4.30 | x² | 7 | **0** | **2.93** |
+| AlexNet (CIFAR-10) | 23.3 | 188 | ReLU | 109 | 15 | 337.2 |
+| VGG-16 (CIFAR-10) | 14.7 | 314 | ReLU | 227 | 28 | 588.6 |
+| **ResNet-20 (CIFAR-10)** | **0.27** | **41.2** | ReLU | **287** | **37** | **618.2** |
+| MobileNet (Tiny IN) | 3.25 | 47.4 | SiLU | 218 | 42 | 892.4 |
+| ResNet-18 (Tiny IN) | 11.3 | 2 260 | SiLU | 138 | 61 | 1 447 |
+| ResNet-34 (ImageNet) | 21.8 | 3 670 | SiLU | 267 | 146 | 14 338 |
+| ResNet-50 (ImageNet) | 25.6 | 4 110 | SiLU | 395 | 351 | 32 324 |
+
+**Latency tracks bootstraps, not work.** ResNet-20 has **4.6× fewer FLOPs than
+AlexNet and is 1.8× slower** — 41.2 against 188 million, 618 s against 337 — because
+it is deeper: 37 bootstraps against 15. The same inversion appears again between
+MobileNet and ResNet-18. And the boundary at zero is a cliff: every network Orion
+evaluates **without** a bootstrap finishes in **0.23–2.93 s**, and every network
+**with** one takes **190–32 324 s**, a gap of two to four orders of magnitude with
+nothing in between.
+
+The mechanism is stated in their own text. A minimax composite approximation of
+ReLU has **multiplicative depth 14** (13 for the sign, 1 for the product); SiLU has
+7. So depth accumulates at 7–14 levels *per activation layer*, the level budget is
+exhausted after a handful of layers, and the remainder of the network is paid for
+in bootstraps. Note also that Orion, like our `lenet5-fhe`, **replaces max pooling
+with average pooling** throughout — for the reason §VI.7 gives, that a
+comparison-free scheme cannot evaluate a maximum.
+
+This is the same discontinuity §VI.7 found from the other side, where HEIR's
+levelled pipeline simply stops at depth 11 instead of bootstrapping. Orion's
+contribution is precisely to place the bootstraps automatically so that it does not
+stop; the table is what that costs.
+
+#### Where MPC must overtake it — to be measured, not projected
+
+Secret sharing has **no depth budget**. Its cost is linear in depth (18 rounds per
+layer, §VI.6) and linear in work, so it has no cliff, and against a system whose
+cost is dominated by a cliff it must overtake it somewhere. **Where** is a question
+this document will answer by measurement or not at all.
+
+An earlier revision of this section carried an extrapolation from our LeNet-5
+figures to ResNet-20, quoting a projected latency for each side. **It has been
+removed.** A projected number is not a result, and placing one beside a measured
+one invites exactly the instability of conclusions that the rest of this record
+exists to prevent. Nothing in this document may quote an MPC-versus-FHE ratio at a
+network we have not run.
+
+Three things are required before the question can be answered, and each is
+tracked as work and not as a prediction.
+
+1. **Elapsed wall clock over a real transport.** Every MPC latency in §VI.6–VI.7
+   is *composed*: rounds and bytes are measured counts put through a network
+   model, and compute is measured but divided by the party count, because
+   `mpcc`'s engines hold every party's share in one process. That is not a running
+   time. The parties must execute concurrently over a transport that really
+   waits, as the three-party path already does.
+2. **A generator that is not scalar.** LeNet-5 emits 8.9 MB of source and
+   636 066 instructions; a network at 146× the multiply--accumulate count would
+   emit on the order of a gigabyte, which will not compile in available memory.
+   A convolution must emit one instruction of width `out_c · out_h · out_w`.
+3. **Residual connections**, which `bench::conv_nn` does not have, and without
+   which a deep stack is not ResNet-20.
+
 ### VI.7 The FHE arm: HEIR as a baseline, and two gates (2026-08-17)
 
 `baru bench-heir`. **No FHE latency has been measured yet, and this section says
@@ -2253,6 +2324,786 @@ Worth keeping from the wrong version: exact ReLU really is better behaved than `
 (1-Lipschitz and non-expansive; it reached seven hidden layers on the unscaled
 fixture where `x²` died at four). It just is not what limits depth once the weights
 are sane. And both gates caught their own arm rather than a reader having to.
+
+---
+
+### VI.9 Elapsed wide-area time, measured — and two optimizations that follow from it (2026-08-18)
+
+*Probes:* `examples/probe_wan.rs`, `examples/probe_rounds.rs`, `examples/probe_accuracy.rs`.
+*Engine:* `src/mpcc/dist.rs` — two parties on separate threads over
+`bench::comm::LatencyTransport`, which really sleeps. Every figure below is
+`max` over the two parties of a wall-clock interval measured with
+`Instant::elapsed`. **Nothing in this section is composed from a cost model.**
+
+#### Why this section exists
+
+Every wide-area figure recorded before it was assembled: a round count from the
+scheduler, a byte count from the engine, and a network profile multiplied together.
+That is a prediction, and §VI.5–VI.8 record three occasions on which a prediction of
+ours was wrong in a direction we did not anticipate. `dist.rs` removes the
+composition: the two parties run concurrently, each message is really waited for, and
+elapsed time is read off a clock.
+
+The first thing this bought was a validation. On the `784×32×10` classifier the cost
+model predicted 110 rounds and the distributed engine spent exactly 110 exchanges. The
+model's *round arithmetic* was right; what it could not tell us was which term of
+`compute + bytes/bandwidth + rounds × RTT` dominates, and that turned out to decide
+what to optimize.
+
+#### The three terms, separated by measurement
+
+The same program was run four times per configuration: at unbounded and at 100 Mbps
+bandwidth, and at 0 ms and 25 ms one-way latency. The differences are themselves
+measurements, so no term is modelled.
+
+| workload | exch | bytes | compute | +bandwidth | +latency | both |
+|---|---:|---:|---:|---:|---:|---:|
+| one ReLU | 11 | 5 KiB | 0 ms | 1 ms | 317 ms | 320 ms |
+| `16×8×4` | 47 | 112 KiB | 2 ms | 13 ms | 1347 ms | 1341 ms |
+| `784×32×10` | 65 | 892 KiB | 17 ms | 102 ms | 1872 ms | 1936 ms |
+| LeNet-5 (FHE-friendly) | 119 | 47.9 MiB | 254 ms | 4408 ms | 3631 ms | 7637 ms |
+
+Read the last two rows against each other, because they disagree. On the classifier,
+bandwidth costs 85 ms and latency costs 1855 ms: **latency is 96% of wide-area time**,
+and one could afford roughly forty times the traffic before bytes began to matter. On
+LeNet-5 that headroom is gone — bandwidth (4.2 s) exceeds latency (3.4 s), and the two
+terms are very nearly additive rather than overlapped, so neither hides behind the
+other.
+
+So "MPC is latency-bound" is *workload-dependent*, and the two workloads want opposite
+optimizations. Both were then done, and both were measured.
+
+#### Optimization 1 — argmax as a tournament, not a fold
+
+`probe_rounds.rs` attributes each scheduled round to the deepest protocol it contains.
+On the classifier, ten of twenty-five rounds were charged to comparison — and the
+network's own definition contains no comparison at all. They came from the argmax.
+
+The argmax had been emitted as a left fold carrying the running best: `n−1`
+comparisons, which is optimal, and what a plaintext implementation would write. Under a
+secret-sharing protocol it is the wrong program, because each comparison reads the
+previous one's output and a comparison is a bit decomposition followed by a
+logarithmic-depth borrow chain, several rounds deep. The fold's *sequential depth* is
+`n−1` in units of that subprotocol.
+
+A single-elimination tournament performs exactly the same `n−1` comparisons — the
+arithmetic is untouched — but makes each bracket's comparisons mutually independent, so
+the scheduler collapses each bracket into one round. Depth falls from `n−1` to
+`⌈log₂ n⌉`: four instead of nine for ten classes.
+
+`src/bench/depth.rs`, with `bench::depth::argmax_tree`. Measured, at 25 ms:
+
+| workload | exchanges | elapsed | |
+|---|---:|---:|---|
+| `784×32×10` fold | 110 | 3228 ms | |
+| `784×32×10` tournament | 65 | 1931 ms | **1.67×** |
+
+Same classification on every input, and `every_protocol_classifies_exactly` still
+passes bit-exactly against `QuantizedNetwork::forward`. This is a free 1.67× — no
+approximation, no extra assumption, purely the shape of the dependence graph.
+
+The same module also balances the dot-product and convolution-tap sums. Addition does
+not communicate, so this buys no rounds; it is there because a left fold over 784 terms
+is a 784-deep expression that the compiler front end recurses through, which is what
+forced LeNet-5 onto a 512 MiB spawned stack.
+
+#### Optimization 2 — rescale with a truncation pair, not a bit decomposition
+
+The byte figure for LeNet-5 could not be explained by the network: it has about 0.28 M
+multiply-accumulates and the engine reported **3.12 M multiplications**. Counting the
+random bits located the other 91%: `553,833` bits, about 59 per rescale, two rescales
+per neuron. In an *FHE-friendly* LeNet-5 — average pooling, `x²` activation, no
+comparison anywhere in its definition — nine tenths of the traffic was fixed-point
+rescaling.
+
+That is the structural gap against an approximate homomorphic scheme, which rescales as
+a ciphertext-level operation for nothing. The fix is a construction from the
+secret-sharing literature that we had not implemented: mask the value with `r` drawn
+uniformly over `2^{k+κ}`, open, shift the *public* result locally, and subtract the
+pre-shifted share `⌊r/2^m⌋`. One opening, no multiplication.
+
+The reason it is worth stating carefully is what makes it cheap. The pair `(r, ⌊r/2^m⌋)`
+does not depend on the value being truncated, so it is **query-independent**: a
+deployment generates it before the query arrives, in exactly the sense that a
+homomorphic deployment generates its evaluation keys before the query arrives. A bit
+decomposition of `x` admits no such treatment, because it is a function of `x`. The two
+are therefore not merely fast and slow versions of one thing; they sit on opposite sides
+of the online/offline boundary.
+
+`vm::trunc_pairs`, opted into per engine via `ShareEngine::trunc_pair_mode` (default
+`false`, so no previously recorded figure moved). Measured at 25 ms, 100 Mbps:
+
+| workload | rescale | exch | bytes | muls | elapsed | |
+|---|---|---:|---:|---:|---:|---|
+| `784×32×10` | decomposition | 65 | 892 KiB | 50,519 | 1936 ms | |
+| `784×32×10` | pair | 51 | 694 KiB | 37,835 | 1539 ms | **1.26×** |
+| LeNet-5 | decomposition | 119 | 47.9 MiB | 3,121,211 | 7637 ms | |
+| LeNet-5 | pair, warm | 56 | 4.66 MiB | 289,055 | **2084 ms** | **3.67×** |
+| LeNet-5 | pair, bits inline | 82 | 4.66 MiB | 289,055 | 3922 ms | 1.95× |
+
+Bytes fall 10.3× and multiplications 10.8×, which is the 91% figure recovered from the
+other side. Note the last row: with bit generation *not* hoisted the gain is 1.95×
+rather than 3.67×, and reporting only the warm number would be the §7.3 error again.
+
+#### What it costs, measured rather than argued
+
+The pair route computes a different function. It returns `⌊x/2^m⌋ + c` where `c` is one
+with probability equal to the discarded fraction, so the cheap rescale is *approximate*
+and the speedups above are not quotable until that is characterised.
+
+`mpcc::vm::tests::stochastic_rescaling_is_off_by_at_most_one_and_is_unbiased` measures
+the primitive over 400 trials at each of six values, and asserts three things: the
+deviation is 0 or 1 and never anything else; the carry rate matches the discarded
+fraction to within four binomial standard deviations; and when nothing is discarded the
+result is exact every time. So the rounding is **unbiased**, where an exact truncation
+always rounds toward negative infinity and therefore contributes a systematic drift
+once per layer. For fixed-point inference the approximate rescale is arguably the more
+faithful of the two, and it is certainly the fairer counterpart to a scheme that does
+not compute exactly either.
+
+At the network level, `probe_accuracy.rs` runs both routes over identical programs and
+inputs: class agreement was 40/40 on `16×8×4`, 40/40 on `784×32×10`, 10/10 on LeNet-5.
+Ninety trials is a real measurement and a small one; it bounds nothing on its own, and
+the primitive-level characterisation above is what the claim rests on.
+
+#### Optimization 3 — every pairwise comparison at once
+
+With rescaling cheap, the argmax became the dominant term, and measuring it in
+isolation said by how much: **38 of LeNet-5's remaining 56 exchanges, 1.09 s of its
+2.07 s**. The tournament had taken the argmax from nine sequential comparisons to
+four, and four is the floor for a tournament, because each bracket must know who won
+the last.
+
+Constant depth requires abandoning the tournament. Computing *every* pairwise
+comparison makes all `n(n−1)/2` of them mutually independent, so they batch into one
+round, and the winner is then read off the comparison matrix: index `i` wins exactly
+when it beats every other candidate, which is a product of `n−1` shared bits. Every
+candidate's product tree is independent of every other's, so all `n` trees together
+cost `⌈log₂(n−1)⌉` rounds of *multiplication* — one exchange each, against roughly
+nine for a comparison. The index is a public-constant weighted sum and so is free.
+
+The trade is forty-five comparisons against nine. Whether that is worth constant depth
+is a property of the link, and the byte-headroom measurement above is what licensed
+spending it. Measured at 25 ms, 100 Mbps, on top of optimizations 1 and 2:
+
+| workload | exch | bytes | elapsed | |
+|---|---:|---:|---:|---|
+| argmax over 10, tournament | 38 | 43 KiB | 1094 ms | |
+| argmax over 10, pairwise | 14 | 214 KiB | **420 ms** | **2.6×** |
+| `784×32×10` | 27 | 866 KiB | **847 ms** | 1.8× |
+| LeNet-5 | 32 | 4.94 MiB | **1412 ms** | 1.47× |
+
+Bytes rose 3.6% on LeNet-5 and 25% on the classifier — the headroom absorbed it, as
+the earlier table said it would. `bench::depth::argmax_pairwise`, with the tie-breaking
+rule checked against the tournament on eleven cases including all-equal inputs, since
+a tie is where the two could silently disagree.
+
+`argmax_tree` is kept rather than replaced: on a link where bandwidth dominates it is
+the right choice, and the point of measuring the terms separately is that the answer
+depends on the link.
+
+#### Where the three optimizations leave the two workloads
+
+| | start of session | after all three | |
+|---|---:|---:|---|
+| `784×32×10` | 3228 ms | **847 ms** | 3.8× |
+| LeNet-5 | 7763 ms | **1412 ms** | 5.5× |
+
+LeNet-5's balance has flipped back: 549 ms of bandwidth against 984 ms of latency, so
+it is latency-bound again and further round reduction is again worth having. Its 32
+exchanges account exactly — nine layers at two each (one multiplication round, one
+rescale opening) plus fourteen for the argmax.
+
+#### Where this leaves the comparison
+
+LeNet-5 on a 50 ms round-trip link, at a matched threat model, two-party dishonest
+majority, with preprocessing hoisted: **1.41 s**, from 7.76 s at the start of the
+session. Orion reports 2.93 s for its LeNet-5, single machine, no network.
+
+That comparison is **not yet valid** and is not being made. Orion's LeNet-5 is
+4.30 MFLOPs against our 0.28 M multiply-accumulates — the same architecture name over a
+15× difference in work — and the withdrawal in §VI.8 was for exactly this error. What
+closes the gap is our own implementation of the Orion pipeline on our own hardware, on
+the same network, which is the outstanding task and is not something to estimate around.
+
+#### Two accounting distinctions now explicit in the engine
+
+`DistEngine` carries two flags rather than one configuration, because conflating them
+is how an online figure gets quoted against a total:
+
+- `hoist_bits` — shared random bits taken from preprocessing (measuring the online
+  phase, comparable to a warm homomorphic server) against generated inline by the
+  exclusive-or protocol (measuring a server handed a query with nothing prepared).
+- `trunc_pairs` — the rescale route above.
+
+Every table in this section names which was in force.
+
+---
+
+### VI.10 Our own homomorphic arm, and the first same-network comparison (2026-08-18)
+
+*Tool:* `tools/ckks_cnn.cpp` — CKKS on OpenFHE 1.5.1, built and run per
+`tools/README.md`. *Fixture:* `bench::conv_nn::export`, so both arms evaluate one
+definition of the network on one input. Machine: the same one every figure in this
+document was measured on.
+
+#### Why the arm was built rather than cited
+
+§VI.8 quoted Orion's 2.93 s for LeNet-5 and then had to withdraw a comparison against
+it, because Orion's LeNet-5 is 4.30 MFLOPs against our 0.28 M multiply-accumulates —
+the same architecture name over a fifteenfold difference in work. Nothing about that
+was fixable by requoting. A comparison needs the same network, on the same machine,
+with both answers checked against the same plaintext reference, and that requires
+implementing the homomorphic side.
+
+What it is: a depth-conscious CKKS implementation of the same pipeline — one ciphertext
+per channel, convolution by rotation, `x²` activation, average pooling with the window
+mean folded into a multiply it needed anyway, and a bootstrap placed exactly when the
+level budget would otherwise be exceeded. What it is not: Orion. Orion's contribution
+is automating that last decision over arbitrary graphs; here the graph is a list and
+the placement is computed from it directly.
+
+#### One bootstrap, measured
+
+Before the network, the primitive that governs it. At `HEStd_128_classic` with a
+bootstrapping level budget, OpenFHE derives ring dimension 2¹⁷ and 65 536 slots:
+
+| | |
+|---|---:|
+| key generation | 30.4 s |
+| one `EvalMult` | 0.130 s |
+| **one `EvalBootstrap`** | **110.7 s** |
+| precision remaining afterwards | 11 bits |
+
+A single bootstrap on this machine costs **78× our entire LeNet-5 inference under
+secret sharing on a wide-area link**. That is the cliff Orion's Table 2 reports from
+the other side — every network they evaluate without a bootstrap finishing in
+0.23–2.93 s and every network with one taking 190–32 324 s — reproduced here as a
+measurement rather than read off their table.
+
+#### LeNet-5, both arms, same network
+
+The average-pooling `x²` variant, which is the only one on which a same-function
+comparison is possible: max pooling is a comparison, and the arm refuses it rather than
+approximate it.
+
+| | secret sharing, 2-party | CKKS, single server |
+|---|---:|---:|
+| threat model | dishonest majority, 2 of 2 | single server, no honest party needed |
+| security | statistical, κ = 26 | `HEStd_128_classic` |
+| ring / parameters | `Z_2^64` | ring 2¹⁵, 1 024 slots, depth 11 |
+| **bootstraps** | not applicable | **0** — LeNet-5 fits the budget |
+| multiplications | 289 055 | 4 378 ciphertext |
+| rotations | not applicable | 2 043 |
+| preprocessing / key generation | hoisted | 4.66 s |
+| **inference** | **1.41 s** (50 ms RTT, 100 Mbps) | **43.8 s** (no network) |
+| verified | class 6, bit-exact reference | class 6, reference class 6 |
+
+**32×, on the same network and the same machine.** And the comparison is conservative
+against the secret-sharing arm in two ways that should be stated rather than quietly
+banked. First, it computes the argmax *inside* the protocol — fourteen of its
+thirty-two exchanges — while the homomorphic protocol returns all ten logits and lets
+the client take the maximum in the clear. So our arm does strictly more work. Second,
+for the same reason it reveals strictly less: one class against a full logit vector.
+
+The asymmetry that runs the other way is the one §VI.6 records and that matching threat
+models does not remove: CKKS lets the client go offline, and two-party computation
+needs it present for the whole circuit.
+
+#### What this does *not* establish
+
+Our CKKS arm is **15× slower than Orion's published LeNet-5 figure**, so the 32× above
+is a margin over our own implementation and not over the state of the art. The reason
+is measured, not guessed: slot utilisation. The arm holds one channel per ciphertext,
+so a ciphertext carries at most 576 live values in 1 024 slots — and at ring 2¹⁵ those
+1 024 slots are themselves a sixteenth of the ring — so utilisation against the ring is
+**3.5%**. Orion's packing is
+precisely what closes that. Until multi-channel packing lands, the honest statement is
+that a competent, secure, bootstrap-free CKKS implementation of this network takes
+43.8 s on this machine, and that a better-packed one would take less.
+
+Three things were fixed on the way to 45.1 s from a first working 104.9 s, and the
+sizes are worth recording because two of the three were not where a reader would guess:
+
+1. **Masked plaintext multiplies replaced by scalar ones** in the convolution taps.
+   The mask exists to clear the positions a rotation drags in from beyond the border,
+   and it is unnecessary: every consumer of a feature map addresses only live
+   positions, so the garbage never reaches a logit. 104.9 → 95.0 s, and the logits came
+   out bit-identical — a **9%** saving, so the encoding cost that looked like the
+   obvious waste was not the problem.
+2. **Convolution rotations hoisted out of the output-channel loop.** The direct
+   transcription rotates in the innermost loop, so the second convolution performed
+   16 × 6 × 25 = 2400 rotations where only 6 × 25 = 150 distinct shifts exist.
+3. **Reduction along each axis at its own stride.** The layout widens the slot stride
+   at each pooling instead of compacting, which costs no levels; after two poolings the
+   maps are 4 × 4 on a row stride of 112, so a contiguous rotate-and-sum walks 448
+   slots in nine rotations where four suffice.
+
+Together (2) and (3) took rotations from 4 239 to 1 583 and the network from 95.0 to
+**45.1 s** — and improved accuracy as a side effect, the logits moving from 0.2335 to
+0.2477 against a reference of 0.2617, because a rotation is a key switch and every one
+of them adds noise.
+
+A fourth change came later, from a failure rather than a profile: forcing the
+bootstrap regime (§VI.11) killed the process, because a rotation key holds two
+polynomials per modulus limb and at ring 2¹⁷ the 180-key set exhausted memory before a
+single ciphertext existed. Two fixes, both of which the sparse packing had made
+available all along and neither of which changes the computed function. **Sparse slot
+encoding**: the ring dimension is fixed by security, but the slot count is not, and this
+network's widest layout spans 784 slots, so encoding 1 024 rather than 16 384 costs
+nothing in a levelled multiply while bootstrapping's cost and key material both scale
+with it. **A logarithmic gather**: collecting scalars into slots `0..n` by shifting each
+from slot 0 asks for a key per destination — 119 for the widest hidden layer — where
+composing power-of-two shifts reaches every destination with `⌈log₂ n⌉` keys, at the
+cost of a population count of rotations instead of one. Together: **180 keys to 48**,
+which is what let the bootstrap measurement run at all, at a 5% cost in the
+bootstrap-free case (43.8 s against the 41.4 s that full-ring encoding with a direct
+gather reached). Every figure in §VI.10 and §VI.11 is from this final configuration.
+
+#### The next measurement this sets up
+
+LeNet-5 needs eleven levels and gets them, so it never bootstraps, which is why 43.8 s
+rather than minutes. The interesting regime is the one where the budget runs out, since
+that is where a 110.7 s primitive starts appearing in the total and where secret
+sharing — which has no depth budget at all — must win. Reaching it needs depth, and
+`--bootstrap` is wired for exactly that. That is a measurement, not a projection, and
+it has not been made yet.
+
+---
+
+### VI.11 The depth sweep, both arms, and a precision result that was not expected (2026-08-18)
+
+*Commands:* `cargo run --release --example probe_depth` and, per depth,
+`export_cnn`/`ckks_cnn` (`tools/README.md`). *Network:* `Cnn::lenet5_deep`, LeNet-5 with
+`extra` additional dense-plus-activation blocks — two levels each, the same unit of
+depth on both sides, so the sweep is over one variable.
+
+#### Why depth
+
+The two paradigms pay for depth in incomparable ways, and that is the whole reason a
+crossover exists. Secret sharing has no depth budget: a layer adds a fixed number of
+communication rounds and a fixed amount of traffic. An approximate homomorphic scheme
+has a level budget fixed at key generation, and the budget is not free to widen —
+the ring dimension must grow with the modulus chain to hold the security level. Past the
+budget the scheme must bootstrap, at 110.7 s against 0.130 s for a multiplication
+(§VI.10).
+
+#### Measured
+
+| levels | instrs | exch | MiB | MPC compute | **MPC, 50 ms WAN** | ring | CKKS mults | CKKS rots | **CKKS** | ratio |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 11 | 626 110 | 32 | 4.82 | 128 ms | **1517 ms** | 2¹⁵ | 4 378 | 2 043 | **43.8 s** | 29× |
+| 13 | 647 614 | 36 | 4.96 | 145 ms | **1683 ms** | 2¹⁵ | 4 463 | 2 883 | **61.1 s** | 36× |
+| 15 | 669 118 | 40 | 5.10 | 238 ms | **1804 ms** | 2¹⁶ | 4 548 | 3 723 | **160.0 s** | 89× |
+| 17 | 690 622 | 44 | 5.23 | 141 ms | **1937 ms** | — | — | — | — | |
+| 19 | 712 126 | 48 | 5.37 | 147 ms | **2110 ms** | — | — | — | — | |
+
+The secret-sharing curve is a line, exactly as the structure predicts: **+4 exchanges,
++0.14 MiB and +148 ms per block**, with no discontinuity anywhere.
+
+**And a second cliff, before bootstrapping enters at all.** Going from 13 to 15 levels
+forces the ring dimension from 2¹⁵ to 2¹⁶ and the cost from 61.1 s to 160.0 s — a
+**2.6× jump for two levels**, against 7% for the same two levels on the secret-sharing
+side. Every ciphertext operation in the network became more expensive because the
+security level demanded a larger ring; the operation *counts* barely moved (4 463 →
+4 548 multiplications). This is not the bootstrap cliff Orion's Table 2 describes, it
+sits below it, and it is a discontinuity in the same direction.
+
+#### The precision result
+
+The fixture's class margins are tight at depth, and disclosing them turned out to
+matter. Reference top-two margins, in units of the fixed-point quantum (2⁻⁸):
+
+| levels | reference class | margin | CKKS worst logit error | CKKS verdict | MPC class |
+|---:|---:|---:|---:|---|---:|
+| 11 | 6 | 58 q | 16 q | agrees | **6** |
+| 13 | 0 | **2 q** | 15 q | **margin below error** — returned 7 | **0** |
+| 15 | 8 | 10 q | 21 q | agrees, but fortuitously | **8** |
+| 17 | 2 | **1 q** | — | — | **2** |
+| 19 | 3 | 72 q | — | — | **3** |
+
+**The secret-sharing arm returned the reference class at all five depths, including the
+two whose margin is one and two quanta. The CKKS arm returned the wrong class at
+thirteen levels.** At fifteen its error (21 q) exceeded the margin (10 q) and it agreed
+anyway, which is luck and is labelled as such.
+
+The mechanism is not subtle and it is worth separating from the fixture. CKKS
+accumulates approximation error through every rescale and key switch, and at thirteen
+levels that error was fifteen times the quantization step. Stochastic truncation's error
+is a carry in the last fixed-point bit, unbiased, so it stays *below* one quantum per
+rescale and the errors do not systematically add. So exactness here is not an aesthetic
+preference: at these depths it is the difference between the right answer and the wrong
+one.
+
+Two honest qualifications. The tight margins are a property of an *untrained* fixture —
+a trained network separates its classes, and §VI.7 records a previous version of a depth
+sweep being written up with a fixture artefact mistaken for a finding. And the latency
+figures are unaffected by any of this, because cost depends on program shape rather than
+weight magnitude, which §VI.7 established by measurement.
+
+So what the table supports is: the **latency** comparison at every depth, and the
+**mechanism** that approximate arithmetic degrades with depth while exact arithmetic
+does not. What it does not support is a quantitative accuracy claim for trained
+networks, which needs a trained fixture.
+
+#### The bootstrap regime, measured
+
+Every CKKS row above is bootstrap-free, so none contains the primitive that dominates
+the literature's deeper networks, and the 29–89× margins are therefore drawn from the
+regime *most favourable* to the homomorphic arm. Capping the computational level budget
+at six (`--levels=6`) forces the other regime on the same network and the same input:
+
+| LeNet-5, 11 levels needed | ring | slots | bootstraps | keygen | **inference** | class |
+|---|---:|---:|---:|---:|---:|---:|
+| budget 11 — never bootstraps | 2¹⁵ | 1 024 | 0 | 1.21 s | **43.8 s** | 6 ✓ |
+| budget 6 — must bootstrap | 2¹⁷ | 1 024 | **20** | 43.9 s | **1345.1 s** | 6 ✓ |
+| secret sharing, 50 ms RTT | — | — | — | hoisted | **1.52 s** | 6 ✓ |
+
+**A 31× discontinuity inside the homomorphic arm**, from a change that leaves the
+network, the input and the answer alone — the decrypted logits are *identical* to the
+bootstrap-free run to every digit printed, which is the strongest available check that
+bootstrapping was performed correctly rather than skipped. Against secret sharing the
+margin goes from 29× to **885×**.
+
+The implied per-bootstrap cost, `(1345.1 − 43.8)/20 ≈ 65 s`, is consistent with the
+110.7 s measured at 65 536 slots in §VI.10, since bootstrapping cost scales with the
+slot count and this run uses 1 024.
+
+**One caveat, and it cuts against our own number.** The count of twenty is inflated by
+our packing. A bootstrap refreshes one ciphertext, and this arm holds one channel per
+ciphertext, so six to sixteen ciphertexts are live at once and each needs its own
+refresh whenever the budget runs out. An implementation packing all channels together
+would exhaust the budget the same number of *times* while having far fewer ciphertexts
+to refresh — plausibly two to four bootstraps rather than twenty. So 1345 s is an upper
+bound on the regime and the defensible reading of the row is narrower than the number:
+the *primitive* cost is ours and library-comparable, the *count* is an artefact of
+3.5% slot utilisation, and even against a well-packed arm needing four bootstraps
+(≈ 260 s) secret sharing at 1.52 s remains ahead by more than two orders of magnitude.
+
+This is the shape §VI.8 read off Orion's Table 2 — latency tracking bootstraps rather
+than work — reproduced here as a measurement on one network, one input and one machine,
+with both arms' answers checked against the same plaintext reference.
+
+#### Still to measure
+
+Multi-channel packing, which is the single change that would make the homomorphic arm
+competitive with Orion and would shrink both the 29× and the 885×. Until it lands, every
+margin in §VI.10 and §VI.11 is a margin over our own implementation, and that is how
+they are stated.
+
+---
+
+### VI.12 Throughput, and why it changes the answer (2026-08-18)
+
+*Commands:* `cargo run --release --example probe_batch`; `ckks_cnn --batch=N`.
+*Network:* LeNet-5 average-pool/`x²`, the same fixture as §VI.10–VI.11.
+
+Every figure so far has been a *latency*: one inference, start to finish. That is the
+right measurement for an interactive query and the wrong one for a server, and the two
+paradigms differ far more under batching than the latency tables suggest — in opposite
+directions, which is why this is not a footnote.
+
+An approximate homomorphic scheme carries thousands of slots per ciphertext and this
+network's layout occupies a few hundred, so further inferences ride in the unused slots
+at **no additional operation at all**: the same rotation shifts every inference's map
+identically, and because the weights are shared, a plaintext mask is the single-inference
+pattern repeated per block. Secret sharing gets nothing for free in traffic — every
+inference's shares must actually be sent — but it gets everything for free in *rounds*,
+because independent inferences are independent instructions and the scheduler puts them
+in one round. One paradigm amortises bytes, the other amortises latency, and on a
+wide-area link those are precisely the two terms that matter.
+
+#### Measured, both arms
+
+| batch | MPC exch | MPC MiB | MPC total | **MPC per inference** | CKKS mults | CKKS total | **CKKS per inference** | ratio |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1 | **32** | 4.82 | 1492 ms | **1492 ms** | 4 378 | 45.10 s | **45.10 s** | 30× |
+| 2 | **32** | 9.47 | 2051 ms | **1026 ms** | — | — | — | |
+| 4 | **32** | 18.78 | 3156 ms | **789 ms** | — | — | — | |
+| 8 | **32** | 37.39 | 5648 ms | **706 ms** | 4 378 | 45.45 s | **5.68 s** | **8.0×** |
+| 16 | — | — | — | — | 4 378 | 45.82 s | **2.86 s** | |
+
+Both predictions hold exactly, and each is visible as a column that does not move. **The
+secret-sharing arm's exchange count is 32 at every batch** — rounds amortise completely.
+**The homomorphic arm's operation counts are 4 378 multiplications and 2 043 rotations at
+every batch** — work amortises completely, the whole 1.6% growth from batch 1 to 16 being
+plaintext encoding over more slots. All sixteen blocks decided the same class, which is
+checked rather than assumed: a packing bug that corrupted the later blocks would
+otherwise be reported as a speedup.
+
+#### The margin narrows by seven times
+
+**30× at batch 1 becomes 8.0× at batch 8**, and at batch 16 the homomorphic arm reaches
+2.86 s per inference against a secret-sharing figure converging on roughly 0.7 s — about
+**4×**. That is the same experiment, the same network and the same machine as §VI.10's
+32×; the only change is asking for throughput instead of latency, and it costs seven
+eighths of the margin.
+
+Both arms then saturate, for different reasons, and the reasons are measured:
+
+- **Secret sharing saturates on bandwidth.** Per-inference cost falls 1492 → 1026 → 789
+  → 706 ms and is converging on the traffic term: 4.67 MiB per inference at 100 Mbps is
+  392 ms that no amount of batching removes, because those bytes are Beaver openings and
+  there is one opening per multiplication. At 289 055 multiplications and 16 bytes each
+  that is 4.6 MiB — so the arm is already at the floor its packing allows, and only a
+  narrower ring element would move it.
+- **The homomorphic arm saturates on slots.** Batch 16 fills the 16 384 slots that ring
+  2¹⁵ provides. Batch 32 needs ring 2¹⁶, where §VI.11 measured every operation becoming
+  2.6× more expensive — so the next doubling of the batch costs more than it saves, and
+  2.86 s per inference is this configuration's optimum rather than a point on a curve.
+
+#### What this does and does not change
+
+It does not change the depth result. §VI.11's bootstrap cliff is a cost per ciphertext
+refresh, and batching does not reduce the number of refreshes — a batched ciphertext
+still exhausts its budget at the same depth. Under batching the 885× would narrow by the
+same factor as the 30×, to something near 30×, and the *shape* — a line against a
+staircase — is untouched.
+
+It does change the headline. The defensible claim from this session is **not** that
+secret sharing beats an approximate homomorphic scheme by thirty times; it is that the
+margin is thirty times on latency, falls to about four times on throughput, and returns
+to two orders of magnitude the moment the network exceeds its level budget. Any single
+number drawn from that would be a choice of regime disguised as a result.
+
+And it sharpens what the remaining packing work is for. Our arm's 3.5% slot utilisation
+costs it twice under batching — once in operations per inference, and once in the batch
+size a ring can hold — so the 15× gap to Orion bites hardest in exactly the regime where
+our margin is thinnest. Closing it is the next thing to build, and until it is built the
+four times is a margin over our own implementation.
+
+---
+
+### VI.13 Opening each operand once, and finding the structure automatically (2026-08-18)
+
+*Code:* `mpcc::vm::{bilinear_batch, multiply_level}`, `ShareEngine::bilinear_triple`,
+`DistEngine::with_bilinear`. *Probes:* `examples/probe_bilinear.rs`,
+`examples/probe_batch.rs`. *Tests:*
+`opening_each_operand_once_is_cheaper_and_gives_the_same_answer`,
+`fusing_a_convolution_does_not_change_what_it_computes`.
+
+#### The constraint this attacks
+
+§VI.12 measured the two-party arm's throughput as bandwidth-bound, and located the
+traffic exactly: one Beaver opening per multiplication, 289 055 multiplications, 16 bytes
+each, 4.6 MiB. Multiplications already equal multiply-accumulates one for one, so scalar
+Beaver is at its floor and no scheduling change reaches it.
+
+The multiply-accumulates are not evenly distributed, and that is the opening. Counting
+them per layer against the number of distinct operand values each layer touches:
+
+| layer | MACs | scalar Beaver elements | operand elements | reuse |
+|---|---:|---:|---:|---:|
+| conv, 6×24×24, k5, 1 in | 86 400 | 172 800 | 934 | **185×** |
+| conv, 16×8×8, k5, 6 in | 153 600 | 307 200 | 3 264 | **94×** |
+| dense 120×256 | 30 720 | 61 440 | 30 976 | 2.0× |
+| dense 84×120 | 10 080 | 20 160 | 10 200 | 2.0× |
+| dense 10×84 | 840 | 1 680 | 924 | 1.8× |
+
+The same hundred and fifty kernel weights are multiplied against a feature map at tens of
+thousands of positions, while a dense layer uses each weight once. So 85% of the network's
+arithmetic sits where operand reuse is two orders of magnitude, and Beaver charges for it
+as though every product were unrelated.
+
+#### The construction
+
+For any map `F` linear in each argument separately — a convolution and a matrix product
+are both such — and a triple `(a, b, F(a,b))` with `a`, `b` uniform, bilinearity gives
+
+```text
+F(x, y) = F(a, b) + F(a, e) + F(d, b) + F(d, e),    d = x − a,   e = y − b
+```
+
+Opening `d` and `e` reveals nothing, `a` and `b` being uniform and unknown. Each of the
+last three terms has at least one *public* argument, so each is a linear combination of
+shares with public coefficients and costs no communication. Traffic is `|x| + |y|`
+elements rather than twice the product count, in one round however many products the form
+contains.
+
+What it costs instead is local work: each product term is evaluated three times rather
+than once. §VI.12's measurement is what says that is the right trade — 392 ms of every
+706 ms was traffic — and on a link fast enough that bytes are cheap the scalar route is
+better, so the engine opts in rather than switching.
+
+#### Measured, two parties over a 50 ms link at 100 Mbps
+
+| layer | products | operands | scalar | bilinear | traffic | elapsed |
+|---|---:|---:|---:|---:|---:|---:|
+| conv 28×28 k5 1→6 | 86 400 | 934 | 1383.1 KiB | **40.4 KiB** | **34×** | 176 → **63 ms** |
+| conv 12×12 k5 6→16 | 153 600 | 3 264 | 2426.8 KiB | **52.2 KiB** | **46×** | 260 → **60 ms** |
+
+Both routes return the same values, checked against a plaintext reference computed
+directly from the definition, and the test asserts on the byte *ratio* rather than a
+constant — because the whole saving is a function of operand reuse and a form over
+unrelated products would show none, which hard-coding a byte count would conceal.
+
+#### Reaching it automatically, without a new instruction
+
+The obvious way to wire this in is an IR operation carrying the index pattern, emitted by
+a vectorised lowering. It turned out not to be necessary. `vm::execute` already gathers
+every independent multiplication at a schedule level into one batch, and the structure the
+scalar lowering discarded is still present in the *operand registers*: a convolution's
+level reads a few hundred distinct registers across tens of thousands of multiplications.
+Two multiplications sharing an operand are recognisable only by register identity —
+comparing share values would be both wrong and impossible — so the batch now carries the
+register pair alongside each product, and `vm::multiply_level` decides per level.
+
+If the level's operands repeat by a factor of four or better it is evaluated as one
+bilinear form; otherwise it falls through to Beaver, which is optimal there. The form
+produces one output per product, leaving the additions that consume them untouched, which
+costs nothing: the traffic is the operand count either way. So **no IR operation, no
+lowering change, no scheduler change**, and the optimisation applies to any program whose
+levels happen to have reuse rather than only to the ones this benchmark emits.
+
+The threshold exists because the route trades bytes for local work — each product is
+evaluated three times — so fusing a level with no reuse would triple its arithmetic and
+save nothing. The convolutions this is aimed at have measured reuse of 94 and 185.
+
+#### Measured on the compiled network
+
+LeNet-5 through the full pipeline, two parties, 50 ms RTT, 100 Mbps, preprocessing
+hoisted, stochastic rescaling:
+
+| | exchanges | traffic | compute | **elapsed** | class |
+|---|---:|---:|---:|---:|---:|
+| Beaver | 32 | 4.82 MiB | 178 ms | **1463 ms** | 6 ✓ |
+| fused | 32 | **1.19 MiB** | 151 ms | **1166 ms** | 6 ✓ |
+
+Traffic falls **4.05×** and the round count is unchanged, which is the claim. Latency
+improves only 1.25×, because at 32 exchanges the link's 1.6 s of round trips dominates and
+bandwidth was never the binding term for a *single* inference.
+
+#### Where it actually matters: throughput
+
+§VI.12 established that throughput is the regime where the two-party arm is bandwidth-bound
+and where its margin over the homomorphic arm is thinnest. That is the regime this changes.
+
+| fusion | batch | traffic | total | **per inference** | inferences/s |
+|---|---:|---:|---:|---:|---:|
+| Beaver | 1 | 4.82 MiB | 1488 ms | **1488 ms** | 0.67 |
+| Beaver | 8 | 37.39 MiB | 5936 ms | **742 ms** | 1.35 |
+| fused | 1 | 1.19 MiB | 1153 ms | **1153 ms** | 0.87 |
+| fused | 2 | 2.19 MiB | 1385 ms | **692 ms** | 1.44 |
+| fused | 4 | 1.99 MiB | 1785 ms | **446 ms** | 2.24 |
+| fused | 8 | **3.47 MiB** | 2905 ms | **363 ms** | **2.75** |
+
+At batch eight, traffic falls **10.8×** and per-inference cost **2.04×**. The reason the
+gain grows with the batch is that a dense layer's weights are shared across the batch while
+only its activations are fresh, so a layer with no reuse at batch one acquires reuse
+proportional to the batch and crosses the threshold. That is visible directly in the
+non-monotonic traffic column — 2.19 MiB at batch two against 1.99 MiB at batch four — where
+a larger batch sends *less in total* because more of its levels became fusable.
+
+**Against the homomorphic arm this roughly doubles the thinnest margin.** CKKS's best
+throughput is 2.86 s per inference (batch 16, §VI.12); the two-party arm now reaches 363 ms
+at batch eight, so **~4× becomes ~8×**.
+
+#### And the bottleneck has moved back
+
+At batch eight the arm sends 0.43 MiB per inference — 35 ms at 100 Mbps — against 1.6 s of
+round trips amortised over eight inferences, or about 200 ms each. So more than half the
+per-inference cost is once again *latency*, and the curve was still falling at batch eight
+rather than flattening. Rounds amortise with batch, so the next thing to measure is simply
+a larger batch, and the round-reduction work of §VI.9 has become relevant again for a
+reason it was not chosen for.
+
+Correctness is checked on both paths: the isolated primitive against a plaintext reference
+computed from the definition, and the automatic path by running a compiled convolutional
+network with fusion on and off and requiring identical outputs, an unchanged round count,
+and traffic that never increases — the last because a level without reuse must be left
+alone rather than fused at a loss.
+
+---
+
+### VI.14 Porting Orion's linear-transform evaluator (2026-08-18)
+
+*Code:* `tools/ckks_cnn.cpp` (`--lt`), `tools/ckks_bsgs.cpp`. *Reference:* Orion,
+ASPLOS'25 (Ebel, Garimella, Reagen), `github.com/baahl-nyu/orion`.
+
+#### Why a port rather than more of our own packing
+
+§VI.12 left our homomorphic arm about fifteen times slower than Orion's published LeNet-5,
+and the cause measured as 3.5% slot utilisation. The obvious remedy — pack channels
+together — turns out to be a *loss*, and the measurement already in hand says so. CKKS eval
+time is nearly independent of batch (45.1 s at batch 1, 45.8 s at 16, identical operation
+counts), so throughput is `eval / batch` and anything reducing the achievable batch costs
+proportionally. Channel packing needs `C×` more slots per inference and saves far less than
+`C×` in operations, so it would take per-inference cost from 2.86 s to roughly 7.9 s.
+
+What Orion does instead is different in kind. Every layer becomes **one linear transform**,
+evaluated by generalized diagonals: for an `n × n` matrix and a vector in `n` slots,
+`A·v = Σ_d diag_d(A) ⊙ rot(v, d)`, so the cost is one plaintext multiply per **nonzero
+diagonal** and not per matrix entry. Baby-step/giant-step then reduces the rotations from
+`D` to about `2√D` by sharing the inner rotations of `v` across diagonal groups.
+
+This corrects a claim that stood in our own source until now. A comment there read that
+realising a convolution as a Toeplitz matrix-vector product would be 2.7 M
+multiply-accumulates against the convolution's 86 400. That is true of a *dense* matvec and
+false of the same matrix evaluated by its diagonals, which is the entire basis of the
+method.
+
+`tools/ckks_bsgs.cpp` verifies the transform in isolation first — 9 diagonals over 1024
+slots, 5 rotations instead of 9, worst error 5.4·10⁻⁹ against a plaintext reference —
+because the index arithmetic of a pre-rotated diagonal is easy to get wrong in a way that
+still yields plausible numbers.
+
+#### What multiplexed packing is actually for, measured
+
+The diagonal count is not a property of the layer; it is a property of the **layout**. The
+first attempt let a convolution's output grid shrink with its data, 28 wide in and 24 out.
+The offset from an input slot to the output slot it feeds is then `y·4 + a·28 + b − oc·576`,
+which depends on the row, so every row contributes its own diagonal:
+
+| | conv 1→6 k5 | conv 6→16 k5 |
+|---|---:|---:|
+| output grid shrinks with the data | **1 225** | **1 500** |
+| grid held fixed, valid region shrinks inside it | **136** | **592** |
+
+Holding the grid fixed and doubling the multiplexing gap at each stride — so that `h·g`, and
+therefore the block size, is invariant across the network — makes a tap's offset `a·W·g + b·g`,
+the same at every position. That is what the gap is for, and the table is the measurement of
+it rather than an argument about it.
+
+#### Measured, LeNet-5, both evaluators
+
+| | mults | rotations | rotation keys | keygen | **eval** | class |
+|---|---:|---:|---:|---:|---:|---:|
+| tap by tap, channel per ciphertext | 4 378 | 2 043 | 48 | 1.21 s | **43.8 s** | 6 ✓ |
+| linear transform, multiplexed | **1 638** | **266** | 133 | 2.71 s | **14.7 s** | 6 ✓ |
+
+**3.0× on latency**, from 2.7× fewer multiplies and 7.7× fewer rotations. Diagonals per
+layer: 136, 23, 592, 32 for the convolutions and poolings, and 555, 203, 93 for the dense
+layers. Worst logit error 0.065 against a reference margin of 0.227, and the class agrees.
+
+#### Neither evaluator dominates, and that is the result
+
+| | latency | best batch | **per inference** |
+|---|---:|---:|---:|
+| tap by tap | 43.8 s | 16 (1024-slot block) | **2.86 s** |
+| linear transform | **14.7 s** | 2 (8192-slot block) | 7.56 s |
+
+The multiplexed layout needs 8192 slots because the first convolution's six output channels
+sit at gap one and cannot be folded — the gap may only grow where the spatial extent shrinks,
+which is at a stride. So the transform evaluator wins single-inference latency by 3.0× and
+loses throughput by 2.6×, and the honest FHE figure is the better of the two per regime,
+stated as such.
+
+#### Where this leaves the comparison
+
+| regime | MPC | CKKS, best of both | margin | was |
+|---|---:|---:|---:|---:|
+| latency | **1.17 s** | 14.7 s | **12.5×** | 37× |
+| throughput | **363 ms/inf** | 2.86 s/inf | **7.9×** | 7.9× |
+
+The latency margin falls by three times, which is what porting a better baseline is *for*.
+Our arm is now about **5× off** Orion's published LeNet-5 rather than 15×, and the remaining
+gap is the part of their design not yet ported: they choose each layer's gap by solving for
+it rather than inheriting it, which is what would shrink the 8192-slot block and let the
+transform evaluator batch as well as it computes.
+
+Not ported, and deliberately: their bootstrap placement, which is a shortest-path problem on
+a DAG of `(layer, level)` nodes weighted by latency. LeNet-5 never bootstraps, so it would
+change nothing measured here; it becomes relevant at the depths of §VI.11.
 
 ---
 

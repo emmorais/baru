@@ -149,6 +149,34 @@ impl Cnn {
         }
     }
 
+    /// [`Cnn::lenet5_fhe_friendly`] with `extra` additional hidden blocks, for the
+    /// experiment that decides where the two paradigms cross.
+    ///
+    /// Depth is the axis along which the comparison must be run, because the two
+    /// paradigms pay for it in incomparable ways. Secret sharing has no depth budget:
+    /// each additional layer adds a fixed number of communication rounds and a fixed
+    /// amount of traffic, so its cost is linear and has no discontinuity. An
+    /// approximate homomorphic scheme has a finite level budget fixed at key
+    /// generation, and once a network exhausts it the scheme must bootstrap — an
+    /// operation measured at 110.7 s on this machine (§VI.10), against 0.130 s for a
+    /// multiplication. So one paradigm's cost curve is a line and the other's is a
+    /// staircase with very tall steps, and the interesting quantity is where they
+    /// cross.
+    ///
+    /// Each block is a dense layer and an activation, which is two levels — the same
+    /// unit of depth on both sides, so the sweep is over one variable.
+    pub fn lenet5_deep(scale_bits: u32, hidden: Activation, extra: usize) -> Cnn {
+        let mut net = Cnn::lenet5_fhe_friendly(scale_bits, hidden);
+        // Insert before the final classifier so the output stays ten-way.
+        let tail = net.layers.pop().expect("a final dense layer");
+        for _ in 0..extra {
+            net.layers.push(Layer::Dense { out: 84 });
+            net.layers.push(Layer::Act);
+        }
+        net.layers.push(tail);
+        net
+    }
+
     /// A deliberately small network for tests: `1x8x8 -> conv(2,3) -> pool -> 4`.
     pub fn tiny(scale_bits: u32, hidden: Activation) -> Cnn {
         Cnn {
@@ -433,13 +461,174 @@ fn argmax_of(v: &[i64]) -> i64 {
 /// The convolution is emitted tap by tap, so its instruction count is the
 /// convolution's own multiply--accumulate count and not that of the dense matrix
 /// realising the same map (see the module docs).
+/// A program evaluating `batch` independent inferences of the same network, together
+/// with its bindings.
+///
+/// Batching is where the two paradigms' parallelism is most different, so it has to be
+/// measured on both. An approximate homomorphic scheme carries thousands of slots per
+/// ciphertext and this network occupies a few hundred, so further inferences ride along
+/// at **no additional operation at all**. Secret sharing gets nothing for free in
+/// traffic — every inference's shares must actually be sent — but it does get something
+/// for free in *rounds*, because independent inferences are independent instructions and
+/// the scheduler puts them in the same round. So one paradigm amortises bytes and the
+/// other amortises latency, and on a wide-area link those are the two terms that matter.
+///
+/// The weight variables are shared across the batch and only the intermediates and
+/// inputs are renamed, so this is one network applied `batch` times rather than `batch`
+/// unrelated networks.
+pub fn debug_batch(net: &Cnn, batch: usize) -> (String, HashMap<String, i64>) {
+    let p = parameters(net);
+    let mut binds: Vec<String> = Vec::new();
+    let mut ids: Vec<String> = Vec::new();
+    let mut ins: HashMap<String, i64> = p.w.clone();
+    for n in 0..batch {
+        let pre = format!("b{n}_");
+        let (b, idx) = network_binds(net, &pre);
+        binds.extend(b);
+        ids.push(idx);
+        for (i, v) in input_vector(net, n).iter().enumerate() {
+            ins.insert(format!("{pre}x{i}"), *v);
+        }
+    }
+    // Combine the per-inference classes with public constants, which costs no
+    // communication and keeps every one of them live rather than dead code.
+    let out = crate::bench::depth::sum_tree(
+        ids.iter()
+            .enumerate()
+            .map(|(n, id)| format!("(* {} {id})", 1i64 << (4 * n.min(12))))
+            .collect(),
+    );
+    (format!("(let* ({}) {out})", binds.join(" ")), ins)
+}
+
+/// Serialise a network, its parameters and one input in the flat text format the
+/// homomorphic arm reads (`tools/ckks_cnn.cpp`).
+///
+/// The two arms must evaluate the *same* network on the *same* input, or the
+/// comparison measures two different computations — the error §VI.8 withdrew a claim
+/// for. Rather than reimplement the fixture on the other side and hope the two agree,
+/// the parameters are exported from the single definition here, in fixed point, and
+/// the homomorphic arm divides by the scale to recover the reals it works in.
+pub fn export(net: &Cnn, k: usize) -> String {
+    let p = parameters(net);
+    let input = input_vector(net, k);
+    let logits = forward(net, &p, &input);
+    let mut out = String::new();
+    out.push_str(&format!("scale_bits {}\n", net.scale_bits));
+    out.push_str(&format!(
+        "input {} {} {}\n",
+        net.input.c, net.input.h, net.input.w
+    ));
+    out.push_str(&format!(
+        "values {}\n",
+        input
+            .iter()
+            .map(|v| v.to_string())
+            .collect::<Vec<_>>()
+            .join(" ")
+    ));
+
+    let mut shape = net.input;
+    let mut flat: Option<usize> = None;
+    for (li, l) in net.layers.iter().enumerate() {
+        match l {
+            Layer::Conv { out_c, k } => {
+                out.push_str(&format!("conv {li} {out_c} {k} {} ", shape.c));
+                for o in 0..*out_c {
+                    for i in 0..shape.c {
+                        for a in 0..*k {
+                            for b in 0..*k {
+                                out.push_str(&format!(
+                                    "{} ",
+                                    p.get(&format!("k{li}_{o}_{i}_{a}_{b}"))
+                                ));
+                            }
+                        }
+                    }
+                }
+                for o in 0..*out_c {
+                    out.push_str(&format!("{} ", p.get(&format!("cb{li}_{o}"))));
+                }
+                out.push('\n');
+                shape = Chw {
+                    c: *out_c,
+                    h: shape.h - k + 1,
+                    w: shape.w - k + 1,
+                };
+            }
+            Layer::Act => out.push_str(&format!("act {li}\n")),
+            Layer::Pool { s } | Layer::AvgPool { s } => {
+                let kind = if matches!(l, Layer::AvgPool { .. }) {
+                    "avgpool"
+                } else {
+                    "maxpool"
+                };
+                out.push_str(&format!("{kind} {li} {s}\n"));
+                shape = Chw {
+                    c: shape.c,
+                    h: shape.h / s,
+                    w: shape.w / s,
+                };
+            }
+            Layer::Flatten => {
+                flat = Some(shape.c * shape.h * shape.w);
+                out.push_str(&format!("flatten {li} {}\n", flat.unwrap()));
+            }
+            Layer::Dense { out: o_dim } => {
+                let n_in = flat.unwrap_or(shape.c * shape.h * shape.w);
+                out.push_str(&format!("dense {li} {o_dim} {n_in} "));
+                for o in 0..*o_dim {
+                    for i in 0..n_in {
+                        out.push_str(&format!("{} ", p.get(&format!("d{li}_{o}_{i}"))));
+                    }
+                }
+                for o in 0..*o_dim {
+                    out.push_str(&format!("{} ", p.get(&format!("db{li}_{o}"))));
+                }
+                out.push('\n');
+                flat = Some(*o_dim);
+                shape = Chw {
+                    c: *o_dim,
+                    h: 1,
+                    w: 1,
+                };
+            }
+        }
+    }
+    out.push_str(&format!(
+        "reference {}\n",
+        logits
+            .iter()
+            .map(|v| v.to_string())
+            .collect::<Vec<_>>()
+            .join(" ")
+    ));
+    out
+}
+
+/// Expose a compiled network and its bindings for the wide-area probe
+/// (`examples/probe_wan.rs`), which measures elapsed time rather than composing it.
+pub fn debug_case(net: &Cnn, k: usize) -> (String, HashMap<String, i64>) {
+    let p = parameters(net);
+    (network_src(net), bindings(&p, &input_vector(net, k)))
+}
+
 fn network_src(net: &Cnn) -> String {
+    let (binds, idx) = network_binds(net, "");
+    format!("(let* ({}) {idx})", binds.join(" "))
+}
+
+/// The bindings and result name for one inference, with every intermediate and input
+/// name carrying `pre`. Weight names are deliberately *not* prefixed: a batch of
+/// inferences shares one network, so sharing the weight variables is what makes the
+/// batch a batch rather than several unrelated programs.
+fn network_binds(net: &Cnn, pre: &str) -> (Vec<String>, String) {
     let sc = net.scale_bits;
     let mut pending: u32 = 0;
     let mut binds: Vec<String> = Vec::new();
     let mut shape = net.input;
     // Names of the current activation tensor, in the layout of `shape`.
-    let mut cur: Vec<String> = (0..shape.len()).map(|i| format!("x{i}")).collect();
+    let mut cur: Vec<String> = (0..shape.len()).map(|i| format!("{pre}x{i}")).collect();
 
     for (li, l) in net.layers.iter().enumerate() {
         match l {
@@ -465,11 +654,8 @@ fn network_src(net: &Cnn) -> String {
                                     )
                                 })
                                 .collect();
-                            let dot = taps
-                                .into_iter()
-                                .reduce(|p, q| format!("(+ {p} {q})"))
-                                .expect("a convolution has at least one tap");
-                            let name = format!("c{li}_{o}_{y}_{x}");
+                            let dot = crate::bench::depth::sum_tree(taps);
+                            let name = format!("{pre}c{li}_{o}_{y}_{x}");
                             binds.push(format!(
                                 "({name} (+ (ash-right {dot} {}) cb{li}_{o}))",
                                 sc + pending
@@ -496,11 +682,8 @@ fn network_src(net: &Cnn) -> String {
                                 .flat_map(|a| (0..*s).map(move |b| (a, b)))
                                 .map(|(a, b)| cur[shape.idx(c, y * s + a, x * s + b)].clone())
                                 .collect();
-                            let sum = terms
-                                .into_iter()
-                                .reduce(|p, q| format!("(+ {p} {q})"))
-                                .expect("a pooling window is nonempty");
-                            let name = format!("v{li}_{c}_{y}_{x}");
+                            let sum = crate::bench::depth::sum_tree(terms);
+                            let name = format!("{pre}v{li}_{c}_{y}_{x}");
                             binds.push(format!("({name} {sum})"));
                             next[out_shape.idx(c, y, x)] = name;
                         }
@@ -529,7 +712,7 @@ fn network_src(net: &Cnn) -> String {
                                         continue;
                                     }
                                     let v = &cur[shape.idx(c, y * s + a, x * s + b)];
-                                    let m = format!("p{li}_{c}_{y}_{x}_{a}_{b}");
+                                    let m = format!("{pre}p{li}_{c}_{y}_{x}_{a}_{b}");
                                     binds.push(format!(
                                         "({m} (+ {acc} (* (> {v} {acc}) (- {v} {acc}))))"
                                     ));
@@ -548,11 +731,12 @@ fn network_src(net: &Cnn) -> String {
                 let n_in = cur.len();
                 let mut next = Vec::with_capacity(*out);
                 for o in 0..*out {
-                    let dot = (0..n_in)
-                        .map(|i| format!("(* d{li}_{o}_{i} {})", cur[i]))
-                        .reduce(|p, q| format!("(+ {p} {q})"))
-                        .expect("a dense layer has at least one input");
-                    let name = format!("h{li}_{o}");
+                    let dot = crate::bench::depth::sum_tree(
+                        (0..n_in)
+                            .map(|i| format!("(* d{li}_{o}_{i} {})", cur[i]))
+                            .collect(),
+                    );
+                    let name = format!("{pre}h{li}_{o}");
                     binds.push(format!(
                         "({name} (+ (ash-right {dot} {}) db{li}_{o}))",
                         sc + pending
@@ -565,7 +749,7 @@ fn network_src(net: &Cnn) -> String {
             Layer::Act => {
                 let mut next = Vec::with_capacity(cur.len());
                 for (i, v) in cur.iter().enumerate() {
-                    let name = format!("a{li}_{i}");
+                    let name = format!("{pre}a{li}_{i}");
                     match net.hidden {
                         Activation::Identity => next.push(v.clone()),
                         Activation::Relu => {
@@ -586,20 +770,10 @@ fn network_src(net: &Cnn) -> String {
         }
     }
 
-    // Argmax fold over the logits: the only thing revealed.
-    let mut best = cur[0].clone();
-    let mut idx = "0".to_string();
-    for (i, l) in cur.iter().enumerate().skip(1) {
-        let c = format!("g{i}");
-        binds.push(format!("({c} (> {l} {best}))"));
-        let nb = format!("gm{i}");
-        binds.push(format!("({nb} (+ {best} (* {c} (- {l} {best}))))"));
-        let ni = format!("gi{i}");
-        binds.push(format!("({ni} (+ {idx} (* {c} (- {i} {idx}))))"));
-        best = nb;
-        idx = ni;
-    }
-    format!("(let* ({}) {idx})", binds.join(" "))
+    // Every pairwise comparison at once, not a tournament and not a fold: see
+    // `bench::depth`. The index is the only thing revealed.
+    let idx = crate::bench::depth::argmax_pairwise(&mut binds, &cur, &format!("{pre}g"));
+    (binds, idx)
 }
 
 fn bindings(p: &Params, input: &[i64]) -> HashMap<String, i64> {
@@ -945,6 +1119,65 @@ fn human(b: u64) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    /// A batched program must be a batch of the *same* network, and each inference in it
+    /// must decide what it would have decided alone.
+    ///
+    /// The batch shares its weight variables and renames only intermediates and inputs.
+    /// Getting that backwards — renaming the weights too — would produce several
+    /// unrelated networks that happen to run together, and the throughput figure would
+    /// then be measuring the wrong thing entirely while looking perfectly healthy.
+    #[test]
+    fn a_batch_is_one_network_applied_several_times() {
+        use crate::mpcc::{compile, run_protocol, schedule, LowerConfig};
+
+        let net = Cnn::tiny(8, Activation::Square);
+        let cfg = LowerConfig {
+            parties: 2,
+            bit_width: 32,
+            ..Default::default()
+        };
+        // What each input decides on its own.
+        let p = parameters(&net);
+        let alone: Vec<i64> = (0..3)
+            .map(|k| argmax_of(&forward(&net, &p, &input_vector(&net, k))))
+            .collect();
+
+        let (src, ins) = debug_batch(&net, 3);
+        // The weights are shared, so a batch of three costs three times the
+        // intermediates and *not* three times the parameters.
+        let weight_vars = ins.keys().filter(|k| !k.contains("_x")).count();
+        let single_weights = p.w.len();
+        assert_eq!(
+            weight_vars, single_weights,
+            "a batch must share one set of weights, not carry a copy per inference"
+        );
+
+        let prog = compile(&src, &cfg).expect("compiles");
+        let sched = schedule(&prog);
+        let got = run_protocol("dealer", 2, &prog, &sched, &ins).expect("runs");
+
+        // The program returns the classes packed four bits apart.
+        let packed = got.outputs[0].1;
+        for (n, want) in alone.iter().enumerate() {
+            let nibble = (packed >> (4 * n)) & 0xF;
+            assert_eq!(
+                nibble, *want,
+                "inference {n} of the batch decided {nibble}, alone it decides {want}"
+            );
+        }
+
+        // And the round count must not grow with the batch, which is the whole reason
+        // batching helps a secret-sharing protocol at all.
+        let (src1, _) = debug_batch(&net, 1);
+        let prog1 = compile(&src1, &cfg).expect("compiles");
+        let rounds1 = schedule(&prog1).round_count();
+        assert_eq!(
+            sched.round_count(),
+            rounds1,
+            "independent inferences are independent instructions and belong in the same rounds"
+        );
+    }
     use super::*;
 
     /// A convolutional network must be deep-stack: `let*` desugars to one nested

@@ -29,6 +29,7 @@ pub struct DealerEngine {
     m: Modulus,
     parties: usize,
     counters: Counters,
+    trunc_pairs: bool,
 }
 
 impl DealerEngine {
@@ -40,7 +41,16 @@ impl DealerEngine {
             m: Modulus::Ring { k: bits },
             parties,
             counters: Counters::default(),
+            trunc_pairs: false,
         })
+    }
+
+    /// Rescale with truncation pairs instead of a bit decomposition, so that the
+    /// accuracy cost of stochastic rounding can be measured in-process across many
+    /// inputs without paying for a distributed run each time.
+    pub fn with_trunc_pairs(mut self, on: bool) -> Self {
+        self.trunc_pairs = on;
+        self
     }
 
     /// Bytes one party sends when every party sends `elems` elements to every
@@ -72,6 +82,10 @@ impl DealerEngine {
 }
 
 impl ShareEngine for DealerEngine {
+    fn trunc_pair_mode(&self) -> bool {
+        self.trunc_pairs
+    }
+
     type Share = Additive;
 
     fn modulus(&self) -> Modulus {

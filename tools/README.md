@@ -276,3 +276,63 @@ plaintext classification — otherwise a too-coarse approximation looks fast.
 `--self-test` evaluates in plaintext and honestly reports `HEStd_NotSet`, so it
 round-trips the contract *and* is rejected. That is deliberate: it is the fixture
 that proves the security gate fires.
+
+## `ckks_cnn.cpp` — the homomorphic arm of the convolutional benchmark
+
+A CKKS implementation of the same convolutional network the secret-sharing arm
+evaluates, written directly against OpenFHE. It exists because comparing our measured
+latency against a figure published for other hardware, another library and — as
+`docs/experiments.md` §VI.8 records having got wrong once — another network under the
+same name, is not a comparison.
+
+It reads the fixture written by `bench::conv_nn::export`, so both arms evaluate one
+definition of the network on one input, and it prints the class it decided beside the
+plaintext reference class so a caller can refuse a latency figure when the two
+disagree.
+
+Build and run (the OpenFHE prefix is the one built for `heir_baseline.py` above):
+
+```sh
+clang++ -std=c++17 -O3 -o ckks_cnn tools/ckks_cnn.cpp \
+  -I$BARU_OPENFHE_PREFIX/include/openfhe \
+  -I$BARU_OPENFHE_PREFIX/include/openfhe/core \
+  -I$BARU_OPENFHE_PREFIX/include/openfhe/pke \
+  -I$BARU_OPENFHE_PREFIX/include/openfhe/binfhe \
+  -I/opt/homebrew/opt/libomp/include \
+  -L$BARU_OPENFHE_PREFIX/lib -lOPENFHEpke -lOPENFHEcore -lOPENFHEbinfhe \
+  -L/opt/homebrew/opt/libomp/lib -lomp -Xpreprocessor -fopenmp
+
+cargo run --release --example export_cnn -- lenet5.txt 0
+DYLD_LIBRARY_PATH=$BARU_OPENFHE_PREFIX/lib:/opt/homebrew/opt/libomp/lib \
+  ./ckks_cnn lenet5.txt            # add --bootstrap for networks that exceed the budget
+```
+
+**The security level is never pinned and never relaxed.** The parameters are set from
+`HEStd_128_classic` and the ring dimension is whatever OpenFHE derives from it; the
+only published HEIR ML datapoint was fast because it ran at `HEStd_NotSet`, and an
+insecure baseline is worse than none.
+
+### Two evaluators, and why both are kept
+
+`--lt` selects a second, independent evaluator following Orion (ASPLOS'25): every layer —
+convolution, average pooling and dense alike — is one linear transform, evaluated by its
+generalized diagonals with baby-step/giant-step. The default evaluator instead applies a
+convolution tap by tap with one ciphertext per channel.
+
+Neither dominates, which is why both are kept and reported. The linear-transform evaluator
+is **3x faster on single-inference latency** because it performs far fewer operations. The
+tap-by-tap evaluator is **2.6x better on throughput**, because its per-channel ciphertexts
+need only a 1024-slot block and so admit a batch of 16, where the multiplexed layout needs
+8192 slots and admits 2. A deployment would pick per workload; a comparison should quote
+the better of the two per regime and say which.
+
+They also check each other. Two independent implementations of the same network that agree
+on the class is a stronger statement than either agreeing with a plaintext reference alone,
+and `tools/ckks_bsgs.cpp` separately verifies the diagonal/BSGS transform against a
+plaintext matrix-vector product before anything is built on it.
+
+**It refuses max pooling**, which is a comparison and which CKKS cannot evaluate
+without a polynomial approximation whose depth would dominate everything else. Export
+the average-pooling variant (`Cnn::lenet5_fhe_friendly`), which is what the homomorphic
+deep-learning literature benchmarks and the only variant on which a same-function
+comparison is possible.

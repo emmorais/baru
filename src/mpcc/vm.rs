@@ -51,7 +51,7 @@
 //! because executing one by peeking at the plaintext would produce
 //! communication counts that are quietly fictional.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use rand::Rng;
 use serde::Serialize;
@@ -334,6 +334,21 @@ pub trait ShareEngine {
     fn mul_batch(&mut self, pairs: &[(Self::Share, Self::Share)]) -> Vec<Self::Share>;
     fn open_batch(&mut self, values: &[Self::Share]) -> Vec<u64>;
 
+    /// Share many inputs at once, returning them in the order given.
+    ///
+    /// The default implementation is the scalar loop, which is right for an
+    /// in-process engine where sharing costs nothing. A **distributed** engine
+    /// must override it: sharing is a message there, and one message per input
+    /// would serialise what the protocol permits in a single round. A comparison
+    /// draws `bit_width + 1 + KAPPA` random bits, so the difference between
+    /// batched and scalar input sharing is two orders of magnitude in round count.
+    fn input_batch(&mut self, values: &[(u64, usize)]) -> Vec<Self::Share> {
+        values
+            .iter()
+            .map(|(v, party)| self.input(*v, *party))
+            .collect()
+    }
+
     /// `n` shared uniform bits, each a sharing of 0 or 1.
     ///
     /// Everything above the sharing layer (comparison, truncation, bit
@@ -347,6 +362,47 @@ pub trait ShareEngine {
     /// lower bound.  `Spdz2kEngine` also draws locally, and that **is** a gap:
     /// see its own documentation.
     fn random_bits(&mut self, n: usize) -> Vec<Self::Share>;
+
+    /// Correlated randomness for one **bilinear** form: random shares `a` and `b` of
+    /// the two operand vectors, together with shares of the form's value on them.
+    ///
+    /// `terms[o]` lists the `(input, weight)` index pairs summed into output `o`, which
+    /// is what a convolution or a matrix product is once the index arithmetic is done.
+    /// The returned `c` satisfies `c[o] = Σ_{(i,w) ∈ terms[o]} a[i]·b[w]`.
+    ///
+    /// Returning `None` — the default — means the caller falls back to one Beaver
+    /// triple per multiplication, so no engine's behaviour changes until it opts in.
+    fn bilinear_triple(
+        &mut self,
+        _n_in: usize,
+        _n_w: usize,
+        _terms: &[Vec<(u32, u32)>],
+    ) -> Option<BilinearTriple<Self::Share>> {
+        None
+    }
+
+    /// Whether this engine wants fixed-point rescaling done with truncation pairs
+    /// rather than with a bit decomposition.
+    ///
+    /// The two compute different functions and the difference is the point. A bit
+    /// decomposition truncates exactly, at a cost of `O(k)` multiplications and
+    /// several rounds, all of which depend on the value being truncated and so
+    /// cannot be prepared in advance. A truncation pair truncates *stochastically*
+    /// — the result is `⌊x/2^m⌋` plus a carry which is one with probability equal
+    /// to the discarded fractional part — at a cost of one opening and no
+    /// multiplications, using randomness that does not depend on the value and can
+    /// therefore be prepared before the query.
+    ///
+    /// For fixed-point machine learning the stochastic version is not merely
+    /// cheaper but arguably more faithful, since it rounds without bias, whereas
+    /// truncation always rounds toward negative infinity and accumulates a
+    /// systematic drift across layers. It is also the fair counterpart to an
+    /// approximate homomorphic scheme, which does not compute exactly either.
+    ///
+    /// Default `false`, so no engine's behaviour changes until it opts in.
+    fn trunc_pair_mode(&self) -> bool {
+        false
+    }
 }
 
 // ─── Composite primitives ─────────────────────────────────────────────────────
@@ -356,6 +412,10 @@ pub trait ShareEngine {
 /// `2^-KAPPA`.  With a 33-bit decomposition that needs 59 bits of headroom,
 /// which both `Z_2^64` and the 61-bit Mersenne field have.
 pub const KAPPA: u32 = 26;
+
+/// A bilinear triple: random shares of the two operand vectors and of the form's value
+/// on them. See [`ShareEngine::bilinear_triple`].
+pub type BilinearTriple<S> = (Vec<S>, Vec<S>, Vec<S>);
 
 /// The bits of each input, LSB first, and the rounds the decomposition took.
 pub type Decomposed<E> = (Vec<Vec<<E as ShareEngine>::Share>>, u64);
@@ -426,14 +486,18 @@ pub fn random_bits_batch<E: ShareEngine>(engine: &mut E, n: usize) -> Vec<E::Sha
     };
 
     let mut rng = rand::thread_rng();
-    let mut layers: Vec<Vec<E::Share>> = Vec::with_capacity(engine.parties());
-    for p in 0..engine.parties() {
-        let mut layer = Vec::with_capacity(n);
+    // One batched sharing for every party's contribution, so a distributed engine
+    // spends one round here instead of `parties * n`.
+    let parties = engine.parties();
+    let mut requests: Vec<(u64, usize)> = Vec::with_capacity(parties * n);
+    for p in 0..parties {
         for _ in 0..n {
-            layer.push(engine.input(u64::from(rng.gen::<bool>()), p));
+            requests.push((u64::from(rng.gen::<bool>()), p));
         }
-        layers.push(layer);
     }
+    let shared = engine.input_batch(&requests);
+    let mut layers: Vec<Vec<E::Share>> = shared.chunks(n).map(|c| c.to_vec()).collect();
+    debug_assert_eq!(layers.len(), parties);
 
     let mut rounds = 0u64;
     while layers.len() > 1 {
@@ -774,12 +838,16 @@ pub fn execute<E: ShareEngine>(
             }
         }
     }
+    let mut requests: Vec<(u64, usize)> = Vec::with_capacity(prog.inputs.len());
     for (name, reg) in &prog.inputs {
         let v = *inputs
             .get(name)
             .ok_or_else(|| format!("mpcc vm: no value supplied for input `{}`", name))?;
-        let party = owner.get(reg).copied().unwrap_or(0);
-        shares.insert(*reg, engine.input(m.from_i64(v), party));
+        requests.push((m.from_i64(v), owner.get(reg).copied().unwrap_or(0)));
+    }
+    // One round for the whole layer of inputs, which is what a real protocol does.
+    for ((_, reg), sh) in prog.inputs.iter().zip(engine.input_batch(&requests)) {
+        shares.insert(*reg, sh);
     }
     if !prog.inputs.is_empty() {
         rounds += 1;
@@ -1010,10 +1078,18 @@ fn exec_round<E: ShareEngine>(
 ) -> Result<u64, String> {
     let mut mul_pairs: Vec<(E::Share, E::Share)> = Vec::new();
     let mut mul_dst: Vec<(Reg, Option<E::Share>)> = Vec::new();
+    // The registers each batched multiplication reads, in the same order. Identity is
+    // what makes the bilinear fusion below possible: two multiplications that share an
+    // operand are only recognisable as such by register, not by comparing share values.
+    // `None` marks a multiplication whose operand is not a plain shared register and so
+    // cannot take part.
+    let mut mul_ids: Vec<Option<(Reg, Reg)>> = Vec::new();
     let mut open_vals: Vec<E::Share> = Vec::new();
     let mut open_dst: Vec<Reg> = Vec::new();
     let mut decomp: Vec<E::Share> = Vec::new();
     let mut decomp_use: Vec<BitUse> = Vec::new();
+    // Rescales taking the truncation-pair route: `(value, destination, shift)`.
+    let mut trunc: Vec<(E::Share, Reg, u32)> = Vec::new();
 
     for &idx in idxs {
         let instr = &prog.code[idx];
@@ -1023,6 +1099,13 @@ fn exec_round<E: ShareEngine>(
                 let b = as_share(engine, shares, clears, instr.src[1])?;
                 mul_pairs.push((a, b));
                 mul_dst.push((instr.dst[0], None));
+                mul_ids.push(
+                    if shares.contains_key(&instr.src[0]) && shares.contains_key(&instr.src[1]) {
+                        Some((instr.src[0], instr.src[1]))
+                    } else {
+                        None
+                    },
+                );
             }
             // `t + c*(e - t)`: the subtraction and the addition are local, so
             // the multiplication joins this level's batch like any other.
@@ -1033,6 +1116,9 @@ fn exec_round<E: ShareEngine>(
                 let diff = engine.sub(&e, &t);
                 mul_pairs.push((c, diff));
                 mul_dst.push((instr.dst[0], Some(t)));
+                // The right operand is a freshly computed difference, not a register, so
+                // this cannot join a fused form.
+                mul_ids.push(None);
             }
             Op::Open => {
                 let a = as_share(engine, shares, clears, instr.src[0])?;
@@ -1054,18 +1140,22 @@ fn exec_round<E: ShareEngine>(
             }
             Op::TruncPr { shift } => {
                 let a = as_share(engine, shares, clears, instr.src[0])?;
-                decomp.push(a);
-                decomp_use.push(BitUse::Truncate {
-                    dst: instr.dst[0],
-                    shift: *shift,
-                });
+                if engine.trunc_pair_mode() {
+                    trunc.push((a, instr.dst[0], *shift));
+                } else {
+                    decomp.push(a);
+                    decomp_use.push(BitUse::Truncate {
+                        dst: instr.dst[0],
+                        shift: *shift,
+                    });
+                }
             }
             other => return Err(unsupported(other)),
         }
     }
 
     if !mul_pairs.is_empty() {
-        let out = engine.mul_batch(&mul_pairs);
+        let out = multiply_level(engine, &mul_pairs, &mul_ids);
         for (v, (dst, base)) in out.into_iter().zip(mul_dst) {
             let v = match base {
                 Some(t) => engine.add(&t, &v),
@@ -1082,6 +1172,76 @@ fn exec_round<E: ShareEngine>(
     }
 
     let mut composite_rounds = 0u64;
+
+    if !trunc.is_empty() {
+        // Stochastic rescaling by masked opening. For a value `x` held as a
+        // `k`-bit signed quantity and a shift `m`:
+        //
+        //   1. lift `x` into `[0, 2^k)` by adding `2^(k−1)`, so that the shift
+        //      below acts on a non-negative number and no sign correction is
+        //      needed;
+        //   2. open `c = x + 2^(k−1) + r`, where `r` is uniform over `2^(k+κ)`
+        //      and hides the lifted value statistically;
+        //   3. shift the *public* `c`, which each party can do locally, and
+        //      subtract the pre-shifted share `⌊r/2^m⌋`;
+        //   4. remove the lift, whose shifted image is exactly `2^(k−1−m)`
+        //      because `2^(k−1)` is a multiple of `2^m`.
+        //
+        // What survives is `⌊x/2^m⌋ + carry`, where the carry is one exactly when
+        // the discarded low bits of the lifted value and of `r` sum past `2^m`.
+        // Since `r` is uniform, that happens with probability equal to the
+        // discarded fraction: the rescale rounds stochastically and without bias.
+        //
+        // The whole protocol is one opening. No multiplication is performed, and
+        // the only randomness consumed does not depend on `x`.
+        let k = prog.bit_width;
+        let order = engine.modulus().order_bits();
+        if k + KAPPA + 1 > order {
+            return Err(format!(
+                "mpcc vm: a truncation pair for a {k}-bit value at statistical distance \
+                 2^-{KAPPA} needs {} bits of headroom, but the protocol computes in a \
+                 {order}-bit domain",
+                k + KAPPA + 1
+            ));
+        }
+        // All rescales at this level share one shift in every program the
+        // compiler emits, but nothing depends on that, so group by shift.
+        let mut by_shift: BTreeMap<u32, Vec<usize>> = BTreeMap::new();
+        for (i, (_, _, m)) in trunc.iter().enumerate() {
+            by_shift.entry(*m).or_default().push(i);
+        }
+        let mut masked: Vec<E::Share> = Vec::with_capacity(trunc.len());
+        let mut shifted: Vec<E::Share> = Vec::with_capacity(trunc.len());
+        // Which entry of `trunc` each opened value belongs to, since grouping by
+        // shift permutes them.
+        let mut slot: Vec<usize> = Vec::with_capacity(trunc.len());
+        for (m, idxs) in &by_shift {
+            let pairs = trunc_pairs(engine, idxs.len(), *m, k);
+            for (&i, (r, rs)) in idxs.iter().zip(pairs) {
+                let lifted = engine.add_const(&trunc[i].0, 1u64 << (k - 1));
+                masked.push(engine.add(&lifted, &r));
+                shifted.push(rs);
+                slot.push(i);
+            }
+        }
+        // One round for every rescale at this level, whatever their shifts.
+        let opened = engine.open_batch(&masked);
+        composite_rounds += 1;
+        for ((c, rs), &i) in opened.into_iter().zip(shifted).zip(&slot) {
+            let (dst, m) = (trunc[i].1, trunc[i].2);
+            let zero = {
+                let one = engine.constant(1);
+                engine.sub(&one, &one)
+            };
+            let neg = engine.sub(&zero, &rs);
+            // Both terms below are public: each party shifts the opened value and
+            // removes the shifted lift locally.
+            let pub_term = (c >> m).wrapping_sub(1u64 << (k - 1 - m));
+            let out = engine.add_const(&neg, pub_term);
+            shares.insert(dst, out);
+        }
+    }
+
     if !decomp.is_empty() {
         // One extra bit of width so a difference of two `bit_width` values
         // still has a meaningful sign bit.
@@ -1154,6 +1314,248 @@ fn exec_round<E: ShareEngine>(
     Ok(simple_rounds.max(composite_rounds))
 }
 
+/// Generate `n` truncation pairs `(r, r >> shift)` for a `k`-bit value domain.
+///
+/// A truncation pair is the correlated randomness that lets a rescale cost one
+/// opening instead of a bit decomposition. The pair is `r`, uniform over
+/// `2^(k+κ)` so that it statistically masks any `k`-bit value, together with the
+/// share of `r` already shifted down by `shift` — a quantity the parties can form
+/// for free once they hold `r`'s bits, but which they could not compute from `r`
+/// alone, since a right shift is not a ring operation.
+///
+/// The decisive property is that the pair does not depend on the value being
+/// truncated. It is therefore *query-independent*: a deployment generates it
+/// before the query arrives, in exactly the sense that a homomorphic deployment
+/// generates its evaluation keys before the query arrives. A bit decomposition of
+/// `x` enjoys no such property, because it is a function of `x`.
+///
+/// Returned as `(r, r_shifted)` pairs. Costs `k + κ` random bits each and no
+/// communication beyond their generation.
+pub fn trunc_pairs<E: ShareEngine>(
+    engine: &mut E,
+    n: usize,
+    shift: u32,
+    k: u32,
+) -> Vec<(E::Share, E::Share)> {
+    let width = (k + KAPPA) as usize;
+    let bits = engine.random_bits(n * width);
+    let mut out = Vec::with_capacity(n);
+    for chunk in bits.chunks(width) {
+        let zero = {
+            let one = engine.constant(1);
+            engine.sub(&one, &one)
+        };
+        let mut r = zero.clone();
+        let mut rs = zero;
+        for (j, b) in chunk.iter().enumerate() {
+            let t = engine.mul_const(b, 1u64 << j);
+            r = engine.add(&r, &t);
+            if j >= shift as usize {
+                let t = engine.mul_const(b, 1u64 << (j - shift as usize));
+                rs = engine.add(&rs, &t);
+            }
+        }
+        out.push((r, rs));
+    }
+    out
+}
+
+/// Evaluate a bilinear form on two shared operand vectors, opening each operand **once**
+/// instead of once per product.
+///
+/// # Why this exists
+///
+/// Beaver's protocol multiplies two shares by opening two masked values, so a circuit of
+/// `n` multiplications sends `2n` ring elements. That is optimal for `n` unrelated
+/// multiplications and badly pessimal for a convolution, where the same hundred and fifty
+/// kernel weights are multiplied against a feature map at every one of tens of thousands
+/// of spatial positions. `docs/experiments.md` §VI.12 measures the consequence: the
+/// two-party arm's throughput is bandwidth-bound, its traffic is one opening per
+/// multiplication, and its convolutions reuse each operand ninety to a hundred and
+/// eighty-five times.
+///
+/// The generalisation is immediate once stated. For a bilinear map `F(x, y)` — any map
+/// linear in each argument separately, which a convolution and a matrix product both are
+/// — and a triple `(a, b, F(a, b))` with `a`, `b` uniform,
+///
+/// ```text
+/// F(x, y) = F(a, b) + F(a, e) + F(d, b) + F(d, e),   d = x − a,  e = y − b
+/// ```
+///
+/// by bilinearity. Opening `d` and `e` reveals nothing, since `a` and `b` are uniform and
+/// unknown. Each of the last three terms has at least one **public** argument, so each is
+/// a linear combination of shares with public coefficients: no communication. The traffic
+/// is therefore `|x| + |y|` elements rather than `2·(number of products)`, and it is one
+/// round however many products the form contains.
+///
+/// # What it costs instead
+///
+/// Local work triples: each product term is evaluated three times rather than once. That
+/// is the right trade here and the measurement says so — §VI.12 has the arm spending
+/// 392 ms of every 706 ms on traffic and a small fraction on computation — but it is a
+/// trade and not a free lunch, and on a link fast enough that bytes are cheap the scalar
+/// route is better.
+///
+/// # Falling back
+///
+/// If the engine supplies no bilinear triple this drops to one Beaver triple per product,
+/// which is exactly what the scalar lowering did, so the answer is unchanged and only the
+/// cost differs.
+pub fn bilinear_batch<E: ShareEngine>(
+    engine: &mut E,
+    inputs: &[E::Share],
+    weights: &[E::Share],
+    terms: &[Vec<(u32, u32)>],
+) -> Vec<E::Share> {
+    let m = engine.modulus();
+    match engine.bilinear_triple(inputs.len(), weights.len(), terms) {
+        Some((a, b, c)) => {
+            // One opening for the whole form: the masked operands, concatenated so they
+            // cost a single round between them.
+            let mut masked: Vec<E::Share> = Vec::with_capacity(inputs.len() + weights.len());
+            for (x, ai) in inputs.iter().zip(&a) {
+                masked.push(engine.sub(x, ai));
+            }
+            for (y, bi) in weights.iter().zip(&b) {
+                masked.push(engine.sub(y, bi));
+            }
+            let opened = engine.open_batch(&masked);
+            let (d, e) = opened.split_at(inputs.len());
+
+            let mut out = Vec::with_capacity(terms.len());
+            for (o, term) in terms.iter().enumerate() {
+                let mut acc = c[o].clone();
+                for &(i, w) in term {
+                    let (i, w) = (i as usize, w as usize);
+                    // F(a, e): shared × public.
+                    let t = engine.mul_const(&a[i], e[w]);
+                    acc = engine.add(&acc, &t);
+                    // F(d, b): public × shared.
+                    let t = engine.mul_const(&b[w], d[i]);
+                    acc = engine.add(&acc, &t);
+                    // F(d, e): public × public, so it is added at one party only, which
+                    // is what `add_const` means.
+                    acc = engine.add_const(&acc, m.mul(d[i], e[w]));
+                }
+                out.push(acc);
+            }
+            out
+        }
+        None => {
+            // No bilinear triple: one Beaver multiplication per product, batched so the
+            // round count is the same as the fast path even though the traffic is not.
+            let mut pairs: Vec<(E::Share, E::Share)> = Vec::new();
+            for term in terms {
+                for &(i, w) in term {
+                    pairs.push((inputs[i as usize].clone(), weights[w as usize].clone()));
+                }
+            }
+            let prods = engine.mul_batch(&pairs);
+            let mut out = Vec::with_capacity(terms.len());
+            let mut k = 0usize;
+            for term in terms {
+                let zero = {
+                    let one = engine.constant(1);
+                    engine.sub(&one, &one)
+                };
+                let mut acc = zero;
+                for _ in term {
+                    acc = engine.add(&acc, &prods[k]);
+                    k += 1;
+                }
+                out.push(acc);
+            }
+            out
+        }
+    }
+}
+
+/// Multiply a whole level, choosing between Beaver and the bilinear route by looking at
+/// how much the level's operands repeat.
+///
+/// # Recovering structure that the lowering threw away
+///
+/// `mpcc::lower` emits one multiplication per multiply-accumulate, so by the time a
+/// convolution reaches this function it is a few hundred thousand unrelated-looking
+/// products. The structure is still there, though, in the *operand registers*: a
+/// convolution's level reads a few hundred distinct registers across tens of thousands of
+/// multiplications, because a kernel weight is multiplied against a feature map at every
+/// spatial position. Two multiplications sharing an operand are recognisable only by
+/// register identity — comparing share values would be both wrong and impossible — which
+/// is why the caller carries `ids` alongside the batch.
+///
+/// So no new instruction and no change to the lowering is needed: the level is scanned,
+/// and if its operands repeat enough the whole level is evaluated as one bilinear form
+/// with `|left| + |right|` elements of traffic instead of twice the product count. A
+/// level whose operands do not repeat — the general case, and every level of a dense
+/// layer at batch one — falls through to Beaver, which is optimal there.
+///
+/// # The threshold, and why there is one
+///
+/// The bilinear route trades bytes for local work: each product is evaluated three times
+/// instead of once. `docs/experiments.md` §VI.12 measures the two-party arm spending
+/// 392 ms of every 706 ms on traffic, so the trade is worth making by a wide margin — but
+/// only when there is traffic to save. Fusing a level with no reuse would triple its
+/// arithmetic and save nothing, so the route is taken only at a reuse factor of four or
+/// better, and the *measured* ratios for the convolutions this is aimed at are 94 and 185.
+fn multiply_level<E: ShareEngine>(
+    engine: &mut E,
+    pairs: &[(E::Share, E::Share)],
+    ids: &[Option<(Reg, Reg)>],
+) -> Vec<E::Share> {
+    // Every multiplication in the level must be a plain register pair for the level to
+    // be fusable as a whole; a partial fusion would need two rounds and lose the point.
+    let all_named = ids.len() == pairs.len() && ids.iter().all(|i| i.is_some());
+    if all_named && pairs.len() >= 64 {
+        let mut left: Vec<Reg> = Vec::new();
+        let mut right: Vec<Reg> = Vec::new();
+        let mut li: HashMap<Reg, u32> = HashMap::new();
+        let mut ri: HashMap<Reg, u32> = HashMap::new();
+        for id in ids {
+            let (a, b) = id.expect("checked above");
+            li.entry(a).or_insert_with(|| {
+                left.push(a);
+                (left.len() - 1) as u32
+            });
+            ri.entry(b).or_insert_with(|| {
+                right.push(b);
+                (right.len() - 1) as u32
+            });
+        }
+        // Traffic either way, in ring elements: twice the products against the operands.
+        let reuse = (2 * pairs.len()) as f64 / (left.len() + right.len()) as f64;
+        if reuse >= 4.0 {
+            // One product per output, so the additions that consume these results are
+            // untouched. Grouping the sums into the form as well would save nothing
+            // further: the traffic is the operand count either way.
+            let terms: Vec<Vec<(u32, u32)>> = ids
+                .iter()
+                .map(|id| {
+                    let (a, b) = id.expect("checked above");
+                    vec![(li[&a], ri[&b])]
+                })
+                .collect();
+            // The operand *shares* come from the batch itself rather than a second
+            // lookup, so the two views cannot disagree.
+            let mut xs: Vec<Option<E::Share>> = vec![None; left.len()];
+            let mut ys: Vec<Option<E::Share>> = vec![None; right.len()];
+            for (p, id) in pairs.iter().zip(ids) {
+                let (a, b) = id.expect("checked above");
+                xs[li[&a] as usize] = Some(p.0.clone());
+                ys[ri[&b] as usize] = Some(p.1.clone());
+            }
+            if xs.iter().all(|v| v.is_some()) && ys.iter().all(|v| v.is_some()) {
+                let xs: Vec<E::Share> = xs.into_iter().map(|v| v.expect("checked")).collect();
+                let ys: Vec<E::Share> = ys.into_iter().map(|v| v.expect("checked")).collect();
+                // Returns the Beaver result unchanged if the engine supplies no bilinear
+                // triple, so this is safe to reach on every engine.
+                return bilinear_batch(engine, &xs, &ys, &terms);
+            }
+        }
+    }
+    engine.mul_batch(pairs)
+}
+
 /// Refuse an instruction by name, with the reason *that* instruction is refused.
 ///
 /// This used to name secret division for every unsupported op, which was
@@ -1194,6 +1596,130 @@ fn unsupported(op: &Op) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    /// What replacing an exact rescale with a truncation pair actually costs.
+    ///
+    /// The two rescale routes compute different functions, so the cheaper one is
+    /// not usable until the difference is characterised. The claim being checked is
+    /// the precise one: the stochastic result is the exact quotient or its
+    /// successor, never anything else, and the successor appears with frequency
+    /// equal to the discarded fraction — that is, the rounding is unbiased.
+    ///
+    /// Unbiasedness is the property that matters for a deep network, because an
+    /// exact truncation always rounds toward negative infinity and so contributes a
+    /// systematic negative drift once per layer, which compounds. Stochastic
+    /// rounding has larger variance per operation and no drift.
+    #[test]
+    fn stochastic_rescaling_is_off_by_at_most_one_and_is_unbiased() {
+        use crate::mpcc::{compile, run_protocol, schedule, LowerConfig};
+
+        let cfg = LowerConfig {
+            parties: 2,
+            bit_width: 32,
+            ..Default::default()
+        };
+        let shift = 8u32;
+        let src = format!("(ash-right x {shift})");
+        let prog = compile(&src, &cfg).expect("compiles");
+        let sched = schedule(&prog);
+
+        // A value whose discarded low bits are a known fraction of 2^shift, so the
+        // expected carry rate is known in advance and not read off the data.
+        for (x, frac) in [
+            (1000i64, 1000f64 % 256.0 / 256.0),
+            (-1000, ((-1000i64).rem_euclid(256)) as f64 / 256.0),
+            (777, 777.0 % 256.0 / 256.0),
+            (-3, ((-3i64).rem_euclid(256)) as f64 / 256.0),
+            // Exactly representable: nothing is discarded, so the rescale must be
+            // exact every single time and the carry can never fire.
+            (512, 0.0),
+            (-512, 0.0),
+        ] {
+            let ins = HashMap::from([("x".to_string(), x)]);
+            let exact = run_protocol("dealer", 2, &prog, &sched, &ins).expect("exact");
+            let want = exact.outputs[0].1;
+            assert_eq!(want, x >> shift, "the exact route is an arithmetic shift");
+
+            let trials = 400;
+            let mut carries = 0usize;
+            for _ in 0..trials {
+                let got = run_protocol("dealer-tp", 2, &prog, &sched, &ins).expect("pairs");
+                let d = got.outputs[0].1 - want;
+                assert!(
+                    d == 0 || d == 1,
+                    "x={x}: stochastic rescale deviated by {d}, which the \
+                     construction does not permit"
+                );
+                carries += usize::from(d == 1);
+            }
+            let rate = carries as f64 / trials as f64;
+            if frac == 0.0 {
+                assert_eq!(carries, 0, "x={x} is exactly representable at this shift");
+            } else {
+                // Binomial with p = frac over 400 trials: three standard
+                // deviations is at most 0.075, and a wider band than that would
+                // not distinguish unbiasedness from its absence.
+                let sd = (frac * (1.0 - frac) / trials as f64).sqrt();
+                assert!(
+                    (rate - frac).abs() < 4.0 * sd + 0.02,
+                    "x={x}: carry rate {rate:.3} against discarded fraction {frac:.3}"
+                );
+            }
+        }
+    }
+
+    /// The cheap route is cheap for the stated reason: it performs no
+    /// multiplication and spends one round.
+    #[test]
+    fn a_truncation_pair_replaces_every_multiplication_with_one_opening() {
+        use crate::mpcc::{compile, run_protocol, schedule, LowerConfig};
+
+        let cfg = LowerConfig {
+            parties: 2,
+            bit_width: 32,
+            ..Default::default()
+        };
+        // Eight independent rescales, so that batching is exercised.
+        let binds: Vec<String> = (0..8)
+            .map(|i| format!("(y{i} (ash-right x{i} 8))"))
+            .collect();
+        let sum = crate::bench::depth::sum_tree((0..8).map(|i| format!("y{i}")).collect());
+        let src = format!("(let* ({}) {sum})", binds.join(" "));
+        let ins: HashMap<String, i64> =
+            (0..8).map(|i| (format!("x{i}"), 1000 + i as i64)).collect();
+        let prog = compile(&src, &cfg).expect("compiles");
+        let sched = schedule(&prog);
+
+        let exact = run_protocol("dealer", 2, &prog, &sched, &ins).expect("exact");
+        let pairs = run_protocol("dealer-tp", 2, &prog, &sched, &ins).expect("pairs");
+
+        // The exact route decomposes: many multiplications, several rounds.
+        assert!(
+            exact.muls > 1000,
+            "eight decompositions should cost thousands of multiplications, got {}",
+            exact.muls
+        );
+        // The pair route performs none at all beyond generating its randomness,
+        // and the randomness is query-independent.
+        assert_eq!(
+            pairs.muls, pairs.random_bit_muls,
+            "a truncation pair should multiply only to generate its own bits"
+        );
+        assert!(
+            pairs.rounds < exact.rounds,
+            "pairs {} should be shallower than a decomposition {}",
+            pairs.rounds,
+            exact.rounds
+        );
+        // Same order of magnitude of randomness: the saving is in multiplications
+        // and rounds, not in bits, and claiming otherwise would be wrong.
+        assert!(
+            pairs.random_bits * 2 > exact.random_bits,
+            "pairs {} vs exact {} random bits",
+            pairs.random_bits,
+            exact.random_bits
+        );
+    }
     use super::*;
 
     #[test]
