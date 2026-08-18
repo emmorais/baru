@@ -1,0 +1,354 @@
+\section{Compilation: flattening, scheduling and backend-aware optimisation}
+\label{sec:compiler}
+
+The comparisons of this survey are possible because one source program is lowered
+to every paradigm rather than being written once per paradigm. That lowering is a
+compiler, and it is a contribution in its own right: the object it optimises is
+not a machine but a \emph{protocol}, whose cost model is unlike a processor's, and
+several standard compiler transformations change sign under it. This section
+develops the intermediate representations, states what the optimiser is permitted
+to do, and proves the two structural facts that distinguish the problem from
+classical instruction selection.
+
+\subsection{Two intermediate representations, and why there are two}
+\label{sec:compiler:ir}
+
+\begin{definition}
+\label{def:flatop}
+A \ib{flat program} over a set of wires $\mathcal{W}$ is a finite sequence of
+instructions in static single-assignment form,
+$\iota_1,\dots,\iota_m$, where each $\iota_j$ has an operation, a list of source
+wires and a destination wire $d_j$, subject to: every $d_j$ is distinct, and every
+source wire either is an input or equals $d_{j'}$ for some $j' < j$. We write
+$\mathcal{P}$ for the set of flat programs. The operations are constants, ring
+addition and subtraction, multiplication, signed and unsigned comparison,
+equality, bitwise operations, shifts, selection and, in the non-deterministic
+setting, division.
+\end{definition}
+
+Flat programs are the representation a proof system wants, because a constraint
+system is a conjunction of relations over named wires and SSA gives exactly that.
+They are also what a homomorphic evaluator wants, because a homomorphic evaluator
+is an interpreter over a dataflow graph. They are, however, the wrong
+representation for costing a secret-sharing protocol, for three reasons that
+Definition~\ref{def:bytecode} then addresses.
+
+\begin{definition}
+\label{def:bytecode}
+A \ib{vectorised bytecode program} is a finite sequence of instructions over
+registers, where each register carries a \ib{width} $\omega \in \N$, a
+\ib{domain} $\mathcal{D} \in \{\Z_{2^k},\ \mathbb{F}_p,\ \mathbb{F}_2\}$ and a
+\ib{secrecy} tag in $\{\textsf{clear},\textsf{secret}\}$. Instructions are
+partitioned into \ib{local} ones, which consume no communication, and
+\ib{interactive} ones, which consume one round and possibly correlated
+randomness. An instruction of width $\omega$ denotes $\omega$ independent
+applications of its operation.
+\end{definition}
+
+The three deficiencies of Definition~\ref{def:flatop} for protocol costing are now
+visible. It is scalar, so a dot product of $784$ terms appears as $784$
+multiplications not as as one instruction of width $784$, and a cost model
+reading it would charge $784$ rounds where a protocol pays one. It carries no
+domain, so it cannot express that the same multiplication costs one Beaver triple
+over $\Z_{2^k}$ and roughly $k$ AND gates over $\mathbb{F}_2$. And it has no
+notion of an \emph{opening}, which is the unit of communication in a
+secret-sharing protocol and does not correspond to any single arithmetic
+operation.
+
+\begin{definition}
+\label{def:lowering}
+A \ib{lowering} is a map $\mathcal{L} : \mathcal{P} \to \mathcal{B}$ from flat
+programs to bytecode programs. It is \ib{faithful} when for every $P$ and every
+input assignment, the outputs of $P$ and $\mathcal{L}(P)$ agree under the
+plaintext semantics of both.
+\end{definition}
+
+Our compiler keeps both representations and one faithful lowering between them,
+in place of a single universal intermediate representation. The reason is not
+expedience: the two have genuinely different notions of cost, and a
+representation that served both would have to carry the union of their
+annotations while permitting only the transformations sound for both. Keeping the
+flat form as the input to lowering, and confining protocol-aware reasoning to the
+bytecode, means that a rewrite justified by a protocol's cost model cannot
+accidentally be applied where the paradigm makes it unsound.
+
+\subsection{Flattening and the classical passes}
+\label{sec:compiler:flatten}
+
+Flattening turns a nested expression into a flat program. Its interesting
+properties are not the traversal, which is standard, but the interaction of the
+classical passes with the cost model that follows.
+
+\begin{definition}
+\label{def:passes}
+Let $P$ be a flat program with designated output wire $r$.
+\ib{Constant folding} replaces any instruction all of whose sources are constants
+by a constant. \ib{Common-subexpression elimination} identifies instructions with
+equal operation and equal source wires, retaining one and substituting its
+destination for the others. \ib{Dead-wire elimination} removes instructions whose
+destinations are not reachable from $r$ in the dependence graph.
+\end{definition}
+
+\begin{proposition}
+\label{prop:passes-sound}
+Constant folding, common-subexpression elimination and dead-wire elimination
+preserve the value computed at $r$, and dead-wire elimination applied after
+common-subexpression elimination removes at least as many instructions as either
+order of the two applied once.
+\end{proposition}
+
+\begin{proof}
+Soundness of folding is that the operations are functions of their arguments;
+soundness of elimination is that equal operations on equal arguments yield equal
+results, so substituting one destination for another preserves every later value;
+soundness of dead-wire removal is that SSA destinations are distinct, so an
+instruction whose destination is unreachable from $r$ cannot influence $r$. For
+the ordering claim, note that eliminating a common subexpression can only decrease
+the set of reachable wires: it replaces occurrences of one destination by another
+and never introduces a new dependence. Hence the set of dead wires after
+elimination contains the set of dead wires before it, and the second pass removes
+at least as many.
+\end{proof}
+
+Proposition~\ref{prop:passes-sound} justifies the pass order our compiler uses. It
+is worth stating because the intuition from classical compilation---that
+elimination and dead-code removal are independent---is false here in a useful
+direction: collapsing duplicates is what \emph{creates} the dead wires, so running
+the removal afterwards is strictly better and not merely tidier.
+
+\subsection{Scheduling: rounds as a graph height}
+\label{sec:compiler:sched}
+
+\begin{definition}
+\label{def:schedule}
+A \ib{schedule} of a bytecode program assigns to each instruction a level in $\N$
+such that every instruction's level exceeds the level of each instruction
+producing one of its sources when that instruction is interactive, and is at least
+that level when it is local. The \ib{as-soon-as-possible} schedule assigns each
+instruction the least level satisfying these constraints.
+\end{definition}
+
+Proposition~\ref{prop:asap} established that the as-soon-as-possible schedule's
+number of interactive levels equals the maximum number of interactive operations
+on a directed path, and that no schedule does better. Two corollaries drive the
+optimiser.
+
+\begin{corolary}
+\label{cor:batching}
+Under the as-soon-as-possible schedule, all interactive instructions at one level
+are mutually independent and may be issued as a single batched protocol
+invocation. Consequently a layer of $n$ independent comparisons costs the rounds
+of one comparison, and the round count of a network is a function of its depth
+alone.
+\end{corolary}
+
+\begin{proof}
+Two instructions at the same level cannot be joined by a directed path, since a
+path through an interactive instruction strictly increases the level. Independence
+permits batching by the definition of the protocols involved. The consequence for
+a network follows because the nonlinearities of one layer depend only on that
+layer's affine map and not on each other.
+\end{proof}
+
+\begin{corolary}
+\label{cor:reassoc}
+Let $\circ$ be an associative operation whose bytecode realisation is interactive,
+and let $e$ be a left-nested chain $x_1 \circ (x_2 \circ (\cdots \circ x_n))$.
+Rebalancing $e$ into a tree of depth $\ceil{\log n}$ leaves the instruction count
+unchanged and reduces the interactive depth from $n-1$ to $\ceil{\log n}$. If the
+realisation of $\circ$ is \emph{local}, rebalancing changes nothing.
+\end{corolary}
+
+\begin{proof}
+A binary tree with $n$ leaves has $n-1$ internal nodes regardless of shape, so the
+instruction count is invariant; the height of a balanced tree is $\ceil{\log n}$
+and of a chain is $n-1$, and by Proposition~\ref{prop:asap} the interactive height
+is the round count. If $\circ$ is local it contributes no interactive levels in
+either shape.
+\end{proof}
+
+Corollary~\ref{cor:reassoc} is the cleanest instance of the phenomenon this
+section exists to formalise: reassociation is a transformation that changes
+\emph{only} depth, leaving every other count identical, so its value is determined
+entirely by whether the target protocol charges for depth. Over an arithmetic
+sharing, addition is local and multiplication is interactive, so rebalancing a
+product chain pays and rebalancing a sum chain does not. Over a binary protocol an
+adder is itself a circuit with AND-depth, so rebalancing a sum chain pays as well.
+Over a constant-round protocol neither pays. One transformation, three answers,
+determined by the cost model and not by a heuristic.
+
+\subsection{Backend-aware rewriting}
+\label{sec:compiler:rewrite}
+
+\begin{definition}
+\label{def:rewrite}
+A \ib{rewrite rule} is a partial map $\rho$ on bytecode programs that preserves
+plaintext semantics. A \ib{cost model} for a protocol $\pi$ and deployment
+$\delta$ is a function $\mathrm{cost}_{\pi,\delta} : \mathcal{B} \to \Rr_{\ge0}$.
+A rule $\rho$ is \ib{profitable} for $(\pi,\delta)$ at $P$ when
+$\mathrm{cost}_{\pi,\delta}(\rho(P)) < \mathrm{cost}_{\pi,\delta}(P)$.
+\end{definition}
+
+\begin{definition}
+\label{def:baopt}
+The \ib{backend-aware optimiser} takes a program $P$, a protocol $\pi$ and a
+deployment $\delta$, and returns
+$\rho_{i_k} \circ \cdots \circ \rho_{i_1}(P)$ obtained by considering candidate
+rules and applying each only when it is profitable for $(\pi,\delta)$ at the
+current program, with semantic preservation checked by differential evaluation
+against the original on random inputs.
+\end{definition}
+
+The definition is greedy and makes no optimality claim; we state its limitations
+below not leave them implicit. What it does provide is that the target
+protocol is a \emph{parameter} of optimisation rather than a fixed assumption, and
+the consequence is that the optimiser emits different circuits for different
+protocols from the same source. We give the phenomenon a statement, since it is
+the contribution.
+
+\begin{proposition}
+\label{prop:rewrite-sign}
+There exist a rewrite rule $\rho$, a program $P$ and protocols $\pi_1,\pi_2$ such
+that $\rho$ is profitable for $\pi_1$ at $P$ and unprofitable for $\pi_2$ at $P$.
+\end{proposition}
+
+\begin{proof}
+Take $\rho$ to be strength reduction, replacing multiplication by a public
+constant $c$ with a sum of shifts, and let $P$ multiply a secret by $c$. Under a
+binary protocol, a $k\times k$ multiplier is $\Theta(k^2)$ AND gates while an
+adder is $\Theta(k)$, so replacing a general multiplication by a small number of
+shifts and additions reduces the gate count and hence the cost; $\rho$ is
+profitable. Under an arithmetic sharing over $\Z_{2^k}$, multiplication by a
+public constant is a local scaling of each share and costs nothing, whereas the
+rewritten form is a sequence of local operations that is no cheaper and adds
+instructions; $\rho$ is not profitable. The two protocols therefore assign
+opposite signs to the same rule at the same program.
+\end{proof}
+
+\begin{remark}
+\label{rem:persite}
+Proposition~\ref{prop:rewrite-sign} concerns one rule at one program. A subtler
+point is that profitability varies \emph{within} a program: on
+$(x \cdot 2^a) + (y \cdot c)$ with $c$ not a power of two, strength reduction is
+profitable at the first site and not at the second under a protocol where the
+shift is free and the general constant is not. An optimiser that decides a rule
+once for the whole program must therefore take both or neither, and will be wrong
+at one site. Deciding per site costs a full cost evaluation per candidate, which
+is affordable because evaluating the model is cheap, and it is what makes the
+emitted circuits differ between protocols by a \emph{subset} relation rather than
+arbitrarily.
+\end{remark}
+
+\begin{remark}
+\label{rem:opt-limits}
+The optimiser of Definition~\ref{def:baopt} is greedy with a fixed rule order and
+evaluates candidate sites independently. It therefore misses any pair of rewrites
+that is profitable only jointly, and it offers no approximation guarantee. We
+state this not characterise the loss, because we have not measured it; the
+honest claim is that the optimiser improves the cost model's prediction relative
+to no optimisation and relative to a backend-blind choice, not that it is optimal.
+\end{remark}
+
+\subsection{Protocol assignment, and why the objective is not separable}
+\label{sec:compiler:assign}
+
+The final transformation chooses \emph{which} protocol evaluates each part of a
+program, paying for conversions where the choice changes.
+
+\begin{definition}
+\label{def:assignment}
+Let $\Sigma$ be a finite set of protocols and let $K$ be the set of operation
+kinds occurring in $P$. An \ib{assignment} is a map $a : K \to \Sigma$. A
+\ib{crossing} is an edge of the dependence graph whose endpoints are assigned
+different protocols; realising it requires a \ib{conversion} instruction. The
+\ib{assignment problem} is to minimise
+$\mathrm{cost}_{\delta}\bigl(a\bigr)$, the cost of the program under $a$ with
+conversions inserted at every crossing.
+\end{definition}
+
+\begin{proposition}
+\label{prop:assign-nonsep}
+The objective of Definition~\ref{def:assignment} is not separable over operations:
+there are programs and deployments for which the cost of an assignment is not
+equal to any sum of per-operation terms, even allowing pairwise terms for
+crossings. Two mechanisms suffice, and either alone is enough:
+\begin{enumerate}
+  \item a level's latency is the \emph{maximum} over the interactive instructions
+  it contains, not their sum;
+  \item conversions at the same level are \emph{batched}, so the marginal cost of a
+  crossing depends on whether another crossing already occurs at that level.
+\end{enumerate}
+\end{proposition}
+
+\begin{proof}
+For (1), consider a deployment with latency $L$ and unbounded bandwidth, and a
+program consisting of $m$ mutually independent interactive operations. By
+Proposition~\ref{prop:asap} the schedule has one interactive level, so the latency
+contribution is $L$ regardless of $m$; any separable objective assigning a
+positive term $c > 0$ to each such operation would report $mc$, which is not
+constant in $m$. Moving one of the $m$ operations to another protocol changes the
+cost by zero if that protocol's level is already occupied and by $L$ if it is not,
+so the marginal cost of an individual assignment decision depends on the rest of
+the assignment. For (2), let two crossings occur at one level; their combined
+conversion cost is that of a single batched conversion, which is strictly less than
+twice the cost of one whenever the conversion has a fixed component. Then the cost
+of the assignment that makes both crossings is less than the sum of the costs of
+the two assignments each making one, contradicting separability with pairwise
+terms.
+\end{proof}
+
+\begin{corolary}
+\label{cor:no-ilp}
+An integer-linear formulation of the assignment problem with per-operation and
+per-crossing variables and a linear objective cannot express the cost of
+Definition~\ref{def:assignment} exactly.
+\end{corolary}
+
+\begin{proof}
+A linear objective over such variables is by construction a sum of per-operation
+and per-crossing terms, which Proposition~\ref{prop:assign-nonsep} shows is not
+equal to the cost function.
+\end{proof}
+
+Corollary~\ref{cor:no-ilp} places our approach with respect to the prior work on
+protocol assignment, which formulates the problem as an integer program and
+therefore commits to a linear, separable cost. That formulation is a good
+approximation in a regime where each operation's cost is dominated by bandwidth,
+which is separable, and it becomes inaccurate in the regime where latency
+dominates---which is the wide-area regime and precisely the one in which the
+paradigms differ most. Because evaluating our cost model on a whole program is
+inexpensive, we can afford to optimise the exact objective by search, giving up
+optimality guarantees instead of fidelity. A learned surrogate for the cost model
+would be the alternative if the search space grew beyond exact evaluation, and it
+is the direction the recent literature takes; we note it as complementary and not as as competing.
+
+\begin{remark}
+\label{rem:assign-scope}
+Our assignment is per operation \emph{kind}, not per instruction. The space is
+therefore $\abs{\Sigma}^{\abs{K}}$ with $\abs{K}$ a few dozen, in place of
+$\abs{\Sigma}^{m}$ with $m$ the instruction count, and the resulting assignment is
+interpretable: a statement such as ``comparisons moved to the binary protocol'' is
+a statement about the cost model. Per-instruction assignment is strictly more
+expressive and is the natural next step; we do not claim it.
+\end{remark}
+
+\subsection{Summary of the compilation pipeline}
+\label{sec:compiler:summary}
+
+Collecting the above, a source program traverses: parsing to an abstract syntax
+tree; flattening to a flat program (Definition~\ref{def:flatop}) with constant
+folding, common-subexpression elimination and dead-wire elimination
+(Proposition~\ref{prop:passes-sound}); lowering to vectorised bytecode
+(Definition~\ref{def:bytecode}) with domain and secrecy annotations; backend-aware
+rewriting against the cost model of the chosen protocol
+(Definition~\ref{def:baopt}); protocol assignment with conversions priced at
+crossings (Definition~\ref{def:assignment}); as-soon-as-possible scheduling
+(Definition~\ref{def:schedule}); and execution on a protocol engine or, for the
+proof and homomorphic paradigms, direct interpretation of the flat program.
+
+Two properties of this pipeline are what the rest of the survey relies on. Every
+paradigm receives the \emph{same} source, so a comparison between paradigms is not
+confounded by a difference in the program. And the cost model that guides
+optimisation is the same one whose predictions we validate against measurement,
+so a claim that an optimisation helps is falsifiable in the same terms as a claim
+about a protocol.

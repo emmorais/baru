@@ -136,7 +136,7 @@ accounting conventions. A practitioner choosing between them, or a reviewer
 assessing a claim that one beats another, must assemble numbers from different
 papers, measured on different hardware, over different networks, counting
 different things. Cross-paradigm comparison is therefore largely \emph{citation
-assembly} rather than measurement.
+assembly} not measurement.
 
 We take a different route. We survey the paradigms through a single artifact,
 \Baru{}, in which one source program runs on all of them---a plain interpreter,
@@ -147,11 +147,11 @@ Every backend is driven through the same transport, charged by the same byte and
 round accounting, and checked bit-exactly against the same plaintext reference.
 A network cost model is validated against a real socket to within \SI{13.6}{\percent}
 worst case, so a claim about a wide-area deployment is computed from measured
-counts rather than asserted.
+counts and not asserted.
 
 Several widely repeated intuitions survive re-measurement; several do not. Among
 the results that only a single-harness study can produce: the FHE-versus-MPC
-crossover is a property of \emph{the baseline's preprocessing} rather than of
+crossover is a property of \emph{the baseline's preprocessing} not of
 either cryptosystem, and disappears once MPC is given somewhat-homomorphic
 preprocessing; at a \emph{matched} corruption model---two parties, dishonest
 majority---and against an external baseline competitive with the published state of
@@ -168,6 +168,13 @@ three times before measuring it---because a study that reports only what worked 
 not
 reporting.
 \end{abstract}
+
+\medskip
+{\small\setlength{\parskip}{0pt}
+ \setcounter{tocdepth}{2}
+ \tableofcontents}
+\clearpage
+
 
 %==============================================================================
 \section{The comparability problem}
@@ -232,21 +239,41 @@ arithmetic of homomorphic encryption, packing, and succinct proofs. A reader who
 this material can begin at Section~\ref{sec:prelim}, which gives the cryptographic
 preliminaries in the specific form our artifact implements them---and we remark that
 several of our results turn on the difference between that form and the textbook one.
-In
-Section~\ref{sec:background} we organize the four paradigms by what each one is
-expensive in. In Section~\ref{sec:artifact} we describe our artifact and the abstract
-machine at its centre, and in Section~\ref{sec:paradigms} we survey and measure each
-paradigm in turn. In Section~\ref{sec:related} we position this study with respect to
+Section~\ref{sec:ml} completes the foundations on the workload side, developing the
+neural inference our experiments compute: the arithmetic of dense and convolutional
+layers, which nonlinearities each cryptosystem can evaluate and at what cost,
+quantisation and its error, the metrics an accuracy figure is quoted in, and the
+threat models a private inference may target---the last of which is what makes two
+published latencies incomparable when one hides the model and the other does not.
+
+In Section~\ref{sec:background} we organize the four paradigms by what each one is
+expensive in, and in Section~\ref{sec:artifact} we describe our artifact and the
+abstract machine at its centre. Section~\ref{sec:compiler} presents the compiler as a
+contribution in its own right: the two intermediate representations and the faithful
+lowering between them, the classical passes and their sound order, scheduling---under
+which round complexity is a graph height---backend-aware rewriting, in which one
+transformation is profitable under one protocol and unprofitable under another, and
+protocol assignment, whose objective we show is not separable and therefore not
+faithfully expressible as an integer program. In Section~\ref{sec:paradigms} we
+survey and measure each paradigm in turn. In Section~\ref{sec:related} we position this study with respect to
 the literature, and in particular with respect to MP-SPDZ. In
 Section~\ref{sec:method} we present the methodology, and in
 Section~\ref{sec:cross} the cross-paradigm findings that motivate it. In
 Section~\ref{sec:medmnist} we give a case study on private medical image diagnosis. In
-Section~\ref{sec:withdrawn} we record what the methodology caught in our own work, in
-Section~\ref{sec:threats} the threats to validity, and in Section~\ref{sec:open} the
-problems that remain open.
+Section~\ref{sec:threats} we state the threats to validity, and in
+Section~\ref{sec:open} the problems that remain open.
+Appendix~\ref{sec:withdrawn} is a detailed experimental report of the errors this
+methodology detected in our own work; it sits outside the body because its interest
+is methodological instead of scientific, and no result of the survey depends on it.
 
 \paragraph{Contributions.}
 \begin{itemize}
+  \item \textbf{Foundations} for cross-paradigm comparison that are developed
+    not cited: the mathematics the paradigms share and the points at
+    which their algebra diverges (\cref{sec:math}), the protocol machinery built
+    on it (\cref{sec:found}), and the arithmetic of the workload itself, since a
+    comparison of privacy-preserving inference is in the end a comparison of how
+    each paradigm evaluates one nonlinearity (\cref{sec:ml}).
   \item A \textbf{systematization} of four paradigms organized by what they
     actually cost, with the cost dimensions (rounds, bytes, compute,
     preprocessing) separated rather than collapsed into one ``performance''
@@ -259,8 +286,19 @@ problems that remain open.
     depends on parameters the original claims left implicit---one of which we
     ourselves mislocated three times before measuring it
     (\cref{sec:crossover-nonlin}).\vspace{-1pt}
-  \item A \textbf{methodology for honest benchmarking} (\cref{sec:method}), with
-    the record of what it caught in our own work (\cref{sec:withdrawn}).
+  \item A \textbf{compiler whose optimiser takes the protocol as a parameter}
+    (\cref{sec:compiler}). One source program is flattened, lowered to a
+    vectorised bytecode carrying domain and secrecy, rewritten against the cost
+    model of the chosen protocol, and scheduled so that round complexity is the
+    height of a dependence graph. We show that a single rewrite rule can be
+    profitable under one protocol and unprofitable under another
+    (\cref{prop:rewrite-sign}), and that the protocol-assignment objective is
+    \emph{not separable} over operations and therefore not faithfully expressible
+    as an integer program (\cref{prop:assign-nonsep,cor:no-ilp})---which
+    distinguishes our formulation from the prior work on the problem.
+  \item A \textbf{methodology for honest benchmarking} (\cref{sec:method}),
+    together with the record, in \cref{sec:withdrawn}, of the errors it detected
+    in our own work.
 \end{itemize}
 
 %==============================================================================
@@ -294,6 +332,9 @@ results are specific to this workload, and where that is the case we say so.
 
 %==============================================================================
 \input{foundations}
+
+%==============================================================================
+\input{mlfoundations}
 
 %==============================================================================
 \section{Cryptographic preliminaries}
@@ -367,15 +408,16 @@ $a$ the mutual information is $I(a;c) \approx 1/(2\ln 2) \approx 0.72$ bits.
 
 The second case of Theorem~\ref{thm:mask} can be interpreted as the statement that a mask
 chosen only to prevent an overflow does not hide anything in particular. We give it as a
-theorem rather than as a remark because we shipped a truncation protocol that satisfied the
-first requirement and violated the second, and no correctness test could observe it; we
-describe the episode in Section~\ref{sec:disclosure}.
+theorem and not as as a remark because the second condition is easy to satisfy
+inadvertently while violating the first, and because no correctness test can
+distinguish the two: a mask that prevents overflow yields correct arithmetic and
+insufficient hiding. Appendix~\ref{sec:appendix:caught} records an instance.
 
 \subsection{Secret-sharing MPC}
 \label{sec:prelim:mpc}
 
 In this section we describe the sharing structures and the multiplication protocol that our
-MPC layer implements. We work over the ring $\Z_{2^k}$ rather than over a prime field,
+MPC layer implements. We work over the ring $\Z_{2^k}$ and not over a prime field,
 because machine arithmetic is already modular and because fixed-point truncation is more
 natural there.
 
@@ -696,8 +738,7 @@ and decrypts by scaling and rounding, so its tensor product carries a factor $\D
 must be scaled away; BGV places the message in the low-order bits and decrypts by reducing
 modulo $t$, so its noise grows multiplicatively and is controlled by \emph{modulus
 switching}, that is, by dividing the ciphertext modulus in order to divide the noise. We
-implement both, and we did so in order to answer a specific question by substitution rather
-than by argument: how much of the cost we measure belongs to RLWE itself and how much belongs
+implement both, and we did so in order to answer a specific question by substitution not by argument: how much of the cost we measure belongs to RLWE itself and how much belongs
 to a particular encoding.
 
 \paragraph{Noise, depth and bootstrapping.} Every homomorphic operation enlarges the error of
@@ -924,7 +965,7 @@ preprocessing realizes $\mathcal{F}_{\mathrm{Prep}}$, and the online phase reali
 the $\mathcal{F}_{\mathrm{Prep}}$-hybrid model. It means that our pool of
 Section~\ref{sec:crossover-nonlin} is not merely an optimization but the boundary between the
 two layers of the proof, and that the miss counter which refuses to let an online phase generate
-its own preprocessing is enforcing that boundary rather than only measuring it.
+its own preprocessing is enforcing that boundary and not merely measuring it.
 
 \begin{lemma}[Opening audit]
 \label{lem:openings}
@@ -942,7 +983,7 @@ In $\Pi_{\mathrm{Trunc}}$ the same holds, which is the reason the mask must cove
 the overflow be corrected rather than avoided. In $\Pi_{\mathrm{PC}}$ the opened value is
 $m \cdot \prod_i c_i$; the $c_i$ carry no randomness of their own, hence the mask $m$ must be a
 uniform unit \emph{and must remain secret}, which is what forces the zero test on $m$ to open
-$m \cdot s$ rather than $m$.
+$m \cdot s$ not $m$.
 \end{proof}
 
 \begin{table}[htb]
@@ -1045,7 +1086,7 @@ We remark that $\mathcal{F}_{\mathrm{NN}}$ is the weakest of the three to specif
 to get wrong, because it is where the application decides what may be public. Ours reveals the
 predicted class and the network's architecture, and nothing else: not the logits, not the
 activations, and not the input. Writing it down is what makes ``the pipeline reveals only the
-class index'' a checkable statement rather than a description of the code.
+class index'' a checkable statement not a description of the code.
 
 \paragraph{What the theorem does not cover, and what it would cost.} The hybrid pipeline is
 outside $\Fabb$, because $\Fabb$ has no ciphertexts. Extending the statement to it needs three
@@ -1061,7 +1102,7 @@ rather than in a model with one. The construction follows the line Damgård and
 Nielsen~\cite{DamgardNielsen} established for an arithmetic black box from threshold homomorphic
 encryption and which Asharov et al.~\cite{AsharovMHE} carry to threshold FHE, with one adaptation
 that the replicated setting forces and one dividend that it pays; both are described in
-Section~\ref{sec:threats}. The adaptation is that components are ternary rather than uniform,
+Section~\ref{sec:threats}. The adaptation is that components are ternary, not uniform,
 because independent sampling cannot deliver a small key and uniform shares at once, and the
 resulting leak is one the standard assumption already absorbs. The dividend is that a product
 ciphertext needs no evaluation key at all, since replicated shares yield a sharing of $s^2$ with no
@@ -1141,8 +1182,7 @@ FHE                & computing server  & \textbf{compute}, ct.\ size & rounds (n
 ZK proofs          & the verifier      & \textbf{prover compute} & verifier, proof size & none \\
 \bottomrule
 \end{tabular}
-\caption{The paradigms organized by cost structure rather than security
-property. Three trade-offs follow directly, and drive most of this paper.}
+\caption{The paradigms organized by cost structure, not by security property. Three trade-offs follow directly, and drive most of this paper.}
 \label{tab:paradigms}
 \end{table}
 
@@ -1210,7 +1250,7 @@ function: in order to evaluate an application $(f\ a)$, the machine pushes onto 
 instruction ``evaluate the argument and then apply $f$'' and moves to $f$; when a value is
 finally produced, the machine pops the topmost frame of $K$ and proceeds. It means that no
 recursion takes place on the stack of the host language, and consequently a deep program
-consumes heap rather than stack, and the entire state of the machine is an ordinary value.
+consumes heap not stack, and the entire state of the machine is an ordinary value.
 
 \begin{figure}[t]
 \centering
@@ -1267,7 +1307,7 @@ Definition~\ref{def:cek} in this work.
     accidentally unwind past a point at which a protocol must synchronize.
   \item \textbf{The abstraction admits batching, although the machine does not perform it.} A
     backend primitive receives a \emph{vector} of operands, so an entire layer of \bt{lt} calls
-    can be one protocol round rather than thousands. We are precise about where that batching
+    can be one protocol round not thousands. We are precise about where that batching
     comes from, because it is not from the continuation: our evaluator issues primitives one at
     a time, and the parallelism is supplied either by a gadget that calls the batched primitive
     explicitly, or by the compiler of Section~\ref{sec:cross}, which recovers it automatically
@@ -1364,6 +1404,10 @@ otherwise, all the figures that follow were obtained on the same machine, an App
 with 8 cores, in a release build.
 
 %==============================================================================
+%==============================================================================
+\input{compiler}
+
+%==============================================================================
 \section{The paradigms, surveyed and measured}
 \label{sec:paradigms}
 
@@ -1429,7 +1473,7 @@ but batches into the same round.}
 
 The dot-product row is a small-workload artifact---the semi-honest leg needs only
 four interactive calls, so a fixed pair-pool cost amortizes against nothing---and
-we report it rather than hide it.
+we report it instead of hiding it.
 
 A second result generalizes, \textbf{with a correction we owe to
 \cref{sec:crossover-nonlin}}. The statistical slack that ring-based verification
@@ -1580,7 +1624,7 @@ from the plaintext reference, and they do not.
 In this section we measure the succinct-proof paradigm of
 Section~\ref{sec:prelim:zk}. The statement that we prove is a quantized neuron in the Q16.16
 format, namely $\ReLU((\sum_i w_i x_i) \gg 16 + b)$, with public weights and private inputs,
-and we prove it on a real Binius64 prover rather than on a placeholder. We give the results in
+and we prove it on a real Binius64 prover not on a placeholder. We give the results in
 Table~\ref{tab:zkp}.
 
 \begin{table}[t]
@@ -1744,7 +1788,7 @@ secret weights, both routes over the same transport and both checked against the
 reference. The gadget route is written by an expert who called the batched primitives
 deliberately; the compiled route is scalar source with no batching hint. \emph{Calls} counts
 backend primitives, \emph{waits} counts the times a party blocked for a peer. The last rung is a
-protocol assignment rather than a compiler pass, so the hand-written route is given the same
+protocol assignment in place of a compiler pass, so the hand-written route is given the same
 assignment in the second row --- the two rows in bold are the comparison that means something.
 Bytes are one run and are stable; the millisecond columns carry the harness's run-to-run variance
 of roughly \SI{13}{\percent}. $^\dagger$Waits carry a $\pm 1$ of their own, and the marker is on
@@ -1798,10 +1842,10 @@ It also shows which pass does the work: levelling alone leaves the compiled rout
 waits against the expert's $\num{33}$, and it is reassociating the dependent reduction that
 closes the gap to $\num{32}$. Common subexpression elimination contributes nothing to waits at
 all, and a great deal to bytes ($\num{881}$ against \SI{33.5}{\kilo\byte}), which is why the
-ladder is reported per pass rather than as one number.
+ladder is reported per pass not as as one number.
 
 \paragraph{The cost of a primitive, measured.}
-Once blocking is the unit, the cost of each primitive can be measured rather than assumed, and
+Once blocking is the unit, the cost of each primitive can be measured and not assumed, and
 Table~\ref{tab:waitcost} does so at two batch widths. The width columns agree, which is the
 property that makes levelling worth doing: a batched primitive blocks the same number of times
 whatever its width, so collapsing a layer into one call is free in rounds.
@@ -1838,11 +1882,11 @@ is one logical round; the executor issues one batched call per \emph{kind} per l
 blocks, so a level holding a multiplication and a comparison pays their \emph{sum}. We expected
 this to be the largest item outstanding. Counting the mixed levels in the network of
 Table~\ref{tab:handvscompiled} shows there are \emph{none}: the schedule has \num{8} interactive
-levels and issues \num{8} batched calls. The reason is structural rather than lucky --- a
+levels and issues \num{8} batched calls. The reason is structural not lucky --- a
 $\ReLU$ written as $z \cdot (z > 0)$ puts its comparison and its multiplication at consecutive
 levels by construction, and so does a mux-style $\max$ --- so the two definitions differ and this
 class of program does not pay for the difference. We keep the counter (\bt{ExecStats::mixed\_levels})
-so that a schedule which does pay is visible rather than inferred, and we do not claim the
+so that a schedule which does pay is visible not inferred, and we do not claim the
 optimisation.
 
 \paragraph{Which primitive to attack, and the assignment that follows.}
@@ -1885,7 +1929,7 @@ hand-written route the same assignment takes it from \numrange{32}{33} to \numra
 so measuring the assigned compiler against the unassigned expert would report roughly a
 $0.36\times$ win of which the compiler contributed nothing. Compared like with like the two are at
 parity, and they are at parity in the strong sense that their observed \emph{ranges} coincide over
-eight runs rather than that two particular readings happened to agree.}
+eight runs not that two particular readings happened to agree.}
 
 \paragraph{Keying the choice on the deployment, and the third term that decides it.}
 An assignment that is right for one link is not an assignment. Baru's precompile registry
@@ -1920,11 +1964,11 @@ garbled one does at this batch size --- that is local arithmetic over $\Z_p$ tog
 preprocessing --- and a model of the form
 $\text{waits} \times \text{RTT} + \text{bytes}/\text{bandwidth}$ charges every candidate zero for
 it. The true ratio is larger still, and we arrive at it below: measured on a whole diagnosis
-rather than on \num{64} comparisons, the factor is \num{16.4} (Table~\ref{tab:marginal}).}
+and not on \num{64} comparisons, the factor is \num{16.4} (Table~\ref{tab:marginal}).}
 
 The omission is not cosmetic, and it failed in two distinct ways. On a fast link the model
 predicts \SI{0}{\second} for all three candidates and cannot rank them at all, so the choice fell
-through to a tie-break which returned the \emph{dominated} entry --- a wrong answer rather than an
+through to a tie-break which returned the \emph{dominated} entry --- a wrong answer instead of an
 arbitrary one. On a thin pipe it mispicked outright, preferring Falcon at \SI{130}{\milli\second}
 to garbled circuits at \SI{105}{\milli\second}: the \SI{78}{\kilo\byte} Falcon saves is worth
 \SI{62}{\milli\second} at \SI{10}{\mega\bit\per\second}, and it spends \SI{66}{\milli\second} more
@@ -1956,20 +2000,19 @@ comparison count and rescales; the right column measures \num{64} comparisons on
 \label{tab:marginal}
 \end{table}
 
-A \num{64}-wide call costs roughly ten times its own marginal cost, because most of it is session
-setup and share distribution rather than comparing. The absolute inflation would not matter --- a
+A \num{64}-wide call costs roughly ten times its own marginal cost, because most of it is session setup and share distribution and not comparison. The absolute inflation would not matter --- a
 ranking does not read absolute numbers --- but it is not uniform across the candidates, and the
 ratio it distorts is exactly what a ranking does read. It makes garbled circuits look
 $2.5\times$ cheaper than bit decomposition where the marginal figure is $7.8\times$.
 
 This is the same slope-against-intercept error we corrected in the analytic model's local-work
-constant, in a different instrument, and we record it as a pattern rather than as two incidents:
+constant, in a different instrument, and we record it as a pattern and not as as two incidents:
 \ib{a cost measured at one scale and applied at another is an intercept masquerading as a slope},
 and the symptom is that the fixed part is common while the ratio is not.
 
 We then made the correction, and it was wrong. Substituting the marginal figures for
 \bt{local\_secs} while leaving the byte term alone flipped the selection to Falcon on a thin pipe,
-where measurement says garbled circuits win --- caught by the validation test rather than by
+where measurement says garbled circuits win --- caught by the validation test not by
 inspection. The error was making one term marginal and not the other, and the byte term does not
 decompose the same way: Falcon's traffic includes \emph{its own} preprocessing, which is a
 protocol-specific cost and not a fixed one common to the candidates. There is no common term to
@@ -2041,7 +2084,7 @@ naturally reach for, and the calibration test now says so at the point of tempta
 We labour the control because this benchmark's own history is three readings that compared
 quantities which were not comparable, and the test that fixes the fourth now asserts that the
 mismatched comparison is the flattering one --- so the reading that would overstate the compiler
-is pinned in place as a thing to avoid rather than described in a comment. What the result does
+is pinned in place as a thing to avoid and not described in a comment. What the result does
 establish is the premise the next section needs: the comparison backends differ enough to be
 worth choosing between, the choice is invisible to correctness, and the compiler is a good enough
 consumer of such a choice that it will not squander it.
@@ -2062,7 +2105,7 @@ compiling ANSI C into a mixed-protocol program. CirC~\cite{CirC} unified circuit
 across MPC and proof back ends, and Silph~\cite{Silph} treats the assignment of protocols as an
 optimization problem. Our own cost model, which we describe in Section~\ref{sec:cross}, is a
 small instance of this line, and we report there that the hybrid split for a neural layer can be
-\emph{derived} from measured per-operation costs rather than annotated by hand. We remark that
+\emph{derived} from measured per-operation costs not annotated by hand. We remark that
 the distinction from those systems is again interpretation: they choose an assignment and emit a
 circuit, whereas we choose per call and keep the program.
 
@@ -2100,7 +2143,7 @@ ASTRA~\cite{ASTRA} and the works of Chida et al.~\cite{Chida} and of Eerikson et
 al.~\cite{Eerikson} supply the machinery for malicious security that we described in
 Section~\ref{sec:prelim:mpc}, and SING~\cite{SING} continues the thread of nonlinearity
 protocols. We implement the MAC construction of Chida and Eerikson and we measure its cost
-against the semi-honest baseline rather than assuming it.
+against the semi-honest baseline instead of assuming it.
 
 \subsection{FHE-based and hybrid inference}
 \label{sec:related:fhe}
@@ -2115,11 +2158,11 @@ better constants, and it is the reference point toward which our own findings re
 Cheetah~\cite{Cheetah} contributed the coefficient-packed convolution of
 Section~\ref{sec:prelim:fhe}, which requires no rotations, and it is the technique whose exactness
 we verify at $5\times5$ in Section~\ref{sec:medmnist}. We remark that PEGASUS~\cite{PEGASUS} and
-CHIMERA~\cite{CHIMERA} address switching \emph{between homomorphic schemes} rather than between
+CHIMERA~\cite{CHIMERA} address switching \emph{between homomorphic schemes} not between
 homomorphic encryption and secret sharing, which is a different problem from ours.
 
 \paragraph{Compilers for homomorphic deep learning, and how we use one.}
-A second line builds \emph{compilers} rather than protocols.
+A second line builds \emph{compilers} not protocols.
 Fhelipe~\cite{Fhelipe} automates data packing; Orion~\cite{Orion} accepts PyTorch
 networks, contributes single-shot multiplexed packing and automatic bootstrap
 placement, and reports the fastest published CKKS inference figures we are aware
@@ -2133,7 +2176,7 @@ exits to OpenFHE, Lattigo, tfhe-rs and several hardware accelerators, and its pa
 claims generality rather than performance.
 
 We use HEIR in Section~\ref{sec:matched} as a \emph{baseline generator}: it supplies
-a homomorphic arm running on tuned C++ rather than on our own arithmetic, which is
+a homomorphic arm running on tuned C++ and not on our own arithmetic, which is
 the confound our own threats section concedes. We note two practical findings from
 doing so, because they are not in its documentation. Its Python front end compiles
 through Numba and cannot express a dense layer at all---tensor subscripting,
@@ -2142,12 +2185,12 @@ to emit \texttt{linalg} MLIR directly, which is the level its machine-learning
 pipeline targets and which the PyTorch route reaches by way of torch-mlir. And its
 emitted code sets the multiplicative depth and the plaintext modulus but never the
 security level, so the level in force is the backend library's default; we read it
-back out of the generated code rather than assume it.
+back out of the generated code instead of assuming it.
 
 Our contribution relative to this line is not a faster hybrid. It is that the hybrid route,
 the pure homomorphic route, the pure secret-sharing route and the garbled route are all present in
 a single artifact over a single transport. It means that the question of what the hybrid actually
-buys, and of where the crossover lies, can be answered by measurement rather than by comparing
+buys, and of where the crossover lies, can be answered by measurement not by comparing
 numbers taken from four papers with four experimental setups.
 
 \paragraph{System-level comparisons of the paradigms.} Huang, Maeng and
@@ -2193,8 +2236,7 @@ that three elements are unusual in combination.
     treat the others as preprocessing or omit them entirely.
   \item \textbf{Comparability treated as the object of study.} The uniform accounting, the
     bit-exactness gate and the validated cost model for the network are themselves the
-    contribution, and we remark that several of our findings are corrections to comparisons
-    rather than new speedups; we present them in Sections~\ref{sec:method}
+    contribution, and we remark that several of our findings are corrections to comparisons and not new speedups; we present them in Sections~\ref{sec:method}
     and~\ref{sec:withdrawn}.
   \item \textbf{Negative and withdrawn results kept in the record}, with the component deleted
     in the cases where it lost. We report three optimizations that were measured and rejected,
@@ -2235,7 +2277,7 @@ Our cost model charges $\text{rounds} \times \text{RTT} + \text{bytes}/\text{ban
 which allows a benchmark to move the parties between continents without deploying anything. We
 \textbf{validated it against a real loopback TCP socket}, and we measured a worst-case error of
 \SI{13.6}{\percent} and an error below \SI{1}{\percent} through the middle of both sweeps, with the
-constants of the link measured rather than assumed. It means that the cost really is linear in the
+constants of the link measured and not assumed. It means that the cost really is linear in the
 rounds and linear in the bytes, with no missing cross-term, and this is what licenses us to compute
 a wall-clock figure from measured counts.
 
@@ -2266,7 +2308,7 @@ means that those optimizations are \emph{exact} and not merely close.
 \label{sec:attest}
 
 Every engine attests the security level that it actually implements, in a single auditable
-table, and asking a session for more than an engine attests is an \emph{error rather than a silent
+table, and asking a session for more than an engine attests is an \emph{error not a silent
 downgrade}. We remark that exactly one of our engines attests malicious security.
 The editing rule is that an attestation records what the code \emph{does}, never
 what the roadmap intends: raising one is the last step of an upgrade, after the
@@ -2283,7 +2325,7 @@ section---is cheap to implement and hard to get wrong by accident.
 Section~\ref{sec:method:attest} describes machine-checked attestations for our own
 engines: each states what it implements and asking for more is an error. When we
 adopted an external baseline (Section~\ref{sec:matched}) we extended the same
-discipline to it, because the failure mode is documented rather than hypothetical.
+discipline to it, because the failure mode is documented not hypothetical.
 A community write-up of a homomorphic MNIST perceptron through HEIR reports roughly
 \SI{30}{\second} at a \emph{security level of ``not set''} and roughly six minutes
 at the secure ring dimension---a factor of twelve sitting between an insecure and a
@@ -2415,11 +2457,11 @@ nothing below contradicts them.
 
 \paragraph{The external baseline.} We drive
 HEIR~\cite{HEIR}---Google's MLIR-based homomorphic-encryption compiler---to
-OpenFHE~\cite{OpenFHE}, so the homomorphic arm runs on tuned C++ rather than on
+OpenFHE~\cite{OpenFHE}, so the homomorphic arm runs on tuned C++ not on
 our own number-theoretic transform. HEIR is compiler \emph{infrastructure}: its
 paper claims generality and reports no private-machine-learning evaluation, so
 this is a baseline generator and not a target. Two properties make the resulting
-number quotable rather than decorative.
+number quotable instead of decorative.
 
 First, it is competitive with the published state of the art.
 Orion~\cite{Orion} reports MNIST at \SI{0.23}{\second} single-threaded; our
@@ -2485,8 +2527,7 @@ advantage widening with depth---holds on both accountings; the magnitude depends
 entirely on which one is quoted.}
 
 Beyond depth 9 the homomorphic arm stops working. HEIR's default pipeline is
-\emph{levelled} and places no bootstraps, so depth is a ceiling rather than a
-step: at depth 11 OpenFHE segmentation-faults inside key generation, after HEIR's
+\emph{levelled} and places no bootstraps, so depth is a ceiling, not a step: at depth 11 OpenFHE segmentation-faults inside key generation, after HEIR's
 MLIR-to-C++ pipeline has succeeded. Secret sharing continues linearly, at
 eighteen additional rounds and roughly \SI{5}{\milli\second} per layer, unbroken.
 
@@ -2522,7 +2563,7 @@ the architecture of Gazelle, Delphi and Cheetah instead of receiving it as an an
 remark that the prior work on the assignment of protocols, from HyCC~\cite{HyCC} through
 Silph~\cite{Silph} to SING~\cite{SING}, is \textbf{restricted to secret sharing}, and that
 extending the cost model so that it spans secret sharing \emph{and} homomorphic encryption is
-what makes the hybrid architecture an output of the search rather than an input to it.
+what makes the hybrid architecture an output of the search not an input to it.
 
 Two structural non-linearities make this objective non-separable, which is worth
 noting for anyone tempted to formulate it as an integer linear program: a
@@ -2645,12 +2686,12 @@ separating from the performance one:
 \finding{Three implementations of one comparison, bit-exact against each other
 behind a single interface, make the protocol backing every \ReLU{}, max-pool and
 argmax a one-line choice rather than a rewrite---which is what made this error
-detectable rather than shippable.}
+detectable not shippable.}
 
 \paragraph{The per-deployment claim, withdrawn and then restored by measurement.} We
 briefly concluded the opposite of what we had claimed: that there was \emph{nothing} to
 choose on this workload, because garbled circuits dominated everywhere we had measured.
-That conclusion rested on a limitation rather than on a result. \bt{lt\_falcon\_batch} ran
+That conclusion rested on a limitation and not on a result. \bt{lt\_falcon\_batch} ran
 its preprocessing inline, so every figure in \cref{tab:crossover} was a \emph{total}, and
 Falcon is a protocol designed to put work in a query-independent phase---charging it inline
 is charging it for the thing its design exists to avoid.
@@ -2658,7 +2699,7 @@ is charging it for the thing its design exists to avoid.
 Building the split was the open work, and it is now built: preprocessing is generated per
 MPC segment from a plan a cold run \emph{measures} (sizes cannot be derived from the layer
 shapes without duplicating the batching decisions inside max-pooling, the fused ReLU and
-argmax), and a pool that fails to serve a request is a hard error rather than a silent
+argmax), and a pool that fails to serve a request is a hard error instead of a silent
 fallback, so an ``online'' latency cannot quietly contain preprocessing. The warm row of
 \cref{tab:crossover} is the result, and it restores the per-deployment claim in a stronger
 form: a \emph{cold} server should prefer garbled circuits above ${\approx}\SI{25}{\mega\bit\per\second}$,
@@ -2708,7 +2749,7 @@ What reopened it is a result from outside. CHIP~\cite{CHIP} packs channels into 
 batch CNN inference and, among other things, reports ``an efficient 2-D convolution that halves the
 number of HE multiplications''. That component is Winograd's minimal filtering
 algorithm~\cite{Winograd,LavinGray}: $F(2,3)$ produces two outputs from a four-element window with
-four multiplications rather than six, and nesting it gives $F(2\times2, 3\times3)$ at \num{16}
+four multiplications in place of six, and nesting it gives $F(2\times2, 3\times3)$ at \num{16}
 multiplications against \num{36}.
 
 \finding{The trick does not need the scheme it was published with. Its three transforms are
@@ -2780,11 +2821,11 @@ asymmetries pointing in opposite directions, each of which looked like the natur
 Removing both moved the shared route to \SI{236}{\milli\second} and the gap to $1.8\times$:
 \SI{95}{\percent} of what we had reported as protocol cost was scaffolding.
 
-We draw the general point rather than the local one. Bit-exactness gated this comparison and passed
+We draw the general point not the local one. Bit-exactness gated this comparison and passed
 it --- every route computed the right convolution throughout --- because what differed was not the
 computation but \emph{where each route's measurement began and ended}. That boundary is invisible
 to a correctness check and is not a property of either protocol, which is precisely why it has to
-be stated for each route rather than assumed to be shared. Our benchmark now derives its summary
+be stated for each route not assumed to be shared. Our benchmark now derives its summary
 sentence from the measured rows instead of asserting one beside them, because we wrote that
 sentence wrongly three times --- ``bytes decide'', then ``compute decides'', then ``the homomorphic
 route is faster everywhere'' --- and each was true of the table in front of us at the time.
@@ -2870,14 +2911,303 @@ Both remain bit-exact with zero bootstraps.
 So ``the packing was the accuracy ceiling'' holds \emph{conditionally}, and the
 condition is data: organa's \num{34561} training images can use the extra capacity,
 pneumonia's \num{4708} overfit it. Either experiment alone would have been misleading.
+\section{Threats to validity}
+\label{sec:threats}
+
+In this section we state the threats to the validity of our results.
+
+\paragraph{The two arms of Section~\ref{sec:matched} are not timed the same way.}
+This is the sharpest threat to that comparison and we state it plainly. The
+homomorphic arm's latency is elapsed wall clock. The secret-sharing arm's is
+composed: round latency and bandwidth come from measured counts put through the
+network model, and local compute is measured but \emph{divided by the party count},
+because our virtual machine runs every party serially in one process. The
+protocols are symmetric, so the division is defensible, but it is a division and
+not a measurement of one party. Two consequences follow. On the wide-area profile,
+where round latency dominates by two orders of magnitude, the composition is
+harmless. On a local-area network it is the whole number, and the local-area
+figures should be read as accurate to a factor not to a percentage. A
+genuinely socketed two-party arm, with parties in separate processes, is the
+experiment that would remove this threat, and we have not run it.
+
+\paragraph{Omitting local compute is an error we made and corrected.} The
+local-area figures of Section~\ref{sec:matched} originally charged secret sharing
+only round latency and bandwidth, with no compute term at all---inherited from a
+harness that reported only wide-area numbers, where the omission is invisible. At
+784-32-10 the modelled \SI{16}{\milli\second} sat against \SI{598}{\milli\second}
+of measured compute, so the local-area figures understated secret sharing by
+roughly $19\times$, and the ratios we first computed additionally compared a
+\emph{warm} secret-sharing arm against a \emph{cold} homomorphic one. Both halves
+flattered secret sharing. Compute is now measured and split warm from cold on both
+sides. We record the error because it is the third instance in this work of a first
+metric flattering the paradigm we implemented---correlated randomness charged as
+free, compute charged as free, and warm compared against cold---and the common
+cause is not a coding mistake but a habit: asking whether a number reproduces
+rather than what it omits.
+
+\paragraph{Quality of the implementation.} Our code is research Rust and not tuned C++.
+Consequently the absolute figures are not competitive, and the ratios measured inside the harness
+are the defensible output. Where we compare against a published number, as for instance our sign
+extraction at approximately \SI{0.043}{\milli\second} against the optimized C++ of Falcon, the
+difference is one of implementation and not one of protocol, and we say so.
+
+\paragraph{A single machine.} All of our figures were obtained on one Apple M1 Pro, and
+therefore the variance across machines is uncharacterized. The network model is validated on
+loopback, and consequently the constants for a wide-area network are modelled rather than
+measured.
+
+\paragraph{Run-to-run variance bounds how sharply a boundary can be read.} Re-running an
+\emph{unchanged} configuration as a separate process moved one cell by \SI{13}{\percent}.
+Repeats \emph{within} one measurement session spread under \SI{2}{\percent}, but they share a
+key-generation session, run back to back and hit warm caches, so they bound jitter not reproducibility---our sweep reports the median of three and marks cells whose ranges
+overlap, and that marking is therefore weaker than it looks. We read every crossover as good
+to about one grid step, and treat cells within ${\approx}\SI{13}{\percent}$ of each other as
+unresolved regardless of which is nominally faster. Latencies carry this variance; message
+and byte counts are deterministic and reproduce exactly, which is why we prefer them for any
+claim that has to be sharp.
+
+\paragraph{The simulated network is a model.} We validated it to \SI{13.6}{\percent} in the
+worst case, but it remains the expression $\text{rounds}\times\text{RTT} +
+\text{bytes}/\text{bandwidth}$ and not a real wide-area network with congestion, jitter or loss of
+packets.
+
+\paragraph{The disclosed cryptographic gaps, one of which has since closed.} The threshold
+\emph{key generation} of our homomorphic layer was dealer-based, and we recorded it on the code
+itself and in the attestation table rather than only in prose. It no longer is, and the reason the
+dealer was there turns out to be worth more than its removal.
+
+A dealer makes the key components \ib{uniform} modulo $q$ while their sum stays \ib{ternary}, by
+choosing $s_2 = s - s_0 - s_1$. Both properties at once are what it buys, and no protocol in which
+each party samples its own component independently can have all three of independent sampling, a
+small sum, and uniform components. Sampling each $s_i$ uniformly makes $s$ uniform modulo $q$, and
+BFV decryption computes $c_0 + c_1 s = \Delta m + (e_1 + e_2 s - e u)$, whose $e_2 s$ term then
+exceeds $q/2t$: decryption fails outright instead of degrading.
+
+Our key generation takes the other horn. Each party samples $s_i$ ternary and sends it to its
+predecessor, so the replicated layout $(s_i, s_{i+1})$ survives --- deliberately, because
+replication is what makes a partial decryption checkable by recompute-and-compare, and a protocol
+producing only additive shares would remove the dealer at the cost of the malicious-security
+argument. A single corruption then learns two of the three components, hence
+$k = s_i + s_{i+1}$, and that $s - k$ is ternary. That is not the weakness it appears to be,
+because the adversary's residual problem is the one the scheme already rests on:
+\[
+  b + a k \;=\; -(a(s-k) + e),
+\]
+an RLWE sample whose secret $s - k$ is ternary. We cannot test hardness, but we can and do test
+the identity that the reduction rests on --- the measured residual has sup-norm exactly $3$, the
+sum of three ternary errors --- so a broken reduction would be visibly and not quietly vacuous.
+The cost is that $\|s\|_\infty \le 3$ rather than $1$, about \num{1.6} bits of noise budget for a
+fresh ciphertext and \num{3.2} for a product, which we report and do not assume, because it
+competes with the smudging budget.
+
+\finding{The expensive part of threshold FHE does not arise here at all. A product decrypts under
+$s^2$ because we relinearize nothing, and under replicated sharing each party forms its own share
+of $s^2$ \emph{with no communication}: writing $s^2 = \sum_i s_i^2 + 2(s_0s_1 + s_1s_2 + s_2s_0)$,
+party $i$ holds $(s_i, s_{i+1})$ and computes $s_i^2 + 2 s_i s_{i+1}$, and the three sum to exactly
+$s^2$. It is the same identity replicated multiplication uses, which is no coincidence --- it is
+the same sharing. Distributed generation of a relinearization key, the costly step in threshold
+FHE, is therefore not deferred but unnecessary, and that is a dividend of the depth-1 design rather
+than of the key generation.}
+
+We measured the cost of using it before proposing to, and we separate two figures that are easy to
+conflate. Against one local decryption, a threshold decryption is $3.5\times$ in \emph{total work},
+which is the throughput cost; the \emph{latency} cost is one party's partial decryption at
+$1.18\times$, plus one communication round, because the three partials are computed concurrently on
+three machines. Quoting the first as a latency figure would repeat the error this paper records
+elsewhere, so the artifact prints both with that warning and asserts that one party performs
+between a fifth and a half of the total, which is the premise the parallelism argument needs.
+
+\paragraph{What the input-boundary proof buys, and what it costs.} The boundary is the one place
+where replication cannot help and zero knowledge is unavoidable, and we can now say concretely why.
+Adding half a $\Delta$ to a single coefficient of an input ciphertext --- the mildest tamper that
+does anything at all --- turns a computed result of \num{42} into \num{43}, and two honest
+co-holders recomputing the evaluation \emph{agree} on the \num{43}, because the evaluation was
+performed correctly. The fault is in the input, which no amount of recomputation inspects. We draw
+attention to the off-by-one: a malformed input need not produce a value that a sanity check would
+reject, and an adversary with more room than half a $\Delta$ can choose noise large enough that
+whether the decryption wraps depends on the model weights, which turns a correctness failure at the
+boundary into a channel that leaks what the protocol exists to protect.
+
+The proof itself is implemented: a Schnorr-style $\Sigma$-protocol over the ring, made
+non-interactive by Fiat--Shamir, with Lyubashevsky rejection sampling not noise flooding, so
+that a released response is \emph{perfectly} hiding rather than statistically so. The interesting
+part is what it costs, and it is not the prover time.
+
+\finding{Soundness slack at the boundary is paid for out of the smudging budget, bit for bit. A
+$\Sigma$-protocol extracts a witness whose norm exceeds the honest one by a slack factor, so a
+verifier accepting the proof is accepting inputs with noise up to $2^{\text{slack}} \cdot B$; that
+noise grows through the evaluation and arrives at the threshold decryption, where the flooding that
+hides the key share must cover it. Our measured \num{26}-bit slack leaves $\lambda = 30$ at the
+largest modulus this implementation can represent, against the \num{40} that an
+honest-input analysis reports. The two analyses were not previously on the same footing, and the
+gap is entirely this term.}
+
+That is why the artifact's attestation for this scheme stays semi-honest: not because the proof is
+missing, but because it is a tested instead of reviewed implementation, and because $\lambda = 30$
+is below what we are willing to call a malicious-security claim. Both are settleable --- a tighter
+proof, or a wider modulus than a \bt{u128} representation admits --- and neither is settled here.
+
+\paragraph{What remains open.} Two things, neither cryptographic in the sense above. The first is
+the review and parameter question just described. The second is harness structure: our benchmark
+evaluates the homomorphic half single-threaded with one decryption key, because simulating one
+evaluator is cheaper than simulating three, so the reported figures do not yet include the
+threshold path even though the protocol no longer requires a party that can decrypt.
+
+The Falcon backend's preprocessing used to be the second such gap---dealt from a
+common seed, so all three parties could reconstruct the mask. It is now generated
+by bit composition, at a cost of one bit decomposition per element offline. That cost is
+what the two Falcon rows of \cref{tab:crossover} separate: the cold row pays it on the
+critical path, the warm row hoists it. An earlier draft of this section said
+\cref{tab:crossover} measured Falcon's \emph{online} cost while another paragraph said every
+figure in it was a \emph{total}. Both statements were in the paper at once; the table now has
+a row for each and says which is which.
+
+\paragraph{A third gap, found while building the pure Falcon route, and closed.}
+\label{sec:disclosure}
+Falcon's exact truncation \emph{opens} $c = a + r$. Its stated precondition is that
+$a+r$ must not wrap, which is a \emph{ceiling} on the mask, and our first
+$\Pi_{\mathrm{ReLU}}$ satisfied it the cheapest way, with $r$ no wider than the value.
+That is correct and hides almost nothing: the posterior on $a$ given $c$ collapses to a
+point at $c=0$, and for uniform $a$ the leak is $1/(2\ln 2) \approx 0.72$ bits per
+truncation, where the batched-bit-decomposition route it replaced opens no function of a
+secret at all. Making the route ``purer'' had therefore traded away a security property.
+
+No correctness test could have caught it---leakage is not a wrong answer---and all three
+tests covering truncation preprocessing happened to pass a mask narrower than the ring, so
+none ever exercised a wrapping one. The fix is not statistical slack but a \emph{wrap bit}:
+let $r$ cover the whole ring, making the opened value uniform and \emph{perfectly}
+independent of $a$, then correct the resulting overflow with $[c < r]$, which is provably
+the overflow indicator and is computable from a public $c$ and a secret $r$ for one
+narrowed \bt{a2b} and one $\Pi_{\mathrm{SS}}$ lift. The alternative---$\kappa$ bits of
+statistical slack---needs a ring wider than our narrowed wire encoding permits and measured
+$1.9\times$ \emph{dearer} in bytes than bit decomposition. The narrow-mask request is now unrepresentable and not merely documented, and the wrap identity is verified
+exhaustively over all $(a,r)$ at $\ell = 10$.
+
+\paragraph{A fourth gap, found by attempting the composability proof, and closed.}
+\label{sec:pcdisclosure}
+$\Pi_{\mathrm{PC}}$ opens $m \cdot \prod_i c_i$ and reads only whether the result is zero. The
+$c_i$ carry no randomness of their own --- they are determined by the compared bits, the public
+$r$ and the secret $\beta$ --- so the unit $m$ is the only thing between the transcript and the
+product, and the comment on our own implementation said exactly that. Our routine for sampling
+$m$ nevertheless \emph{opened} each candidate in order to reject zeros, and returned the same
+shares. The justification attached to it read that opening whether a mask is zero leaks nothing,
+because $m$ is drawn independently of any input and the sampling runs offline. The premise is
+true and the conclusion does not follow: what the code opened was $m$ itself, and the purpose of
+$m$ is to blind a \emph{later} opening, so a public $m$ blinds nothing.
+
+The consequence is measurable not hypothetical. With $m$ known, $\prod_i c_i = d/m$ is
+public, and at $\ell = 6$ a single predicate class contains \num{31} distinct products, so the
+opening carried $\log_2 31 \approx 5$ bits where the predicate is entitled to one. In
+$\Pi_{\mathrm{WA}}$ the compared secret is the wrap mask $x$ while $r = a + x$ is public, and
+therefore those are bits of the activation.
+
+The repair is to test the mask without opening it: draw a second uniform $s$ and open
+$d = m\cdot s$. Then $d \neq 0$ implies $m \neq 0$, and conditioned on any accepting $d$ the
+mask is still uniform on $\Z_p^\star$, because each candidate admits exactly one witness. We
+verify the counting exhaustively over $\Z_p \times \Z_p$ not statistically. The cost is
+one extra random share and one extra batched multiplication per attempt, both offline, and the
+per-attempt rejection rate rises from $1/p$ to $2/p - 1/p^2$ because either factor may vanish.
+
+We record two things about how this was found. It was not found by testing --- every correctness
+test passed before and after, since leakage is not a wrong answer, and the protocol computed the
+right comparison throughout. It was found by writing the enumeration that
+Lemma~\ref{lem:openings} needed, which forced the question ``what distribution does the
+simulator sample this opening from?'' at a site where the answer turned out to depend on a
+secret. Together with the truncation of Section~\ref{sec:disclosure} that is two of our nine
+openings repaired by the same question, which we take as the strongest argument we can offer for
+stating a composability claim in a form precise enough to be checked.
+
+\paragraph{Breadth of the workload.} Our findings are anchored on inference in feed-forward
+convolutional networks at $28\times28$. We do not cover transformers, larger images, or workloads
+other than inference.
+
+\paragraph{This is not an adversarial evaluation.} Our tests for the detection of cheating
+drive real attacks over the transport against the malicious layer, but we remark that this work is
+not a security audit, and that none of our formal proofs is machine-checked.
 
 %==============================================================================
-\section{What the methodology caught in our own work}
+\section{Open problems}
+\label{sec:open}
+
+In this section we list the problems that remain open, in the order in which we consider them
+tractable.
+
+\begin{enumerate}
+  \item \textbf{A private convolutional network at the scale of CIFAR} requires SIMD packing
+    in slots, since coefficient packing bounds the size of the image. We remark that the story of
+    composition and security is independent of this choice.
+  \item \textbf{Transformer nonlinearities} (softmax, LayerNorm) need
+    exponential, reciprocal and inverse-square-root subprotocols.
+  \item \textbf{Malicious security at the boundary with homomorphic encryption.} Replication
+    cannot catch a \emph{malformed input ciphertext}, because both honest co-holders compute on it
+    faithfully and therefore agree. It means that the positioning becomes sharper: a
+    zero-knowledge proof is needed \emph{only at the input boundary and never for the evaluation},
+    whereas verifiable homomorphic encryption on a single server needs one over the whole
+    computation. We have since implemented the boundary proof, that is, a proof that a ciphertext
+    is a well-formed encryption with bounded noise, and what remains open is a parameter question
+    instead of a construction: the proof's soundness slack is subtracted from the smudging budget
+    bit for bit, so the measured \num{26}-bit slack leaves $\lambda = 30$ at the widest modulus a
+    \bt{u128} representation admits, against the \num{40} an honest-input analysis reports. Either
+    a tighter proof or a wider modulus recovers it. Composing the proof with the malicious
+    secret-sharing layer, so that a single protocol carries both guarantees, remains open
+    alongside it.
+  \item \textbf{Secret-index array access}, priced by the cost model, before
+    ORAM. CirC~\cite{CirC} implements exactly the two cases either side of that
+    line and does not implement ORAM at all.
+  \item \textbf{Per-instruction protocol assignment}, versus the current
+    per-operation-kind granularity.
+  \item \textbf{Cross-machine and real-WAN validation} of the cost model's
+    constants.
+\end{enumerate}
+
+%==============================================================================
+\section{Conclusion}
+
+Cross-paradigm claims about performance in privacy-preserving computation are not at present
+falsifiable, because the numbers come from sources that cannot be compared. In this survey we have
+described a harness in which such claims become falsifiable, and we have reported what changes when
+the paradigms are re-measured under a uniform accounting.
+
+Three of those changes are worth restating. The crossover between homomorphic encryption and secret
+sharing belongs to the preprocessing of the baseline not to either cryptosystem. Active
+security costs bytes and not rounds. And the boundary between the comparison protocols lies between
+$20$ and \SI{30}{\mega\bit\per\second} for a server that pays for its preprocessing on the critical
+path, and above \SI{100}{\mega\bit\per\second} for a server that has generated it in advance, which
+is a difference of a factor of four in bandwidth between two deployments of the same protocol. We
+mislocated that boundary four times before locating it, and each of the four figures was
+reproducible and agreed with our own cost model. In Section~\ref{sec:crossover-nonlin} we report
+that sequence and not only its endpoint, because the failure mode which it illustrates, namely two
+measurements that are individually sound and mutually incommensurable, is not caught by any check
+that we had.
+
+We consider that the transferable part of this work is not the artifact but the discipline:
+identical transports for both legs of any comparison, a cost model checked against a real socket,
+bit-exactness as a precondition for quoting a cost, and the security level as a machine-checked
+property of running code not as as a sentence of prose. Each of these is cheap to adopt, and
+each of them caught something here that would otherwise have been published.
+
+%==============================================================================
+\appendix
+
+%==============================================================================
+\section{Experimental report: what the methodology caught}
+\label{sec:appendix:caught}
+
+This appendix records, in more detail than the body requires, the errors our own
+methodology detected in our own work, and what each cost. It is placed here and not in the body because its interest is methodological, not scientific: the
+results of the survey do not depend on it, and a reader concerned only with those
+results may stop at Section~\ref{sec:open}. We include it because the discipline
+described in Section~\ref{sec:method} is only credible if what it caught is on the
+record, and because several of the errors are, we believe, ones a reader of this
+literature is likely to make.
+
+
+%==============================================================================
 \label{sec:withdrawn}
 
 In this section we record what the methodology of Section~\ref{sec:method} caught in our own
 work. We consider that the credibility of a study rests partly on what its authors were willing to
-withdraw, and consequently each item below is recorded in the artifact rather than quietly fixed.
+withdraw, and consequently each item below is recorded in the artifact not quietly fixed.
 
 \paragraph{A backend for proofs that proved nothing.} Until 2026-07-31 the \bt{verify}
 routine of the shipped backend never checked that a witness satisfied any constraint, and it means
@@ -2894,7 +3224,7 @@ every operand was already public. Repairing the protocol cost $4.4\times$ in tim
 $130\times$ in bandwidth, and we later recovered both by means of the triple-free multiplication of
 Theorem~\ref{thm:mul} and of batching.
 
-\paragraph{An insecure homomorphic scheme, removed rather than caveated.} Our fast engine was
+\paragraph{An insecure homomorphic scheme, removed not caveated.} Our fast engine was
 a port of a scale-invariant NTRU construction~\cite{LTV,YASHE}. An analysis showed it to be insecure
 at the parameters that our construction requires, even at depth
 one~\cite{ABDucas,KirchnerFouque,DucasvanWoerden}: the large LTV secret raises the fatigue point to
@@ -2938,282 +3268,6 @@ tuning was measured at ${\approx}10\%$ and not built. A fused garbled max-of-fou
 was measured as a $1.68\times$ \emph{loss} and not built.
 
 %==============================================================================
-\section{Threats to validity}
-\label{sec:threats}
-
-In this section we state the threats to the validity of our results.
-
-\paragraph{The two arms of Section~\ref{sec:matched} are not timed the same way.}
-This is the sharpest threat to that comparison and we state it plainly. The
-homomorphic arm's latency is elapsed wall clock. The secret-sharing arm's is
-composed: round latency and bandwidth come from measured counts put through the
-network model, and local compute is measured but \emph{divided by the party count},
-because our virtual machine runs every party serially in one process. The
-protocols are symmetric, so the division is defensible, but it is a division and
-not a measurement of one party. Two consequences follow. On the wide-area profile,
-where round latency dominates by two orders of magnitude, the composition is
-harmless. On a local-area network it is the whole number, and the local-area
-figures should be read as accurate to a factor rather than to a percentage. A
-genuinely socketed two-party arm, with parties in separate processes, is the
-experiment that would remove this threat, and we have not run it.
-
-\paragraph{Omitting local compute is an error we made and corrected.} The
-local-area figures of Section~\ref{sec:matched} originally charged secret sharing
-only round latency and bandwidth, with no compute term at all---inherited from a
-harness that reported only wide-area numbers, where the omission is invisible. At
-784-32-10 the modelled \SI{16}{\milli\second} sat against \SI{598}{\milli\second}
-of measured compute, so the local-area figures understated secret sharing by
-roughly $19\times$, and the ratios we first computed additionally compared a
-\emph{warm} secret-sharing arm against a \emph{cold} homomorphic one. Both halves
-flattered secret sharing. Compute is now measured and split warm from cold on both
-sides. We record the error because it is the third instance in this work of a first
-metric flattering the paradigm we implemented---correlated randomness charged as
-free, compute charged as free, and warm compared against cold---and the common
-cause is not a coding mistake but a habit: asking whether a number reproduces
-rather than what it omits.
-
-\paragraph{Quality of the implementation.} Our code is research Rust and not tuned C++.
-Consequently the absolute figures are not competitive, and the ratios measured inside the harness
-are the defensible output. Where we compare against a published number, as for instance our sign
-extraction at approximately \SI{0.043}{\milli\second} against the optimized C++ of Falcon, the
-difference is one of implementation and not one of protocol, and we say so.
-
-\paragraph{A single machine.} All of our figures were obtained on one Apple M1 Pro, and
-therefore the variance across machines is uncharacterized. The network model is validated on
-loopback, and consequently the constants for a wide-area network are modelled rather than
-measured.
-
-\paragraph{Run-to-run variance bounds how sharply a boundary can be read.} Re-running an
-\emph{unchanged} configuration as a separate process moved one cell by \SI{13}{\percent}.
-Repeats \emph{within} one measurement session spread under \SI{2}{\percent}, but they share a
-key-generation session, run back to back and hit warm caches, so they bound jitter rather
-than reproducibility---our sweep reports the median of three and marks cells whose ranges
-overlap, and that marking is therefore weaker than it looks. We read every crossover as good
-to about one grid step, and treat cells within ${\approx}\SI{13}{\percent}$ of each other as
-unresolved regardless of which is nominally faster. Latencies carry this variance; message
-and byte counts are deterministic and reproduce exactly, which is why we prefer them for any
-claim that has to be sharp.
-
-\paragraph{The simulated network is a model.} We validated it to \SI{13.6}{\percent} in the
-worst case, but it remains the expression $\text{rounds}\times\text{RTT} +
-\text{bytes}/\text{bandwidth}$ and not a real wide-area network with congestion, jitter or loss of
-packets.
-
-\paragraph{The disclosed cryptographic gaps, one of which has since closed.} The threshold
-\emph{key generation} of our homomorphic layer was dealer-based, and we recorded it on the code
-itself and in the attestation table rather than only in prose. It no longer is, and the reason the
-dealer was there turns out to be worth more than its removal.
-
-A dealer makes the key components \ib{uniform} modulo $q$ while their sum stays \ib{ternary}, by
-choosing $s_2 = s - s_0 - s_1$. Both properties at once are what it buys, and no protocol in which
-each party samples its own component independently can have all three of independent sampling, a
-small sum, and uniform components. Sampling each $s_i$ uniformly makes $s$ uniform modulo $q$, and
-BFV decryption computes $c_0 + c_1 s = \Delta m + (e_1 + e_2 s - e u)$, whose $e_2 s$ term then
-exceeds $q/2t$: decryption fails outright rather than degrading.
-
-Our key generation takes the other horn. Each party samples $s_i$ ternary and sends it to its
-predecessor, so the replicated layout $(s_i, s_{i+1})$ survives --- deliberately, because
-replication is what makes a partial decryption checkable by recompute-and-compare, and a protocol
-producing only additive shares would remove the dealer at the cost of the malicious-security
-argument. A single corruption then learns two of the three components, hence
-$k = s_i + s_{i+1}$, and that $s - k$ is ternary. That is not the weakness it appears to be,
-because the adversary's residual problem is the one the scheme already rests on:
-\[
-  b + a k \;=\; -(a(s-k) + e),
-\]
-an RLWE sample whose secret $s - k$ is ternary. We cannot test hardness, but we can and do test
-the identity that the reduction rests on --- the measured residual has sup-norm exactly $3$, the
-sum of three ternary errors --- so a broken reduction would be visibly rather than quietly vacuous.
-The cost is that $\|s\|_\infty \le 3$ rather than $1$, about \num{1.6} bits of noise budget for a
-fresh ciphertext and \num{3.2} for a product, which we report rather than assume because it
-competes with the smudging budget.
-
-\finding{The expensive part of threshold FHE does not arise here at all. A product decrypts under
-$s^2$ because we relinearize nothing, and under replicated sharing each party forms its own share
-of $s^2$ \emph{with no communication}: writing $s^2 = \sum_i s_i^2 + 2(s_0s_1 + s_1s_2 + s_2s_0)$,
-party $i$ holds $(s_i, s_{i+1})$ and computes $s_i^2 + 2 s_i s_{i+1}$, and the three sum to exactly
-$s^2$. It is the same identity replicated multiplication uses, which is no coincidence --- it is
-the same sharing. Distributed generation of a relinearization key, the costly step in threshold
-FHE, is therefore not deferred but unnecessary, and that is a dividend of the depth-1 design rather
-than of the key generation.}
-
-We measured the cost of using it before proposing to, and we separate two figures that are easy to
-conflate. Against one local decryption, a threshold decryption is $3.5\times$ in \emph{total work},
-which is the throughput cost; the \emph{latency} cost is one party's partial decryption at
-$1.18\times$, plus one communication round, because the three partials are computed concurrently on
-three machines. Quoting the first as a latency figure would repeat the error this paper records
-elsewhere, so the artifact prints both with that warning and asserts that one party performs
-between a fifth and a half of the total, which is the premise the parallelism argument needs.
-
-\paragraph{What the input-boundary proof buys, and what it costs.} The boundary is the one place
-where replication cannot help and zero knowledge is unavoidable, and we can now say concretely why.
-Adding half a $\Delta$ to a single coefficient of an input ciphertext --- the mildest tamper that
-does anything at all --- turns a computed result of \num{42} into \num{43}, and two honest
-co-holders recomputing the evaluation \emph{agree} on the \num{43}, because the evaluation was
-performed correctly. The fault is in the input, which no amount of recomputation inspects. We draw
-attention to the off-by-one: a malformed input need not produce a value that a sanity check would
-reject, and an adversary with more room than half a $\Delta$ can choose noise large enough that
-whether the decryption wraps depends on the model weights, which turns a correctness failure at the
-boundary into a channel that leaks what the protocol exists to protect.
-
-The proof itself is implemented: a Schnorr-style $\Sigma$-protocol over the ring, made
-non-interactive by Fiat--Shamir, with Lyubashevsky rejection sampling rather than noise flooding, so
-that a released response is \emph{perfectly} hiding rather than statistically so. The interesting
-part is what it costs, and it is not the prover time.
-
-\finding{Soundness slack at the boundary is paid for out of the smudging budget, bit for bit. A
-$\Sigma$-protocol extracts a witness whose norm exceeds the honest one by a slack factor, so a
-verifier accepting the proof is accepting inputs with noise up to $2^{\text{slack}} \cdot B$; that
-noise grows through the evaluation and arrives at the threshold decryption, where the flooding that
-hides the key share must cover it. Our measured \num{26}-bit slack leaves $\lambda = 30$ at the
-largest modulus this implementation can represent, against the \num{40} that an
-honest-input analysis reports. The two analyses were not previously on the same footing, and the
-gap is entirely this term.}
-
-That is why the artifact's attestation for this scheme stays semi-honest: not because the proof is
-missing, but because it is a tested rather than reviewed implementation, and because $\lambda = 30$
-is below what we are willing to call a malicious-security claim. Both are settleable --- a tighter
-proof, or a wider modulus than a \bt{u128} representation admits --- and neither is settled here.
-
-\paragraph{What remains open.} Two things, neither cryptographic in the sense above. The first is
-the review and parameter question just described. The second is harness structure: our benchmark
-evaluates the homomorphic half single-threaded with one decryption key, because simulating one
-evaluator is cheaper than simulating three, so the reported figures do not yet include the
-threshold path even though the protocol no longer requires a party that can decrypt.
-
-The Falcon backend's preprocessing used to be the second such gap---dealt from a
-common seed, so all three parties could reconstruct the mask. It is now generated
-by bit composition, at a cost of one bit decomposition per element offline. That cost is
-what the two Falcon rows of \cref{tab:crossover} separate: the cold row pays it on the
-critical path, the warm row hoists it. An earlier draft of this section said
-\cref{tab:crossover} measured Falcon's \emph{online} cost while another paragraph said every
-figure in it was a \emph{total}. Both statements were in the paper at once; the table now has
-a row for each and says which is which.
-
-\paragraph{A third gap, found while building the pure Falcon route, and closed.}
-\label{sec:disclosure}
-Falcon's exact truncation \emph{opens} $c = a + r$. Its stated precondition is that
-$a+r$ must not wrap, which is a \emph{ceiling} on the mask, and our first
-$\Pi_{\mathrm{ReLU}}$ satisfied it the cheapest way, with $r$ no wider than the value.
-That is correct and hides almost nothing: the posterior on $a$ given $c$ collapses to a
-point at $c=0$, and for uniform $a$ the leak is $1/(2\ln 2) \approx 0.72$ bits per
-truncation, where the batched-bit-decomposition route it replaced opens no function of a
-secret at all. Making the route ``purer'' had therefore traded away a security property.
-
-No correctness test could have caught it---leakage is not a wrong answer---and all three
-tests covering truncation preprocessing happened to pass a mask narrower than the ring, so
-none ever exercised a wrapping one. The fix is not statistical slack but a \emph{wrap bit}:
-let $r$ cover the whole ring, making the opened value uniform and \emph{perfectly}
-independent of $a$, then correct the resulting overflow with $[c < r]$, which is provably
-the overflow indicator and is computable from a public $c$ and a secret $r$ for one
-narrowed \bt{a2b} and one $\Pi_{\mathrm{SS}}$ lift. The alternative---$\kappa$ bits of
-statistical slack---needs a ring wider than our narrowed wire encoding permits and measured
-$1.9\times$ \emph{dearer} in bytes than bit decomposition. The narrow-mask request is now
-unrepresentable rather than merely documented, and the wrap identity is verified
-exhaustively over all $(a,r)$ at $\ell = 10$.
-
-\paragraph{A fourth gap, found by attempting the composability proof, and closed.}
-\label{sec:pcdisclosure}
-$\Pi_{\mathrm{PC}}$ opens $m \cdot \prod_i c_i$ and reads only whether the result is zero. The
-$c_i$ carry no randomness of their own --- they are determined by the compared bits, the public
-$r$ and the secret $\beta$ --- so the unit $m$ is the only thing between the transcript and the
-product, and the comment on our own implementation said exactly that. Our routine for sampling
-$m$ nevertheless \emph{opened} each candidate in order to reject zeros, and returned the same
-shares. The justification attached to it read that opening whether a mask is zero leaks nothing,
-because $m$ is drawn independently of any input and the sampling runs offline. The premise is
-true and the conclusion does not follow: what the code opened was $m$ itself, and the purpose of
-$m$ is to blind a \emph{later} opening, so a public $m$ blinds nothing.
-
-The consequence is measurable rather than hypothetical. With $m$ known, $\prod_i c_i = d/m$ is
-public, and at $\ell = 6$ a single predicate class contains \num{31} distinct products, so the
-opening carried $\log_2 31 \approx 5$ bits where the predicate is entitled to one. In
-$\Pi_{\mathrm{WA}}$ the compared secret is the wrap mask $x$ while $r = a + x$ is public, and
-therefore those are bits of the activation.
-
-The repair is to test the mask without opening it: draw a second uniform $s$ and open
-$d = m\cdot s$. Then $d \neq 0$ implies $m \neq 0$, and conditioned on any accepting $d$ the
-mask is still uniform on $\Z_p^\star$, because each candidate admits exactly one witness. We
-verify the counting exhaustively over $\Z_p \times \Z_p$ rather than statistically. The cost is
-one extra random share and one extra batched multiplication per attempt, both offline, and the
-per-attempt rejection rate rises from $1/p$ to $2/p - 1/p^2$ because either factor may vanish.
-
-We record two things about how this was found. It was not found by testing --- every correctness
-test passed before and after, since leakage is not a wrong answer, and the protocol computed the
-right comparison throughout. It was found by writing the enumeration that
-Lemma~\ref{lem:openings} needed, which forced the question ``what distribution does the
-simulator sample this opening from?'' at a site where the answer turned out to depend on a
-secret. Together with the truncation of Section~\ref{sec:disclosure} that is two of our nine
-openings repaired by the same question, which we take as the strongest argument we can offer for
-stating a composability claim in a form precise enough to be checked.
-
-\paragraph{Breadth of the workload.} Our findings are anchored on inference in feed-forward
-convolutional networks at $28\times28$. We do not cover transformers, larger images, or workloads
-other than inference.
-
-\paragraph{This is not an adversarial evaluation.} Our tests for the detection of cheating
-drive real attacks over the transport against the malicious layer, but we remark that this work is
-not a security audit, and that none of our formal proofs is machine-checked.
-
-%==============================================================================
-\section{Open problems}
-\label{sec:open}
-
-In this section we list the problems that remain open, in the order in which we consider them
-tractable.
-
-\begin{enumerate}
-  \item \textbf{A private convolutional network at the scale of CIFAR} requires SIMD packing
-    in slots, since coefficient packing bounds the size of the image. We remark that the story of
-    composition and security is independent of this choice.
-  \item \textbf{Transformer nonlinearities} (softmax, LayerNorm) need
-    exponential, reciprocal and inverse-square-root subprotocols.
-  \item \textbf{Malicious security at the boundary with homomorphic encryption.} Replication
-    cannot catch a \emph{malformed input ciphertext}, because both honest co-holders compute on it
-    faithfully and therefore agree. It means that the positioning becomes sharper: a
-    zero-knowledge proof is needed \emph{only at the input boundary and never for the evaluation},
-    whereas verifiable homomorphic encryption on a single server needs one over the whole
-    computation. We have since implemented the boundary proof, that is, a proof that a ciphertext
-    is a well-formed encryption with bounded noise, and what remains open is a parameter question
-    rather than a construction: the proof's soundness slack is subtracted from the smudging budget
-    bit for bit, so the measured \num{26}-bit slack leaves $\lambda = 30$ at the widest modulus a
-    \bt{u128} representation admits, against the \num{40} an honest-input analysis reports. Either
-    a tighter proof or a wider modulus recovers it. Composing the proof with the malicious
-    secret-sharing layer, so that a single protocol carries both guarantees, remains open
-    alongside it.
-  \item \textbf{Secret-index array access}, priced by the cost model, before
-    ORAM. CirC~\cite{CirC} implements exactly the two cases either side of that
-    line and does not implement ORAM at all.
-  \item \textbf{Per-instruction protocol assignment}, versus the current
-    per-operation-kind granularity.
-  \item \textbf{Cross-machine and real-WAN validation} of the cost model's
-    constants.
-\end{enumerate}
-
-%==============================================================================
-\section{Conclusion}
-
-Cross-paradigm claims about performance in privacy-preserving computation are not at present
-falsifiable, because the numbers come from sources that cannot be compared. In this survey we have
-described a harness in which such claims become falsifiable, and we have reported what changes when
-the paradigms are re-measured under a uniform accounting.
-
-Three of those changes are worth restating. The crossover between homomorphic encryption and secret
-sharing belongs to the preprocessing of the baseline rather than to either cryptosystem. Active
-security costs bytes and not rounds. And the boundary between the comparison protocols lies between
-$20$ and \SI{30}{\mega\bit\per\second} for a server that pays for its preprocessing on the critical
-path, and above \SI{100}{\mega\bit\per\second} for a server that has generated it in advance, which
-is a difference of a factor of four in bandwidth between two deployments of the same protocol. We
-mislocated that boundary four times before locating it, and each of the four figures was
-reproducible and agreed with our own cost model. In Section~\ref{sec:crossover-nonlin} we report
-that sequence and not only its endpoint, because the failure mode which it illustrates, namely two
-measurements that are individually sound and mutually incommensurable, is not caught by any check
-that we had.
-
-We consider that the transferable part of this work is not the artifact but the discipline:
-identical transports for both legs of any comparison, a cost model checked against a real socket,
-bit-exactness as a precondition for quoting a cost, and the security level as a machine-checked
-property of running code rather than as a sentence of prose. Each of these is cheap to adopt, and
-each of them caught something here that would otherwise have been published.
 
 %==============================================================================
 \section*{Reproducibility}

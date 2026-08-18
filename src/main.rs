@@ -57,6 +57,9 @@ fn main() -> Result<(), Box<dyn Error>> {
     if args.first().map(String::as_str) == Some("bench-2pc-nn") {
         return baru::bench::two_party_nn::run_cli(&args[1..]).map_err(|e| e.into());
     }
+    if args.first().map(String::as_str) == Some("bench-2pc-cnn") {
+        return baru::bench::conv_nn::run_cli(&args[1..]).map_err(|e| e.into());
+    }
     if args.first().map(String::as_str) == Some("bench-heir") {
         return baru::bench::heir::run_cli(&args[1..]).map_err(|e| e.into());
     }

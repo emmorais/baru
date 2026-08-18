@@ -1,0 +1,151 @@
+\contentsline {section}{\numberline {1}The comparability problem}{4}{section.1}%
+\contentsline {paragraph}{Organization.}{4}{section*.2}%
+\contentsline {paragraph}{Contributions.}{5}{section*.3}%
+\contentsline {section}{\numberline {2}Scope}{6}{section.2}%
+\contentsline {paragraph}{In scope.}{6}{section*.4}%
+\contentsline {paragraph}{Out of scope.}{6}{section*.5}%
+\contentsline {paragraph}{Application focus.}{6}{section*.6}%
+\contentsline {section}{\numberline {3}Mathematical groundwork}{6}{section.3}%
+\contentsline {subsection}{\numberline {3.1}Notation}{7}{subsection.3.1}%
+\contentsline {subsection}{\numberline {3.2}Asymptotics, negligible functions and the two kinds of security}{7}{subsection.3.2}%
+\contentsline {subsection}{\numberline {3.3}Algebraic structures, and why the choice of ring is not cosmetic}{9}{subsection.3.3}%
+\contentsline {subsection}{\numberline {3.4}Fast polynomial multiplication}{10}{subsection.3.4}%
+\contentsline {subsection}{\numberline {3.5}Fixed-point representation and its two error terms}{11}{subsection.3.5}%
+\contentsline {subsection}{\numberline {3.6}Communication complexity and the cost model}{12}{subsection.3.6}%
+\contentsline {section}{\numberline {4}Foundations of the protocols}{13}{section.4}%
+\contentsline {subsection}{\numberline {4.1}The real/ideal paradigm}{13}{subsection.4.1}%
+\contentsline {subsection}{\numberline {4.2}Secret sharing}{15}{subsection.4.2}%
+\contentsline {subsection}{\numberline {4.3}Multiplication: from correlated randomness, and from triples}{16}{subsection.4.3}%
+\contentsline {subsection}{\numberline {4.4}Comparison, bit decomposition and truncation}{17}{subsection.4.4}%
+\contentsline {subsection}{\numberline {4.5}Oblivious transfer and its extensions}{18}{subsection.4.5}%
+\contentsline {subsection}{\numberline {4.6}Garbling schemes}{19}{subsection.4.6}%
+\contentsline {subsection}{\numberline {4.7}Lattices, LWE and the hardness assumptions}{20}{subsection.4.7}%
+\contentsline {subsection}{\numberline {4.8}Homomorphic encryption: noise, depth and the operations that manage them}{20}{subsection.4.8}%
+\contentsline {subsection}{\numberline {4.9}Packing: two encodings and the operations they admit}{22}{subsection.4.9}%
+\contentsline {subsection}{\numberline {4.10}Succinct proofs}{24}{subsection.4.10}%
+\contentsline {section}{\numberline {5}The workload: foundations of neural inference}{25}{section.5}%
+\contentsline {subsection}{\numberline {5.1}Classification and the inference function}{25}{subsection.5.1}%
+\contentsline {subsection}{\numberline {5.2}Nonlinearities, and which ones a cryptosystem can evaluate}{26}{subsection.5.2}%
+\contentsline {subsection}{\numberline {5.3}Structured layers: convolution and pooling}{27}{subsection.5.3}%
+\contentsline {subsection}{\numberline {5.4}The decision: why classification does not need a softmax}{28}{subsection.5.4}%
+\contentsline {subsection}{\numberline {5.5}Quantisation: from real networks to the arithmetic a protocol offers}{28}{subsection.5.5}%
+\contentsline {subsection}{\numberline {5.6}What an accuracy figure means}{29}{subsection.5.6}%
+\contentsline {subsection}{\numberline {5.7}Threat models for private inference}{30}{subsection.5.7}%
+\contentsline {section}{\numberline {6}Cryptographic preliminaries}{30}{section.6}%
+\contentsline {subsection}{\numberline {6.1}Security models}{31}{subsection.6.1}%
+\contentsline {subsection}{\numberline {6.2}Secret-sharing MPC}{32}{subsection.6.2}%
+\contentsline {paragraph}{Crossing between arithmetic and Boolean domains.}{33}{section*.7}%
+\contentsline {paragraph}{Malicious security by a multiplicative MAC.}{33}{section*.8}%
+\contentsline {paragraph}{Fixed point and truncation.}{34}{section*.9}%
+\contentsline {subsection}{\numberline {6.3}Garbled circuits}{34}{subsection.6.3}%
+\contentsline {paragraph}{Three parties without oblivious transfer.}{35}{section*.10}%
+\contentsline {subsection}{\numberline {6.4}Lattices and homomorphic encryption}{35}{subsection.6.4}%
+\contentsline {paragraph}{Noise, depth and bootstrapping.}{36}{section*.11}%
+\contentsline {paragraph}{Packing.}{36}{section*.12}%
+\contentsline {paragraph}{Relinearization, and how to avoid it.}{36}{section*.13}%
+\contentsline {paragraph}{Threshold decryption.}{37}{section*.14}%
+\contentsline {subsection}{\numberline {6.5}A composability theorem, and what it costs}{37}{subsection.6.5}%
+\contentsline {paragraph}{On the preprocessing.}{39}{section*.15}%
+\contentsline {paragraph}{What the theorem does not cover, and what it would cost.}{40}{section*.16}%
+\contentsline {subsection}{\numberline {6.6}Crossing between the paradigms}{41}{subsection.6.6}%
+\contentsline {subsection}{\numberline {6.7}Succinct proofs}{42}{subsection.6.7}%
+\contentsline {section}{\numberline {7}Four paradigms, four cost structures}{42}{section.7}%
+\contentsline {paragraph}{Secret sharing and garbled circuits trade rounds against bytes.}{42}{section*.17}%
+\contentsline {paragraph}{Homomorphic encryption and secret sharing trade compute against communication.}{42}{section*.18}%
+\contentsline {paragraph}{Succinct proofs are orthogonal, and conflating them with the others is a category error.}{43}{section*.19}%
+\contentsline {subsection}{\numberline {7.1}The hybrid, and why it exists}{43}{subsection.7.1}%
+\contentsline {section}{\numberline {8}The \normalfont \scshape Baru artifact}{43}{section.8}%
+\contentsline {subsection}{\numberline {8.1}\Baru {} is a CEK machine}{43}{subsection.8.1}%
+\contentsline {paragraph}{Why an abstract machine and not a circuit.}{44}{section*.20}%
+\contentsline {paragraph}{What the continuation buys.}{44}{section*.21}%
+\contentsline {paragraph}{The cost of this choice.}{45}{section*.22}%
+\contentsline {subsection}{\numberline {8.2}One program, many backends}{45}{subsection.8.2}%
+\contentsline {subsection}{\numberline {8.3}Composability}{45}{subsection.8.3}%
+\contentsline {subsection}{\numberline {8.4}What is implemented}{45}{subsection.8.4}%
+\contentsline {section}{\numberline {9}Compilation: flattening, scheduling and backend-aware optimisation}{46}{section.9}%
+\contentsline {subsection}{\numberline {9.1}Two intermediate representations, and why there are two}{46}{subsection.9.1}%
+\contentsline {subsection}{\numberline {9.2}Flattening and the classical passes}{47}{subsection.9.2}%
+\contentsline {subsection}{\numberline {9.3}Scheduling: rounds as a graph height}{48}{subsection.9.3}%
+\contentsline {subsection}{\numberline {9.4}Backend-aware rewriting}{49}{subsection.9.4}%
+\contentsline {subsection}{\numberline {9.5}Protocol assignment, and why the objective is not separable}{49}{subsection.9.5}%
+\contentsline {subsection}{\numberline {9.6}Summary of the compilation pipeline}{51}{subsection.9.6}%
+\contentsline {section}{\numberline {10}The paradigms, surveyed and measured}{51}{section.10}%
+\contentsline {subsection}{\numberline {10.1}Secret-sharing MPC}{51}{subsection.10.1}%
+\contentsline {paragraph}{The cost of active security.}{51}{section*.23}%
+\contentsline {subsection}{\numberline {10.2}Garbled circuits}{52}{subsection.10.2}%
+\contentsline {paragraph}{This result reverses a figure that we published.}{52}{section*.24}%
+\contentsline {paragraph}{A correction to another of our claims.}{53}{section*.25}%
+\contentsline {subsection}{\numberline {10.3}Fully homomorphic encryption}{53}{subsection.10.3}%
+\contentsline {subsection}{\numberline {10.4}The hybrid and the no-bootstrap result}{54}{subsection.10.4}%
+\contentsline {subsection}{\numberline {10.5}Zero-knowledge proofs}{54}{subsection.10.5}%
+\contentsline {subsection}{\numberline {10.6}Preprocessing: OT versus SHE}{55}{subsection.10.6}%
+\contentsline {paragraph}{A caveat about comparability that the literature routinely drops, and that we dropped ourselves.}{55}{section*.26}%
+\contentsline {section}{\numberline {11}Related work, and where this study sits}{55}{section.11}%
+\contentsline {subsection}{\numberline {11.1}Frameworks that run many protocols}{55}{subsection.11.1}%
+\contentsline {paragraph}{MP-SPDZ~\cite {MPSPDZ}}{55}{section*.27}%
+\contentsline {paragraph}{The cost of a primitive, measured.}{57}{section*.28}%
+\contentsline {paragraph}{Which primitive to attack, and the assignment that follows.}{58}{section*.29}%
+\contentsline {paragraph}{Keying the choice on the deployment, and the third term that decides it.}{59}{section*.30}%
+\contentsline {paragraph}{The microbenchmark understates the spread, and we nearly built on it.}{59}{section*.31}%
+\contentsline {paragraph}{The same term in the analytic model, and what fitting it changed.}{60}{section*.32}%
+\contentsline {paragraph}{Frameworks based on circuit compilation.}{61}{section*.33}%
+\contentsline {subsection}{\numberline {11.2}Three-party honest-majority protocols}{62}{subsection.11.2}%
+\contentsline {paragraph}{ABY3.}{62}{section*.34}%
+\contentsline {paragraph}{Falcon.}{62}{section*.35}%
+\contentsline {paragraph}{Other work in the honest-majority setting.}{62}{section*.36}%
+\contentsline {subsection}{\numberline {11.3}FHE-based and hybrid inference}{62}{subsection.11.3}%
+\contentsline {paragraph}{Compilers for homomorphic deep learning, and how we use one.}{63}{section*.37}%
+\contentsline {paragraph}{System-level comparisons of the paradigms.}{63}{section*.38}%
+\contentsline {subsection}{\numberline {11.4}Homomorphic encryption schemes and libraries}{63}{subsection.11.4}%
+\contentsline {subsection}{\numberline {11.5}What is distinctive here}{64}{subsection.11.5}%
+\contentsline {section}{\numberline {12}Methodology}{64}{section.12}%
+\contentsline {subsection}{\numberline {12.1}Identical transport, uniform accounting}{64}{subsection.12.1}%
+\contentsline {subsection}{\numberline {12.2}A validated network model}{64}{subsection.12.2}%
+\contentsline {subsection}{\numberline {12.3}Bit-exactness as a gate on quoting cost}{65}{subsection.12.3}%
+\contentsline {subsection}{\numberline {12.4}Machine-checked security attestations}{65}{subsection.12.4}%
+\contentsline {subsection}{\numberline {12.5}Gating an external baseline the way we gate our own}{65}{subsection.12.5}%
+\contentsline {subsection}{\numberline {12.6}Recording withdrawn results---and deleting the component}{66}{subsection.12.6}%
+\contentsline {section}{\numberline {13}Cross-paradigm findings}{66}{section.13}%
+\contentsline {subsection}{\numberline {13.1}The FHE-versus-MPC crossover belongs to the baseline's preprocessing}{66}{subsection.13.1}%
+\contentsline {subsection}{\numberline {13.2}MPC versus FHE at a matched threat model, against an external baseline}{67}{subsection.13.2}%
+\contentsline {paragraph}{The comparison is only meaningful at a matched corruption model.}{67}{section*.39}%
+\contentsline {paragraph}{The external baseline.}{67}{section*.40}%
+\contentsline {paragraph}{The activation is forced, and it costs the secret-sharing arm nothing.}{68}{section*.41}%
+\contentsline {paragraph}{Result.}{68}{section*.42}%
+\contentsline {paragraph}{What this comparison is not.}{69}{section*.43}%
+\contentsline {subsection}{\numberline {13.3}Protocol assignment can be derived, not annotated}{69}{subsection.13.3}%
+\contentsline {subsection}{\numberline {13.4}The nonlinearity crossover, and three wrong answers on the way to it}{69}{subsection.13.4}%
+\contentsline {paragraph}{We reported three other answers before this one, and we consider the sequence to be the more useful result.}{70}{section*.44}%
+\contentsline {paragraph}{What we can still say.}{71}{section*.45}%
+\contentsline {paragraph}{The per-deployment claim, withdrawn and then restored by measurement.}{71}{section*.46}%
+\contentsline {paragraph}{The scope of the withdrawal.}{71}{section*.47}%
+\contentsline {subsection}{\numberline {13.5}The convolution crossover, and a trick that did not need its scheme}{72}{subsection.13.5}%
+\contentsline {paragraph}{We report this boundary with a correction attached, because our first version of it was wrong by a factor of twenty.}{73}{section*.48}%
+\contentsline {section}{\numberline {14}Case study: private medical image diagnosis}{73}{section.14}%
+\contentsline {paragraph}{Privacy costs nothing in accuracy, and we show this rather than asserting it.}{73}{section*.49}%
+\contentsline {paragraph}{Accuracy alone misreads a medical classifier.}{74}{section*.50}%
+\contentsline {paragraph}{The ceiling on accuracy is the packing and not the cryptography.}{74}{section*.51}%
+\contentsline {section}{\numberline {15}Threats to validity}{75}{section.15}%
+\contentsline {paragraph}{The two arms of Section~\ref {sec:matched} are not timed the same way.}{75}{section*.52}%
+\contentsline {paragraph}{Omitting local compute is an error we made and corrected.}{75}{section*.53}%
+\contentsline {paragraph}{Quality of the implementation.}{75}{section*.54}%
+\contentsline {paragraph}{A single machine.}{75}{section*.55}%
+\contentsline {paragraph}{Run-to-run variance bounds how sharply a boundary can be read.}{75}{section*.56}%
+\contentsline {paragraph}{The simulated network is a model.}{76}{section*.57}%
+\contentsline {paragraph}{The disclosed cryptographic gaps, one of which has since closed.}{76}{section*.58}%
+\contentsline {paragraph}{What the input-boundary proof buys, and what it costs.}{76}{section*.59}%
+\contentsline {paragraph}{What remains open.}{77}{section*.60}%
+\contentsline {paragraph}{A third gap, found while building the pure Falcon route, and closed.}{77}{section*.61}%
+\contentsline {paragraph}{A fourth gap, found by attempting the composability proof, and closed.}{78}{section*.62}%
+\contentsline {paragraph}{Breadth of the workload.}{78}{section*.63}%
+\contentsline {paragraph}{This is not an adversarial evaluation.}{78}{section*.64}%
+\contentsline {section}{\numberline {16}Open problems}{78}{section.16}%
+\contentsline {section}{\numberline {17}Conclusion}{79}{section.17}%
+\contentsline {section}{\numberline {A}Experimental report: what the methodology caught}{79}{appendix.A}%
+\contentsline {paragraph}{A backend for proofs that proved nothing.}{80}{section*.65}%
+\contentsline {paragraph}{A break of privacy in bit decomposition.}{80}{section*.66}%
+\contentsline {paragraph}{An insecure homomorphic scheme, removed not caveated.}{80}{section*.67}%
+\contentsline {paragraph}{A channel of selective failure that passes every functional test.}{80}{section*.68}%
+\contentsline {paragraph}{A crossover withdrawn three times, for three different reasons.}{80}{section*.69}%
+\contentsline {paragraph}{Comparison errors of framing.}{81}{section*.70}%
+\contentsline {paragraph}{Honest negatives retained.}{81}{section*.71}%

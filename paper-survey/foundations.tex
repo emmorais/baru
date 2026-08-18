@@ -225,14 +225,14 @@ to be modified before it can run over machine words.
   evaluation points inverted. Over $\Z_{2^k}$ those differences are frequently
   even and therefore not invertible, so the scheme is not well defined for
   arbitrary evaluation points. This is why our ring-based layer uses
-  \emph{replicated} rather than threshold sharing
+  \emph{replicated} instead of threshold sharing
   (Definition~\ref{def:sharings}), and why the field-based engines in our
   compiler use a Mersenne prime instead.
   \item \textbf{Statistical masking must respect the power-of-two structure.} A
   mask uniform on $\Z_{2^k}$ hides perfectly (Theorem~\ref{thm:mask}), but a mask
   uniform on a subinterval does not, and the failure is not visible to any
-  correctness test. We shipped exactly that bug and describe it in
-  Section~\ref{sec:disclosure}.
+  correctness test, since the arithmetic is unaffected. An instance is recorded in
+  Appendix~\ref{sec:appendix:caught}.
   \item \textbf{Truncation is natural.} Division by $2^d$ with rounding is a shift
   on a machine word, and fixed-point arithmetic wants precisely that operation.
   Over $\mathbb{F}_p$ the corresponding operation needs a comparison against
@@ -278,7 +278,7 @@ irreducible over $\Q$, so $\Q[X]/(X^N+1)$ is a field and $\Ring$ is the ring of
 integers of a cyclotomic number field. Two properties of the negacyclic quotient
 are used constantly. First, reduction is free: $X^N \equiv -1$, so a product of
 two degree-$(N-1)$ polynomials is reduced by subtracting the high half from the
-low half rather than by long division. Second, multiplication is a \ib{negacyclic
+low half not by long division. Second, multiplication is a \ib{negacyclic
 convolution},
 \begin{equation}
 \label{eq:negconv}
@@ -345,7 +345,7 @@ Theorem~\ref{thm:crt}: represent $\Z_q$ as a residue number system over
 machine-word primes each satisfying $q_i \equiv 1 \pmod{2N}$, and transform
 independently in each. What remains after that is the cost of a single butterfly,
 and the engineering lesson we report is that this cost is dominated by modular
-reduction rather than by memory traffic, which is why a Shoup-preconditioned
+reduction not by memory traffic, which is why a Shoup-preconditioned
 multiply is worth more than a better loop order.
 \end{remark}
 
@@ -438,8 +438,7 @@ failure and the fix in Section~\ref{sec:matched}.
 \label{sec:math:cost}
 
 Our comparisons are quoted in wall-clock time computed from measured counts, so
-the model that performs that conversion is part of the foundations rather than a
-detail of the harness.
+the model that performs that conversion is part of the foundations and not a detail of the harness.
 
 \begin{definition}
 \label{def:roundsbytes}
@@ -490,12 +489,12 @@ Conversely, along a path carrying $m$ interactive operations, each must complete
 before the next begins, so any schedule uses at least $m$ rounds.
 \end{proof}
 
-Proposition~\ref{prop:asap} is why we report \emph{dependence depth} rather than
+Proposition~\ref{prop:asap} is why we report \emph{dependence depth} not
 operation counts as the predictor of latency, and why batching a layer's
 comparisons is worth more than reducing their number: a layer of $n$ independent
 comparisons costs one comparison's rounds. It also explains a structural feature
 of the assignment problem in Section~\ref{sec:assign}: because a level costs the
-maximum over its members rather than the sum, the objective is not separable
+maximum over its members not the sum, the objective is not separable
 across operations, and an integer-linear formulation of it is not faithful.
 
 \section{Foundations of the protocols}
@@ -846,7 +845,7 @@ section for our measurements. It says that the nonlinear surface of a network
 costs \emph{rounds proportional to depth and not to width}, which is why our
 latency figures scale with the number of layers and are almost independent of the
 number of neurons per layer, and why the dominant term in a comparison's cost is
-the random bits rather than the prefix network.
+the random bits instead of the prefix network.
 
 \begin{proposition}[Truncation]
 \label{prop:trunc}
@@ -876,11 +875,13 @@ they are local.
 \begin{remark}
 \label{rem:trunc-sign}
 The sign correction in Proposition~\ref{prop:trunc} is easy to omit, and omitting
-it yields a \emph{logical} rather than arithmetic shift: the result is correct for
+it yields a \emph{logical} and not an arithmetic shift: the result is correct for
 non-negative inputs and wrong for every negative one. Since roughly half of a
 network's pre-activations are negative, the error is not subtle in effect---but it
-is invisible to a test suite whose fixtures happen to be positive. We shipped that
-omission and describe it in Section~\ref{sec:disclosure}.
+is invisible to any test whose fixtures are non-negative. This is a case where the
+natural test set and the failure set are disjoint, which is why the correctness
+condition is worth stating as a proposition not left to the
+implementation.
 \end{remark}
 
 \subsection{Oblivious transfer and its extensions}
@@ -961,7 +962,7 @@ output label that decodes to anything other than $f(x)$.
 Privacy is what a semi-honest evaluator requires. Authenticity is what makes a
 malicious evaluator unable to forge a result, and it is why the garbled-circuit
 route can be given active security cheaply on the evaluator's side. Obliviousness
-matters in our setting because the garbled output is kept as a sharing rather than
+matters in our setting because the garbled output is kept as a sharing not
 decoded, which is exactly how a garbled comparison composes with an arithmetic
 protocol.
 
@@ -1003,13 +1004,12 @@ The \ib{ring} variant replaces $\Z_q^n$ by $\Rq = \Z_q[X]/(X^N+1)$: samples are
 $(a_i, a_i s + e_i)$ with $a_i \gets \Rq$, $s \in \Rq$ fixed and $e_i$ drawn
 coefficientwise from $\chi$. A single ring sample carries $N$ scalar samples, so
 the public key is smaller by a factor of $N$ and multiplication becomes a ring
-product rather than a matrix--vector product.
+product instead of a matrix--vector product.
 \end{definition}
 
 The assumptions we rely on are that decision LWE and decision ring-LWE are hard
-for suitable parameters. Two facts about them shape our practice rather than our
-proofs. First, search-to-decision and worst-case-to-average-case reductions are
-known, which is why these problems are used at all; we cite rather than reprove
+for suitable parameters. Two facts about them shape our practice and not our proofs. First, search-to-decision and worst-case-to-average-case reductions are
+known, which is why these problems are used at all; we cite not reprove
 them. Second, and this is what a parameter table actually depends on, the
 \emph{concrete} hardness is estimated by running the best known attacks---lattice
 reduction with a sieving or enumeration subroutine, plus algebraic and hybrid
@@ -1023,10 +1023,10 @@ security beyond what the standard tables assert.
 The distinction between ``a problem is hard'' and ``these parameters are hard'' is
 not academic for us. We implemented a scheme whose security rested on a variant
 assumption, and the variant admitted a subfield-lattice attack for the parameter
-shape we had chosen; the construction was removed rather than reparameterised. We
-report the episode in Section~\ref{sec:withdrawn}, because a survey that lists
-only the primitives that survived gives a misleading picture of how the choice is
-made.
+shape we had chosen; the construction was removed not reparameterised. We
+record such a case in Appendix~\ref{sec:appendix:caught}. A survey that lists only
+the primitives that survived would give a misleading picture of how the choice
+between them is made.
 \end{remark}
 
 \subsection{Homomorphic encryption: noise, depth and the operations that manage them}
@@ -1166,7 +1166,7 @@ Definition~\ref{def:bootstrap} refreshes noise by computing decryption
 homomorphically. A scheme switch achieves the same effect by a different route:
 the ciphertext is decrypted \emph{under a sharing}, so the plaintext is never
 exposed, and re-encrypted fresh. The cost is a round of interaction with parties
-who hold the key in shares, rather than a homomorphic evaluation of decryption.
+who hold the key in shares, instead of a homomorphic evaluation of decryption.
 Whether this is a better trade is precisely a measurement question, and it is the
 one our hybrid result answers: the switch is milliseconds where the bootstrap is
 seconds, and the price is that the parties must be online.
@@ -1265,7 +1265,7 @@ cannot compute a sign, so a nonlinearity must be a polynomial, which is why the
 only activation both paradigms evaluate exactly is a monomial
 (Remark~\ref{rem:x2}). And precision degrades along the modulus chain, so a
 classification margin narrower than the accumulated error is not recoverable---a
-failure mode that presents as a wrong label rather than as an error signal, which
+failure mode that presents as a wrong label and not as as an error signal, which
 is why our harness compares against a plaintext reference before quoting any
 timing.
 \end{remark}
@@ -1277,7 +1277,7 @@ a protocol. The subtlety is that a partial decryption reveals a noise term that
 depends on the key share, so partial decryptions must be flooded by noise drawn
 from a range at least $2^{\kappa}$ times the bound---Lemma~\ref{lem:smudge}---and
 that flooding is subtracted from the same budget as the evaluation. The practical
-consequence, which we report as a disclosed gap rather than a solved problem, is
+consequence, which we report as a disclosed gap and not a solved problem, is
 that a statistical security level for the decryption and a depth budget for the
 computation are drawn on the same account.
 \end{remark}
@@ -1310,7 +1310,7 @@ verification time are $o(\abs{w})$, typically polylogarithmic in the circuit siz
 Two points of principle bear on how we report our zero-knowledge measurements.
 First, soundness in Definition~\ref{def:argument} is \emph{computational}: an
 unbounded prover can cheat, which is the price of succinctness, and it is why
-these objects are called arguments rather than proofs. Second, non-interactivity
+these objects are called arguments not proofs. Second, non-interactivity
 is normally obtained by the Fiat--Shamir transform, replacing the verifier's
 random challenges with a hash of the transcript; the transform is provable in the
 random-oracle model and its concrete instantiation is an assumption, so a proof
@@ -1323,8 +1323,8 @@ The gap between ``a proof verifies'' and ``a proof proves the intended statement
 is where our own zero-knowledge error lived: a backend can be complete and
 internally consistent while the constraint system it emits fails to bind the
 witness to the computation one intended, and no amount of successful verification
-detects it. We describe the episode in Section~\ref{sec:withdrawn}. The
-methodological consequence we draw is that a proof system needs a negative
-test---a witness that should fail and does---and that reporting only successful
-verifications is not evidence.
+detects it. The methodological consequence is that a proof system requires a
+\ib{negative} test---a witness that ought to fail and does---and that a report of
+successful verifications alone is not evidence of soundness.
+Appendix~\ref{sec:appendix:caught} records an instance.
 \end{remark}

@@ -11,6 +11,13 @@ measured in a single harness. The prose draft this was written from is
 - `foundations.tex` — **§3–4, the mathematical and protocol foundations**,
   `\input` from `main.tex`. Kept in its own file because it is long and largely
   self-contained; `pdflatex main` picks it up with no extra step.
+- `mlfoundations.tex` — **§5, the workload**: neural inference, which
+  nonlinearities each cryptosystem can evaluate, quantisation and its error
+  propagation, accuracy metrics, and the private-inference threat models.
+- `compiler.tex` — **§9, the compiler as a contribution**: the two intermediate
+  representations, the classical passes and their sound order, scheduling, and
+  the two structural results (a rewrite's profitability is protocol-dependent;
+  the assignment objective is not separable).
 - `references.bib` — bibliography, 70 entries. Seeded from
   [`../paper/references.bib`](../paper/references.bib) and extended with the
   entries this paper needs (Falcon, SecureNN, Chida, Eerikson, Overdrive,
@@ -24,10 +31,19 @@ measured in a single harness. The prose draft this was written from is
 pdflatex main && bibtex main && pdflatex main && pdflatex main
 ```
 
-or `latexmk -pdf main.tex`. Builds clean: **71 pages**, no undefined references
-or citations. Roughly a third of that is the foundations of §3–4, which carry
-**26 proofs**; they are written to be cut rather than skimmed, so a venue with a
-page limit should remove whole subsections rather than compress them.
+or `latexmk -pdf main.tex`. Builds clean: **85 pages**, no undefined references
+or citations, **39 proofs**. A table of contents is included at `tocdepth 2`
+(sections and subsections, 81 entries); the 70 `\paragraph` headings are
+suppressed there but remain in `main.toc` if a deeper contents is wanted.
+
+Structure follows the convention of Boneh–Shoup, *A Graduate Course in Applied
+Cryptography* (<https://toc.cryptobook.us/>): definitions, then constructions,
+then theorems with proofs, with discussion confined to explicitly marked
+remarks. The **body is scientific prose**; the detailed experimental narrative —
+including the errors the methodology caught in our own work — is
+**Appendix A**, so that the body's claims stand without it. A venue with a page
+limit should cut whole subsections of §3–5 rather than compress them, and may
+drop Appendix A entirely.
 
 The document deliberately avoids venue-specific classes so it compiles
 anywhere. To target a venue, swap the first line for that venue's

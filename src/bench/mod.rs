@@ -945,6 +945,7 @@ pub mod cohort;
 pub mod cohort_eval;
 pub mod comm;
 pub mod compiled_nn;
+pub mod conv_nn;
 pub mod conv_route;
 pub mod deep_nn;
 pub mod falcon;
