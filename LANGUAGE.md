@@ -415,6 +415,48 @@ have quietly cost privacy:
   `NativeFunc`s, which have no gate-level meaning; a program compiled to FHE or
   ZKP has already resolved its public structure.
 
+### 5.2c Batched vector primitives
+
+Element-wise operations on whole vectors. On shares each of these is **one
+batched protocol round for the entire vector** rather than one round per element,
+which is the difference §6.2 is about; on public values they are plain integer
+arithmetic, so the same source text runs on either backend.
+
+| Builtin | Signature | Rounds on shares |
+|---|---|---|
+| `vadd` `vsub` | `(vadd a b)` | 0 — local |
+| `vscale` | `(vscale vec k)` — scale by one scalar | 0 for a public `k`; 1 (`mul_batch`) for a secret one |
+| `vmul` | `(vmul a b)` | 1 (`mul_batch`); 0 if one side is public |
+| `vlt` `vge` | `(vlt a b)` → 1/0 per lane | 1 (`lt_batch`) |
+| `vmax` | `(vmax a b)` — ties keep `a` | 2 (`lt_batch` + `mul_batch`) |
+| `vashr` | `(vashr vec n)` | 1 batched `a2b`, then local recomposition |
+| `vslice` | `(vslice vec base rows cols row-stride col-stride)` | 0 — data movement |
+| `vrep` | `(vrep x n)` — constant vector | 0 |
+
+`vslice` takes two strides because both users need both: a convolution tap is a
+contiguous-column window at row stride `iw`, and a 2×2/stride-2 pooling phase is
+column stride 2 at row stride `2·iw`. Between them, `vslice` and `vscale` are
+enough to write a convolution as a **sum of scaled strided views** — which is
+what [`examples/medmnist.baru`](examples/medmnist.baru) does, and what makes it
+tractable.
+
+Why these exist at all: `Backend` has had `mul_batch`, `lt_batch` and `a2b_batch`
+throughout, and nothing in the language could reach them — `dot`, `vsum` and
+`matvec` were the entire vector surface, and neither a comparison nor a shift was
+in it. A CNN written with scalar `>` and `ash-right` spent **864 361 messages**
+on one diagnosis; the same network over these primitives spends **33 181**, and
+runs 189× faster. See [`docs/experiments.md` IV.2b](docs/experiments.md).
+
+**`vashr` is a logical shift on the two's-complement residue**, matching
+`ash-right` on a share. It is meaningful on the non-negative branch only, which
+is why a fused ReLU∘rescale multiplies by the sign mask rather than trusting the
+shift on negatives:
+
+```lisp
+(define (vrelu-rescale xs s)
+  (vmul (vashr xs s) (vge xs (vrep 0 (length xs)))))   ; v >= 0 ? v >> s : 0
+```
+
 ### 5.3 Fixed-point conversions
 
 | Builtin | Description |
@@ -892,12 +934,17 @@ else, so the class index is the only value revealed.
 `--private 2` change no prediction: the oblivious rewrite is exact, not
 approximate.
 
-**It is not the fast path.** `bench-medmnist` evaluates the same network in 283 ms
-because it calls the *batched* primitives (`lt_batch`, `mul_batch`, `a2b_batch` —
-§6.2), which run a whole layer in the round count of one element. The Lisp
-program calls the per-element forms, so it pays one round per comparison. That
-is the gap §6.2 warns about, measured on a real network: see
-[`docs/private-inference-performance.md`](docs/private-inference-performance.md).
+**Measured** (pneumonia, one diagnosis, M1 Pro): **322 ms** plaintext,
+**6.4 s** with the image secret, **10.1 s** with the image *and* the model
+secret. The Rust hybrid pipeline computes the same network in **268 ms** with
+both hidden — so at a matched threat model the Lisp program is 38× off, and the
+remaining gap is *protocol choice*: the Rust path runs the linear layers under
+FHE and the nonlinearities as garbled circuits, while this one runs everything on
+plain ABY3, where every fused ReLU∘rescale is an `a2b`. Note that the encrypted
+Rust pipeline is *faster than the plaintext Lisp program* — privacy is not what
+makes private inference slow. See
+[`docs/experiments.md` IV.2b](docs/experiments.md) for the full table, including
+what the first, scalar-written version of this file cost (189× more).
 
 ---
 

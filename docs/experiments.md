@@ -1288,10 +1288,6 @@ the identical `i64`s the Rust pipeline multiplies — so the two are two
 implementations of one model, and `tests/medmnist_baru.rs` pins them together
 image by image on all three datasets.
 
-It needed `baru run` (LANGUAGE.md §10.5) to exist at all: the REPL reads one
-expression per line, and it needed the trampoline's step budget raised, since a
-single 28×28 convolution exceeds the REPL's 1 000 000-frame runaway guard.
-
 **Pneumonia, one diagnosis, Apple M1 Pro. Same weights, same images, every
 integer path bit-identical.**
 
@@ -1300,55 +1296,86 @@ integer path bit-identical.**
 | PyTorch float32, batch of 20 | nothing | **0.06 ms** | — |
 | NumPy, integer | nothing | **1.53 ms** | — |
 | pure Python, integer | nothing | **33.2 ms** | — |
-| **Baru program, plain interpreter** | nothing | **2 783 ms** | — |
-| **Rust hybrid pipeline** (`bench-medmnist --gc --precompute`) | image **and** model | **307 ms** | 61 |
-| **Baru program, 3-party MPC** (`--mpc --private 1`) | the image | **1 216 404 ms** | 864 361 |
+| **Baru program, plain interpreter** | nothing | **322 ms** | — |
+| **Rust hybrid pipeline** (`bench-medmnist --gc --precompute`) | image **and** model | **268 ms** | 61 |
+| **Baru program, 3-party MPC** | the image | **6 446 ms** | 33 181 |
+| **Baru program, 3-party MPC** | image **and** model | **10 093 ms** | 215 847 |
 
-Organa and derma on the plain interpreter: **10 476 ms** and **3 985 ms**.
-The float32 row is not bit-exact (17/20 against the integer net's 18/20) and is
-a batched call, so it is a throughput figure; every other row is one image at a
+Organa and derma on the plain interpreter: **2 010 ms** and **398 ms**.
+The float32 row is not bit-exact (17/20 against the integer net's 18/20) and is a
+batched call, so it is a throughput figure; every other row is one image at a
 time.
 
-Four readings, and the ordering of the middle two is the point.
+#### What the first version cost, and why
 
-**Interpretation costs ~1 800× more than vectorised integer arithmetic, and the
-crypto is not why.** Baru's plaintext CNN is 2 783 ms against NumPy's 1.53 ms and
-pure Python's 33.2 ms. A tree-walking evaluator against a bytecode one is most of
-that 84× gap to pure Python; the rest is that every scalar is an `Rc`-boxed
-`Types`. Nothing about privacy has happened yet at this row.
+The first draft of this program was written the way one writes a CNN in a
+scalar language — a loop over sliding windows, `>` and `ash-right` per
+activation. It is worth recording what that cost, because the arithmetic was
+identical and the answers were the same:
 
-**The encrypted Rust pipeline is 9× FASTER than the plaintext Baru program.**
-307 ms with both the model and the image encrypted, against 2 783 ms with nothing
-hidden at all. Privacy is not what makes a private-inference system slow —
-*evaluation strategy* is. This is the cleanest statement of that in the
-repository, and it only became measurable once the same network existed on both
-sides.
+| | scalar Lisp | vector Lisp | change |
+|---|---|---|---|
+| plaintext | 2 783 ms | **322 ms** | 8.6× |
+| private, secret image | 1 216 404 ms | **6 446 ms** | **189×** |
+| — its messages | 864 361 | **33 181** | 26× |
+| — its bytes | 483 MB | **84 MB** | 5.7× |
+| private, image + model | *did not finish* | **10 093 ms** | — |
 
-**The Lisp private path is 4 000× the Rust one, for a reason already written
-down.** 864 361 messages against 61. §I.3 says the cost is the round count and
-not the multiplication count, and §6.2 warns that calling the per-element
-primitive in a loop pays `O(n)` rounds for nothing. The Lisp program does exactly
-that: one `lt` per comparison, ~12 600 comparisons per diagnosis, each ~9 rounds.
-The Rust pipeline calls `lt_batch`/`mul_batch` and spends one round per *layer*.
-The gap is not the language being interpreted — it is that the batched primitives
-`src/gadgets/` is written over are **not exposed to the language**. That is the
-concrete next piece of work, and it is a frontend question, not a protocol one.
+Three changes got that, none of them to the network:
 
-**The threat models on those two rows differ, and the weaker one is the fast
-one.** `--private 1` hides the image and leaves the model public — the setting
-most 2-party private-inference papers measure. The 307 ms pipeline hides *both*.
-`--private 2` hides both in Baru too and is verified exact
-(`tests/medmnist_baru.rs`), but its wall clock on the real transport is **not
-measured**: at `--private 1` a convolution's multiplications are share×public and
-therefore local (I.2d), while at `--private 2` every one of them becomes an
-interactive resharing, and the run did not finish inside the ~20 minutes
-`--private 1` took. So the honest comparison across those two rows is
-*model-public Lisp* against *model-hidden Rust*, and the Lisp side would only get
-slower if the models were matched.
+1. **Batched vector primitives, reachable from the language**
+   (`src/interpreter/vector_builtins.rs`, LANGUAGE.md §5.2c). `lt_batch`,
+   `mul_batch` and `a2b_batch` were already in `Backend`; nothing in the language
+   could call them, so `dot`/`vsum`/`matvec` was the whole vector surface and
+   neither a comparison nor a shift was in it. This is I.3's lesson — *cost is
+   rounds, not operations* — applied to the frontend instead of to Rust code.
+2. **The network rewritten a layer at a time.** A convolution became a **sum of
+   scaled strided views** (`vslice`) rather than a loop over windows: one view
+   per tap, shared across output channels, so conv1 does 9 gathers and 72
+   scale-accumulates instead of building 5 408 nine-element window lists. The
+   nonlinearity applies to a whole layer at once, so it costs three rounds per
+   layer rather than three per element. This is the reshaping NumPy code does,
+   and it is why the plaintext row moved too — most of the 8.6× is *not* crypto.
+3. **`vscale` batches a secret scalar.** With the model shared, a convolution tap
+   is a secret scalar times a vector; doing that per element is one round per
+   activation. One `mul_batch` broadcasting the scalar down the lanes took the
+   shared-weight conv from 48 672 rounds to 72, and `--private 2` from 289 s to
+   10 s.
 
-Writing this program is also what surfaced I.2c (`b2a` mistagging its width, a
-silent wrong diagnosis) and I.2d (public × secret paying a round). Both were
-invisible to 553 unit tests and to every Rust benchmark.
+#### What is left, and what it is not
+
+At a **matched threat model** — image and model both hidden, which is what the
+268 ms pipeline does — the Lisp program is now **10.1 s against 268 ms, 38×**,
+down from a ratio of roughly 4 500×. The residue is *protocol choice*, not
+batching and not interpretation:
+
+- the Rust pipeline evaluates the linear layers under **FHE** (one packed ct×ct
+  matvec per layer) and the nonlinearities with **garbled circuits** (`--gc`,
+  constant-round). The Lisp program runs everything on plain ABY3, where each
+  fused ReLU∘rescale is an `a2b` — ~9 rounds and `O(nbits · log nbits)` AND
+  gates even when perfectly batched. That is the 215 847 messages against 61.
+- **The share width is the model's, not a flag.** `medmnist-model` now returns
+  the width `CnnModel::from_trained` calibrated from the worst activation it
+  actually observed (20 bits for all three sets). `a2b` cost scales with it, and
+  a hand-picked width is a silent wrong answer on the dataset it does not fit —
+  the same argument `cnn.rs`'s `wire_bits_for` makes. Reading it from the model
+  rather than from `--nbits` took the private run from 22.7 s to 6.4 s at
+  `--private 1` and cut its bytes 4×.
+
+Two readings that survive all of this.
+
+**The encrypted Rust pipeline is comparable to the *plaintext* Lisp program** —
+268 ms with both the model and the image encrypted, against 322 ms with nothing
+hidden at all. Privacy is not what makes a private-inference system slow;
+evaluation strategy is. That only became measurable once the same network existed
+on both sides.
+
+**Every factor of the original 4 500× was a frontend gap, not a protocol one.**
+The batched primitives existed; the language could not reach them. Writing the
+network in the language is what made that visible, and it is also what surfaced
+I.2c (`b2a` mistagging its width — a silent wrong diagnosis) and I.2d (public ×
+secret paying a round). All four were invisible to 553 unit tests and to every
+Rust benchmark.
 
 ### IV.3 A real CNN through the hybrid pipeline
 

@@ -2196,6 +2196,15 @@ impl Participant {
             Rc::new(RefCell::new(Types::NativeFunc(list_fn))),
         );
 
+        // Batched element-wise vector primitives (LANGUAGE.md §5.2c). These are
+        // what let a Baru program pay one round per LAYER instead of one per
+        // element — see `vector_builtins`' module docs.
+        for (name, f) in crate::interpreter::vector_builtins::vector_builtins(backend.clone()) {
+            self.store
+                .borrow_mut()
+                .insert(name, Rc::new(RefCell::new(f)));
+        }
+
         // MedMNIST weights + test images as ordinary Lisp data. Loading only —
         // the network itself is written in Baru (`examples/medmnist.baru`), which
         // is the point; see `dataset_builtins`' module docs.
@@ -4382,6 +4391,26 @@ fn fixed_share_binop(
 /// Element-wise product for the vector builtins.  Handles Num, Fixed and
 /// Share operands (including Q16.16 shares) following the interpreter's
 /// scalar coercion rules.
+/// Re-export for [`crate::interpreter::vector_builtins`], which needs the same
+/// per-element operand rules for its mixed and fixed-point fallbacks. Kept as a
+/// thin alias rather than duplicated: the operand dispatch drifting apart is
+/// exactly the defect I.4 records.
+pub(crate) fn vec_mul_pub(
+    backend: &Arc<Mutex<Box<dyn Backend>>>,
+    a: &Types,
+    b: &Types,
+) -> Result<Types, Types> {
+    vec_mul(backend, a, b)
+}
+
+pub(crate) fn vec_add_pub(
+    backend: &Arc<Mutex<Box<dyn Backend>>>,
+    a: &Types,
+    b: &Types,
+) -> Result<Types, Types> {
+    vec_add(backend, a, b)
+}
+
 fn vec_mul(backend: &Arc<Mutex<Box<dyn Backend>>>, a: &Types, b: &Types) -> Result<Types, Types> {
     use crate::interpreter::ast::FIXED_SCALE;
     let to_fixed = |v: &Types| -> i64 {
@@ -4541,7 +4570,7 @@ fn vec_dot(
 }
 
 // Convert a signed i64 value into an unsigned field element representing two's complement with `nbits` bits
-fn int_to_fr_signed(n: i64, nbits: usize) -> u128 {
+pub(crate) fn int_to_fr_signed(n: i64, nbits: usize) -> u128 {
     if nbits >= 128 {
         return n as i128 as u128;
     }

@@ -19,7 +19,7 @@
 //!
 //! # The model layout
 //!
-//! `(medmnist-model name)` returns a nine-element list. It is positional rather
+//! `(medmnist-model name)` returns a ten-element list. It is positional rather
 //! than keyed because this language has no `assoc`, and `examples/medmnist.baru`
 //! defines named accessors over it so no call site indexes it by hand:
 //!
@@ -34,6 +34,7 @@
 //! | 6 | hidden dense | list of `(weights biases)` |
 //! | 7 | `dense-w` | output layer, `[nclasses][in]` |
 //! | 8 | `dense-b` | output layer bias |
+//! | 9 | `nbits` | calibrated share width for this model |
 //!
 //! Every integer is exactly the `i64` the Rust pipeline multiplies, so a
 //! disagreement between this path and `bench-medmnist` is a bug in one of the
@@ -54,7 +55,7 @@ fn rows(xs: &[Vec<i64>]) -> Types {
     Types::List(xs.iter().map(|r| nums(r)).collect())
 }
 
-/// The nine-element model list documented at the module level.
+/// The ten-element model list documented at the module level.
 fn model_to_lisp(m: &TrainedCnn) -> Types {
     let conv1 = Types::List(vec![
         rows(&m.kernels),
@@ -94,6 +95,14 @@ fn model_to_lisp(m: &TrainedCnn) -> Types {
         hidden,
         rows(&m.dense_w),
         nums(&m.dense_b),
+        // The share width this model needs, **calibrated by
+        // `CnnModel::from_trained` from the worst activation actually observed**
+        // over the embedded images — not guessed. Pneumonia is exact at 20 bits
+        // and wrong at 19; organa needs more. It belongs to the model, so the
+        // program reads it here rather than taking it from the command line: a
+        // width chosen by hand is a silent wrong answer on the dataset it does
+        // not fit (`cnn.rs`'s `wire_bits_for` makes the same argument).
+        Types::Num(m.model().nbits as i64),
     ])
 }
 
@@ -198,7 +207,12 @@ mod tests {
             let m = load(name).expect("dataset must be embedded");
             let lisp = model_to_lisp(&m);
             let top = as_list(&lisp);
-            assert_eq!(top.len(), 9, "{name}: model layout is nine fields");
+            assert_eq!(top.len(), 10, "{name}: model layout is ten fields");
+            assert_eq!(
+                as_num(&top[9]),
+                m.model().nbits as i64,
+                "{name}: nbits must be the model's own calibrated width"
+            );
             assert_eq!(as_num(&top[0]), m.d as i64, "{name}: d");
             assert_eq!(as_num(&top[1]), m.in_c() as i64, "{name}: in_c");
             assert_eq!(as_num(&top[2]), m.shift as i64, "{name}: shift");

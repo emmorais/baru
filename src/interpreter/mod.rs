@@ -8,6 +8,7 @@ pub mod hashcons;
 pub mod malicious_backend;
 pub mod parser;
 pub mod transport_backend;
+pub mod vector_builtins;
 
 pub use ast::*;
 pub use backend::*;

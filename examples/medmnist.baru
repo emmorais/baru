@@ -6,9 +6,9 @@
 ;
 ; The same source text evaluates on the plain interpreter and on the MPC
 ; backend. Nothing below branches on the backend: every operator dispatches on
-; the runtime type of its operands, so `dot`, `matvec`, `ash-right` and `>` are
-; local integer arithmetic when handed a Num and ABY3 protocol steps when handed
-; a Share. The one place privacy is chosen is `load-input`, at the bottom.
+; the runtime type of its operands, so `vmul`, `vmax`, `vashr` and `matvec` are
+; local integer arithmetic when handed Nums and ABY3 protocol steps when handed
+; Shares. The one place privacy is chosen is `load-input`, near the bottom.
 ;
 ; PRIVATE is injected by `baru run`:
 ;   0  plaintext — no sharing, no encryption. The cost of the computation alone.
@@ -20,10 +20,22 @@
 ;      `bench-medmnist` measures (there, ciphertext×ciphertext), where the only
 ;      value that ever leaves the cryptographic domain is the class index.
 ;
-; The weights and images come from `medmnist-model` / `medmnist-image`, which do
-; no arithmetic — they hand over exactly the i64s `bench-medmnist` multiplies, so
-; a disagreement between the two implementations is a bug in one of them and not
-; a difference of inputs.
+; ─── Written a layer at a time, on purpose ──────────────────────────────────
+;
+; Everything below operates on WHOLE LAYERS through the vector primitives
+; (`vmul`, `vlt`, `vmax`, `vashr`, `vslice`, LANGUAGE.md §5.2c), never on one
+; activation at a time. That is not a style preference — it is the difference
+; between one communication round per layer and one per element. §6.2: "cost is
+; rounds, not operations". The first version of this file was written with
+; scalar `>` and `ash-right` and cost 864 361 messages for one diagnosis; the
+; arithmetic was identical.
+;
+; A convolution is therefore expressed as a **sum of scaled strided views**
+; rather than as a loop over sliding windows: for each of the `in_c*k*k` taps,
+; take the `oh x ow` view of the input at that tap's offset, scale it by that
+; tap's weight, accumulate. The views are the same for every output channel, so
+; they are computed once per layer. This is the same reshaping NumPy code does,
+; and for the same reason.
 
 ; ─── the model, as ordinary Lisp data ────────────────────────────────────────
 ; Layout is documented in src/interpreter/dataset_builtins.rs. Named here so no
@@ -37,6 +49,12 @@
 (define (model-hidden m)   (list-ref m 6))
 (define (model-dense-w m)  (list-ref m 7))
 (define (model-dense-b m)  (list-ref m 8))
+; The share width for this model, calibrated by the trainer from the worst
+; activation it actually saw — NOT the command line. Pneumonia is exact at 20
+; bits and wrong at 19, and organa needs more than pneumonia; a hand-picked
+; width is a silent wrong answer on the dataset it does not fit. `a2b` cost
+; scales with it, so this is also the single biggest lever on the private run.
+(define (model-nbits m)    (list-ref m 9))
 
 (define (conv-kernels c) (list-ref c 0))
 (define (conv-bias c)    (list-ref c 1))
@@ -52,25 +70,96 @@
 (define (dense-w l) (list-ref l 0))
 (define (dense-b l) (list-ref l 1))
 
-; ─── oblivious primitives ───────────────────────────────────────────────────
-; Written as muxes rather than `if`, because `(if (> z 0) z 0)` on shares
-; REVEALS the condition bit (LANGUAGE.md §6.3) — it would leak the sign of every
-; pre-activation. These forms are branch-free and so leak nothing; on public
-; values they compute exactly the same thing with c bound to 1 or 0.
+; A feature map travels as (values c h w).
+(define (fm-v f) (list-ref f 0))
+(define (fm-c f) (list-ref f 1))
+(define (fm-h f) (list-ref f 2))
+(define (fm-w f) (list-ref f 3))
 
-(define (mux c a b) (+ (* c a) (* (- 1 c) b)))
+; ─── oblivious primitives, whole-vector ─────────────────────────────────────
+; Muxes rather than `if`: `(if (> z 0) z 0)` on a share REVEALS the condition
+; bit (§6.3), which here would leak the sign of every pre-activation. These
+; forms are branch-free, so they leak nothing; on public values they compute
+; exactly the same thing with the mask bound to 1 or 0.
 
-(define (max2 a b) (mux (> a b) a b))
+; The fused ReLU∘rescale the hybrid pipeline implements: `v >= 0 ? v >> s : 0`,
+; over a whole layer in three batched rounds. The shift is only valid on the
+; non-negative branch, which is why the mask multiplies the shifted value.
+(define (vrelu-rescale xs s)
+  (vmul (vashr xs s) (vge xs (vrep 0 (length xs)))))
 
-; The fused ReLU∘rescale the hybrid pipeline implements: `v >= 0 ? v >> s : 0`.
-; The shift is only valid on the non-negative branch, which is why the mask
-; multiplies the shifted value rather than the other way round.
-(define (relu-rescale v s) (* (ash-right v s) (>= v 0)))
+; ─── convolution: a sum of scaled strided views ─────────────────────────────
+; The taps are enumerated in (ic, ky, kx) order — the order a kernel row is
+; stored in — so tap i pairs with kernel element i without a lookup table.
+(define (conv-views v in-c ih iw k oh ow)
+  (let ((acc (quote ()))
+        (hw (* ih iw)))
+    (do ((ic (- in-c 1) (- ic 1))) ((< ic 0) acc)
+      (do ((ky (- k 1) (- ky 1))) ((< ky 0))
+        (do ((kx (- k 1) (- kx 1))) ((< kx 0))
+          (set! acc
+                (cons (vslice v (+ (* ic hw) (+ (* ky iw) kx)) oh ow iw 1)
+                      acc)))))))
+
+; One output channel: sum_t weight[t] * view[t], plus the pre-shifted bias.
+(define (conv-channel views kern n b)
+  (let loop ((vs views) (ws kern) (acc (vrep b n)))
+    (if (null? vs)
+        acc
+        (loop (cdr vs) (cdr ws) (vadd acc (vscale (car vs) (car ws)))))))
+
+; conv → fused ReLU∘rescale over the WHOLE layer (not per channel), so the
+; nonlinearity costs three rounds for the layer rather than three per channel.
+(define (conv2d v in-c ih iw kernels cbias k s)
+  (let* ((oh (+ (- ih k) 1))
+         (ow (+ (- iw k) 1))
+         (n (* oh ow))
+         (views (conv-views v in-c ih iw k oh ow)))
+    (let loop ((ks kernels) (bs cbias) (acc (quote ())))
+      (if (null? ks)
+          (list (vrelu-rescale acc s) (length kernels) oh ow)
+          (loop (cdr ks) (cdr bs)
+                (append acc
+                        (conv-channel views (car ks) n (ash-left (car bs) s))))))))
+
+; ─── 2x2 max-pool, stride 2 ─────────────────────────────────────────────────
+; The four pooling phases are four strided views (column stride 2, row stride
+; 2*iw), so the whole layer pools in two levels of `vmax` — four rounds — rather
+; than three comparisons per window.
+;
+; `ash-right` and not `/` for the geometry: this language's `/` is EXACT integer
+; division and refuses a remainder, but pooling floors — an 11-wide input pools
+; to 5, not to an error. Matches gadgets::maxpool2d_ref: (in - 2) / 2 + 1.
+(define (maxpool f)
+  (let* ((v (fm-v f)) (c (fm-c f)) (ih (fm-h f)) (iw (fm-w f))
+         (oh (+ (ash-right (- ih 2) 1) 1))
+         (ow (+ (ash-right (- iw 2) 1) 1))
+         (hw (* ih iw))
+         (rs (* 2 iw)))
+    (let loop ((ch 0) (p00 (quote ())) (p01 (quote ()))
+                      (p10 (quote ())) (p11 (quote ())))
+      (if (== ch c)
+          (list (vmax (vmax p00 p01) (vmax p10 p11)) c oh ow)
+          (let ((base (* ch hw)))
+            (loop (+ ch 1)
+                  (append p00 (vslice v base                oh ow rs 2))
+                  (append p01 (vslice v (+ base 1)          oh ow rs 2))
+                  (append p10 (vslice v (+ base iw)         oh ow rs 2))
+                  (append p11 (vslice v (+ base (+ iw 1))   oh ow rs 2))))))))
+
+; ─── dense layers ───────────────────────────────────────────────────────────
+; `matvec` dispatches to a batched precompile when both operands are shares, and
+; is local when the weights are public — either way one call, not one per weight.
+; The conv bias is pre-shifted (`cbias << s`) and the dense bias is not; that
+; asymmetry is the trained model's, and CnnModel::forward_logits has it too.
+(define (hidden-layer x l s)
+  (vrelu-rescale (vadd (matvec (dense-w l) x) (dense-b l)) s))
 
 ; First maximum wins, matching gadgets::argmax_ref — a strict `>` never moves
 ; off an earlier equal candidate. The index is carried as a value, so when the
-; logits are shares the returned index is a share too and only its
-; reconstruction reveals the class.
+; logits are shares the index is a share too and only its reconstruction reveals
+; the class. Left fold, not a tournament: this runs over `nclasses` (2 to 11)
+; elements once per diagnosis, so its rounds are noise next to a conv layer's.
 (define (argmax xs)
   (let ((n (length xs)))
     (let loop ((i 1) (bi 0) (bv (car xs)))
@@ -78,79 +167,9 @@
           bi
           (let* ((v (list-ref xs i))
                  (c (> v bv)))
-            (loop (+ i 1) (mux c i bi) (mux c v bv)))))))
-
-; ─── convolution ────────────────────────────────────────────────────────────
-; `fmap` is a vector (O(1) indexing; a list would make every window O(n)).
-; The window is flattened in (ic, ky, kx) order — the same order the kernel row
-; is stored in, so one `dot` computes the whole multiply-accumulate.
-(define (window fmap in-c ih iw k oy ox)
-  (let ((acc (quote ()))
-        (hw (* ih iw)))
-    (do ((ic (- in-c 1) (- ic 1))) ((< ic 0) acc)
-      (do ((ky (- k 1) (- ky 1))) ((< ky 0))
-        (do ((kx (- k 1) (- kx 1))) ((< kx 0))
-          (set! acc
-                (cons (vector-ref fmap (+ (* ic hw) (+ (* (+ oy ky) iw) (+ ox kx))))
-                      acc)))))))
-
-; conv → fused ReLU∘rescale, returning (fmap out-c oh ow).
-(define (conv2d fmap in-c ih iw kernels cbias k s)
-  (let* ((oh (+ (- ih k) 1))
-         (ow (+ (- iw k) 1))
-         (oc (length kernels))
-         (out (make-vector (* oc (* oh ow)) 0)))
-    (do ((c 0 (+ c 1))) ((== c oc) (list out oc oh ow))
-      (let ((kern (list-ref kernels c))
-            (b (ash-left (list-ref cbias c) s))
-            (base (* c (* oh ow))))
-        (do ((oy 0 (+ oy 1))) ((== oy oh))
-          (do ((ox 0 (+ ox 1))) ((== ox ow))
-            (vector-set! out (+ base (+ (* oy ow) ox))
-                         (relu-rescale
-                          (+ (dot kern (window fmap in-c ih iw k oy ox)) b)
-                          s))))))))
-
-; ─── 2×2 max-pool, stride 2 ─────────────────────────────────────────────────
-; Same floor geometry as gadgets::maxpool2d_ref: out = (in - 2) / 2 + 1.
-(define (maxpool fmap c ih iw)
-  ; `ash-right` and not `/`: this language's `/` is EXACT integer division and
-  ; refuses a remainder, but the pool geometry floors — an 11-wide input pools to
-  ; 5, not to an error.
-  (let* ((oh (+ (ash-right (- ih 2) 1) 1))
-         (ow (+ (ash-right (- iw 2) 1) 1))
-         (out (make-vector (* c (* oh ow)) 0))
-         (hw (* ih iw)))
-    (do ((ch 0 (+ ch 1))) ((== ch c) (list out c oh ow))
-      (do ((oy 0 (+ oy 1))) ((== oy oh))
-        (do ((ox 0 (+ ox 1))) ((== ox ow))
-          (let* ((iy (* oy 2))
-                 (ix (* ox 2))
-                 (o (+ (* ch hw) (+ (* iy iw) ix)))
-                 (a (vector-ref fmap o))
-                 (b (vector-ref fmap (+ o 1)))
-                 (cc (vector-ref fmap (+ o iw)))
-                 (d (vector-ref fmap (+ o (+ iw 1)))))
-            (vector-set! out (+ (* ch (* oh ow)) (+ (* oy ow) ox))
-                         (max2 (max2 a b) (max2 cc d)))))))))
-
-; ─── dense layers ───────────────────────────────────────────────────────────
-; The conv bias is pre-shifted (`cbias << s`) and the dense bias is not — that
-; asymmetry is the trained model's, and CnnModel::forward_logits has it too.
-(define (add-bias v b)
-  (let loop ((xs v) (bs b) (acc (quote ())))
-    (if (null? xs)
-        (reverse acc)
-        (loop (cdr xs) (cdr bs) (cons (+ (car xs) (car bs)) acc)))))
-
-(define (relu-rescale-list xs s)
-  (let loop ((ys xs) (acc (quote ())))
-    (if (null? ys)
-        (reverse acc)
-        (loop (cdr ys) (cons (relu-rescale (car ys) s) acc)))))
-
-(define (hidden-layer x l s)
-  (relu-rescale-list (add-bias (matvec (dense-w l) x) (dense-b l)) s))
+            (loop (+ i 1)
+                  (+ (* c i) (* (- 1 c) bi))
+                  (+ (* c v) (* (- 1 c) bv))))))))
 
 ; ─── the forward pass ───────────────────────────────────────────────────────
 ; conv → ReLU∘rescale → pool, once per conv layer; then the hidden dense stack;
@@ -159,30 +178,30 @@
 (define (forward m img)
   (let* ((s (model-shift m))
          (c1 (model-conv1 m))
-         (a (conv2d img (model-in-c m) (model-d m) (model-d m)
-                    (conv-kernels c1) (conv-bias c1) (conv-k c1) s))
-         (p (maxpool (list-ref a 0) (list-ref a 1) (list-ref a 2) (list-ref a 3))))
+         (p (maxpool (conv2d img (model-in-c m) (model-d m) (model-d m)
+                             (conv-kernels c1) (conv-bias c1) (conv-k c1) s))))
     ; every additional conv is just another conv + nonlinearity + pool
     (let loop ((xs (model-extra m)) (f p))
       (if (null? xs)
-          ; dense stack over the flattened feature map
-          (let ((flat (vector->list (list-ref f 0))))
-            (let dloop ((hs (model-hidden m)) (x flat))
-              (if (null? hs)
-                  (argmax (add-bias (matvec (model-dense-w m) x) (model-dense-b m)))
-                  (dloop (cdr hs) (hidden-layer x (car hs) s)))))
-          (let* ((cl (car xs))
-                 (a2 (conv2d (list-ref f 0) (xconv-in-c cl) (xconv-in-h cl) (xconv-in-w cl)
-                             (xconv-kernels cl) (xconv-bias cl) (xconv-k cl) s))
-                 (p2 (maxpool (list-ref a2 0) (list-ref a2 1) (list-ref a2 2) (list-ref a2 3))))
-            (loop (cdr xs) p2))))))
+          (let dloop ((hs (model-hidden m)) (x (fm-v f)))
+            (if (null? hs)
+                (argmax (vadd (matvec (model-dense-w m) x) (model-dense-b m)))
+                (dloop (cdr hs) (hidden-layer x (car hs) s))))
+          (let ((cl (car xs)))
+            (loop (cdr xs)
+                  (maxpool (conv2d (fm-v f) (xconv-in-c cl)
+                                   (xconv-in-h cl) (xconv-in-w cl)
+                                   (xconv-kernels cl) (xconv-bias cl)
+                                   (xconv-k cl) s))))))))
 
 ; ─── privacy: the only place the backend is chosen ──────────────────────────
+(define WIDTH (model-nbits (medmnist-model DATASET)))
+
 (define (share-list xs)
   (let loop ((ys xs) (acc (quote ())))
     (if (null? ys)
         (reverse acc)
-        (loop (cdr ys) (cons (share (car ys) NBITS) acc)))))
+        (loop (cdr ys) (cons (share (car ys) WIDTH) acc)))))
 
 (define (share-rows rs)
   (let loop ((ys rs) (acc (quote ())))
@@ -192,7 +211,7 @@
 
 ; PRIVATE 0 → plaintext; 1 or 2 → the image is secret-shared.
 (define (load-input pixels)
-  (list->vector (if (== PRIVATE 0) pixels (share-list pixels))))
+  (if (== PRIVATE 0) pixels (share-list pixels)))
 
 ; PRIVATE 2 additionally shares every weight, so the model is hidden too.
 (define (load-model name)
