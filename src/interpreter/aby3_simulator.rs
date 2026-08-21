@@ -92,6 +92,14 @@ impl Backend for Aby3Simulator {
         self.store(out, a.nbits.max(b.nbits), a.owner)
     }
 
+    /// Local: scale all three components (`arith::scalar_mul`). No resharing,
+    /// no messages.
+    fn mul_public(&mut self, a: &ShareRef, k: crate::crypto::types::Fr) -> ShareRef {
+        let sa = self.get_cloned(a);
+        let out = arith::scalar_mul(&sa, k);
+        self.store(out, a.nbits, a.owner)
+    }
+
     fn mul(&mut self, a: &ShareRef, b: &ShareRef) -> ShareRef {
         let sa = self.get_cloned(a);
         let sb = self.get_cloned(b);
@@ -143,11 +151,12 @@ impl Backend for Aby3Simulator {
             let term = crate::crypto::arith::scalar_mul(&b, 1u128 << i);
             out = crate::crypto::arith::add_shares(&out, &term);
         }
-        self.store(
-            out,
-            bits.first().map(|s| s.nbits).unwrap_or(0),
-            bits.first().map(|s| s.owner).unwrap_or(0),
-        )
+        // The recomposed value is `bits.len()` bits wide, NOT one bit wide.
+        // Tagging it with the *first bit's* nbits (which is 1) made every
+        // downstream signed comparison run at one bit — so two `ash-right`
+        // results compared only their LSBs and `a > b` was decided by parity.
+        // `a2b`/`b2a` round-trips and `shift_right` both depend on this width.
+        self.store(out, bits.len(), bits.first().map(|s| s.owner).unwrap_or(0))
     }
 
     fn and(&mut self, a: &ShareRef, b: &ShareRef) -> ShareRef {

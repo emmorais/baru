@@ -139,7 +139,49 @@ enum Task {
     Apply(Continuation, Types, Env),
 }
 
-const MAX_FRAMES: usize = 1_000_000;
+/// Default trampoline step budget per top-level expression.
+///
+/// This is a **runaway-recursion guard**, not a cap on legitimate work: a
+/// non-terminating `letrec` must fail loudly rather than hang. One convolution
+/// over a 28×28 input is already several hundred thousand steps, so a real
+/// program — `examples/medmnist.baru` — exceeds it while being perfectly
+/// well-behaved. `BARU_MAX_FRAMES` raises it for those, in the same style as
+/// `BARU_NTT_THREADS` and `BARU_WIRE_BITS`; the default is unchanged, so nothing
+/// that used to fail now silently hangs instead.
+const DEFAULT_MAX_FRAMES: usize = 1_000_000;
+
+/// Budget raised by a host that knows it is running a whole program rather than
+/// a REPL line — see [`set_max_frames`]. `0` means "not set".
+static FRAME_BUDGET: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Raise the step budget for this process.
+///
+/// `baru run` calls this: a source file is a whole program, and one convolution
+/// over a 28×28 input costs far more steps than any REPL line ever would, so the
+/// REPL's guard would reject every real program. `BARU_MAX_FRAMES` still wins, so
+/// a user can pull the budget back *down* to debug a runaway loop.
+pub fn set_max_frames(n: usize) {
+    FRAME_BUDGET.store(n, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn max_frames() -> usize {
+    // The env var is read once; the host-set budget is read live, because it is
+    // set after the first participant already exists.
+    static ENV: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    let env = *ENV.get_or_init(|| {
+        std::env::var("BARU_MAX_FRAMES")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|&v| v > 0)
+    });
+    if let Some(v) = env {
+        return v;
+    }
+    match FRAME_BUDGET.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => DEFAULT_MAX_FRAMES,
+        n => n,
+    }
+}
 
 // Note: added `owner` parameter so reduce_expression can pass participant id
 // into share_secret and reveal operations.
@@ -179,7 +221,7 @@ pub fn reduce_expression(
 
     while let Some(task) = stack.pop() {
         frames = frames.saturating_add(1);
-        if frames > MAX_FRAMES {
+        if frames > max_frames() {
             if trace_enabled {
                 eprintln!(
                     "{}",
@@ -191,10 +233,15 @@ pub fn reduce_expression(
             }
             panic!(
                 "{}",
-                format!("evaluation exceeded max frames ({})", MAX_FRAMES).bright_red()
+                format!(
+                    "evaluation exceeded max frames ({}); raise BARU_MAX_FRAMES if the program is \
+                     legitimately this large",
+                    max_frames()
+                )
+                .bright_red()
             );
         }
-        if frames.is_multiple_of(10000) {
+        if trace_enabled && frames.is_multiple_of(10000) {
             eprintln!(
                 "{}",
                 format!("reduce_expression frames = {}", frames).bright_yellow()
@@ -2148,6 +2195,15 @@ impl Participant {
             "list".to_string(),
             Rc::new(RefCell::new(Types::NativeFunc(list_fn))),
         );
+
+        // MedMNIST weights + test images as ordinary Lisp data. Loading only —
+        // the network itself is written in Baru (`examples/medmnist.baru`), which
+        // is the point; see `dataset_builtins`' module docs.
+        for (name, f) in crate::interpreter::dataset_builtins::dataset_builtins() {
+            self.store
+                .borrow_mut()
+                .insert(name, Rc::new(RefCell::new(f)));
+        }
 
         self.register_scheme_builtins();
 
@@ -4240,6 +4296,22 @@ fn operand_is_fixed(v: &Types) -> bool {
 fn share_mul_typed(be: &mut dyn Backend, a: &Types, b: &Types) -> ShareRef {
     let nbits = operand_nbits(a, b);
     let (fa, fb) = (operand_is_fixed(a), operand_is_fixed(b));
+    // Public integer × secret integer is LOCAL (`Backend::mul_public`): scaling
+    // the components scales the secret, so no round is owed. Restricted to the
+    // all-integer case on purpose — a Q16.16 operand needs the scale-lifting and
+    // post-rescale below, and duplicating that here is how the two paths would
+    // drift apart. This is the difference between one round per weight and none,
+    // which on a convolution is most of the protocol cost.
+    if !fa && !fb {
+        match (a, b) {
+            (Types::Share(sr), Types::Num(k)) | (Types::Num(k), Types::Share(sr)) => {
+                let mut r = be.mul_public(sr, int_to_fr_signed(*k, sr.nbits));
+                r.fixed = false;
+                return r;
+            }
+            _ => {}
+        }
+    }
     let sa = share_operand(be, a, nbits, false);
     let sb = share_operand(be, b, nbits, false);
     let prod = be.mul(&sa, &sb);

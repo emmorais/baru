@@ -115,6 +115,7 @@ the corrections behind each row are in [`docs/experiments.md`](docs/experiments.
 | Private CNN, 28×28, image *and* weights encrypted | **260 ms**, 0 bootstraps, exact | `bench-cnn --img 28 --gc --precompute` |
 | Real MNIST accuracy, deployed integer model | **98.89%**; every encrypted prediction equals the plaintext one | `bench-mnist` |
 | Private *diagnosis* (MedMNIST chest X-ray) | **84.78%**, **268 ms** online per diagnosis (435 ms single-core), 0 bootstraps, encrypted==plaintext on **300/300** | `bench-medmnist` |
+| **The same CNN written *in Baru*** (`examples/medmnist.baru`) | plaintext **2.78 s**/diagnosis, bit-exact against the Rust model on all 3 datasets — and the *encrypted* Rust pipeline is **9× faster** than the plaintext Lisp one | `run examples/medmnist.baru` |
 | Private *training* (SGD under MPC, backprop through ReLU) | trained model **bit-identical** to plaintext integer SGD, in **3 643** wire messages | `bench-train --hidden 8` |
 | Convolution packing | 1352 ct×ct multiplications → **8** | `bench-cnn --img 28` |
 | Our NTT vs schoolbook | **40.6× faster** at n=4096 (1.77 ms vs 71.9 ms); it also beat NTL+GMP by 1.8× before that backend was removed | `bench-polymul` |
@@ -276,6 +277,7 @@ Benchmarks (`baru bench-<name>`; all accept `--json`, most accept
 | `bench-hybrid-nn` | one private dense layer under mpc / tfhe / hybrid-tfhe / hybrid-bfv |
 | `bench-deep-nn` | **the headline**: deep private inference, zero bootstraps, linear in depth |
 | `bench-cnn` | full conv classifier through the hybrid pipeline, 0 bootstraps |
+| `run FILE.baru` | evaluate a Baru **source file** on the plain interpreter or on 3-party MPC (`--mpc`), timed — see [`LANGUAGE.md` §10.5](LANGUAGE.md) |
 | `bench-mnist`, `bench-medmnist` | trained+quantised CNNs on real MNIST / real biomedical images |
 | `bench-train` | private SGD training, including backprop through ReLU |
 | `bench-fhe-innerprod` | the minimal-FHE inner product across secure schemes |

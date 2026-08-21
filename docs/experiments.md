@@ -118,6 +118,76 @@ generate/propagate + 138 prefix + 19 final). At D=28 that is 2375 `a2b` calls
 the first cut each drew a Beaver triple dealt online — ~117 MB of the observed
 159 MB, since removed (I.1).
 
+### I.2c `b2a` returned a share tagged **one bit wide**
+
+Found 2026-08-21 by writing the MedMNIST CNN as a Baru program
+(`examples/medmnist.baru`) and getting a *wrong diagnosis* out of the private run
+while the plaintext run was correct.
+
+`Backend::b2a` recomposes `nbits` bit-shares into one arithmetic share. It set
+the result's `ShareRef.nbits` from **`bits.first().nbits`** — the width of a
+*bit*, i.e. `1` — instead of `bits.len()`. Both backends had it
+(`Aby3Simulator` and `TransportBackend`). Nothing about the *value* was wrong:
+`(reconstruct (b2a (a2b (share 12345 32) 32)))` returned 12345, and the
+reconstruct path consults `nbits` only for fixed-point shares.
+
+What was wrong was every **signed comparison downstream**, because `lt`/`le` size
+the two's-complement comparison as `a.nbits.max(b.nbits)`. One mistagged operand
+was survivable — the other operand's 64 still won the `max`. Two mistagged
+operands were not: the comparison ran at one bit and decided `a > b` on the
+parity of the low bit.
+
+`shift_right` is `a2b` → drop bits → `b2a`, so `ash-right` on a share returned a
+1-bit-tagged share. That makes the failing pattern exactly **fused ReLU∘rescale
+followed by a max-pool** — compare two rescaled activations — which is the shape
+of every CNN in this repository:
+
+```lisp
+(let ((a (* (ash-right (share 5000 64) 8) (>= (share 5000 64) 0)))   ; = 19
+      (b (* (ash-right (share 1000 64) 8) (>= (share 1000 64) 0))))  ; = 3
+  (reconstruct (> a b)))            ; 0 before the fix, 1 after
+```
+
+Three things worth keeping.
+
+**It was invisible to 553 unit tests, and that is not their fault.** Every
+existing MPC test either compares a *freshly shared* value against a derived one
+(the `max` picks the good width) or reconstructs without comparing. The gadget
+suite exercises `gadgets::relu`/`maxpool2d` on the Rust batched path, which sizes
+its own widths and never routes through `b2a`. Reaching this needed a program
+that composes `ash-right` with `>` twice in a row, which only the Lisp CNN does.
+
+**The failure was silent and plausible.** A wrong pool output is a wrong
+diagnosis, not a crash: the private run returned a confident answer that
+disagreed with plaintext. It was caught only because the Baru program is checked
+against `CnnModel::forward` image by image (`tests/medmnist_baru.rs`) — the
+argument for keeping two independent implementations of one model.
+
+**Bisection was by layer checksum, not by debugger.** Reconstructing `vsum` of
+each feature map located it in one pass: conv1 agreed (154 588 both ways), the
+pool did not (42 544 plaintext vs 38 625 private). Any per-layer invariant would
+have done; none existed for the Lisp path before this.
+
+### I.2d Public × secret was paying a communication round
+
+Same day, same program. `LANGUAGE.md` §6.2 has always said scalar multiplication
+is "local on shares, no communication" — the interpreter's `*` did not implement
+it. `share_mul_typed` injected the public operand as a share (`share_operand`)
+and called the interactive `Backend::mul`, so `weight * pixel` with a *public*
+weight cost one resharing round.
+
+`crypto::arith::scalar_mul` and `aby3_protocol::scalar_mul_party` already existed
+and are local; nothing reached them from the language. `Backend::mul_public` now
+does, with a default that falls back to inject-and-multiply so a backend that
+cannot do it locally still computes the right answer. Restricted to the
+all-integer case on purpose: a Q16.16 operand needs the existing scale-lifting
+and post-rescale, and duplicating that is how two paths drift apart (I.4).
+
+Why it survived: with public weights this is *every multiplication in a
+convolution*, and no test measured a convolution from Lisp. The Rust gadgets
+never hit it because `precompile::mpc_matvec` handles the public-weight case
+directly.
+
 ### I.3 Batching — the round count, not the multiplication count
 
 After triples were gone the dominant cost was **round latency, not bandwidth**.
@@ -1206,6 +1276,79 @@ fhe-mock and ABY3, and equal to ~1e-7 under CKKS.
 quantisation is not recalibrated silently wraps the plaintext modulus (III.6),
 and a per-dataset normalisation mismatch produces a plausible-but-wrong accuracy
 rather than an error. Both are checked now; neither announces itself.
+
+### IV.2b The same diagnosis written *in Baru* — and what the language costs
+
+Added 2026-08-21. Everything in IV.2 is hand-written Rust calling the backends.
+[`examples/medmnist.baru`](../examples/medmnist.baru) is the same trained network
+written as a **Baru program**: the convolution, the fused ReLU∘rescale, the
+2×2 max-pool, the dense stack and the argmax are Lisp. Only *loading* is a
+builtin (`medmnist-model` / `medmnist-image`, LANGUAGE.md §5.8), which hands over
+the identical `i64`s the Rust pipeline multiplies — so the two are two
+implementations of one model, and `tests/medmnist_baru.rs` pins them together
+image by image on all three datasets.
+
+It needed `baru run` (LANGUAGE.md §10.5) to exist at all: the REPL reads one
+expression per line, and it needed the trampoline's step budget raised, since a
+single 28×28 convolution exceeds the REPL's 1 000 000-frame runaway guard.
+
+**Pneumonia, one diagnosis, Apple M1 Pro. Same weights, same images, every
+integer path bit-identical.**
+
+| implementation | what is hidden | per diagnosis | messages |
+|---|---|---|---|
+| PyTorch float32, batch of 20 | nothing | **0.06 ms** | — |
+| NumPy, integer | nothing | **1.53 ms** | — |
+| pure Python, integer | nothing | **33.2 ms** | — |
+| **Baru program, plain interpreter** | nothing | **2 783 ms** | — |
+| **Rust hybrid pipeline** (`bench-medmnist --gc --precompute`) | image **and** model | **307 ms** | 61 |
+| **Baru program, 3-party MPC** (`--mpc --private 1`) | the image | **1 216 404 ms** | 864 361 |
+
+Organa and derma on the plain interpreter: **10 476 ms** and **3 985 ms**.
+The float32 row is not bit-exact (17/20 against the integer net's 18/20) and is
+a batched call, so it is a throughput figure; every other row is one image at a
+time.
+
+Four readings, and the ordering of the middle two is the point.
+
+**Interpretation costs ~1 800× more than vectorised integer arithmetic, and the
+crypto is not why.** Baru's plaintext CNN is 2 783 ms against NumPy's 1.53 ms and
+pure Python's 33.2 ms. A tree-walking evaluator against a bytecode one is most of
+that 84× gap to pure Python; the rest is that every scalar is an `Rc`-boxed
+`Types`. Nothing about privacy has happened yet at this row.
+
+**The encrypted Rust pipeline is 9× FASTER than the plaintext Baru program.**
+307 ms with both the model and the image encrypted, against 2 783 ms with nothing
+hidden at all. Privacy is not what makes a private-inference system slow —
+*evaluation strategy* is. This is the cleanest statement of that in the
+repository, and it only became measurable once the same network existed on both
+sides.
+
+**The Lisp private path is 4 000× the Rust one, for a reason already written
+down.** 864 361 messages against 61. §I.3 says the cost is the round count and
+not the multiplication count, and §6.2 warns that calling the per-element
+primitive in a loop pays `O(n)` rounds for nothing. The Lisp program does exactly
+that: one `lt` per comparison, ~12 600 comparisons per diagnosis, each ~9 rounds.
+The Rust pipeline calls `lt_batch`/`mul_batch` and spends one round per *layer*.
+The gap is not the language being interpreted — it is that the batched primitives
+`src/gadgets/` is written over are **not exposed to the language**. That is the
+concrete next piece of work, and it is a frontend question, not a protocol one.
+
+**The threat models on those two rows differ, and the weaker one is the fast
+one.** `--private 1` hides the image and leaves the model public — the setting
+most 2-party private-inference papers measure. The 307 ms pipeline hides *both*.
+`--private 2` hides both in Baru too and is verified exact
+(`tests/medmnist_baru.rs`), but its wall clock on the real transport is **not
+measured**: at `--private 1` a convolution's multiplications are share×public and
+therefore local (I.2d), while at `--private 2` every one of them becomes an
+interactive resharing, and the run did not finish inside the ~20 minutes
+`--private 1` took. So the honest comparison across those two rows is
+*model-public Lisp* against *model-hidden Rust*, and the Lisp side would only get
+slower if the models were matched.
+
+Writing this program is also what surfaced I.2c (`b2a` mistagging its width, a
+silent wrong diagnosis) and I.2d (public × secret paying a round). Both were
+invisible to 553 unit tests and to every Rust benchmark.
 
 ### IV.3 A real CNN through the hybrid pipeline
 

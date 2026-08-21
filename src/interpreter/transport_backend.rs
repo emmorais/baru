@@ -919,6 +919,16 @@ impl<T: Transport + 'static> Backend for TransportBackend<T> {
         self.store(id, ps, a.nbits.max(b.nbits), a.owner)
     }
 
+    /// Local: scale both replicated components. Deliberately does **not**
+    /// call `note_interactive` — no message is sent, and counting it would
+    /// overstate the round count this backend reports.
+    fn mul_public(&mut self, a: &ShareRef, k: crate::crypto::types::Fr) -> ShareRef {
+        let id = self.alloc_id();
+        let pa = self.get_cloned(a);
+        let ps = crate::crypto::aby3_protocol::scalar_mul_party(&pa, k);
+        self.store(id, ps, a.nbits, a.owner)
+    }
+
     fn mul(&mut self, a: &ShareRef, b: &ShareRef) -> ShareRef {
         self.note_interactive();
         let id = self.alloc_id();
@@ -1179,10 +1189,13 @@ impl<T: Transport + 'static> Backend for TransportBackend<T> {
             let term = crate::crypto::aby3_protocol::scalar_mul_party(&bp, 1u128 << i);
             acc = crate::crypto::aby3_protocol::add_party(&acc, &term);
         }
+        // Width is the number of bits recomposed — see the same fix in
+        // `Aby3Simulator::b2a`: the old `bits.first().nbits` was 1, which made
+        // every later signed comparison a one-bit comparison.
         self.store(
             id,
             acc,
-            bits.first().map(|s| s.nbits).unwrap_or(0),
+            bits.len(),
             bits.first().map(|s| s.owner).unwrap_or(0),
         )
     }

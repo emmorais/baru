@@ -475,6 +475,26 @@ which is the point of switching in the first place.
 | `nn-load-model` | `(nn-load-model "model.quant.json")` | Load a quantised `NetworkSpec` (produced by `baru quantize`, §10.2) as ordinary Lisp data: a list of `(weights bias activation)` triples, inspectable like any other value rather than an opaque handle. Requires `--scale-bits 16`. |
 | `nn-forward` | `(nn-forward layers input)` | Full multi-layer forward pass: matvec + bias-add + activation, chained layer to layer, reusing the `matvec` precompile. Works identically whether `input` is public (`Num`/`Fixed`) or a private `Share` vector, and whether the model is public or shared — each helper dispatches per element on the runtime type, so there is no separate "private mode". Only `relu` and `identity` activations are supported. |
 
+### 5.8 Dataset builtins
+
+The trained MedMNIST weights and test images the Rust benchmarks use, handed to
+Baru as ordinary Lisp data. They **load and do no arithmetic**: the network that
+consumes them is written in Baru
+([`examples/medmnist.baru`](examples/medmnist.baru), §11), which is the point —
+a `medmnist-forward` builtin would move the whole computation back into Rust.
+
+| Builtin | Signature | Description |
+|---|---|---|
+| `medmnist-model` | `(medmnist-model "pneumonia")` | The quantised CNN as a nine-element list: `d`, `in-c`, `shift`, `nclasses`, conv1 `(kernels cbias k)`, extra convs, hidden dense layers, `dense-w`, `dense-b`. Layout documented in `src/interpreter/dataset_builtins.rs`; `medmnist.baru` defines named accessors over it. |
+| `medmnist-image` | `(medmnist-image "pneumonia" i)` | `(pixels label)` for the `i`th embedded test image. An out-of-range index is an error, not a wrap. |
+| `medmnist-count` | `(medmnist-count "pneumonia")` | How many test images are embedded. |
+
+Datasets: `pneumonia` (chest X-ray, 2 classes), `organa` (abdominal CT, 11),
+`derma` (dermatoscopy, RGB, 7). The integers are *exactly* the `i64`s
+`bench-medmnist` multiplies, so a disagreement between the Baru program and the
+Rust pipeline is a bug in one of them rather than a difference of inputs —
+which is what `tests/medmnist_baru.rs` checks.
+
 ---
 
 ## 6. MPC layer
@@ -739,6 +759,35 @@ Records benchmark results so a claim in a paper can be traced to the run that
 produced it. `--store local:PATH` (a JSONL file, the default) or `barudb:PATH`
 (the encrypted store — see [`docs/barudb-api.md`](docs/barudb-api.md)).
 
+### 10.5 `baru run` — evaluate a source file
+
+```sh
+baru run FILE.baru [--plain|--mpc] [--private 0|1|2] [--dataset NAME]
+                   [--images N] [--nbits N] [--rtt-ms N] [--bandwidth-mbps F]
+```
+
+The REPL reads one expression per line, so a program longer than a line needs
+this. Top-level expressions are evaluated in order against one persistent store,
+so a `define` at file scope is visible to everything after it.
+
+`--plain` (default) evaluates on the plain interpreter — no sharing, no
+encryption, so the timing is the cost of the computation itself. `--mpc` runs
+**three parties, one thread each, over a real in-process transport**, and reports
+the slowest party plus the message count and bytes; that is the only
+configuration whose timings are quotable, because a single simulated party has
+no peers and never pays for a round.
+
+`--private` sets the injected `PRIVATE` binding, which is what the *program*
+hides, independently of which backend evaluates it (`0` nothing, `1` the input,
+`2` the input and the model). Running `--mpc --private 0` is therefore a
+control: it says how much of the cost is protocol rather than interpretation.
+The runner also injects `DATASET`, `NIMAGES` and `NBITS`.
+
+**Step budget.** The trampoline's per-expression guard (`MAX_FRAMES`, 1 000 000)
+is sized for a REPL line; one 28×28 convolution exceeds it. `baru run` raises the
+budget, and `BARU_MAX_FRAMES` overrides in either direction — set it low to make
+a non-terminating `letrec` fail fast.
+
 ---
 
 ## 11. Worked examples
@@ -813,6 +862,42 @@ comparison. That backend was removed on 2026-08-03 — see §13.
 discriminator over 784 encrypted pixels with Q16.16 public weights, run on
 plain / fhe-mock / MPC / TFHE, with all
 backends checked against the plain result.
+
+### MedMNIST private diagnosis — a CNN written in Baru
+
+[`examples/medmnist.baru`](examples/medmnist.baru) is the largest Baru program in
+the repository: a trained two-conv CNN over real biomedical images, with the
+convolution, the fused ReLU∘rescale, the max-pool, the dense stack and the
+argmax all written in Lisp.
+
+```sh
+baru run examples/medmnist.baru --dataset pneumonia --images 3              # plaintext
+baru run examples/medmnist.baru --dataset pneumonia --images 1 --mpc        # secret input
+baru run examples/medmnist.baru --dataset pneumonia --images 1 --mpc --private 2
+```
+
+Two things it is written to demonstrate. **One source text, two backends**:
+nothing in the layer code branches on the backend, because every operator
+dispatches on the runtime type of its operands — `dot` over a public kernel and
+a shared feature map is local ring arithmetic, and the same `dot` over two
+shared vectors is a protocol. Privacy is chosen in exactly one place,
+`load-input`. **Obliviousness is a source-level property**: the nonlinearities
+are muxes (`(* v (>= v 0))`, `(+ (* c a) (* (- 1 c) b))`) and not `if`, because
+`if` on a share reveals the condition bit (§6.3) — which here would leak the
+sign of every pre-activation. `reconstruct` is called on the argmax and nowhere
+else, so the class index is the only value revealed.
+
+`tests/medmnist_baru.rs` pins every diagnosis to
+`bench::cnn::CnnModel::forward`, and checks that `--private 1` and
+`--private 2` change no prediction: the oblivious rewrite is exact, not
+approximate.
+
+**It is not the fast path.** `bench-medmnist` evaluates the same network in 283 ms
+because it calls the *batched* primitives (`lt_batch`, `mul_batch`, `a2b_batch` —
+§6.2), which run a whole layer in the round count of one element. The Lisp
+program calls the per-element forms, so it pays one round per comparison. That
+is the gap §6.2 warns about, measured on a real network: see
+[`docs/private-inference-performance.md`](docs/private-inference-performance.md).
 
 ---
 

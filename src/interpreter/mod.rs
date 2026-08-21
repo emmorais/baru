@@ -2,6 +2,7 @@
 pub mod aby3_simulator;
 pub mod ast;
 pub mod backend;
+pub mod dataset_builtins;
 pub mod eval;
 pub mod hashcons;
 pub mod malicious_backend;

@@ -186,6 +186,24 @@ pub trait Backend: Send + Sync {
     fn shift_right(&mut self, a: &ShareRef, n: usize) -> ShareRef;
     fn shift_left(&mut self, a: &ShareRef, n: usize) -> ShareRef;
 
+    /// Multiply a share by a **public** scalar, with no communication.
+    ///
+    /// `k` is a two's-complement field element at `a.nbits`, as
+    /// [`Backend::share_secret`] takes. Scaling every additive component scales
+    /// the secret, so this is local for both replicated and additive sharing —
+    /// which is what LANGUAGE.md §6.2 means by "scalar × : local on shares,
+    /// none". Without it, `weight * pixel` with a public weight injects the
+    /// weight as a share and runs a full interactive multiplication, paying one
+    /// round for arithmetic that needs none. On a CNN that is the difference
+    /// between a few thousand rounds and a few hundred thousand.
+    ///
+    /// The default is *correct but interactive*, so a backend that cannot do it
+    /// locally still computes the right answer.
+    fn mul_public(&mut self, a: &ShareRef, k: Fr) -> ShareRef {
+        let ks = self.share_public(k, a.nbits);
+        self.mul(a, &ks)
+    }
+
     /// Inject a value that is **public** (known identically to every party)
     /// as a share, with no communication. Every party can do this locally
     /// because it knows its own party id — the canonical construction

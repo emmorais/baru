@@ -125,6 +125,9 @@ fn main() -> Result<(), Box<dyn Error>> {
     if args.first().map(String::as_str) == Some("mpcc") {
         return baru::mpcc::run_cli(&args[1..]).map_err(|e| e.into());
     }
+    if args.first().map(String::as_str) == Some("run") {
+        return baru::runner::run_cli(&args[1..]).map_err(|e| e.into());
+    }
     if args.first().map(String::as_str) == Some("db") {
         return baru::db::run_cli(&args[1..]).map_err(|e| e.into());
     }
