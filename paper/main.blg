@@ -1,52 +1,49 @@
-This is BibTeX, Version 0.99d (TeX Live 2024/Homebrew)
+This is BibTeX, Version 0.99e (TeX Live 2026)
 Capacity: max_strings=200000, hash_size=200000, hash_prime=170003
 The top-level auxiliary file: main.aux
 The style file: plain.bst
 Database file #1: references.bib
 Warning--empty booktitle in CHIMERA
 Warning--can't use both volume and number fields in CHIMERA
-Warning--empty booktitle in TFHE
-Warning--can't use both volume and number fields in TFHE
-Warning--empty booktitle in FV
-You've used 31 entries,
+You've used 32 entries,
             2118 wiz_defined-function locations,
-            700 strings with 9272 characters,
-and the built_in function-call counts, 14125 in all, are:
-= -- 1402
-> -- 599
-< -- 27
-+ -- 237
-- -- 204
-* -- 896
-:= -- 2060
-add.period$ -- 94
-call.type$ -- 31
-change.case$ -- 194
+            706 strings with 9563 characters,
+and the built_in function-call counts, 14456 in all, are:
+= -- 1437
+> -- 632
+< -- 25
++ -- 250
+- -- 216
+* -- 934
+:= -- 2131
+add.period$ -- 97
+call.type$ -- 32
+change.case$ -- 203
 chr.to.int$ -- 0
-cite$ -- 36
-duplicate$ -- 628
-empty$ -- 1156
-format.name$ -- 204
-if$ -- 3162
+cite$ -- 34
+duplicate$ -- 624
+empty$ -- 1168
+format.name$ -- 216
+if$ -- 3216
 int.to.chr$ -- 0
-int.to.str$ -- 31
+int.to.str$ -- 32
 missing$ -- 30
-newline$ -- 159
-num.names$ -- 62
-pop$ -- 267
+newline$ -- 164
+num.names$ -- 64
+pop$ -- 270
 preamble$ -- 1
-purify$ -- 163
+purify$ -- 171
 quote$ -- 0
-skip$ -- 541
+skip$ -- 536
 stack$ -- 0
-substring$ -- 993
-swap$ -- 275
-text.length$ -- 27
+substring$ -- 1018
+swap$ -- 267
+text.length$ -- 25
 text.prefix$ -- 0
 top$ -- 0
-type$ -- 124
-warning$ -- 5
-while$ -- 142
-width$ -- 33
-write$ -- 342
-(There were 5 warnings)
+type$ -- 128
+warning$ -- 2
+while$ -- 145
+width$ -- 34
+write$ -- 354
+(There were 2 warnings)

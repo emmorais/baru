@@ -55,6 +55,21 @@ pub struct ExecStats {
     pub batch_calls: usize,
     /// Interactive operations executed.
     pub interactive_ops: usize,
+    /// Levels that issued more than one batched call, and so blocked more than
+    /// once.
+    ///
+    /// This is the gap between what the cost model charges and what the
+    /// executor pays. [`crate::mpcc::cost`] prices a level at the *maximum*
+    /// over the primitives it contains, on the reasoning that a level is one
+    /// logical round; the executor issues one batched call per kind and each
+    /// call blocks, so a level holding a comparison and a multiply pays their
+    /// *sum*. Closing that needs the primitives split into a send phase and a
+    /// receive phase so a level's sends can all be in flight at once — the
+    /// round merging MP-SPDZ does in its allocator, which we do not yet do.
+    ///
+    /// Until then this counter says how much is at stake, which is why it is
+    /// reported rather than assumed: `batch_calls - rounds`.
+    pub mixed_levels: usize,
 }
 
 /// How the executor issues interactive operations.
@@ -168,34 +183,33 @@ pub fn run_flat_with(
                     env.insert(flat[i].dst().to_string(), r);
                 }
             }
-            if !muls.is_empty() {
-                let pairs: Vec<(ShareRef, ShareRef)> = muls
-                    .iter()
-                    .map(|&i| {
-                        let ins = flat[i].inputs();
-                        Ok((get(&env, ins[0])?, get(&env, ins[1])?))
-                    })
-                    .collect::<Result<_, String>>()?;
-                let out = be.mul_batch(&pairs);
-                stats.batch_calls += 1;
-                for (&i, mut r) in muls.iter().zip(out) {
-                    r.nbits = nbits;
-                    env.insert(flat[i].dst().to_string(), r);
+            // Multiplies and muxes share one batched call, because a mux *is* a
+            // multiply: `mux(c, t, e) = e + c·(t − e)`. Issuing them separately
+            // costs a second block for a level that holds both, and a block is
+            // what the latency model charges — see `ExecStats::mixed_levels`.
+            if !muls.is_empty() || !muxes.is_empty() {
+                let mut pairs: Vec<(ShareRef, ShareRef)> =
+                    Vec::with_capacity(muls.len() + muxes.len());
+                for &i in &muls {
+                    let ins = flat[i].inputs();
+                    pairs.push((get(&env, ins[0])?, get(&env, ins[1])?));
                 }
-            }
-            if !muxes.is_empty() {
-                // mux(c, t, e) = e + c·(t − e): one batched multiply for the level.
-                let mut diffs = Vec::with_capacity(muxes.len());
                 for &i in &muxes {
                     let ins = flat[i].inputs();
                     let (c, t, e) = (get(&env, ins[0])?, get(&env, ins[1])?, get(&env, ins[2])?);
-                    diffs.push((c, be.sub(&t, &e)));
+                    pairs.push((c, be.sub(&t, &e)));
                 }
-                let sel = be.mul_batch(&diffs);
+                let out = be.mul_batch(&pairs);
                 stats.batch_calls += 1;
-                for (&i, s) in muxes.iter().zip(sel) {
+                let (mul_out, mux_out) = out.split_at(muls.len());
+                for (&i, r) in muls.iter().zip(mul_out) {
+                    let mut r = r.clone();
+                    r.nbits = nbits;
+                    env.insert(flat[i].dst().to_string(), r);
+                }
+                for (&i, s) in muxes.iter().zip(mux_out) {
                     let e = get(&env, flat[i].inputs()[2])?;
-                    let mut r = be.add(&e, &s);
+                    let mut r = be.add(&e, s);
                     r.nbits = nbits;
                     env.insert(flat[i].dst().to_string(), r);
                 }
@@ -213,6 +227,7 @@ pub fn run_flat_with(
     }
 
     let out = get(&env, output_wire)?;
+    stats.mixed_levels = stats.batch_calls.saturating_sub(stats.rounds);
     Ok((out, stats))
 }
 
@@ -298,5 +313,6 @@ fn run_serial(
         env.insert(op.dst().to_string(), v);
     }
     let out = get(&env, output_wire)?;
+    stats.mixed_levels = stats.batch_calls.saturating_sub(stats.rounds);
     Ok((out, stats))
 }

@@ -149,14 +149,40 @@ pub fn run_cli(args: &[String]) -> Result<(), String> {
 
 /// A layer's activation. Deliberately small: only what every Baru backend
 /// (MPC via mux, integer FHE via `cmpslt`+`mux`) can actually express
-/// obliviously. CKKS cannot represent either — real-arithmetic layers must
-/// stay `Identity` (see `bench-nn`'s CKKS runner, which skips
-/// comparison-shaped workloads for exactly this reason).
+/// obliviously.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Activation {
     Relu,
     Identity,
+    /// `x²` — the **FHE-friendly** nonlinearity, and the only one a
+    /// comparison-free scheme can evaluate exactly.
+    ///
+    /// It exists because CKKS cannot compare, so an exact [`Activation::Relu`] is
+    /// not expressible on a CKKS arm at all: comparing MPC against CKKS on the
+    /// *same* function requires an activation both can compute exactly, and this
+    /// is it. Orion (ASPLOS'25) makes the same choice for its MNIST networks.
+    ///
+    /// **In fixed point it is not cheaper for MPC, which is the interesting
+    /// part.** Over plain integers `x²` would be one multiplication where ReLU
+    /// needs a masked-opening bit decomposition. But squaring a `Q(scale_bits)`
+    /// value doubles its scale, so it needs a *rescale* — and a rescale is
+    /// exactly the same decomposition the comparison was. Per neuron:
+    ///
+    /// | | decompositions | secret muls |
+    /// |---|---|---|
+    /// | `relu` | dot-rescale + comparison = **2** | 1 (the mux) |
+    /// | `square` | dot-rescale + square-rescale = **2** | 1 (the squaring) |
+    ///
+    /// So the FHE-friendly activation buys the MPC arm nothing here. What would
+    /// make it cheaper is folding the doubled scale into the *next* layer's
+    /// rescale (shift by `2·scale_bits` there instead of `scale_bits`), which
+    /// removes the extra decomposition at the cost of wider intermediates; that
+    /// is not done, and the measured equality is reported instead.
+    ///
+    /// Not a drop-in replacement for training: `x²` is unbounded and not
+    /// monotonic, so a network has to be trained with it rather than converted.
+    Square,
 }
 
 /// One dense layer in floating point, as exported from a training framework.
@@ -187,6 +213,7 @@ impl LayerSpec {
         match self.activation {
             Activation::Identity => pre,
             Activation::Relu => pre.into_iter().map(|v| v.max(0.0)).collect(),
+            Activation::Square => pre.into_iter().map(|v| v * v).collect(),
         }
     }
 }
@@ -365,6 +392,14 @@ impl QuantizedNetwork {
             cur = match layer.activation {
                 Activation::Identity => pre,
                 Activation::Relu => pre.into_iter().map(|v| v.max(0)).collect(),
+                // Squaring a Q(scale_bits) value doubles its scale, so the
+                // product has to be rescaled back. That rescale is the reason
+                // `x^2` is not cheaper than ReLU for fixed-point MPC — see
+                // `Activation::Square`.
+                Activation::Square => pre
+                    .into_iter()
+                    .map(|v| ((v as i128 * v as i128) >> self.scale_bits) as i64)
+                    .collect(),
             };
         }
         cur

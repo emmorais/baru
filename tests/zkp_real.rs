@@ -419,3 +419,56 @@ fn an_off_by_one_quotient_is_rejected() {
         );
     }
 }
+
+/// **The derived forms reach the real prover with no compiler change.**
+///
+/// `cond`, `when`, `let*`, named `let` and `case` are desugared in the parser
+/// into `If`/`Let`/`LetRec`/`Seq`, precisely so the circuit backends need no
+/// knowledge of them. This test is the load-bearing evidence for that design
+/// choice: a ReLU *written as a `cond`* compiles, proves and verifies through
+/// Binius64, and a false claim about its output is still rejected.
+///
+/// If someone later gives one of these forms its own `Expr` variant, this test
+/// fails and tells them the compilers now need teaching too.
+#[test]
+fn derived_forms_compile_prove_and_verify() {
+    let be = Binius64Real::new();
+    // relu(x), written three ways that must all lower to the same circuit.
+    for src in [
+        "(cond ((> x 0) x) (else 0))",
+        "(when (> x 0) x)",
+        "(let* ((positive (> x 0))) (* x positive))",
+    ] {
+        let expr = parse(src).unwrap_or_else(|e| panic!("parse {src}: {e}"));
+        let ckt = be
+            .compile_circuit(&expr, &["x".to_string()])
+            .unwrap_or_else(|e| panic!("compile {src}: {e}"));
+
+        for (x, out) in [(5i64, 5i64), (-5, 0), (7, 7)] {
+            let mut pubs = HashMap::new();
+            pubs.insert(OUTPUT_NAME.to_string(), out);
+            let mut w = HashMap::new();
+            w.insert("x".to_string(), x);
+
+            let proof = be
+                .prove(&ckt, &w, &pubs)
+                .unwrap_or_else(|e| panic!("prove {src} at x={x}: {e}"));
+            assert!(
+                be.verify(&ckt, &proof, &pubs).expect("verify"),
+                "{src} should verify at x={x} with relu={out}"
+            );
+        }
+
+        // Soundness is not weakened by the desugaring: a wrong claimed output
+        // must still fail, or the form would be proving nothing.
+        let mut bad = HashMap::new();
+        bad.insert(OUTPUT_NAME.to_string(), 99);
+        let mut w = HashMap::new();
+        w.insert("x".to_string(), -5);
+        let rejected = match be.prove(&ckt, &w, &bad) {
+            Err(_) => true,
+            Ok(p) => !be.verify(&ckt, &p, &bad).unwrap_or(false),
+        };
+        assert!(rejected, "{src}: relu(-5)=99 must not be provable");
+    }
+}

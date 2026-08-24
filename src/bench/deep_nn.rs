@@ -34,7 +34,7 @@
 //! approximation consumes multiplicative levels every layer and must
 //! bootstrap when they run out. [`competitor_bootstraps`] estimates that
 //! count from *our own measured* per-ReLU level cost
-//! (`CkksCompareBackend::levels_for_relu`), with the per-bootstrap level
+//! (`fhe::leveled_relu_cost`), with the per-bootstrap level
 //! budget as a stated, conservative assumption — the point being the shape
 //! (bootstraps grow ∝ depth for them, stay 0 for us), not a fabricated
 //! head-to-head timing.
@@ -61,7 +61,7 @@ use crate::bench::comm::{CommStats, NetworkProfile};
 use crate::bench::hybrid_nn::{run_parties, sleep_link, MpcTransport};
 use crate::crypto::types::Fr;
 use crate::fhe::bfv::{Bfv, BfvAdapter, BfvCt, BfvParams};
-use crate::fhe::ckks_compare::CkksCompareBackend;
+use crate::fhe::leveled_relu_cost::levels_for_relu;
 use crate::hybrid::FheAdapter;
 use crate::interpreter::backend::{Backend, ShareRef};
 use crate::interpreter::transport_backend::TransportBackend;
@@ -431,11 +431,11 @@ pub fn run_deep_hybrid(mlp: &DeepMlp, input: &[i64], profile: NetworkProfile) ->
 
 /// Estimated FHE bootstraps a leveled-CKKS deep net would need for the same
 /// `depth` (ours is always 0). Per layer it spends 1 multiplicative level
-/// on the linear map plus `CkksCompareBackend::levels_for_relu(relu_iters)` on the
+/// on the linear map plus `levels_for_relu(relu_iters)` on the
 /// polynomial ReLU; `boot_budget` usable levels are recovered per
 /// bootstrap. Returns `(bootstraps, levels_per_layer)`.
 pub fn competitor_bootstraps(depth: usize, relu_iters: u32, boot_budget: u32) -> (u64, u32) {
-    let per_layer = 1 + CkksCompareBackend::levels_for_relu(relu_iters);
+    let per_layer = 1 + levels_for_relu(relu_iters);
     let total = depth as u64 * per_layer as u64;
     // Start from one fresh budget, bootstrap each time it is exhausted.
     let boots = if total <= boot_budget as u64 {
@@ -585,8 +585,8 @@ pub fn run_cli(args: &[String]) -> Result<(), String> {
         println!(
             "competitor model: CKKS, {} levels/layer (1 linear + {} ReLU@{relu_iters} iters), \
              {boot_budget} levels/bootstrap",
-            1 + CkksCompareBackend::levels_for_relu(relu_iters),
-            CkksCompareBackend::levels_for_relu(relu_iters)
+            1 + levels_for_relu(relu_iters),
+            levels_for_relu(relu_iters)
         );
         println!();
         println!(

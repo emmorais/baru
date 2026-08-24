@@ -46,71 +46,122 @@ pub struct TransportBackend<T: Transport> {
     /// through the same primitives, so this counts *how often each route had
     /// to synchronise*, independently of how it was written.
     interactive_calls: std::sync::atomic::AtomicUsize,
+    /// Width at which ring shares are **serialised**, distinct from any value's
+    /// `nbits`. Default 128, which is what the wire has always used.
+    ///
+    /// # Why this is a backend-wide setting and not per-share
+    ///
+    /// [`Self::store`] explains why narrowing a share to *its own* value width is
+    /// wrong: `lt` produces a one-bit value whose sharing is then multiplied by a
+    /// 20-bit operand, so its components must be valid modulo `2^20`, not `2^1`.
+    /// The required modulus is a property of the share's *future consumers*, which
+    /// is not known when it is created — which is why two attempts to derive it
+    /// from `nbits` produced silently wrong results.
+    ///
+    /// A single program-wide width sidesteps that entirely. Every sharing is valid
+    /// modulo `2^wire_bits`, arithmetic modulo `2^wire_bits` is closed, so any
+    /// consumer is satisfied provided **every value and intermediate product in the
+    /// program fits in `wire_bits`**. That is one global precondition instead of a
+    /// per-share inference, and it is checkable: the bit-exactness tests fail loudly
+    /// when it is violated, because a product that overflows comes back wrong.
+    ///
+    /// It is left at 128 so nothing changes unless a caller opts in. What it is
+    /// worth: ring traffic is 84% padding at the CNN's `nbits = 20`, and `a2b` is
+    /// almost entirely ring traffic — see `docs/falcon-reproduction.md`.
+    wire_bits: u32,
+    /// Falcon preprocessing generated ahead of a query, if any. See [`FalconPool`].
+    falcon_pool: Option<FalconPool>,
+    /// Comparison elements `NonlinMode::Falcon` has been asked for, cumulatively.
+    ///
+    /// This is the number [`Self::fill_falcon_pool`] must be given, and it is not
+    /// derivable from the model without mirroring the internals of `maxpool2d`,
+    /// `fused_relu_rescale` and `argmax` — all three reduce to `lt_batch` at sizes that
+    /// depend on their own batching decisions. Counting what was actually requested is
+    /// exact where re-deriving it would be a second implementation to keep in step.
+    falcon_comparisons: std::sync::atomic::AtomicUsize,
+    /// `Π_Trunc` pairs requested — **not** the same as comparisons, and that is the whole
+    /// reason it is counted separately. A max-pool window costs comparisons and no
+    /// truncation; a ReLU costs one of each. Pneumonia's first conv segment asks for 5 408
+    /// comparisons but only 1 352 truncations, so sizing a truncation pool from the
+    /// comparison count would over-generate 4× — and each pair is `ℓ` daBits, the
+    /// expensive kind.
+    falcon_truncations: std::sync::atomic::AtomicUsize,
+}
+
+/// Correlated randomness for `NonlinMode::Falcon`, generated before a query arrives.
+///
+/// # Why this exists
+///
+/// Falcon puts **91% of its bytes** in preprocessing
+/// (`falcon_mpc::the_online_drelu_figure_is_not_the_whole_cost`), and every figure this
+/// repo published for it was a *total*, because `lt_falcon_batch` generated that
+/// preprocessing inline. Comparing a total against garbled circuits — which has no
+/// offline phase to speak of — charged Falcon roughly eleven times its online cost, and
+/// that is the accounting error the crossover in `docs/falcon-reproduction.md` was
+/// withdrawn for.
+///
+/// With a pool, a deployment's two honest numbers are both measurable: a **cold** server
+/// pays the total, a **warm** one pays only the online phase. Neither is the "real"
+/// answer on its own.
+///
+/// # The width is part of the contract
+///
+/// Preprocessing is generated for a specific ring width — the mask's bits are `ℓ` field
+/// elements and `δ` is its wrap at that `ℓ`. Randomness drawn for one width is not valid
+/// at another, so a mismatched draw is refused rather than silently reused.
+struct FalconPool {
+    wrap: std::collections::VecDeque<crate::crypto::falcon_mpc::WrapPreproc>,
+    sel: std::collections::VecDeque<crate::crypto::falcon_mpc::SelectPreproc>,
+    /// `Π_Trunc` pairs. Empty for a segment that only compares.
+    ///
+    /// These were generated inline until 2026-08-04 even when the pool was warm, so a
+    /// "warm" ReLU still paid `ℓ` daBits per activation on the critical path — roughly half
+    /// the offline phase, which made the measured warm speedup an understatement rather
+    /// than a wrong number.
+    trunc: std::collections::VecDeque<crate::crypto::falcon_mpc::TruncPreproc>,
+    /// Shift and ring width `trunc` was generated for. A pair is built for one `d`: its
+    /// `r >> d` and `r mod 2^d` are fixed at generation, so serving it at another shift
+    /// would truncate by the wrong amount — silently, and with the right *shape*.
+    trunc_d: u32,
+    trunc_l: u32,
+    /// The width `wrap` was generated for.
+    nbits: u32,
+    /// The width `sel`'s ring image was generated for, which is **not** always `nbits`:
+    /// `Π_SS` lifts a bit into whatever ring its consumer works in, and a selector built
+    /// mod `2^nbits` produces garbage when used in a wider select. Keyed separately
+    /// because `lt` lifts at `nbits` and `relu` lifts at the truncation's width, so one
+    /// pool cannot serve both.
+    lift_bits: u32,
+    /// Wall-clock spent generating, reported as offline.
+    pub offline_ms: f64,
+    /// Items served from the pool, and items the online path had to generate itself
+    /// because the pool was empty or the wrong width.
+    served: usize,
+    missed: usize,
+}
+
+/// What one segment's Falcon pool must carry.
+///
+/// A struct rather than five positional arguments because two of the fields are counts of
+/// different things at the same type, and `fill(n_cmp, n_trunc, ..)` transposed is a pool
+/// that is silently the wrong size in both directions. Named fields make that a compile
+/// error to write and a diff to read.
+pub struct FalconPoolSpec {
+    /// Comparison elements (`Π_DReLU` preprocessing): max-pool, argmax **and** ReLU gates.
+    pub comparisons: usize,
+    /// Truncation pairs (`Π_Trunc`): one per ReLU, zero for a segment that only compares.
+    pub truncations: usize,
+    /// Ring width the comparisons run at.
+    pub nbits: u32,
+    /// Width the `Π_SS` lift must produce. See `falcon_drelu_ring`.
+    pub lift_bits: u32,
+    /// Fixed-point shift the truncations use. Ignored when `truncations == 0`.
+    pub shift: u32,
 }
 
 /// Id space one `lt_falcon_batch` reserves: the inner `Π_WA`, its `Π_PC` tree
 /// and the lifting select each need disjoint operation ids.
 const FALCON_ID_BLOCK: u64 = 4096;
-
-/// Dealt `Π_WA` preprocessing — **a stand-in, not a secure offline phase.**
-///
-/// Derived from a seed every party can compute, so every party can reconstruct
-/// the mask. Falcon generates this interactively (bit composition, bit
-/// injection; their Fig. 6). Replacing this is the one thing standing between
-/// `NonlinMode::Falcon` and a deployable protocol; the online costs it produces
-/// are already real.
-fn falcon_wrap_preproc(
-    base: u64,
-    i: u64,
-    l_bits: u32,
-    me: PartyId,
-) -> crate::crypto::falcon_mpc::WrapPreproc {
-    use crate::crypto::falcon_mpc::WrapPreproc;
-    use crate::crypto::field::Fp;
-    use crate::crypto::fp_protocol::share_component as fp_component;
-    let l = 1u64 << l_bits;
-    let seed = base.wrapping_mul(0x9E37_79B9).wrapping_add(i);
-    let xs = [
-        seed.wrapping_mul(53).wrapping_add(7) % l,
-        seed.wrapping_mul(29).wrapping_add(3) % l,
-        seed.wrapping_mul(17).wrapping_add(5) % l,
-    ];
-    let m: u128 = (1u128 << l_bits) - 1;
-    let x = ((xs[0] as u128 + xs[1] as u128 + xs[2] as u128) & m) as u64;
-    let beta = seed & 1;
-    WrapPreproc {
-        x: PartyShare {
-            left: xs[me % 3] as u128,
-            right: xs[(me + 1) % 3] as u128,
-        },
-        bits: (0..l_bits)
-            .map(|k| fp_component(Fp::new((x >> k) & 1), 0, me))
-            .collect(),
-        delta: {
-            let d = crate::crypto::falcon::wrap3(xs[0], xs[1], xs[2], l_bits);
-            [u64::from(me == 0) * d, u64::from(me == 2) * d]
-        },
-        beta_fp: fp_component(Fp::new(beta), 0, me),
-        beta_bit: [u64::from(me == 0) * beta, u64::from(me == 2) * beta],
-        m: fp_component(Fp::ONE, 0, me),
-    }
-}
-
-/// Dealt `Π_SS` preprocessing — same stand-in caveat as
-/// [`falcon_wrap_preproc`].
-fn falcon_sel_preproc(base: u64, i: u64, me: PartyId) -> crate::crypto::falcon_mpc::SelectPreproc {
-    let seed = base.wrapping_mul(0x85EB_CA6B).wrapping_add(i);
-    let c = [seed % 2, (seed / 2) % 2, (seed / 4) % 2];
-    let cbit = (c[0] ^ c[1] ^ c[2]) & 1;
-    let cr = [cbit as u128, 0u128, 0u128];
-    crate::crypto::falcon_mpc::SelectPreproc {
-        c_bit: [c[me % 3], c[(me + 1) % 3]],
-        c_ring: PartyShare {
-            left: cr[me % 3],
-            right: cr[(me + 1) % 3],
-        },
-    }
-}
 
 /// Which protocol backs every comparison — and therefore ReLU, max-pool and
 /// argmax, all of which reduce to `lt_batch`.
@@ -169,13 +220,229 @@ impl<T: Transport> TransportBackend<T> {
             next_id: 1,
             nonlin: NonlinMode::A2b,
             interactive_calls: std::sync::atomic::AtomicUsize::new(0),
+            wire_bits: 128,
+            falcon_pool: None,
+            falcon_comparisons: std::sync::atomic::AtomicUsize::new(0),
+            falcon_truncations: std::sync::atomic::AtomicUsize::new(0),
         }
+    }
+
+    /// Generate `n` items of Falcon preprocessing for width `nbits`, *now*.
+    ///
+    /// Shared by the pool and the inline path so the two cannot drift: whichever runs,
+    /// the same protocols consume the same id spans in the same order. Every span comes
+    /// from the protocol's own span function rather than a hardcoded offset — the
+    /// earlier fixed `base + 1_000 / 2_000 / 3_000` layout overlapped once a batch
+    /// passed ~333 elements, which is a privacy bug and not merely a mixed-up tag.
+    fn gen_falcon_preproc(
+        &mut self,
+        n: usize,
+        nbits: u32,
+        lift_bits: u32,
+    ) -> (
+        Vec<crate::crypto::falcon_mpc::WrapPreproc>,
+        Vec<crate::crypto::falcon_mpc::SelectPreproc>,
+    ) {
+        use crate::crypto::falcon_mpc::{
+            dabit_id_span, nonzero_mask_id_span, random_dabits_fp, random_dabits_ring,
+            random_nonzero_masks, random_wrap_masks, wrap_mask_id_span, SelectPreproc, WrapPreproc,
+        };
+        let span = wrap_mask_id_span(n, nbits)
+            + dabit_id_span(n) // β
+            + nonzero_mask_id_span(n) // Π_PC masks
+            + dabit_id_span(n); // Π_SS selector
+        let mut off = self.alloc_block(span);
+
+        // `Π_WA`'s masks: a uniform `x`, its bits over `Z_p`, and its own wrap `δ` —
+        // generated by bit composition, so no party learns `x`.
+        let wm = random_wrap_masks(n, nbits, off, self.me, &self.mailbox);
+        off += wrap_mask_id_span(n, nbits);
+        let (beta_z2, beta_fp) = random_dabits_fp(n, off, self.me, &self.mailbox);
+        off += dabit_id_span(n);
+        let masks = random_nonzero_masks(n, off, self.me, &self.mailbox);
+        off += nonzero_mask_id_span(n);
+        // `Π_SS`'s selector is a daBit over `Z₂` and the ring — fully interactive.
+        // At `lift_bits`, not `nbits`: this daBit's ring image *is* the 0/1 the select
+        // returns, so it has to be a valid sharing at the width the caller consumes.
+        let (sel_z2, sel_ring) =
+            random_dabits_ring(n, lift_bits as usize, off, self.me, &self.mailbox);
+
+        let wp = wm
+            .into_iter()
+            .enumerate()
+            .map(|(i, (x, bits, delta))| WrapPreproc {
+                x,
+                bits,
+                delta,
+                beta_fp: beta_fp[i],
+                beta_bit: beta_z2[i],
+                m: masks[i],
+            })
+            .collect();
+        let sp = (0..n)
+            .map(|i| SelectPreproc {
+                c_bit: sel_z2[i],
+                c_ring: sel_ring[i].clone(),
+            })
+            .collect();
+        (wp, sp)
+    }
+
+    /// Fill the Falcon preprocessing pool with `n` items at width `nbits`, returning the
+    /// wall-clock spent — which the caller reports as **offline**, not as latency.
+    ///
+    /// All parties must call this with the same arguments: it consumes operation ids, and
+    /// the id counter is a lockstep sequence every party advances identically.
+    pub fn fill_falcon_pool(&mut self, spec: &FalconPoolSpec) -> f64 {
+        use crate::crypto::falcon_mpc::{random_trunc_pairs, trunc_pair_id_span};
+        let t = std::time::Instant::now();
+        let (wp, sp) = self.gen_falcon_preproc(spec.comparisons, spec.nbits, spec.lift_bits);
+        // The truncation pairs, generated here rather than inline. `r_bits == l_bits` is
+        // forced — a narrower mask leaks when `a + r` is opened — so the widths follow the
+        // ring and there is nothing to choose.
+        let trunc = if spec.truncations > 0 {
+            let l = spec.nbits;
+            let off = self.alloc_block(trunc_pair_id_span(spec.truncations, l));
+            random_trunc_pairs(
+                spec.truncations,
+                spec.shift,
+                l,
+                l,
+                off,
+                self.me,
+                &self.mailbox,
+            )
+        } else {
+            Vec::new()
+        };
+        let ms = t.elapsed().as_secs_f64() * 1e3;
+        self.falcon_pool = Some(FalconPool {
+            lift_bits: spec.lift_bits,
+            wrap: wp.into(),
+            sel: sp.into(),
+            trunc: trunc.into(),
+            trunc_d: spec.shift,
+            trunc_l: spec.nbits,
+            nbits: spec.nbits,
+            offline_ms: ms,
+            served: 0,
+            missed: 0,
+        });
+        ms
+    }
+
+    /// Draw `n` truncation pairs for shift `d` in an `l_bits` ring, or `None`.
+    ///
+    /// Refuses a shift or width mismatch as well as an empty pool. A pair's `r >> d` and
+    /// `r mod 2^d` are fixed when it is generated, so serving it at a different `d` gives a
+    /// value truncated by the wrong amount — the right *shape*, silently wrong.
+    fn take_trunc_preproc(
+        &mut self,
+        n: usize,
+        d: u32,
+        l_bits: u32,
+    ) -> Option<Vec<crate::crypto::falcon_mpc::TruncPreproc>> {
+        let p = self.falcon_pool.as_mut()?;
+        if p.trunc_d != d || p.trunc_l != l_bits || p.trunc.len() < n {
+            p.missed += n;
+            return None;
+        }
+        p.served += n;
+        Some(p.trunc.drain(..n).collect())
+    }
+
+    /// Truncation pairs the Falcon path has requested — the second number a pool needs.
+    pub fn falcon_truncations(&self) -> usize {
+        self.falcon_truncations
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Draw `n` items at width `nbits` from the pool, or `None` if it cannot serve them.
+    ///
+    /// Refuses a **width mismatch** as well as an empty pool: the mask's bits are `ℓ`
+    /// field elements and `δ` is its wrap at that `ℓ`, so randomness drawn for one width
+    /// is not valid at another. Serving it anyway would return wrong comparisons rather
+    /// than an error, which is the failure mode this repo has been bitten by repeatedly.
+    #[allow(clippy::type_complexity)]
+    fn take_falcon_preproc(
+        &mut self,
+        n: usize,
+        nbits: u32,
+        lift_bits: u32,
+    ) -> Option<(
+        Vec<crate::crypto::falcon_mpc::WrapPreproc>,
+        Vec<crate::crypto::falcon_mpc::SelectPreproc>,
+    )> {
+        let p = self.falcon_pool.as_mut()?;
+        if p.nbits != nbits || p.lift_bits != lift_bits || p.wrap.len() < n || p.sel.len() < n {
+            p.missed += n;
+            return None;
+        }
+        p.served += n;
+        let wp: Vec<_> = p.wrap.drain(..n).collect();
+        let sp: Vec<_> = p.sel.drain(..n).collect();
+        Some((wp, sp))
+    }
+
+    /// Comparison elements the Falcon path has been asked for so far — the size a pool
+    /// needs to serve the same workload warm. Run once cold, read this, then pool it.
+    pub fn falcon_comparisons(&self) -> usize {
+        self.falcon_comparisons
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Offline milliseconds spent filling the Falcon pool, and how many preprocessing
+    /// items were served from it against generated on the critical path.
+    ///
+    /// The miss count is the honest part: a benchmark quoting an online latency while
+    /// silently generating preprocessing inline would be reporting a total and calling
+    /// it online.
+    pub fn falcon_pool_stats(&self) -> Option<(f64, usize, usize)> {
+        self.falcon_pool
+            .as_ref()
+            .map(|p| (p.offline_ms, p.served, p.missed))
+    }
+
+    /// Set the ring-share serialisation width. See the [`wire_bits`] field for the
+    /// precondition — every value **and intermediate product** must fit, or results
+    /// go silently wrong. All parties must agree, since it changes the encoding.
+    ///
+    /// [`wire_bits`]: Self::wire_bits
+    pub fn set_wire_bits(&mut self, bits: u32) {
+        assert!(
+            (2..=128).contains(&bits),
+            "wire_bits = {bits} outside 2..=128"
+        );
+        self.wire_bits = bits;
+    }
+
+    /// The current serialisation width.
+    pub fn wire_bits(&self) -> u32 {
+        self.wire_bits
     }
 
     /// Batched interactive protocol invocations so far — see the field docs.
     pub fn interactive_calls(&self) -> usize {
         self.interactive_calls
             .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Times this party blocked waiting for a peer — the count that predicts
+    /// wall clock, and which `interactive_calls` does not.
+    ///
+    /// A primitive call is not a round: `lt_batch` performs a whole bit
+    /// decomposition and blocks once per prefix-adder stage, whereas
+    /// `mul_batch` blocks once. Comparing two routes by their call counts
+    /// therefore weighs a comparison and a multiplication equally, which is how
+    /// a route with half the calls can take the same wall clock.
+    pub fn sync_waits(&self) -> u64 {
+        self.mailbox.sync_waits()
+    }
+
+    /// Receives served from the buffer, costing nothing. See
+    /// [`Self::sync_waits`].
+    pub fn buffer_hits(&self) -> u64 {
+        self.mailbox.buffer_hits()
     }
 
     fn note_interactive(&self) {
@@ -222,45 +489,55 @@ impl<T: Transport> TransportBackend<T> {
     ///
     /// **Preprocessing.** `Π_WA` needs a random mask `x` with its bits shared
     /// over `Z_p` and its own `wrap3` — and `δ = wrap3(x₁,x₂,x₃)` is not
-    /// derivable by any party, since each is missing a summand. Falcon
-    /// generates these with an interactive offline phase (bit composition and
-    /// bit injection, their Fig. 6). **Here they are dealt from a common seed,
-    /// which is a stand-in and not secure**: all three parties can reconstruct
-    /// the mask. The *online* protocol is real and its costs are real; the
-    /// offline correlated randomness is not yet. This is the same disclosed
-    /// caveat the repo already carries for dealer-based BFV key generation.
-    fn lt_falcon_batch(&mut self, pairs: &[(ShareRef, ShareRef)]) -> Vec<ShareRef> {
+    /// derivable by any party, since each is missing a summand. All of it is now
+    /// generated by a real interactive offline phase
+    /// ([`random_wrap_masks`](crate::crypto::falcon_mpc::random_wrap_masks)),
+    /// by bit composition as in Falcon's Fig. 6: the mask is *built from* shared
+    /// bits rather than sampled and decomposed, so its bits come for free and its
+    /// wrap falls out of one carry chain. No party learns the mask.
+    ///
+    /// This closes the last dealt piece. Until it did, the triple came from a
+    /// seed every party could evaluate, so all three could reconstruct the mask
+    /// — the online costs were real but a `NonlinMode::Falcon` run was not
+    /// private. The cost of closing it is one `a2b` per element, offline; see
+    /// `random_wrap_masks` for why that does not undo the online win.
+    /// `Π_DReLU` on `diffs`, lifted to a ring share of the 0/1 bit `[diff ≥ 0]`.
+    ///
+    /// The shared core of Falcon's comparison and its ReLU: `lt` is `1 −` this, and
+    /// `ReLU(v) = v ·` this. Extracted so the offline phase, the id layout and the `Π_SS`
+    /// lift exist once — the weight-cursor and mask-pool bugs earlier in this file both
+    /// came from two places computing what had to be one thing.
+    /// `lift_bits` is the width of the returned **ring** sharing, which is not always
+    /// `nbits`. The sign is a property of the value at `nbits`, but the 0/1 result has to
+    /// be a valid sharing at whatever width its consumer works in — and a sharing valid
+    /// only mod `2^nbits` has share components that may differ from 0/1 by multiples of
+    /// `2^nbits`.
+    ///
+    /// That distinction is invisible until a consumer works *wider*: `relu_falcon_batch`
+    /// multiplies by this and then truncates in an `nbits + κ + 1` bit ring, where the
+    /// `k·2^nbits` slop stops being masked away and becomes a wrong answer. Lifting at
+    /// `nbits` and truncating at 20 bits agreed; lifting at `nbits` and truncating at 60
+    /// did not, and the failure was `ReLU` of a *negative* value coming back nonzero —
+    /// which reads like a broken gate rather than a width mismatch.
+    fn falcon_drelu_ring(
+        &mut self,
+        diffs: &[PartyShare],
+        nbits: u32,
+        lift_bits: u32,
+    ) -> Vec<PartyShare> {
         use crate::crypto::falcon_mpc::{drelu_batch, select_batch};
-        let nbits = pairs
-            .iter()
-            .map(|(a, b)| a.nbits.max(b.nbits))
-            .max()
-            .unwrap() as u32;
-        let mask: Fr = if nbits >= 128 {
-            Fr::MAX
-        } else {
-            (1u128 << nbits) - 1
-        };
-        let n = pairs.len();
-
-        let diffs: Vec<PartyShare> = pairs
-            .iter()
-            .map(|(a, b)| {
-                let (pa, pb) = (self.get_cloned(a), self.get_cloned(b));
-                PartyShare {
-                    left: pa.left.wrapping_sub(pb.left) & mask,
-                    right: pa.right.wrapping_sub(pb.right) & mask,
-                }
-            })
-            .collect();
-
+        let n = diffs.len();
+        if n == 0 {
+            return Vec::new();
+        }
+        let diffs = diffs.to_vec();
+        self.falcon_comparisons
+            .fetch_add(n, std::sync::atomic::Ordering::Relaxed);
         let base = self.alloc_block(FALCON_ID_BLOCK);
-        let wp: Vec<_> = (0..n)
-            .map(|i| falcon_wrap_preproc(base, i as u64, nbits, self.me))
-            .collect();
-        let sp: Vec<_> = (0..n)
-            .map(|i| falcon_sel_preproc(base, i as u64, self.me))
-            .collect();
+        let (wp, sp) = match self.take_falcon_preproc(n, nbits, lift_bits) {
+            Some(pooled) => pooled,
+            None => self.gen_falcon_preproc(n, nbits, lift_bits),
+        };
         let bits = drelu_batch(&diffs, &wp, nbits, base, self.me, &self.mailbox);
 
         // Lift `Z_2 → Z_L` so the result composes like an `a2b` output.
@@ -277,16 +554,59 @@ impl<T: Transport> TransportBackend<T> {
                 c_ring: sp[i].c_ring.clone(),
             })
             .collect();
-        let drelu = select_batch(
+        select_batch(
             &zeros,
             &ones,
             &bits,
             &sp2,
-            nbits,
+            lift_bits,
             base + FALCON_ID_BLOCK / 2,
             self.me,
             &self.mailbox,
-        );
+        )
+    }
+
+    fn lt_falcon_batch(&mut self, pairs: &[(ShareRef, ShareRef)]) -> Vec<ShareRef> {
+        let nbits = pairs
+            .iter()
+            .map(|(a, b)| a.nbits.max(b.nbits))
+            .max()
+            .unwrap() as u32;
+        let mask: Fr = if nbits >= 128 {
+            Fr::MAX
+        } else {
+            (1u128 << nbits) - 1
+        };
+        let diffs: Vec<PartyShare> = pairs
+            .iter()
+            .map(|(a, b)| {
+                let (pa, pb) = (self.get_cloned(a), self.get_cloned(b));
+                PartyShare {
+                    left: pa.left.wrapping_sub(pb.left) & mask,
+                    right: pa.right.wrapping_sub(pb.right) & mask,
+                }
+            })
+            .collect();
+
+        // ── Offline phase ───────────────────────────────────────────────────
+        // Run here rather than in a separate pass because this backend has no
+        // offline/online split to hang it on; the *costs* are still attributed
+        // to preprocessing in `docs/falcon-reproduction.md`, which is what
+        // Falcon does too.
+        //
+        // Every id range below is reserved from the protocol's own span
+        // function. The previous fixed offsets (`base + 1_000`, `+ 2_000`,
+        // `+ 3_000`) overlapped once `n` passed ~333, because the `Z₂` draw
+        // consumes one PRF counter *per bit*; a CNN ReLU layer is well past
+        // that, so two offline protocols were deriving randomness from the
+        // same counters.
+        // Preprocessing, either drawn from a pool filled before the query arrived or
+        // generated here. Which one happened is recorded rather than inferred — the
+        // whole reason this split exists is that a total and an online cost are
+        // different quantities, and a benchmark that cannot tell them apart is how
+        // this repo's crossover came to be measured wrong.
+        // `lt` consumes the bit at the same width it compared at.
+        let drelu = self.falcon_drelu_ring(&diffs, nbits, nbits);
 
         // lt = 1 − DReLU, with the public 1 in a single component.
         drelu
@@ -442,6 +762,108 @@ impl<T: Transport> TransportBackend<T> {
     /// garble round: `outᵢ = (vᵢ>=0) ? (vᵢ>>shift) : 0`. Same Yao-leg protocol
     /// and roles as [`Self::lt_gc_batch`]; returns RSS arithmetic shares of the
     /// activations (`nbits−shift`-bit results carried in `nbits`).
+    /// Falcon's own `ReLU∘rescale`: `Π_DReLU` for the gate, `Π_Trunc` for the shift.
+    ///
+    /// # Why the gate comes first
+    ///
+    /// [`crate::crypto::falcon_mpc::truncate_batch`] requires `a + r` not to wrap, which
+    /// its preprocessing controls by bounding `r`. A *negative* input has a residue near
+    /// `2^nbits`, so truncating it first would violate that precondition for half the
+    /// inputs — and violate it silently, since the formula
+    /// `a>>d = (c>>d) − (r>>d) − borrow` just comes out wrong rather than failing.
+    ///
+    /// Gating first fixes it and costs nothing: `ReLU(v) = v·[v ≥ 0]` is in
+    /// `[0, 2^(nbits−1))`, so the truncation's bound is satisfiable, and
+    /// `truncate(ReLU(v)) = ReLU(v) >> shift` exactly because a non-negative value's
+    /// arithmetic and logical shifts agree. That is bit-identical to what the `a2b`
+    /// route computes, which is the property `falcon_and_a2b_relu_agree` checks.
+    ///
+    /// # What this replaces
+    ///
+    /// Until this existed, `NonlinMode::Falcon` routed ReLU through `a2b`, because there
+    /// was no *secure* truncation to route to — `random_trunc_pairs` closed that. The
+    /// consequence was that a "falcon" run put only its max-pool comparisons through
+    /// Falcon: 5 256 of ~12 700 nonlinearities on a pneumonia diagnosis. See
+    /// `docs/falcon-reproduction.md`.
+    pub fn relu_falcon_batch(
+        &mut self,
+        vals: &[ShareRef],
+        nbits: usize,
+        shift: u32,
+    ) -> Vec<ShareRef> {
+        use crate::crypto::falcon_mpc::{
+            random_trunc_pairs, trunc_pair_id_span, truncate_batch, TRUNC_ID_BLOCK,
+        };
+        if vals.is_empty() {
+            return Vec::new();
+        }
+        let n = vals.len();
+        let vs: Vec<PartyShare> = vals.iter().map(|v| self.get_cloned(v)).collect();
+
+        // ── the truncation runs in the caller's own ring ──
+        // `r` is uniform over all of `Z_{2^nbits}`, so the opened `c = a + r` is uniform
+        // and perfectly independent of the activation; `truncate_batch` corrects the
+        // resulting wrap with a bit it computes. The alternative — keeping `r` inside the
+        // no-wrap range — needs an `nbits + κ + 1` bit ring to hide anything, which the
+        // narrowed wire cannot carry. See `truncate_batch`.
+        let t_bits = nbits as u32;
+        let r_bits = t_bits;
+        // The ring, plus one bit for the `c − r` difference the wrap bit is read from.
+        let needed = t_bits + 1;
+        assert!(
+            self.wire_bits >= needed,
+            "Falcon's ReLU needs a wire of at least {needed} bits (the {t_bits}-bit ring \
+             plus one for the wrap bit's difference) but the wire is {}",
+            self.wire_bits
+        );
+
+        // ── gate: keep = [v ≥ 0], via Falcon's DReLU on v − 0 ──
+        // `drelu_batch` yields exactly this bit; lifting it to the ring is `Π_SS`, which
+        // `lt_falcon_batch` already does, so the ring bit comes back from that path.
+        // `v − 0` is `v`, so the DReLU runs on the values directly.
+        //
+        // The sign is read at `nbits` but the bit is lifted at `t_bits`, because the
+        // product below is truncated in the `t_bits` ring — see `falcon_drelu_ring`.
+        let keep = self.falcon_drelu_ring(&vs, nbits as u32, t_bits);
+
+        // ── ReLU(v) = v · keep, now non-negative ──
+        let prod_pairs: Vec<(PartyShare, PartyShare)> =
+            vs.iter().cloned().zip(keep.iter().cloned()).collect();
+        let mul_id = self.alloc_id();
+        let relu = crate::crypto::aby3_protocol::mul_batch_party_at(
+            &prod_pairs,
+            self.wire_bits,
+            mul_id,
+            self.me,
+            &self.mailbox,
+        );
+
+        // ── shift: Falcon's exact truncation over generated pairs ──
+        self.falcon_truncations
+            .fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+        // Pooled if a plan supplied them, generated inline otherwise. Inline is safe and
+        // visible: `falcon_pool_stats`' miss counter goes non-zero, and a benchmark that
+        // reports the result as an online cost is then reporting a partial total.
+        let pre = match self.take_trunc_preproc(n, shift, t_bits) {
+            Some(pooled) => pooled,
+            None => {
+                let off = self.alloc_block(trunc_pair_id_span(n, r_bits));
+                random_trunc_pairs(n, shift, r_bits, t_bits, off, self.me, &self.mailbox)
+            }
+        };
+        let base = self.alloc_block(TRUNC_ID_BLOCK);
+        // The result is non-negative and `< 2^(val_bits − shift)`, so although it is
+        // produced mod `2^t_bits` it is equally valid at the caller's `nbits`.
+        let out = truncate_batch(&relu, &pre, shift, t_bits, base, self.me, &self.mailbox);
+        self.note_interactive();
+        out.into_iter()
+            .map(|ps| {
+                let id = self.alloc_id();
+                self.store(id, ps, nbits, 0)
+            })
+            .collect()
+    }
+
     pub fn relu_gc_batch(
         &mut self,
         vals: &[ShareRef],
@@ -551,8 +973,9 @@ impl<T: Transport + 'static> Backend for TransportBackend<T> {
             .iter()
             .map(|(a, b)| (self.get_cloned(a), self.get_cloned(b)))
             .collect();
-        let results = crate::crypto::aby3_protocol::mul_batch_party(
+        let results = crate::crypto::aby3_protocol::mul_batch_party_at(
             &party_pairs,
+            self.wire_bits,
             base_op_id,
             self.me,
             &self.mailbox,
@@ -717,9 +1140,10 @@ impl<T: Transport + 'static> Backend for TransportBackend<T> {
         // One id block for the whole batch: `a2b_batch_party` runs the same
         // ~9 rounds as a single decomposition, just wider.
         let op_id = self.alloc_block(crate::crypto::aby3_protocol::A2B_ID_BLOCK);
-        let bit_sets = crate::crypto::aby3_protocol::a2b_batch_party(
+        let bit_sets = crate::crypto::aby3_protocol::a2b_batch_party_at(
             &party_vals,
             nbits,
+            self.wire_bits,
             op_id,
             self.me,
             &self.mailbox,

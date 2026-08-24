@@ -1,0 +1,434 @@
+\section{The workload: foundations of neural inference}
+\label{sec:ml}
+
+Every measurement in this survey is of the same computation: a forward pass
+through a trained neural network in which the input, and in our case also the
+weights, are hidden from the party performing it. A reader cannot judge those
+measurements without knowing precisely which function is being computed, which of
+its parts are expensive under which cryptographic paradigm, and what an accuracy
+figure for it means. This section supplies that. It is deliberately elementary in
+the machine-learning direction and precise in the arithmetic direction, because
+the arithmetic is what the cryptography charges for.
+
+\subsection{Classification and the inference function}
+\label{sec:ml:class}
+
+\begin{definition}
+\label{def:classifier}
+Let $\mathcal{X} \subseteq \Rr^{n_0}$ be an input space and
+$\mathcal{Y} = \{0,\dots,C-1\}$ a finite label set. A \ib{classifier} is a map
+$h : \mathcal{X} \to \mathcal{Y}$. It is usually presented as
+$h = \argmax \circ\, g$ where $g : \mathcal{X} \to \Rr^{C}$ produces a vector of
+\ib{logits} and $\argmax$ returns the index of the largest.
+\end{definition}
+
+Training chooses $g$ from data; \ib{inference} evaluates it on one input. This
+survey measures inference only. The distinction matters because the two have
+different arithmetic: training needs gradients, and therefore division and
+accumulation across a batch, whereas inference needs a fixed sequence of affine
+maps and nonlinearities. Our artifact does implement private training, and we
+report it, but the comparisons in Section~\ref{sec:cross} are of inference.
+
+\begin{definition}
+\label{def:ffn}
+A \ib{feedforward network} of depth $L$ is a composition
+\[
+  g \;=\; A_L \circ \sigma \circ A_{L-1} \circ \cdots \circ \sigma \circ A_1 ,
+\]
+where each $A_\ell : \Rr^{n_{\ell-1}} \to \Rr^{n_\ell}$ is affine,
+$A_\ell(\mathbf{u}) = \mathbf{W}_\ell \mathbf{u} + \mathbf{b}_\ell$, and $\sigma$
+is a fixed nonlinearity applied coordinatewise. We call $n_\ell$ the \ib{width}
+of layer $\ell$ and $L$ the \ib{depth}. The parameters are
+$\theta = (\mathbf{W}_\ell, \mathbf{b}_\ell)_{\ell \le L}$.
+\end{definition}
+
+Definition~\ref{def:ffn} already exposes the structure that governs every cost in
+this survey. The affine maps are \emph{linear} in the shared or encrypted value,
+so under any linearly homomorphic representation---an additive secret sharing, or
+a lattice ciphertext---they require no interaction and no ciphertext
+multiplication beyond scaling by public constants. The nonlinearity $\sigma$ is
+not linear, and it is the only place where a protocol must do something
+irreducibly expensive. The entire comparison between paradigms is therefore a
+comparison of how each one implements $\sigma$, and how many times it must.
+
+\begin{proposition}
+\label{prop:nonlin-count}
+A network as in Definition~\ref{def:ffn} performs
+$\sum_{\ell} n_{\ell-1} n_\ell$ multiply--accumulate operations in its affine maps
+and $\sum_{\ell < L} n_\ell$ applications of $\sigma$. The first quantity is
+quadratic in width and the second is linear; consequently the ratio of linear to
+nonlinear work grows with width and is independent of depth.
+\end{proposition}
+
+\begin{proof}
+The matrix $\mathbf{W}_\ell$ has $n_\ell n_{\ell-1}$ entries and each contributes
+one multiply--accumulate; $\sigma$ is applied once per coordinate of each hidden
+layer, of which there are $n_\ell$ at layer $\ell < L$. The stated asymptotics
+follow by inspection: doubling every width multiplies the first sum by four and
+the second by two, while appending a layer adds one term to each.
+\end{proof}
+
+Proposition~\ref{prop:nonlin-count} is the reason our measurements report both
+quantities separately, and the reason the same network can look
+nonlinearity-dominated or arithmetic-dominated depending on its shape: at small
+width the $\sigma$ applications dominate the cost even though they are
+asymptotically fewer, because each costs orders of magnitude more than a
+multiply--accumulate under secret sharing.
+
+\subsection{Nonlinearities, and which ones a cryptosystem can evaluate}
+\label{sec:ml:activation}
+
+\begin{definition}
+\label{def:relu}
+The \ib{rectified linear unit} is $\ReLU(x) = \max(x,0)$. The \ib{square}
+activation is $\mathrm{sq}(x) = x^2$. A \ib{polynomial activation} of degree $d$
+is any $p \in \Rr[x]$ with $\deg p = d$.
+\end{definition}
+
+\begin{proposition}
+\label{prop:relu-props}
+$\ReLU$ is $1$-Lipschitz and non-expansive: $\abs{\ReLU(x)-\ReLU(y)} \le
+\abs{x-y}$ and $\abs{\ReLU(x)} \le \abs{x}$. Consequently, in a network whose
+affine maps have operator norm at most $\gamma$ in the infinity norm, the
+activations satisfy $\norm{\mathbf{u}_\ell}_\infty \le \gamma^{\ell}
+\norm{\mathbf{u}_0}_\infty + O(\max_\ell \norm{\mathbf{b}_\ell}_\infty)$. By
+contrast $\mathrm{sq}$ satisfies $\norm{\mathbf{u}_{\ell+1}}_\infty \le
+(\gamma\norm{\mathbf{u}_\ell}_\infty)^2$, so for $\gamma\norm{\mathbf{u}}_\infty >
+1$ the magnitude grows doubly exponentially in depth.
+\end{proposition}
+
+\begin{proof}
+Both properties of $\ReLU$ follow from $\max(\cdot,0)$ being a projection onto a
+convex set, or directly by cases. The propagation bound is then induction on
+$\ell$: $\norm{\sigma(A_\ell \mathbf{u})}_\infty \le \norm{A_\ell
+\mathbf{u}}_\infty \le \gamma \norm{\mathbf{u}}_\infty +
+\norm{\mathbf{b}_\ell}_\infty$. For the square activation the same induction gives
+$\norm{\mathbf{u}_{\ell+1}}_\infty = \norm{(A_\ell\mathbf{u}_\ell)^2}_\infty \le
+(\gamma\norm{\mathbf{u}_\ell}_\infty)^2$, and iterating a map of the form
+$m \mapsto (\gamma m)^2$ from $m_0$ gives $\log m_\ell = 2^{\ell}(\log m_0 + \log
+\gamma) - \log\gamma$, which diverges when $\gamma m_0 > 1$ and converges to zero
+when $\gamma m_0 < 1$.
+\end{proof}
+
+Proposition~\ref{prop:relu-props} is the analytic content behind a practical
+constraint we measure. A fixed-point or lattice representation carries a bounded
+dynamic range, so an activation whose iterates diverge doubly exponentially
+exhausts that range within a few layers, and one whose iterates converge to zero
+erases the signal. The square activation has a neutral point at
+$\gamma\norm{\mathbf{u}}_\infty = 1$ and is unstable on both sides of it, whereas
+$\ReLU$ is neutral everywhere. Standard initialisation, which sets
+$\norm{\mathbf{W}}$ to approximately $1/\sqrt{n_{\ell-1}}$ so that the layer has
+unit gain, places a square-activation network at precisely that neutral point,
+which is why such networks are trainable at all and why they must be trained
+rather than converted.
+
+The cryptographic significance is a dichotomy.
+
+\begin{remark}
+\label{rem:activation-dichotomy}
+Evaluating $\ReLU$ requires the \emph{sign} of a hidden value, that is, a
+comparison. A secret-sharing protocol can compute a comparison exactly, at the
+cost of Corollary~\ref{cor:cmp-cost}. An approximate homomorphic scheme over the
+reals cannot compute a comparison at all: its operations are addition and
+multiplication of ciphertexts, and the sign function is not a polynomial. Such a
+scheme must therefore replace $\sigma$ by a polynomial approximation, paying in
+multiplicative depth for the degree and in accuracy for the residual error, or the
+network must be trained with a polynomial activation in the first place. The only
+activations both paradigms evaluate \emph{exactly} are polynomials, and the
+cheapest nonconstant one is $\mathrm{sq}$. This dichotomy, and not any difference
+in raw throughput, determines the shape of our matched comparison in
+Section~\ref{sec:matched}.
+\end{remark}
+
+\subsection{Structured layers: convolution and pooling}
+\label{sec:ml:conv}
+
+Image classifiers do not use dense affine maps at every layer. The structured
+alternatives matter here because their structure is exactly what a packed
+ciphertext can exploit.
+
+\begin{definition}
+\label{def:conv}
+Let $\mathbf{u} \in \Rr^{c \times h \times w}$ be an input with $c$ channels and
+let $\mathbf{K} \in \Rr^{c' \times c \times k \times k}$ be a kernel. The
+\ib{convolution} with unit stride and no padding is
+\[
+  (\mathbf{K} * \mathbf{u})_{o,y,x} \;=\;
+  \sum_{i=0}^{c-1}\ \sum_{a=0}^{k-1}\ \sum_{b=0}^{k-1}
+  \mathbf{K}_{o,i,a,b}\, \mathbf{u}_{i,\,y+a,\,x+b} ,
+\]
+for $o < c'$ and $y < h-k+1$, $x < w-k+1$. \ib{Max pooling} with window $s$
+replaces each disjoint $s \times s$ window by its maximum, and \ib{average
+pooling} by its mean.
+\end{definition}
+
+\begin{proposition}
+\label{prop:conv-linear}
+Convolution is linear in $\mathbf{u}$, and for fixed $\mathbf{K}$ it is a
+matrix--vector product with a matrix whose entries are the kernel entries,
+repeated with a shift structure. It performs $c'c k^2 (h-k+1)(w-k+1)$
+multiply--accumulate operations, and it applies no nonlinearity.
+\end{proposition}
+
+\begin{proof}
+Linearity is immediate from the definition, which is a finite sum of scalar
+multiples of coordinates of $\mathbf{u}$. Flattening $\mathbf{u}$ and the output
+into vectors exhibits the map as a matrix; the count is the number of terms in the
+triple sum times the number of output positions.
+\end{proof}
+
+Proposition~\ref{prop:conv-linear} says that a convolutional layer is free of
+nonlinearity, so by Proposition~\ref{prop:nonlin-count} its cost under secret
+sharing is traffic and not rounds. Its interaction with packing is sharper:
+Equation~\eqref{eq:negconv} showed that a product in a negacyclic ring is a
+shifted-and-signed convolution of coefficient vectors, and
+Definition~\ref{def:conv} is a shifted inner product. Laying the input forwards
+and the kernel reversed therefore places an entire convolutional layer in the
+coefficients of a \emph{single} ring product, with the wanted outputs at a stride
+and the unwanted ones discarded. That is the mechanism behind the technique we
+implement and measure, and it explains why the ciphertext cost of a convolution in
+our harness does not grow with the spatial size of the image.
+
+Max pooling, by contrast, is a nonlinearity: it is a fold of maxima, and a maximum
+is a mux on a comparison, $\max(x,y) = y + (x-y)\cdot[x>y]$. It therefore falls on
+the expensive side of the dichotomy of Remark~\ref{rem:activation-dichotomy}, and
+a window of size $s$ costs $s^2-1$ comparisons per output. Average pooling is
+linear and free. This asymmetry is a design lever: our measurements exploit the
+fact that $\ReLU$ and max pooling commute, so pooling first reduces the number of
+$\ReLU$ applications by the pooling factor.
+
+\begin{proposition}
+\label{prop:pool-commute}
+For any $s$, $\max$ over a window commutes with a coordinatewise nondecreasing
+map. In particular $\mathrm{maxpool} \circ \ReLU = \ReLU \circ \mathrm{maxpool}$,
+and more generally $\mathrm{maxpool} \circ (\ReLU \circ \rho) = \ReLU \circ \rho
+\circ \mathrm{maxpool}$ for any nondecreasing rescaling $\rho$.
+\end{proposition}
+
+\begin{proof}
+Let $f$ be nondecreasing and $S$ a finite set. Then $\max_{x \in S} f(x) =
+f(\max_{x\in S} x)$: the right side is attained by some $x^\ast$ maximising $x$,
+and $f(x^\ast) \ge f(x)$ for every $x \in S$ by monotonicity, so it is also the
+maximum of the image; conversely it lies in the image. Both $\ReLU$ and a
+nonnegative rescaling are nondecreasing, as is their composition.
+\end{proof}
+
+Proposition~\ref{prop:pool-commute} converts directly into a saving, because
+applying the nonlinearity after pooling evaluates it on $s^2$ times fewer values.
+Ordering the two operations is therefore not a matter of taste; it changes the
+comparison count of the whole network, and we report the measured factor.
+
+\subsection{The decision: why classification does not need a softmax}
+\label{sec:ml:argmax}
+
+Trained classifiers are usually described as ending in a \ib{softmax},
+$\mathrm{sm}(\mathbf{z})_j = e^{z_j}/\sum_l e^{z_l}$, which converts logits into a
+probability vector. Under encryption this would be a serious obstacle: it needs an
+exponential and a reciprocal, neither of which is a low-degree polynomial. It is
+also unnecessary.
+
+\begin{proposition}
+\label{prop:argmax-invariance}
+Softmax is strictly increasing in each coordinate relative to the others, in the
+sense that $z_j > z_l \iff \mathrm{sm}(\mathbf{z})_j > \mathrm{sm}(\mathbf{z})_l$.
+Consequently $\argmax \circ\, \mathrm{sm} = \argmax$, and a classifier that
+reveals only its predicted label may omit the softmax entirely. The same holds for
+any strictly increasing scalar function applied coordinatewise, and for
+multiplication by any positive constant.
+\end{proposition}
+
+\begin{proof}
+The denominator of $\mathrm{sm}$ is a positive constant common to all coordinates,
+and $t \mapsto e^{t}$ is strictly increasing, so
+$\mathrm{sm}(\mathbf{z})_j > \mathrm{sm}(\mathbf{z})_l$ iff $e^{z_j} > e^{z_l}$ iff
+$z_j > z_l$. Hence the coordinatewise order, and in particular its maximiser, is
+preserved. For a general strictly increasing $f$ applied coordinatewise the same
+argument applies verbatim; for a positive scalar multiple it is immediate.
+\end{proof}
+
+Proposition~\ref{prop:argmax-invariance} is what makes a \emph{classifier}
+tractable under encryption while a language model is not: the former reveals
+$\argmax$ of the logits, which is invariant under the transformation one would
+otherwise have to compute, whereas the latter must sample from the distribution
+and therefore needs the normalisation itself. It also fixes what a private
+inference protocol should output, namely a sharing or ciphertext of the index, and
+what it should reveal, namely that index alone.
+
+\begin{definition}
+\label{def:argmax-prot}
+Given logits $\mathbf{z} \in \Rr^{C}$, the \ib{argmax fold} computes
+$(m_0,i_0) = (z_0,0)$ and
+\[
+  c_j = [\,z_j > m_{j-1}\,], \qquad
+  m_j = m_{j-1} + c_j (z_j - m_{j-1}), \qquad
+  i_j = i_{j-1} + c_j (j - i_{j-1}),
+\]
+returning $i_{C-1}$. It uses $C-1$ comparisons and $2(C-1)$ multiplications, and
+its comparisons are sequentially dependent.
+\end{definition}
+
+The sequential dependence in Definition~\ref{def:argmax-prot} is worth noting
+because it is the one place in an inference where our round count is not
+determined by network depth: a $C$-way argmax contributes $C-1$ dependent
+comparisons. A tournament fold reduces this to $\ceil{\log C}$ levels at the same
+comparison count, which matters when $C$ is large.
+
+\subsection{Quantisation: from real networks to the arithmetic a protocol offers}
+\label{sec:ml:quant}
+
+Networks are trained over the reals; protocols offer $\Z_{2^k}$, $\mathbb{F}_p$ or
+approximate reals. The bridge is quantisation, and because its error is one of the
+two error terms in every accuracy figure we report, we state it explicitly.
+
+\begin{definition}
+\label{def:qnet}
+Fix a scale $f$. The \ib{quantised network} $\widehat{g}$ of a network $g$
+replaces every parameter by its fixed-point encoding at scale $f$
+(Definition~\ref{def:fixed}) and every affine map by integer arithmetic followed
+by a rescale, so that layer $\ell$ computes
+$\widehat{\mathbf{u}}_\ell = \sigma\bigl(\rnd{2^{-f}\widehat{\mathbf{W}}_\ell
+\widehat{\mathbf{u}}_{\ell-1}} + \widehat{\mathbf{b}}_\ell\bigr)$, with the bias
+stored at output scale.
+\end{definition}
+
+\begin{proposition}
+\label{prop:quant-error}
+Let $g$ have $L$ layers of width at most $n$, with parameters and activations
+bounded by $M$ and each $\sigma$ $1$-Lipschitz. Then the quantised network
+satisfies
+\[
+  \norm{\widehat{g}(x)\,2^{-f} - g(x)}_\infty \;\le\;
+  \bigl(nM + \tfrac12\bigr)\,\frac{\gamma^{L}-1}{\gamma-1}\,2^{-f}
+  \qquad\text{where } \gamma = nM,
+\]
+that is, the per-layer error of Proposition~\ref{prop:fixed-error} amplified by
+the network's gain and accumulated over depth.
+\end{proposition}
+
+\begin{proof}
+By Proposition~\ref{prop:fixed-error} each layer introduces error at most
+$\varepsilon = (nM + \tfrac12)2^{-f}$ relative to exact evaluation on its own
+input. Write $\eta_\ell$ for the error at the output of layer $\ell$. A
+$1$-Lipschitz $\sigma$ does not amplify, and the affine map amplifies by at most
+its infinity-norm operator norm, bounded by $nM$; hence $\eta_\ell \le \gamma
+\eta_{\ell-1} + \varepsilon$ with $\eta_0 = 0$. Unrolling the recurrence gives
+$\eta_L \le \varepsilon(1 + \gamma + \cdots + \gamma^{L-1})$, which is the stated
+geometric sum.
+\end{proof}
+
+Proposition~\ref{prop:quant-error} is pessimistic---it assumes worst-case sign
+alignment at every step, whereas real errors partly cancel---and we therefore do
+not use it to predict accuracy. We use it for its shape, which carries two
+practical consequences. Error grows geometrically in depth with ratio equal to the
+network's gain, so a network with unit gain accumulates error linearly in depth
+while one with gain above unity does not remain usable; and the scale $f$ trades
+directly against every cost in the protocol, because the arithmetic domain must
+carry $f$ plus the integer range plus the statistical margin of
+Remark~\ref{rem:kappa-cost}. In practice one measures not bounds, which is
+why our pipeline reports the observed quantisation error of every model it
+deploys.
+
+\begin{remark}
+\label{rem:exactness}
+There is a stronger property than small error, and our harness insists on it
+wherever it is available: \ib{bit-exactness}. A private evaluation is bit-exact
+when its output equals that of the \emph{same} quantised network evaluated in the
+clear, digit for digit. Bit-exactness says nothing about whether quantisation was
+a good idea; it says that the cryptography computed what the plaintext reference
+computed, and it therefore separates a protocol error from an approximation error.
+Where a paradigm cannot offer it---an approximate homomorphic scheme cannot---the
+weaker comparison is agreement of the predicted label, and we say which of the two
+a figure rests on.
+\end{remark}
+
+\subsection{What an accuracy figure means}
+\label{sec:ml:metrics}
+
+Two of our case studies are medical, where accuracy alone is misleading, so we fix
+the metrics.
+
+\begin{definition}
+\label{def:metrics}
+For a binary classifier with true positives $\mathit{TP}$, false positives
+$\mathit{FP}$, true negatives $\mathit{TN}$ and false negatives $\mathit{FN}$,
+\ib{accuracy} is $(\mathit{TP}+\mathit{TN})/N$, \ib{sensitivity} (recall) is
+$\mathit{TP}/(\mathit{TP}+\mathit{FN})$, \ib{specificity} is
+$\mathit{TN}/(\mathit{TN}+\mathit{FP})$, and \ib{balanced accuracy} is the mean of
+the last two. For $C$ classes, balanced accuracy is the mean of the per-class
+recalls. The \ib{area under the receiver operating characteristic}, $\mathrm{AUC}$,
+is the probability that a uniformly chosen positive receives a higher score than a
+uniformly chosen negative, ties counting one half.
+\end{definition}
+
+\begin{proposition}
+\label{prop:auc-mw}
+$\mathrm{AUC}$ equals the normalised Mann--Whitney statistic: if $s_1,\dots,s_m$
+are the scores of the positives and $t_1,\dots,t_n$ those of the negatives, then
+\[
+  \mathrm{AUC} \;=\; \frac{1}{mn}\sum_{i=1}^{m}\sum_{j=1}^{n}
+  \Bigl(\mathbb{1}[s_i > t_j] + \tfrac12\,\mathbb{1}[s_i = t_j]\Bigr).
+\]
+\end{proposition}
+
+\begin{proof}
+The double sum counts, over all $mn$ pairs, the indicator of the event in
+Definition~\ref{def:metrics} with ties weighted one half; dividing by the number
+of pairs converts the count into the probability under the uniform choice of a
+pair.
+\end{proof}
+
+Proposition~\ref{prop:auc-mw} is the form an implementation must use, and the tie
+term is the part that is easy to omit; a quantised network produces exact ties far
+more often than a real-valued one, because its scores are integers, so an
+$\mathrm{AUC}$ computed without the tie correction is biased for exactly the models
+we deploy.
+
+\begin{definition}
+\label{def:wilson}
+For $k$ successes in $N$ independent trials with unknown rate $p$, the
+\ib{Wilson score interval} at level $1-\alpha$ is
+\[
+  \frac{1}{1+z^2/N}\left(\widehat{p} + \frac{z^2}{2N}
+  \;\pm\; z\sqrt{\frac{\widehat{p}(1-\widehat{p})}{N} + \frac{z^2}{4N^2}}\right),
+  \qquad \widehat{p} = k/N,
+\]
+where $z$ is the standard normal quantile at $1-\alpha/2$.
+\end{definition}
+
+We quote Wilson instead of normal-approximation intervals because our evaluation
+sets are small enough, and our rates close enough to one, that the normal interval
+can extend past unity; Wilson does not, and it retains nominal coverage at those
+extremes. An accuracy difference between two configurations is reported as
+meaningful only when the intervals are disjoint.
+
+\subsection{Threat models for private inference}
+\label{sec:ml:threat}
+
+Finally, the same computation admits several confidentiality goals, and the
+literature's figures are not comparable across them. We name them because our
+comparison depends on holding one fixed.
+
+\begin{definition}
+\label{def:pi-models}
+In \ib{input privacy} the client's $x$ is hidden from the server and the
+parameters $\theta$ are public or held in the clear by the server. In \ib{model
+privacy} $\theta$ is hidden from the client. In \ib{joint privacy} both are
+hidden from whoever evaluates: the evaluator learns neither $x$ nor $\theta$, and
+only the label is revealed, to a designated recipient.
+\end{definition}
+
+\begin{remark}
+\label{rem:pi-cost}
+The distinction is not a detail of framing; it changes the arithmetic. Under input
+privacy alone, an affine layer is a \emph{plaintext}--ciphertext product, which for
+a lattice scheme costs no ciphertext multiplication and adds far less noise
+(Proposition~\ref{prop:noise-growth}(2)) and for a secret sharing is a purely
+local scaling. Under joint privacy it is a ciphertext--ciphertext or
+sharing--sharing product, which consumes multiplicative depth or a Beaver triple
+per term. Comparing a joint-privacy system against an input-privacy one on
+latency therefore compares two different computations, and the hybrid systems most
+often cited for their speed---in which the server holds the model in the
+clear---occupy the cheaper setting. Our measurements are of joint privacy
+throughout, and where we place them beside a published figure we state which
+setting that figure was obtained in.
+\end{remark}

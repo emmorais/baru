@@ -76,6 +76,7 @@ fn load_model() -> (CnnModel, Vec<Vec<i64>>, Vec<u8>) {
         .map(|(kernels, cbias, in_c, in_h, in_w)| ConvLayer {
             kernels,
             cbias,
+            k: crate::bench::cnn::DEFAULT_K,
             in_c,
             in_h,
             in_w,
@@ -85,6 +86,9 @@ fn load_model() -> (CnnModel, Vec<Vec<i64>>, Vec<u8>) {
     let dense_w: Vec<Vec<i64>> = data::DENSE_W.iter().map(|r| r.to_vec()).collect();
     let model = CnnModel::from_trained(
         data::D,
+        // MNIST is grayscale; the medmnist loader derives this from the embedded
+        // image length instead, but this path builds the model directly.
+        1,
         kernels,
         data::CBIAS.to_vec(),
         extra_conv,

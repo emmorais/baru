@@ -42,8 +42,8 @@
 
 use rand::Rng;
 
+use crate::fhe::ntt;
 use crate::fhe::ntt::I256;
-use crate::fhe::poly;
 
 // ─── Parameters ───────────────────────────────────────────────────────────────
 
@@ -102,7 +102,7 @@ pub(crate) fn poly_mul_mod(a: &[u128], b: &[u128], p: &BfvParams) -> Poly {
     let mask = p.q_mask();
     let ac: Vec<i128> = a.iter().map(|&c| center(c, p)).collect();
     let bc: Vec<i128> = b.iter().map(|&c| center(c, p)).collect();
-    poly::negacyclic_product(&ac, &bc, p.n)
+    ntt::exact_negacyclic_product(&ac, &bc, p.n)
         .into_iter()
         .map(|c| c.low_u128() & mask)
         .collect()
@@ -163,6 +163,23 @@ pub fn public_parts(key_bytes: &[u8]) -> (Vec<u128>, Vec<u128>) {
     (k.b, k.a)
 }
 
+/// Serialize a **public** key bundle from its two polynomials.
+///
+/// The inverse of [`public_parts`], for a key that was never generated in one
+/// place: distributed key generation
+/// ([`crate::fhe::threshold::dkg_aggregate_public`]) produces `b` as a sum of
+/// per-party contributions, and `s` is never assembled at all. The bundle it
+/// writes carries an empty `s`, exactly as [`Bfv::keygen`]'s server half does,
+/// so every encryption path is unchanged.
+pub fn public_key_bytes(b: &[u128], a: &[u128]) -> Vec<u8> {
+    bincode::serialize(&KeyBundle {
+        s: Vec::new(),
+        b: b.to_vec(),
+        a: a.to_vec(),
+    })
+    .expect("serialize BFV public key")
+}
+
 /// The secret polynomial `s` from a client key bundle, so it can be split into
 /// threshold shares by [`crate::fhe::threshold::deal_key_shares`].
 pub fn secret_part(client_key_bytes: &[u8]) -> Vec<u128> {
@@ -187,20 +204,20 @@ impl BfvCt {
 /// A public key deserialized and forward-transformed once, for repeated
 /// encryption within a session. See [`Bfv::encrypt_key`].
 pub struct EncryptKey {
-    b: poly::PreparedPoly,
-    a: poly::PreparedPoly,
+    b: Box<ntt::Transformed>,
+    a: Box<ntt::Transformed>,
 }
 
 /// A secret key deserialized and forward-transformed once, for repeated
 /// decryption within a session. See [`Bfv::decrypt_key`].
 pub struct DecryptKey {
-    pre: poly::PreparedPoly,
+    pre: Box<ntt::Transformed>,
 }
 
 /// A fresh ciphertext held in the NTT domain, ready to be multiplied
 /// against many others without re-transforming.
 pub struct BfvCtNtt {
-    pre: poly::PreparedPair,
+    pre: (Box<ntt::Transformed>, Box<ntt::Transformed>),
 }
 
 pub struct Bfv {
@@ -255,8 +272,8 @@ impl Bfv {
         let pk = self.bundle(key_bytes);
         let cen = |v: &[u128]| -> Vec<i128> { v.iter().map(|&c| center(c, p)).collect() };
         EncryptKey {
-            b: poly::prepare_poly(&cen(&pk.b), p.n),
-            a: poly::prepare_poly(&cen(&pk.a), p.n),
+            b: Box::new(ntt::forward_transform(&cen(&pk.b), p.n)),
+            a: Box::new(ntt::forward_transform(&cen(&pk.a), p.n)),
         }
     }
 
@@ -274,8 +291,8 @@ impl Bfv {
         let e1 = sample_ternary(p.n);
         let e2 = sample_ternary(p.n);
         let uc: Vec<i128> = u.iter().map(|&c| center(c, p)).collect();
-        let prod = |k: &poly::PreparedPoly| -> Poly {
-            poly::negacyclic_product_pre(k, &uc, p.n)
+        let prod = |k: &ntt::Transformed| -> Poly {
+            ntt::exact_negacyclic_product_pre(k, &uc, p.n)
                 .into_iter()
                 .map(|c| c.low_u128() & mask)
                 .collect()
@@ -337,7 +354,7 @@ impl Bfv {
         assert!(!s.is_empty(), "BFV decrypt needs the client key (with s)");
         let sc: Vec<i128> = s.iter().map(|&c| center(c, p)).collect();
         DecryptKey {
-            pre: poly::prepare_poly(&sc, p.n),
+            pre: Box::new(ntt::forward_transform(&sc, p.n)),
         }
     }
 
@@ -352,7 +369,7 @@ impl Bfv {
         let mut acc = ct.c.last().expect("ciphertext has components").clone();
         for ci in ct.c.iter().rev().skip(1) {
             let accc: Vec<i128> = acc.iter().map(|&c| center(c, p)).collect();
-            acc = poly::negacyclic_product_pre(&key.pre, &accc, p.n)
+            acc = ntt::exact_negacyclic_product_pre(&key.pre, &accc, p.n)
                 .into_iter()
                 .map(|c| c.low_u128() & mask)
                 .collect();
@@ -440,7 +457,7 @@ impl Bfv {
     /// ciphertext by an unscaled `m` scales the message: `Δ·m₀ · m ⇒ m₀·m`.
     /// The ciphertext degree is untouched, so unlike [`Bfv::mul`] this does not
     /// consume the one multiplication the depth-1 parameters allow — it is what
-    /// makes single-server PIR ([`crate::pir`]) a depth-0 operation.
+    /// makes a plaintext-selector product a depth-0 operation.
     ///
     /// The plaintext is **centered** into `(−t/2, t/2]` first. That is exact
     /// rather than merely convenient: `q = Δ·t` here, so `Δ·m₀·t ≡ 0 (mod q)`
@@ -500,7 +517,10 @@ impl Bfv {
         let p = &self.params;
         let cen = |v: &[u128]| -> Vec<i128> { v.iter().map(|&c| center(c, p)).collect() };
         BfvCtNtt {
-            pre: poly::prepare_pair(&cen(&ct.c[0]), &cen(&ct.c[1]), p.n),
+            pre: (
+                Box::new(ntt::forward_transform(&cen(&ct.c[0]), p.n)),
+                Box::new(ntt::forward_transform(&cen(&ct.c[1]), p.n)),
+            ),
         }
     }
 
@@ -513,7 +533,8 @@ impl Bfv {
     /// online path instead of 2 forward + 3 inverse.
     pub fn mul_pre_pre(&self, a: &BfvCtNtt, b: &BfvCtNtt) -> BfvCt {
         let p = &self.params;
-        let (t0, t1, t2) = poly::rlwe_tensor_pre_pre(&a.pre, &b.pre, p.n);
+        let (t0, t1, t2) =
+            ntt::exact_bfv_tensor_pre_pre(&a.pre.0, &a.pre.1, &b.pre.0, &b.pre.1, p.n);
         BfvCt {
             c: vec![rescale(t0, p), rescale(t1, p), rescale(t2, p)],
         }
@@ -526,7 +547,7 @@ impl Bfv {
         let p = &self.params;
         let cen = |v: &[u128]| -> Vec<i128> { v.iter().map(|&c| center(c, p)).collect() };
         let (b0, b1) = (cen(&b.c[0]), cen(&b.c[1]));
-        let (t0, t1, t2) = poly::rlwe_tensor_pre(&a.pre, &b0, &b1, p.n);
+        let (t0, t1, t2) = ntt::exact_bfv_tensor_pre(&a.pre.0, &a.pre.1, &b0, &b1, p.n);
         BfvCt {
             c: vec![rescale(t0, p), rescale(t1, p), rescale(t2, p)],
         }

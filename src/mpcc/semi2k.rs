@@ -162,6 +162,10 @@ impl Semi2kEngine {
 
     /// Generate `self.batch` triples, all their OTs in one extension call.
     fn refill(&mut self) -> Result<(), String> {
+        // Preprocessing compute, charged apart from the online phase — on a LAN
+        // it is the dominant term, and `bench-2pc-nn` reports it in the cold
+        // column only.
+        let t_offline = std::time::Instant::now();
         let mask = self.mask();
         let mut rng = rand::thread_rng();
         let n = self.batch;
@@ -196,6 +200,7 @@ impl Semi2kEngine {
                 .push((vec![a[i].0, a[i].1], vec![b[i].0, b[i].1], vec![c0, c1]));
         }
         self.counters.triples_generated += n as u64;
+        self.counters.offline_micros += t_offline.elapsed().as_micros();
         Ok(())
     }
 
@@ -240,6 +245,9 @@ impl ShareEngine for Semi2kEngine {
     }
     fn counters(&self) -> &Counters {
         &self.counters
+    }
+    fn counters_mut(&mut self) -> &mut Counters {
+        &mut self.counters
     }
 
     fn input(&mut self, value: u64, _party: usize) -> Additive {
@@ -293,16 +301,13 @@ impl ShareEngine for Semi2kEngine {
     }
 
     fn random_bits(&mut self, n: usize) -> Vec<Additive> {
-        // Same simplification as `DealerEngine`: counted as preprocessing, drawn
-        // locally rather than executed. See `crate::mpcc::vm`.
-        self.counters.random_bits += n as u64;
-        let mut rng = rand::thread_rng();
-        (0..n)
-            .map(|_| {
-                let bit = u64::from(rng.gen::<bool>());
-                self.split(bit)
-            })
-            .collect()
+        // Generated, not dealt: each party contributes a private bit and the
+        // shared bit is their XOR, one `mul_batch` for the whole batch. That
+        // consumes `n` real OT-generated triples, so a comparison's
+        // preprocessing is now measured by the same route its multiplications
+        // are. See `vm::random_bits_batch` for why the traffic is charged to
+        // `random_bit_bytes` rather than to the online column.
+        super::vm::random_bits_batch(self, n)
     }
 }
 

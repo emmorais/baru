@@ -88,6 +88,10 @@ pub enum Tag {
     VFheCiphertext,
     /// Q16.16 fixed-point literal (`Expr::Fixed`).
     EFixed,
+    /// `(define name value)` (`Expr::Define`).
+    EDefine,
+    /// `(set! name value)` (`Expr::Set`).
+    ESet,
 }
 
 /// An interned node: a tag, an inline byte payload for leaves, and links to
@@ -228,6 +232,17 @@ impl Store {
     /// Intern a runtime [`Types`] value, returning its handle.
     pub fn intern_value(&mut self, v: &Types) -> NodeId {
         match v {
+            // Interned like any other opaque builtin: it has no structure.
+            Types::NativeApply => self.intern(Tag::VNative, vec![], vec![]),
+            // By message: two conditions with the same text are the same node.
+            Types::Error(e, _) => self.intern(Tag::VStr, e.message.as_bytes().to_vec(), vec![]),
+            // Interned by *contents*, like a list. Two vectors with equal
+            // elements therefore share a handle even though `eq?` distinguishes
+            // them — hash-consing is about structure, `eq?` about identity.
+            Types::Vector(v) => {
+                let ids: Vec<NodeId> = v.borrow().iter().map(|x| self.intern_value(x)).collect();
+                self.list(&ids)
+            }
             Types::Num(n) => self.num(*n),
             Types::Fixed(v) => self.intern(Tag::VFixed, v.to_le_bytes().to_vec(), vec![]),
             Types::Bool(b) => self.boolean(*b),
@@ -242,7 +257,7 @@ impl Store {
                 self.tuple(Tag::VQuoted, &[eh])
             }
             // Closures are committed by their *code* only (see module note).
-            Types::Closure(params, body, _env) => {
+            Types::Closure(params, _rest, body, _env) => {
                 let p = self.sym_list(params);
                 let b = self.intern_expr(body);
                 self.tuple(Tag::VClosure, &[p, b])
@@ -353,7 +368,23 @@ impl Store {
                 let (ah, bh) = (self.intern_expr(a), self.intern_expr(b));
                 self.tuple(Tag::ECons, &[ah, bh])
             }
-            Expr::Lambda(params, body) => {
+            Expr::Guard(var, handler, body) => {
+                let v = self.intern(Tag::EVar, var.as_bytes().to_vec(), vec![]);
+                let h = self.expr_list(handler);
+                let b = self.expr_list(body);
+                self.tuple(Tag::ESeq, &[v, h, b])
+            }
+            Expr::Define(name, value) => {
+                let n = self.intern(Tag::EVar, name.as_bytes().to_vec(), vec![]);
+                let v = self.intern_expr(value);
+                self.tuple(Tag::EDefine, &[n, v])
+            }
+            Expr::Set(name, value) => {
+                let n = self.intern(Tag::EVar, name.as_bytes().to_vec(), vec![]);
+                let v = self.intern_expr(value);
+                self.tuple(Tag::ESet, &[n, v])
+            }
+            Expr::Lambda(params, _rest, body) => {
                 let p = self.sym_list(params);
                 let b = self.intern_expr(body);
                 self.tuple(Tag::ELambda, &[p, b])

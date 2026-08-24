@@ -9,7 +9,7 @@ mid-computation without being exposed:
 |---|---|---|
 | **Plain interpreter** | Ordinary evaluation (CEK-style trampolined evaluator) — the correctness baseline | `src/interpreter/` |
 | **MPC** | 3-party secure computation with ABY3-style replicated secret sharing; triple-free multiplication, batched bit protocols, garbled-circuit nonlinearities | `src/crypto/`, `src/interpreter/*_backend.rs` |
-| **FHE** | Fully homomorphic evaluation of compiled circuits — mock, TFHE-rs (exact integers) and SEAL CKKS (approximate reals) | `src/fhe/` |
+| **FHE** | Fully homomorphic evaluation of compiled circuits — mock, TFHE-rs (exact integers), and an exact real-arithmetic backend | `src/fhe/` |
 | **ZKP** | Zero-knowledge proofs of circuit satisfaction using the Binius64 SNARK | `src/zkp/` |
 | **Hybrid** | Scheme switching in both directions (`share->fhe`, `fhe->share`), and re-encryption as an alternative to bootstrapping | `src/hybrid/` |
 
@@ -31,9 +31,9 @@ cargo run --bin baru bench  # benchmark harness (see §10)
 cargo run --release --example mnist   # MNIST private-inference demo (see §11)
 ```
 
-Multi-party TCP mode uses the `tcp_party` binary (see §6.5). Optional cargo
-features: `ntl` (NTL+GMP polynomial backend, needs a C++ toolchain plus NTL and
-GMP) and `pq-tls` (post-quantum TLS transports).
+Multi-party TCP mode uses the `tcp_party` binary (see §6.5). One optional cargo
+feature: `pq-tls` (post-quantum TLS transports). Everything else is in the
+default build, which is pure Rust and needs no C++ toolchain.
 
 ---
 
@@ -85,9 +85,57 @@ Fixed values print with 4 decimal digits (`3.5000`). Conversions are explicit vi
 ((lambda (x) (* x x)) 7)                  ; direct call => 49
 ```
 
+```lisp
+(let* ((x 2) (y (* x 3))) (+ x y))       ; => 8; each init sees the previous
+(let loop ((i 0) (acc 0))                ; named let — the standard Scheme loop
+  (if (== i 5) acc (loop (+ i 1) (+ acc i))))   ; => 10
+
+(define x 5)                             ; bind in the current environment
+(define (sq n) (* n n))                  ; sugar for (define sq (lambda (n) ...))
+(set! x 42)                              ; assign to an EXISTING binding
+
+(lambda (a . rest) (length rest))        ; variadic: rest collects the remainder
+(lambda (. args) (length args))          ; every argument in one list
+```
+
+With a rest parameter the fixed parameters become a **minimum** rather than an
+exact arity, and the rest list is empty (not absent) when only the fixed
+arguments are supplied. Scheme spells the take-everything form `(lambda args …)`;
+here a bare identifier in that position already means *one required parameter*,
+so the dotted `(lambda (. args) …)` is the supported spelling — see §13.
+
+`define` introduces a binding; `set!` assigns to one that already exists and
+errors if it does not. Both return the value (this language has no "unspecified").
+
+**`set!` writes through a shared cell**, so a closure sees assignments made after
+it was created — the usual counter works:
+
+```lisp
+(let ((n 0))
+  (let ((bump (lambda () (set! n (+ n 1)))))
+    (begin (bump) (bump) (bump) n)))     ; => 3
+```
+
+Neither form can be compiled to a circuit: an FHE or ZKP circuit has no
+environment to extend and is single-assignment. Both are refused with an error
+naming the reason rather than mis-compiled.
+
 Currying, higher-order functions, closures capturing their environment, and
 mutual recursion (`even?`/`odd?` style) all work; the evaluator is trampolined so
 deep recursion (Ackermann, Collatz, …) does not overflow the Rust stack.
+
+**Tail calls are proper.** A closure body is evaluated with the *caller's*
+continuation rather than a new frame, so a named-`let` loop runs in constant
+continuation space. The practical ceiling is `MAX_FRAMES` (a step budget on the
+trampoline, currently 1 000 000 ≈ 50 000 loop iterations), not the recursion
+depth.
+
+> **`let` is sequential, unlike Scheme's.** In Baru, `(let ((a 1) (b (+ a 10))) b)`
+> is `11`: a later init sees an earlier binding. Scheme's `let` evaluates inits in
+> the *outer* scope and would reject that (or see an outer `a`); the sequential
+> behaviour is Scheme's `let*`. **`let*` is therefore semantically redundant
+> here** and is provided so Scheme source ports unchanged and so intent is
+> explicit. See §13.
 
 ### `:sintN` sugar — auto-sharing in `let` bindings
 
@@ -103,16 +151,113 @@ Inside a `let` binding, the annotation `:sintN` wraps the bound expression in
 
 ```lisp
 (if cond then else)
+(begin e1 e2 ... en)                     ; evaluate in order, return the last
+(when   cond body...)                    ; body if truthy, else 0
+(unless cond body...)                    ; body if falsy,  else 0
+(cond (test1 body...)                    ; first matching clause wins
+      (test2 body...)
+      (else  body...))                   ; optional; must come last
+(case key ((1 2) body...)                ; key evaluated once, compared with ==
+          ((3)   body...)
+          (else  body...))
+(do ((i 0 (+ i 1))                       ; iteration: (var init [step])
+     (acc 0 (+ acc i)))
+    ((== i 5) acc)                       ; (test result...) — result may be empty
+  body...)                               ; body runs each pass, for effect
 ```
 
 Any nonzero number / `#t` is truthy. When `cond` is a **shared** value the
 condition bit is revealed first — see §6.3.
+
+### Conditions and `guard`
+
+```lisp
+(guard (e handler...)                    ; e is bound to the condition
+  body...)                               ; if body raises, handler runs instead
+(error "message" irritant...)            ; signal a condition
+(raise obj)                              ; raise any object
+```
+
+```lisp
+(guard (e (error-message e)) (error "boom"))   ; => "boom"
+(guard (e 0) (/ 1 0))                          ; => 0
+(guard (e 99) some-unbound-name)               ; => 99
+```
+
+**Errors propagate through an error continuation.** A raised condition never
+reaches the continuation it was handed to: the machine truncates its task stack
+back to the height recorded when the innermost `guard` was installed, then runs
+that handler. Unwinding is therefore a single truncate, not a walk over pending
+frames, and everything the guarded expression had left to do is discarded.
+
+Three consequences worth knowing:
+
+- **An uncaught condition is the value of the evaluation**, not a crash. A REPL
+  session survives a bad expression and carries on to the next one.
+- **The condition is bound inert** inside the handler, so `e` can be inspected
+  and passed around. A handler may `raise` it again, and it then propagates to
+  the *enclosing* guard.
+- **A handler is uninstalled when its body exits normally**, so it cannot catch
+  something raised later in the program.
+
+| Builtin | Description |
+|---|---|
+| `error` | `(error "msg" irritant...)` — build and signal a condition. |
+| `raise` | Re-raise a caught condition, or wrap any other object. |
+| `error?` | Is this value a condition? |
+| `error-message` / `error-irritants` | Accessors on a caught condition. |
+
+**Coverage, stated precisely.** Catchable by `guard`:
+
+- explicit `error` / `raise`;
+- unbound variables, and `set!` on an unbound name;
+- arity mismatches (including the zero-argument case), and calling a
+  non-procedure or a share as one;
+- division and modulo by zero, non-exact division;
+- type errors in `car`, `cdr`, `cons`, `if`, `not`, `null?`, `bitlen`,
+  negation and the arithmetic shifts — each carrying the offending value as an
+  irritant;
+- every failure in the procedures of §5.2–§5.2b;
+- **every MPC, FHE and ZKP builtin failure** — bad arguments, malformed JSON, a
+  missing model or proof file, a wrong quantisation scale.
+
+- length and type errors in the vector builtins `dot`, `vsum`, `matvec` and
+  `nn-forward`;
+- secret-dependent failures: a branch under a shared condition that cannot
+  produce a share (`(if <share> "yes" "no")`), and operations with no
+  fixed-point-share implementation such as `(mod <share> 2.5)`.
+
+Still a panic, so **not** catchable — 17 sites, each deliberate:
+
+- the `MAX_FRAMES` step budget, and one internal invariant that would indicate a
+  bug in the evaluator rather than in the program;
+- six type invariants guarded by an outer match that has already established the
+  type, so no program can reach them (verified: `and`/`or` on shares, which
+  looked like the likely route, dispatch correctly);
+- the `eval_plain` / `eval_shared` / `eval_fhe` test harness, where a panic is
+  the point: a test should fail loudly rather than return a condition a
+  careless assertion might ignore.
+
+`guard` cannot be compiled to a circuit: a circuit has no control flow to unwind,
+so there is nothing for a handler to intercept.
+
+A `cond` or `case` with no matching clause and no `else` evaluates to `0`, the
+same "no value" an untaken `when` produces.
+
+> **These are derived forms.** `begin`, `when`, `unless`, `cond`, `case`, `do`,
+> `let*` and named `let` are desugared **in the parser** into `if` / `let` /
+> `letrec` / sequences. Nothing in the evaluator or the FHE/ZKP circuit compilers knows they
+> exist, which is why they work on every backend the core forms work on — a ReLU
+> written `(cond ((> x 0) x) (else 0))` compiles, proves and verifies under
+> Binius64 exactly like the `if` it lowers to
+> (`tests/zkp_real.rs::derived_forms_compile_prove_and_verify`).
 
 ### Operators
 
 | Form | Meaning |
 |---|---|
 | `(+ a b)` `(- a b)` `(* a b)` | arithmetic (wrapping on i64; works on `Num`, `Fixed`, and shares) |
+| `(+ a b c …)` `(* a b c …)` `(- a)` `(- a b c)` `(/ a b c)` | **non-binary arities** route to the operator's *procedure* binding: variadic, but **public values only** |
 | `(/ a b)` | exact integer division |
 | `(mod a b)` | modulo |
 | `(- a)` | unary negation |
@@ -123,6 +268,26 @@ condition bit is revealed first — see §6.3.
 | `(bitlen x)` | number of significant bits |
 | `(atom x)` | 1 if `x` is an atom |
 | `(null? lst)` | 1 if the list is empty |
+
+**Operators are also values.** `+`, `-`, `*`, `/`, `mod` and the comparisons are
+bound as ordinary procedures, so they can be applied or passed around:
+
+```lisp
+(- 5)                     ; => -5   (unary negation)
+(+ 1 2 3)                 ; => 6
+(+)                       ; => 0    (Scheme's additive identity)
+(apply * (list 2 3 4))    ; => 24
+```
+
+Two operands take the **special-form** path, which is the only one that
+dispatches secret shares and FHE ciphertexts through the backend. Any other
+arity — and any use of an operator as a *value* — takes the procedure path,
+which handles `Num` and `Fixed` but **refuses secrets** with an error naming the
+two-operand form. Duplicating the MPC dispatch into a second code path is the
+kind of drift this repository is built to measure, so it is not done.
+
+`apply` is likewise a **binding, not syntax**, so `(let ((apply …)) …)` shadows
+it exactly as in Scheme.
 
 ### Lists
 
@@ -188,6 +353,67 @@ through the backend):
 | `dot` | `(dot vec-a vec-b)` | Inner product. |
 | `vsum` | `(vsum vec)` | Sum of the elements. |
 | `matvec` | `(matvec matrix vec)` | Matrix (list of row lists) × vector. |
+| `length` | `(length lst)` | Number of elements. |
+| `append` | `(append lst …)` | Concatenate lists. |
+| `reverse` | `(reverse lst)` | Reversed copy. |
+| `list-ref` | `(list-ref lst i)` | Element at **public** index `i`. A *secret* index is refused with an error rather than silently scanned — see the note below. |
+
+### 5.2a Vectors
+
+Fixed-length, mutable, with **reference semantics** — the counterpart to this
+language's immutable lists. Indices are public, as for `list-ref`.
+
+| Builtin | Description |
+|---|---|
+| `vector` | `(vector v1 v2 …)` — build from arguments. |
+| `make-vector` | `(make-vector n [fill])` — `n` slots, `fill` defaults to `0`. |
+| `vector-length` | Number of slots. |
+| `vector-ref` | `(vector-ref v i)` at a **public** index; bounds-checked. |
+| `vector-set!` | `(vector-set! v i x)` — mutates in place, returns `x`. |
+| `vector->list` / `list->vector` | Convert between the two. |
+| `vector?` | Type test. |
+
+`vector-set!` is the reason vectors exist: without mutation a vector would be a
+list with O(1) indexing, which `list-ref` already provides. Because the storage
+is shared, a mutation is visible through every alias and through any procedure
+the vector was passed to:
+
+```lisp
+(let ((v (vector 1 2)))
+  (let ((f (lambda (x) (vector-set! x 1 77))))
+    (begin (f v) (vector-ref v 1))))     ; => 77
+```
+
+### 5.2b Predicates and equivalence
+
+| Builtin | Description |
+|---|---|
+| `number?` `integer?` `boolean?` `string?` `char?` `vector?` `error?` | Type tests on public values. |
+| `list?` `pair?` | `pair?` is a *non-empty* list; there are no improper pairs (§13). |
+| `procedure?` | True for closures and builtins. |
+| `share?` `ciphertext?` | Is this value a secret share / an FHE ciphertext? |
+| `zero?` | `(zero? x)` on a `Num` or `Fixed`. |
+| `eq?` `eqv?` | Identity/atom equality. Returns `1`/`0`. |
+| `equal?` | Structural equality, recursing into lists. |
+
+All predicates return `1`/`0` rather than `#t`/`#f`, so they compose with the
+existing numeric comparisons and with `and`/`or`'s bitwise behaviour.
+
+Three deliberate boundaries, because each is a place where a convenience could
+have quietly cost privacy:
+
+- **`share?` is safe and `eq?` on shares is cheap.** A value's *type* is public —
+  only its contents are secret — so asking whether something is a share leaks
+  nothing. `eq?` on two shares compares **handle identity**, never contents:
+  comparing secrets by value needs a protocol round, and spending one inside a
+  predicate would hide a real cost. Use `(== a b)`, which is visibly a protocol
+  operation.
+- **`list-ref` requires a public index.** A secret index needs a linear scan of
+  muxes over the whole list (or ORAM). That is a protocol decision with a cost,
+  not something an accessor should pick silently, so it is an error.
+- **These builtins do not exist on the circuit backends.** They are
+  `NativeFunc`s, which have no gate-level meaning; a program compiled to FHE or
+  ZKP has already resolved its public structure.
 
 ### 5.3 Fixed-point conversions
 
@@ -216,8 +442,7 @@ printed, and persisted.
 |---|---|---|
 | `fhe-keygen` | `(fhe-keygen)` | Key pair for the **mock** backend (plaintext u64 "ciphertexts" — instant, for development). Returns key JSON. |
 | `fhe-keygen-tfhe` | `(fhe-keygen-tfhe)` | Key pair for the real **TFHE-rs** backend (exact 64-bit integers; keygen ≈ seconds). Installs the server key globally. |
-| `fhe-keygen-ckks` | `(fhe-keygen-ckks)` | Key pair for the **SEAL CKKS** backend (approximate real arithmetic; vendored, patched `sealy` in `third_party/`). |
-| `fhe-keygen-ckks-mock` | `(fhe-keygen-ckks-mock)` | Exact `f64` twin of the CKKS backend, for fast differential testing. |
+| `fhe-keygen-ckks-mock` | `(fhe-keygen-ckks-mock)` | Key pair for the **exact real-arithmetic** backend (plain `f64`, no keys, no noise). Named for the SEAL CKKS backend it used to mirror, removed 2026-08-03. |
 | `fhe-enc` | `(fhe-enc keys value)` | Encrypt a `Num`, `Fixed`, or `Bool` under the client key. On CKKS backends a `Fixed` crosses the boundary as its true real value (`v / 2¹⁶`). |
 | `fhe-dec` | `(fhe-dec keys ct)` | Decrypt; returns `Num`, or `Fixed` if the ciphertext is flagged fixed-point. |
 | `fhe-compile` | `(fhe-compile 'expr '("enc-var"))` | Compile to an FHE circuit (integer mode, Q16.16 gadgets for fixed-point). Second arg names variables supplied as ciphertexts. Returns circuit JSON. |
@@ -225,7 +450,7 @@ printed, and persisted.
 | `fhe-eval` | `(fhe-eval circuit keys '(pub-keys) '(pub-vals) '(enc-keys) '(enc-cts))` | Homomorphically evaluate the circuit. Public inputs are plaintext; encrypted inputs are ciphertexts (build the list with `(list ct1 ct2 …)`, or `'()` for none). Returns the encrypted result. |
 
 The key JSON's `backend_id` selects the backend at `fhe-enc`/`fhe-dec`/`fhe-eval`
-time, so the same program text runs on mock, TFHE, or CKKS by swapping the keygen
+time, so the same program text runs on mock, TFHE, or the real-arithmetic backend by swapping the keygen
 call.
 
 ### 5.6 Scheme-switching builtins
@@ -339,15 +564,16 @@ optimised) → `FheCircuit` → `evaluate_fhe` per-gate on an `FheBackend`.
 |---|---|---|---|
 | mock | `FheBackend` | exact u64 | plaintext stand-in; instant; use for development and differential tests |
 | `tfhe-rs-v1.6` | `FheBackend` | exact `FheUint64` | real FHE; supports comparisons (so ReLU works); slow (minutes for large circuits) |
-| `seal-ckks` | `RealFheBackend` | approximate `f64` (N=8192, 128-bit security) | only `+ − ×` — **no exact comparisons**, so no encrypted ReLU/argmax from the builtins; errors ~1e-8; supports SIMD batching and plaintext-weight dot products with rotation keys (Rust API: `encrypt_vec`, `dot_plain`). *Approximate* comparison via polynomial sign approximation is implemented in `fhe::ckks_compare` (Rust-level, deep context, seconds per operation — see §7.1) |
-| `ckks-mock` | `RealFheBackend` | exact `f64` | drop-in twin of `seal-ckks` for fast testing |
+| `ckks-mock` | `RealFheBackend` | exact `f64` | the real-arithmetic backend; only `+ − ×`, since comparison has no meaning on reals here |
 
 Compile with `fhe-compile` for integer backends and `fhe-compile-ckks` for the
-CKKS pair. Fixed-point values are Q16.16 gadgets on integer backends and true
-reals on CKKS.
+real-arithmetic one. Fixed-point values are Q16.16 gadgets on integer backends
+and true reals under real-arithmetic mode.
 
-MNIST benchmark data point (784-input linear layer): TFHE eval ≈ 2800 s; CKKS
-circuit form ≈ 1.6 s; CKKS batched SIMD form ≈ 92 ms with one 393 KB ciphertext
+MNIST benchmark data point (784-input linear layer): TFHE eval ≈ 2800 s. The
+SEAL CKKS rows that sat here — ≈ 1.6 s in circuit form, ≈ 92 ms batched with one
+393 KB ciphertext — went with that backend on 2026-08-03 and are no longer
+reproducible; `docs/experiments.md` §II.4 keeps them
 per image (see `examples/mnist.rs`). Those were measured at **2365 gates**;
 common-subexpression elimination inside `CircuitCompiler` has since brought the
 same circuit to **1764 gates (−25%)** with bit-identical scores, so the integer
@@ -376,7 +602,8 @@ builtins (§5.6):
 
 Composing the two directions gives **re-encryption instead of bootstrapping**
 (`hybrid::mpc_reencrypt`): the round trip resets FHE noise and, for levelled
-CKKS, restores the full depth budget, for the price of one interactive round.
+a levelled scheme, restores the full depth budget, for the price of one
+interactive round.
 That is the mechanism behind the repository's headline result — a network of
 arbitrary depth evaluated with zero FHE bootstraps, since the scheme switch that
 computes each ReLU also refreshes the ciphertext. See
@@ -390,8 +617,7 @@ The Rust-level FHE schemes that make this cheap are not exposed as builtins,
 because they implement one specialized primitive rather than a general circuit
 evaluator: `fhe::bfv` and `fhe::bgv` do a **depth-1 packed matvec** — one
 ciphertext×ciphertext multiplication, no relinearization keys, no bootstrapping,
-decrypting the degree-2 product under `s²` — and `fhe::ckks_compare` does
-polynomial sign approximation for CKKS. Drive them from Rust (`src/bench/`,
+decrypting the degree-2 product under `s²`. Drive them from Rust (`src/bench/`,
 `src/gadgets/`) or through the `baru bench-*` commands.
 
 ---
@@ -455,10 +681,10 @@ rewrite.
 The size-swept and application-level benchmarks are separate subcommands
 (`bench-nn`, `bench-hybrid-nn`, `bench-deep-nn`, `bench-cnn`, `bench-mnist`,
 `bench-medmnist`, `bench-train`, `bench-fhe-innerprod`, `bench-polymul`,
-`bench-triples`, `bench-ot`, `bench-psi`, `bench-pir`, `bench-layer`,
+`bench-triples`, `bench-ot`, `bench-psi`, `bench-layer`,
 `bench-net`, `bench-circuit`, `bench-backend-aware`, `bench-compiled-nn`,
 `bench-abstraction`, `bench-gc-compare`, `bench-mixed-layer`, `bench-cohort`,
-`bench-cohort-eval`, `bench-ckks-compare`). They drive the Rust APIs directly
+`bench-cohort-eval`). They drive the Rust APIs directly
 rather than the interpreter, for cost attribution and to reach realistic sizes;
 most accept `--json`, `--rtt-ms` and `--bandwidth-mbps`. What each one measures is
 listed in the [README](README.md#command-line-surface) and what it *found* is in
@@ -549,9 +775,14 @@ integer-share × fixed-constant products are exact at any width.
 
 ```lisp
 (let ((c (zkp-compile '(* x (+ x 1)) '("x"))))
-  (let ((p (zkp-prove c '("x") '(3) '() '())))
-    (zkp-verify c p '() '())))            ; => 1
+  (let ((p (zkp-prove c '("x") '(3) '("__out") '(12))))
+    (zkp-verify c p '("__out") '(12))))   ; => 1
 ```
+
+The claimed output must be supplied as the public input `__out`. Without it the
+statement would be "some circuit was evaluated", which proves nothing useful, so
+the prover refuses. (This example passed `'() '()` before 2026-08-03 and had not
+been updated when the real Binius64 backend replaced the placeholder.)
 
 ### FHE: encrypted input, public weight
 
@@ -563,21 +794,24 @@ integer-share × fixed-constant products are exact at any width.
       (fhe-eval circ keys '() '() '("y") (list ct))))) ; => 19
 ```
 
-### CKKS: approximate reals
+### Real arithmetic: exact `f64`
 
 ```lisp
-(let ((keys (fhe-keygen-ckks)))                        ; or fhe-keygen-ckks-mock
+(let ((keys (fhe-keygen-ckks-mock)))                   ; exact real arithmetic
   (let ((ct (fhe-enc keys 1.5))
         (circ (fhe-compile-ckks '(* y 2.0) '("y"))))
     (fhe-dec keys
       (fhe-eval circ keys '() '() '("y") (list ct))))) ; => 3.0000
 ```
 
+This used to run on SEAL CKKS too, with a tolerance instead of an exact
+comparison. That backend was removed on 2026-08-03 — see §13.
+
 ### MNIST private inference
 
-`cargo run --release --example mnist [--mpc] [--tfhe] [--ckks]` — a linear
+`cargo run --release --example mnist [--mpc] [--tfhe]` — a linear
 discriminator over 784 encrypted pixels with Q16.16 public weights, run on
-plain / fhe-mock / MPC / TFHE / CKKS (scalar and batched SIMD), with all
+plain / fhe-mock / MPC / TFHE, with all
 backends checked against the plain result.
 
 ---
@@ -597,11 +831,12 @@ src/
   crypto/                Fr/Share3, ABY3 protocols (mul, a2b, batched forms),
                          garbled circuits, Transport (InprocHandle/TcpTransport),
                          PQ-TLS, identity, sim (in-process wrappers)
-  fhe/                   FheBackend/RealFheBackend traits and the mock, TFHE-rs and
-                         SEAL CKKS backends; bfv/bgv/bgv_wide (depth-1 packed matvec,
-                         no relin); ckks_compare (deep, polynomial sign); ntt
-                         (multi-modular, exact over power-of-two q); ntl (oracle);
-                         poly (runtime backend switch); slots (CRT packing);
+  fhe/                   FheBackend/RealFheBackend traits and the mock, TFHE-rs
+                         and exact_real backends; bfv/bgv/bgv_wide (depth-1
+                         packed matvec, no relin); leveled_relu_cost (the CKKS
+                         experiment's surviving level model); ntt
+                         (multi-modular, exact over power-of-two q);
+                         slots (CRT packing);
                          conv_pack (Cheetah-style); circuit_emitter; market; lifecycle
   hybrid/                MPC <-> FHE scheme switching, mpc_reencrypt
   gadgets/               relu, max2/max_reduce/maxpool2d, argmax, dense, conv2d
@@ -609,7 +844,7 @@ src/
                          (dealer/shamir/semi2k/lowgear), mixed assignment, VM
   zkp/                   CircuitCompiler (FlatIR), Binius64 backend, proof
                          serialization
-  ot/ psi/ pir/          Chou-Orlandi + IKNP OT; DH-PSI; single-server BFV PIR
+  ot/ psi/               Chou-Orlandi + IKNP OT; DH-PSI
   ml/                    NetworkSpec/QuantizedNetwork, `baru quantize`
   precompile/            Gadget/Registry/champion dispatch, batched matvec
   db/                    the experiment store (local JSONL and BaruDB backends)
@@ -617,7 +852,6 @@ src/
   demo/                  `baru demo-private-mnist`
   repl.rs                REPL commands + example library
   bin/tcp_party.rs       multi-party node (inproc demo + TCP mode)
-third_party/sealy/       vendored, patched SEAL bindings (see BARU_PATCHES.md)
 ```
 
 ## 13. Known limitations
@@ -633,11 +867,68 @@ third_party/sealy/       vendored, patched SEAL bindings (see BARU_PATCHES.md)
 - **Scheme switching simulates threshold decryption** with a single client key
   (§7.1). The data flow is the right one; a real deployment needs
   distributed-key threshold FHE.
-- **CKKS**: approximate results; the builtins offer `+ − ×` only. Encrypted
-  comparison exists only as a Rust-level polynomial approximation with real error
-  and seconds-per-operation cost.
+- **No approximate-real FHE.** The SEAL CKKS backends were removed on
+  2026-08-03: approximate comparison cost seconds per operation with real error,
+  and they carried 3.4 MB of vendored C++ plus the whole Windows build story. The
+  `ckks-mock` backend that remains is *exact* `f64` and offers `+ − ×` only. The
+  measurement lives in [`docs/experiments.md`](docs/experiments.md) §II.4, and the
+  level arithmetic the flagship comparison needs lives in
+  `fhe::leveled_relu_cost`.
 - **Ring size**: the 128-bit ring wraps on overflow; there is no prime-order
   field.
 - **Single-evaluator model**: all parties evaluate the same expression text.
 - **`nn-forward` activations**: only `relu` and `identity`. Richer
   nonlinearities need a polynomial approximation to stay oblivious.
+
+### Deviations from Scheme
+
+Baru is Scheme-*like*, not a Scheme. The gaps are of three different kinds, and
+the distinction matters because only the first is a matter of effort:
+
+**Simply not implemented yet** (ordinary interpreter work):
+`values`/`call-with-values`, `delay`/`force`, `call/cc`, hygienic macros
+(`define-syntax`/`syntax-rules`), string and char procedures beyond equality, and
+the numeric tower (only `i64` and Q16.16 exist).
+
+Errors *are* now catchable via `guard` (§3): the evaluator, the Scheme
+procedures, the MPC/FHE/ZKP builtins and the vector builtins all raise. The 17
+remaining panics are the `MAX_FRAMES` budget, one evaluator invariant, six
+unreachable type invariants and the test harness. The exact list is in §3.
+
+Also: `define` binds in the *current* environment rather than being hoisted like
+Scheme's internal `define` (which behaves as `letrec*` at the head of a body), so
+mutual recursion between two internal `define`s needs `letrec`.
+
+**Representational differences** that would need a refactor:
+
+- **`let` is sequential** (Scheme's `let*`); see §3. `let*` is provided but
+  redundant.
+- **No improper pairs.** A list is `List(Vec<Types>)`, not cons cells, so
+  `(cons 1 2)` is an error rather than a dotted pair, and `set-car!` has nothing
+  to mutate.
+- **`quote` yields an AST wrapper, not data.** `'sym` evaluates to a quoted
+  *expression*, and `(car '(a b))` fails, because quoted forms are inputs to
+  `eval` / `zkp-compile` rather than list-and-symbol data. Scheme's code-is-data
+  property is therefore absent.
+- **`and` / `or` are two-argument and bitwise**, not variadic and
+  short-circuiting: `(and 6 3)` is `2`. Short-circuiting on a *secret* condition
+  would leak, so this is not purely an oversight.
+- **Take-everything lambdas are written `(lambda (. args) …)`**, not Scheme's
+  `(lambda args …)`. A bare identifier in that position already means one
+  required parameter here, and changing it would silently alter existing
+  programs.
+
+**In conflict with the cryptography**, and so unlikely ever to close:
+
+- **Secret-dependent recursion is not expressible obliviously.** A loop whose
+  trip count depends on a secret cannot reveal the condition (a leak) and cannot
+  evaluate both branches (it diverges). Any oblivious language must bound loops
+  publicly. The same argument applies to `call/cc` under a secret, which makes
+  the *round count* data-dependent.
+- **The circuit backends are static by construction.** `zkp::circuit_compiler`
+  resolves lists at compile time and unrolls recursion, terminating via static
+  `if` resolution; a circuit has no runtime control flow at all. Runtime-shaped
+  data and dynamic dispatch are unrepresentable there, not merely unimplemented.
+
+A fuller treatment, including why the public/secret split is the natural stopping
+point, is in [`docs/survey.md`](docs/survey.md) §3.

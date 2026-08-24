@@ -291,15 +291,20 @@ fn diff_tfhe_subset() {
 }
 
 // ---------------------------------------------------------------------------
-// CKKS real-arithmetic pipeline: compile_fhe in new_real mode, evaluate with
-// RealFheBackend.  The mock twin is exact f64; SEAL is approximate, so the
-// comparison is tolerance-based.  Corpus values stay exactly representable
-// in Q16.16 so the plain interpreter's truncating fixed multiply introduces
-// no rounding of its own.
+// Real-arithmetic pipeline: compile_fhe in new_real mode, evaluated with a
+// RealFheBackend. Corpus values stay exactly representable in Q16.16 so the
+// plain interpreter's truncating fixed multiply introduces no rounding of its
+// own, which makes the comparison exact rather than tolerance-based.
+//
+// This used to run twice — once against the exact f64 backend and once against
+// SEAL CKKS, where the tolerance covered approximation noise. The SEAL half went
+// with the CKKS backend on 2026-08-03; what remains is the check that the
+// real-arithmetic *circuit path* agrees with the interpreter, which is the part
+// that has no other coverage.
 // ---------------------------------------------------------------------------
 
 use baru::fhe::circuit_emitter::evaluate_fhe_real;
-use baru::fhe::{CkksBackend, MockCkksBackend, RealFheBackend};
+use baru::fhe::{MockCkksBackend, RealFheBackend};
 
 fn compile_real_with_encrypted_x(expr_src: &str) -> FheCircuit {
     let expr = parse(expr_src).expect("parse");
@@ -365,36 +370,6 @@ fn diff_ckks_mock() {
 
 #[test]
 #[ignore]
-fn diff_ckks_seal() {
-    // Fresh SEAL keygen + evaluation keys; approximate arithmetic, so the
-    // tolerance covers CKKS encoding noise (~2^-40 relative per op).
-    let (ck, sk) = CkksBackend::new().keygen();
-    let be = CkksBackend::with_server_keys(&sk);
-    let mut ran = 0;
-    for (expr, xs) in ckks_corpus() {
-        let circuit = compile_real_with_encrypted_x(expr);
-        for x in xs {
-            let plain = eval_plain_real(expr, x);
-            let mut enc = HashMap::new();
-            enc.insert("x".to_string(), be.encrypt(&ck, x as f64));
-            let ct = evaluate_fhe_real(&circuit, &HashMap::new(), &enc, &be);
-            let got = be.decrypt(&ck, &ct);
-            assert!(
-                (got - plain).abs() <= 1e-4,
-                "SEAL CKKS divergence for `{}` at x={}: plain={} ckks={}",
-                expr,
-                x,
-                plain,
-                got
-            );
-            ran += 1;
-        }
-    }
-    assert!(ran > 0);
-}
-
-#[test]
-#[ignore]
 fn diff_ckks_rejects_comparisons() {
     // Comparisons/mux cannot exist on approximate ciphertexts; the real-mode
     // emitter must fail loudly rather than compute nonsense.
@@ -416,28 +391,4 @@ fn diff_ckks_rejects_fixed_to_int() {
     let expr = parse("(fixed->int (* x 1.5))").expect("parse");
     let mut cc = CircuitCompiler::new_real();
     assert!(cc.compile_fhe(&expr).is_err());
-}
-
-#[test]
-#[ignore]
-fn diff_ckks_batched_dot() {
-    // The batched SIMD path used by the MNIST demo: one ciphertext holds the
-    // whole vector; dot_plain sums via rotations.
-    let be = CkksBackend::new();
-    let (ck, sk) = be.keygen();
-    let eval_be = CkksBackend::with_server_keys(&sk);
-
-    let xs: Vec<f64> = (0..784).map(|i| (i % 256) as f64 / 255.0).collect();
-    let ws: Vec<f64> = (0..784).map(|i| ((i as f64) * 0.37).sin()).collect();
-    let expected: f64 = xs.iter().zip(&ws).map(|(a, b)| a * b).sum();
-
-    let ct = be.encrypt_vec(&ck, &xs);
-    let dot = eval_be.dot_plain(&ct, &ws);
-    let got = eval_be.decrypt(&ck, &dot);
-    assert!(
-        (got - expected).abs() < 1e-4,
-        "batched dot: expected {} got {}",
-        expected,
-        got
-    );
 }

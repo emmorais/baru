@@ -82,6 +82,107 @@ impl ConvShape {
     }
 }
 
+/// Largest number of input channels that fits one ciphertext at ring dimension
+/// `n`, for this shape's spatial geometry. Zero when even a single channel
+/// cannot fit.
+///
+/// `required_degree` grows as `2·in_c·hw`, so a wide layer overruns `n` long
+/// before its data does: 16 channels at 13×13 needs degree 5266 against
+/// `n = 4096`, and the largest group that fits is **12** — which is exactly the
+/// channel count the CNN's first convolution has been capped at.
+pub fn max_group_channels(shape: ConvShape, n: usize) -> usize {
+    (1..=shape.in_c)
+        .rev()
+        .find(|&g| ConvShape { in_c: g, ..shape }.required_degree() < n)
+        .unwrap_or(0)
+}
+
+/// Split a convolution's input channels into equal groups that each fit one
+/// ciphertext. Returns `(group_size, n_groups)`.
+///
+/// # Why this is sound, and free
+///
+/// Convolution is **linear in the input channels**: `conv(x, k)` is the sum over
+/// channel groups of `conv(x_g, k_g)`. So a layer too wide for one ciphertext
+/// becomes `n_groups` independent ciphertext multiplications whose results are
+/// **added** — and homomorphic addition is free, needing no evaluation key and
+/// consuming no depth. That is what keeps the no-evaluation-keys property that
+/// SIMD/rotation-based packing would forfeit.
+///
+/// # Why the groups must be equal, with the last zero-padded
+///
+/// [`ConvShape::output_position`] is `(in_c − 1)·hw + …`, so **where the answer
+/// lands depends on the group's channel count.** A final short group would write
+/// its outputs to different coefficients and the sum would be silent nonsense.
+/// Padding it to the full group size with zero channels costs nothing (the
+/// coefficients are already zero) and keeps every group's geometry identical.
+pub fn channel_groups(shape: ConvShape, n: usize) -> Result<(usize, usize), String> {
+    let g = max_group_channels(shape, n);
+    if g == 0 {
+        return Err(format!(
+            "conv packing: a single channel of {}×{} with a {}×{} kernel needs degree {} \
+             against ring dimension {n}; channel splitting cannot help — the ring must grow",
+            shape.h,
+            shape.w,
+            shape.kh,
+            shape.kw,
+            ConvShape { in_c: 1, ..shape }.required_degree(),
+        ));
+    }
+    Ok((g, shape.in_c.div_ceil(g)))
+}
+
+/// The per-group shape: `group_size` channels with the same spatial geometry.
+pub fn group_shape(shape: ConvShape, group_size: usize) -> ConvShape {
+    ConvShape {
+        in_c: group_size,
+        ..shape
+    }
+}
+
+/// Pack channel group `gi` of the input, zero-padded to `group_size` channels.
+pub fn pack_input_group(
+    img: &[i64],
+    shape: ConvShape,
+    gi: usize,
+    group_size: usize,
+    n: usize,
+    t_mask: u64,
+) -> Vec<u64> {
+    assert_eq!(img.len(), shape.input_len(), "input length mismatch");
+    let hw = shape.h * shape.w;
+    let mut chunk = vec![0i64; group_size * hw];
+    for c in 0..group_size {
+        let src = gi * group_size + c;
+        if src < shape.in_c {
+            chunk[c * hw..(c + 1) * hw].copy_from_slice(&img[src * hw..(src + 1) * hw]);
+        }
+    }
+    pack_input(&chunk, group_shape(shape, group_size), n, t_mask)
+}
+
+/// Pack channel group `gi` of one output channel's kernel, zero-padded to
+/// `group_size` channels.
+pub fn pack_kernel_group(
+    kernel: &[i64],
+    shape: ConvShape,
+    gi: usize,
+    group_size: usize,
+    n: usize,
+    t_mask: u64,
+) -> Vec<u64> {
+    let per = shape.kh * shape.kw;
+    assert_eq!(kernel.len(), shape.in_c * per, "kernel length mismatch");
+    let mut chunk = vec![0i64; group_size * per];
+    for c in 0..group_size {
+        let src = gi * group_size + c;
+        if src < shape.in_c {
+            chunk[c * per..(c + 1) * per].copy_from_slice(&kernel[src * per..(src + 1) * per]);
+        }
+    }
+    pack_kernel(&chunk, group_shape(shape, group_size), n, t_mask)
+}
+
 /// Pack the input tensor (`[in_c][h][w]`, row-major) into message
 /// coefficients mod `t`.
 pub fn pack_input(img: &[i64], shape: ConvShape, n: usize, t_mask: u64) -> Vec<u64> {
@@ -164,6 +265,137 @@ mod tests {
             .collect()
     }
 
+    /// Plain negacyclic product of two packed polynomials, as the layout tests use.
+    fn negacyclic(x: &[u64], k: &[u64], n: usize) -> Vec<i128> {
+        let mut prod = vec![0i128; n];
+        for (i, &xi) in x.iter().enumerate() {
+            if xi == 0 {
+                continue;
+            }
+            for (j, &kj) in k.iter().enumerate() {
+                if kj == 0 {
+                    continue;
+                }
+                let p = (xi as i64 as i128) * (kj as i64 as i128);
+                let idx = i + j;
+                if idx < n {
+                    prod[idx] += p
+                } else {
+                    prod[idx - n] -= p
+                }
+            }
+        }
+        prod
+    }
+
+    /// **A layer too wide for one ciphertext, split across channel groups and
+    /// summed.** This is the packing limit that actually binds: `required_degree`
+    /// grows as `2·in_c·hw`, so 16 channels at 13×13 needs degree 5266 against
+    /// `n = 4096` — which is why the CNN's first convolution has been capped at 12.
+    ///
+    /// Splitting works because convolution is linear in the input channels, and the
+    /// per-group results are combined by **addition**, which is free homomorphically.
+    /// The subtle part is that groups must be equal-sized with the last zero-padded:
+    /// `output_position` depends on `in_c`, so a short final group would write its
+    /// answers to different coefficients and the sum would be quietly wrong. This
+    /// checks the sum against the unsplit plaintext convolution, which catches that.
+    #[test]
+    fn channel_splitting_reproduces_a_convolution_too_wide_to_pack() {
+        for (shape, n, want_groups) in [
+            // The real case: 16 channels at 13×13 does not fit n = 4096.
+            (
+                ConvShape {
+                    in_c: 16,
+                    h: 13,
+                    w: 13,
+                    kh: 3,
+                    kw: 3,
+                },
+                4096,
+                2,
+            ),
+            // Deliberately uneven: group size 3 over 7 channels, so the third
+            // group carries one real channel and two zero-padded ones.
+            (
+                ConvShape {
+                    in_c: 7,
+                    h: 6,
+                    w: 6,
+                    kh: 3,
+                    kw: 3,
+                },
+                256,
+                3,
+            ),
+            // Already fits: must come out as a single group and change nothing.
+            (
+                ConvShape {
+                    in_c: 3,
+                    h: 5,
+                    w: 5,
+                    kh: 2,
+                    kw: 2,
+                },
+                512,
+                1,
+            ),
+        ] {
+            let (gs, ng) = channel_groups(shape, n).expect("must split");
+            assert_eq!(ng, want_groups, "group count for {shape:?} at n={n}");
+            assert!(
+                group_shape(shape, gs).required_degree() < n,
+                "each group must fit: {shape:?} group {gs} at n={n}"
+            );
+
+            let img = pseudo(shape.input_len(), 1);
+            let kernel = pseudo(shape.in_c * shape.kh * shape.kw, 2);
+            let t_mask = u64::MAX;
+
+            // Sum the groups, as the homomorphic path would with ciphertext adds.
+            let mut acc = vec![0i128; n];
+            for gi in 0..ng {
+                let x = pack_input_group(&img, shape, gi, gs, n, t_mask);
+                let k = pack_kernel_group(&kernel, shape, gi, gs, n, t_mask);
+                for (a, p) in acc.iter_mut().zip(negacyclic(&x, &k, n)) {
+                    *a += p;
+                }
+            }
+
+            // Read out at the *group* geometry, and compare against the unsplit
+            // convolution over all `in_c` channels.
+            let gshape = group_shape(shape, gs);
+            let want = conv2d_ref(&img, &kernel, shape);
+            for oy in 0..shape.out_h() {
+                for ox in 0..shape.out_w() {
+                    assert_eq!(
+                        acc[gshape.output_position(oy, ox)],
+                        want[oy * shape.out_w() + ox] as i128,
+                        "{shape:?} at n={n}, group size {gs}, position ({oy},{ox})"
+                    );
+                }
+            }
+        }
+    }
+
+    /// When a *single* channel will not fit, splitting cannot help and the error
+    /// says so rather than returning an unusable group size.
+    #[test]
+    fn channel_splitting_refuses_when_one_channel_already_overruns_the_ring() {
+        let shape = ConvShape {
+            in_c: 4,
+            h: 64,
+            w: 64,
+            kh: 3,
+            kw: 3,
+        };
+        let err = channel_groups(shape, 4096).expect_err("must refuse");
+        assert!(
+            err.contains("the ring must grow"),
+            "error should name the real remedy, got: {err}"
+        );
+        assert_eq!(max_group_channels(shape, 4096), 0);
+    }
+
     /// Pure index-math check: the packed product's read-out coefficients
     /// equal the convolution, computed here with a plain integer negacyclic
     /// product (no encryption involved).
@@ -191,6 +423,28 @@ mod tests {
                 w: 5,
                 kh: 2,
                 kw: 2,
+            },
+            // 5×5, which is LeNet's kernel and was untested until 2026-08-04: every
+            // shape above has `kh ≤ 3`, so the row-wrap argument (contamination would
+            // need `ox ≤ −1`) had only ever been exercised with a one- or two-column
+            // overhang. LeNet's first layer is this shape at `h = w = 28`.
+            ConvShape {
+                in_c: 1,
+                h: 12,
+                w: 12,
+                kh: 5,
+                kw: 5,
+            },
+            // 5×5 with several input channels, where the channel-offset argument
+            // (`c + (C−1−c′) = C−1` iff `c = c′`) and the wider overhang interact.
+            // Sized to the n = 512 ring above: `in_c: 3, h: 10, w: 11` needs degree 596
+            // and asserts, which is the packing bound doing its job rather than a bug.
+            ConvShape {
+                in_c: 2,
+                h: 8,
+                w: 8,
+                kh: 5,
+                kw: 4,
             },
         ] {
             let img = pseudo(shape.input_len(), 1);
@@ -260,6 +514,66 @@ mod tests {
             for ox in 0..shape.out_w() {
                 let got = s.to_signed(out[shape.output_position(oy, ox)]);
                 assert_eq!(got, want[oy * shape.out_w() + ox], "at ({oy},{ox})");
+            }
+        }
+    }
+
+    /// **Channel splitting under real encryption**, at a ring too small for the
+    /// layer: 4 channels of 5×5 needs degree 249 against `n = 64`, so it splits.
+    ///
+    /// The point being checked is not the index arithmetic — the plaintext test above
+    /// covers that — but that the per-group results combine with **ciphertext
+    /// addition** and decrypt to the unsplit convolution. That is what makes this a
+    /// route to wider layers rather than a re-derivation: adds need no evaluation key
+    /// and consume no depth, so the layer still costs `n_groups` multiplications and
+    /// **zero** bootstraps.
+    #[test]
+    fn channel_splitting_stays_exact_under_encryption() {
+        let s = Bfv::new(BfvParams::TEST_SMALL); // n = 64
+        let n = s.params.n;
+        let t_mask = s.params.t() - 1;
+        let shape = ConvShape {
+            in_c: 4,
+            h: 5,
+            w: 5,
+            kh: 3,
+            kw: 3,
+        };
+        assert!(
+            shape.required_degree() >= n,
+            "this test is pointless unless the layer genuinely does not fit: \
+             degree {} against n={n}",
+            shape.required_degree()
+        );
+        let (gs, ng) = channel_groups(shape, n).expect("must split");
+        assert!(ng > 1, "expected a real split, got {ng} group(s)");
+
+        let img = pseudo(shape.input_len(), 3);
+        let kernel = pseudo(shape.in_c * shape.kh * shape.kw, 4);
+        let (ck, pk) = s.keygen();
+
+        // One multiplication per group, then free ciphertext additions.
+        let mut acc: Option<_> = None;
+        for gi in 0..ng {
+            let cx = s.encrypt_poly(&pk, &pack_input_group(&img, shape, gi, gs, n, t_mask));
+            let ckt = s.encrypt_poly(&pk, &pack_kernel_group(&kernel, shape, gi, gs, n, t_mask));
+            let prod = s.mul(&cx, &ckt);
+            acc = Some(match acc {
+                None => prod,
+                Some(a) => s.add(&a, &prod),
+            });
+        }
+        let out = s.decrypt_poly(&ck, &acc.expect("at least one group"));
+
+        let gshape = group_shape(shape, gs);
+        let want = conv2d_ref(&img, &kernel, shape);
+        for oy in 0..shape.out_h() {
+            for ox in 0..shape.out_w() {
+                assert_eq!(
+                    s.to_signed(out[gshape.output_position(oy, ox)]),
+                    want[oy * shape.out_w() + ox],
+                    "split conv at ({oy},{ox}) with {ng} groups of {gs}"
+                );
             }
         }
     }

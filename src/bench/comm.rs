@@ -46,6 +46,17 @@ pub struct CommStats {
     /// Of `bytes`, those carried by `MpcMsg::GcFromGarbler` — garbled tables
     /// and labels, already `Vec<u8>` and so compact.
     pub gc_bytes: u64,
+    /// Of `bytes`, those sent by `broadcast` rather than `send`, counted the same
+    /// way (once per recipient).
+    ///
+    /// Broken out because the counting layer and the *simulated pipe* disagree
+    /// about what a broadcast costs, and this says how much that disagreement is
+    /// worth. `CountingTransport::broadcast` charges `len × fanout`, which is
+    /// right for point-to-point links: a party's uplink really does carry one
+    /// copy per peer. `LatencyTransport::broadcast` calls `deliver_at(len)`
+    /// **once**, so the delay it simulates is short by the fanout. Whether that
+    /// matters is a question about this fraction, not about the two definitions.
+    pub broadcast_bytes: u64,
 }
 
 impl std::ops::Add for CommStats {
@@ -58,6 +69,7 @@ impl std::ops::Add for CommStats {
             bytes: self.bytes + o.bytes,
             ring_bytes: self.ring_bytes + o.ring_bytes,
             gc_bytes: self.gc_bytes + o.gc_bytes,
+            broadcast_bytes: self.broadcast_bytes + o.broadcast_bytes,
         }
     }
 }
@@ -69,6 +81,7 @@ impl CommStats {
             bytes: self.bytes.saturating_sub(other.bytes),
             ring_bytes: self.ring_bytes.saturating_sub(other.ring_bytes),
             gc_bytes: self.gc_bytes.saturating_sub(other.gc_bytes),
+            broadcast_bytes: self.broadcast_bytes.saturating_sub(other.broadcast_bytes),
         }
     }
 }
@@ -118,6 +131,7 @@ pub struct CountingTransport<T: Transport> {
     bytes: Arc<AtomicU64>,
     ring_bytes: Arc<AtomicU64>,
     gc_bytes: Arc<AtomicU64>,
+    broadcast_bytes: Arc<AtomicU64>,
 }
 
 impl<T: Transport> CountingTransport<T> {
@@ -129,6 +143,7 @@ impl<T: Transport> CountingTransport<T> {
             ring_bytes: Arc::new(AtomicU64::new(0)),
             gc_bytes: Arc::new(AtomicU64::new(0)),
             bytes: Arc::new(AtomicU64::new(0)),
+            broadcast_bytes: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -139,6 +154,7 @@ impl<T: Transport> CountingTransport<T> {
             bytes: self.bytes.load(Ordering::Relaxed),
             ring_bytes: self.ring_bytes.load(Ordering::Relaxed),
             gc_bytes: self.gc_bytes.load(Ordering::Relaxed),
+            broadcast_bytes: self.broadcast_bytes.load(Ordering::Relaxed),
         }
     }
 
@@ -172,6 +188,7 @@ impl<T: Transport> CountingTransport<T> {
             bytes: self.bytes.clone(),
             ring_bytes: self.ring_bytes.clone(),
             gc_bytes: self.gc_bytes.clone(),
+            broadcast_bytes: self.broadcast_bytes.clone(),
         }
     }
 }
@@ -184,6 +201,7 @@ pub struct CommHandle {
     bytes: Arc<AtomicU64>,
     ring_bytes: Arc<AtomicU64>,
     gc_bytes: Arc<AtomicU64>,
+    broadcast_bytes: Arc<AtomicU64>,
 }
 
 impl CommHandle {
@@ -193,6 +211,7 @@ impl CommHandle {
             bytes: self.bytes.load(Ordering::Relaxed),
             ring_bytes: self.ring_bytes.load(Ordering::Relaxed),
             gc_bytes: self.gc_bytes.load(Ordering::Relaxed),
+            broadcast_bytes: self.broadcast_bytes.load(Ordering::Relaxed),
         }
     }
 }
@@ -213,6 +232,8 @@ impl<T: Transport> Transport for CountingTransport<T> {
         let fanout = self.nparties.saturating_sub(1) as u64;
         self.messages.fetch_add(fanout, Ordering::Relaxed);
         self.bytes
+            .fetch_add(msg.len() as u64 * fanout, Ordering::Relaxed);
+        self.broadcast_bytes
             .fetch_add(msg.len() as u64 * fanout, Ordering::Relaxed);
         self.classify(&msg, fanout);
         self.inner.broadcast(msg);
@@ -282,6 +303,24 @@ pub struct LatencyTransport<T: Transport + 'static> {
     /// byte-heavy MPC linear phase from a compact one — were undercharged
     /// by a factor of the message count.)
     last_departure: Mutex<std::time::Instant>,
+    /// Recipients a `broadcast` reaches, so the pipe charges it the way the
+    /// counters do.
+    ///
+    /// Over point-to-point links a broadcast is not one transmission: the
+    /// sender's uplink carries one copy per peer, and
+    /// [`CountingTransport::broadcast`] has always billed `len × fanout` for
+    /// exactly that reason. This pipe used to call `deliver_at(len)` once, so the
+    /// two layers disagreed about what a broadcast costs and the simulated delay
+    /// was short by this factor.
+    ///
+    /// Measured before changing it, because the size of a discrepancy is a
+    /// question about the traffic rather than about the definitions:
+    /// **0% of the bytes** in every route of `bench-compiled-nn` are broadcast,
+    /// and the worst case anywhere was one party at 4%. ABY3's traffic is
+    /// point-to-point `send`. So this correction is worth nothing measurable
+    /// today and is made now precisely for that reason --- it cannot be made
+    /// later without the change being confounded with whatever else moved.
+    fanout: u64,
 }
 
 enum Delayed {
@@ -290,7 +329,10 @@ enum Delayed {
 }
 
 impl<T: Transport + 'static> LatencyTransport<T> {
-    pub fn new(inner: T, profile: NetworkProfile) -> Self {
+    /// `nparties` is the size of the computation, not the peer count; the
+    /// broadcast fanout is `nparties - 1`, matching
+    /// [`CountingTransport::broadcast`].
+    pub fn new(inner: T, profile: NetworkProfile, nparties: usize) -> Self {
         let inner = Arc::new(inner);
         let queue =
             if profile.one_way_latency.is_zero() && profile.bandwidth_bytes_per_sec.is_none() {
@@ -326,6 +368,7 @@ impl<T: Transport + 'static> LatencyTransport<T> {
             profile,
             queue,
             last_departure: Mutex::new(std::time::Instant::now()),
+            fanout: nparties.saturating_sub(1) as u64,
         }
     }
 
@@ -371,7 +414,10 @@ impl<T: Transport + 'static> Transport for LatencyTransport<T> {
         match &self.queue {
             None => self.inner.broadcast(msg),
             Some(q) => {
-                let at = self.deliver_at(msg.len());
+                // `len * fanout`: one copy per peer leaves this party's link. See
+                // the `fanout` field for why this was wrong and why fixing it
+                // changes nothing measurable on today's traffic.
+                let at = self.deliver_at(msg.len() * self.fanout as usize);
                 q.lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .send(Delayed::Broadcast(at, msg))
@@ -410,15 +456,76 @@ mod tests {
         );
 
         counted.broadcast(vec![0u8; 5]);
-        // broadcast to 2 other parties -> 2 messages, 10 bytes, on top of the unicast.
+        // broadcast to 2 other parties -> 2 messages, 10 bytes, on top of the unicast,
+        // and all 10 of those attributed to broadcast so the pipe can charge the same.
         assert_eq!(
             counted.stats(),
             CommStats {
                 messages: 3,
                 bytes: 20,
+                broadcast_bytes: 10,
                 ..Default::default()
             }
         );
+    }
+
+    /// **The counting layer and the simulated pipe must agree on what a broadcast costs.**
+    ///
+    /// They did not. `CountingTransport::broadcast` bills `len × fanout`, which is right for
+    /// point-to-point links — a party's uplink carries one copy per peer — while
+    /// `LatencyTransport::broadcast` charged `deliver_at(len)` once, so the delay it simulated
+    /// was short by the fanout. The measured cost of the disagreement was nil (0% of the bytes in
+    /// every `bench-compiled-nn` route are broadcast; ABY3 sends point-to-point), which is why it
+    /// went unnoticed and why it was safe to correct.
+    ///
+    /// This pins the agreement directly: a broadcast of `n` bytes to `f` peers must take as long
+    /// as `f` unicasts of `n` bytes, because that is the same traffic on the same link.
+    #[test]
+    fn a_broadcast_costs_the_pipe_what_it_costs_the_counters() {
+        let handles = InprocHandle::create(3);
+        // A slow link so the serialization term dominates timing noise: 10 kB at
+        // 100 kB/s is 100 ms per copy.
+        let profile = NetworkProfile::fixed_latency(Duration::ZERO).with_bandwidth(100_000.0);
+        let payload = vec![0u8; 10_000];
+
+        // Compare the *scheduled departure* the pipe computes, not wall clock: sends are
+        // non-blocking, so timing the call measures queue insertion and would pass whatever
+        // the pipe charged. `deliver_at` is the quantity under test.
+        let bcast = LatencyTransport::new(handles[0].clone(), profile, 3);
+        let base = std::time::Instant::now();
+        let bcast_at = bcast.deliver_at(payload.len() * bcast.fanout as usize);
+        let bcast_delay = bcast_at.duration_since(base);
+
+        let uni = LatencyTransport::new(handles[1].clone(), profile, 3);
+        let base2 = std::time::Instant::now();
+        uni.deliver_at(payload.len());
+        let uni_at = uni.deliver_at(payload.len());
+        let uni_delay = uni_at.duration_since(base2);
+
+        println!(
+            "  broadcast to 2 peers is scheduled at {:?}; two unicasts of the same payload at {:?}",
+            bcast_delay, uni_delay
+        );
+        let ratio = bcast_delay.as_secs_f64() / uni_delay.as_secs_f64();
+        assert!(
+            (0.95..=1.05).contains(&ratio),
+            "a broadcast to {} peers must cost the pipe what {} unicasts cost it, got {ratio:.3}x \
+             ({bcast_delay:?} vs {uni_delay:?})",
+            bcast.fanout,
+            bcast.fanout
+        );
+
+        // And the counters' side of the same fact: fanout is applied, so a broadcast is not
+        // billed as one transmission.
+        let counted = CountingTransport::new(handles[2].clone(), 3);
+        counted.broadcast(payload.clone());
+        let s = counted.stats();
+        assert_eq!(
+            s.bytes, 20_000,
+            "a broadcast to 2 peers puts 2 copies on the link"
+        );
+        assert_eq!(s.broadcast_bytes, s.bytes, "all of it is broadcast traffic");
+        assert_eq!(s.messages, 2, "one message per recipient");
     }
 
     #[test]
@@ -436,7 +543,7 @@ mod tests {
         // the ≈ 10 ms a per-message (non-cumulative) model would charge.
         let handles = InprocHandle::create(2);
         let profile = NetworkProfile::fixed_latency(Duration::ZERO).with_bandwidth(1_000_000.0);
-        let a = LatencyTransport::new(handles[0].clone(), profile);
+        let a = LatencyTransport::new(handles[0].clone(), profile, 2);
         let b = handles[1].clone();
         let t0 = std::time::Instant::now();
         for _ in 0..20 {
@@ -465,7 +572,7 @@ mod tests {
         // in-order delivery (share_input's paired InputShare messages).
         let handles = InprocHandle::create(2);
         let profile = NetworkProfile::fixed_latency(Duration::from_millis(1));
-        let a = LatencyTransport::new(handles[0].clone(), profile);
+        let a = LatencyTransport::new(handles[0].clone(), profile, 2);
         let b = handles[1].clone();
         for i in 0..50u8 {
             a.send(1, vec![i]);
@@ -480,7 +587,7 @@ mod tests {
     fn latency_delays_arrival_without_blocking_sender() {
         let handles = InprocHandle::create(2);
         let profile = NetworkProfile::fixed_latency(Duration::from_millis(50));
-        let a = LatencyTransport::new(handles[0].clone(), profile);
+        let a = LatencyTransport::new(handles[0].clone(), profile, 2);
         let b = handles[1].clone();
 
         let t0 = std::time::Instant::now();
@@ -515,7 +622,7 @@ mod tests {
     #[test]
     fn zero_latency_profile_delivers_synchronously() {
         let handles = InprocHandle::create(2);
-        let a = LatencyTransport::new(handles[0].clone(), NetworkProfile::INSTANT);
+        let a = LatencyTransport::new(handles[0].clone(), NetworkProfile::INSTANT, 2);
         let b = handles[1].clone();
         a.send(1, b"sync".to_vec());
         // No injected delay -> delivered before send() even returns.

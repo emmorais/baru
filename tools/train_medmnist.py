@@ -70,12 +70,18 @@ Get the data:
                 "https://ossci-datasets.s3.amazonaws.com/mnist/$f.gz"; done
 
 RGB datasets.  Four of the twelve MedMNIST v2 2D sets ship (N,28,28,3):
-Path, Derma, Blood, Retina.  The FHE conv packing assumes a single input
-channel, so those are folded to luminance (ITU-R BT.601: 0.299R+0.587G+
-0.114B, rounded to uint8) before anything else happens.  That is a real
-change to the task -- colour carries diagnostic signal in dermatoscopy and
-histology -- so the generated file records it and the accuracy must be read
-against a grayscale baseline, never against the published RGB ResNet-18.
+Path, Derma, Blood, Retina.  `--rgb` keeps the three channels; the default folds
+them to luminance (ITU-R BT.601: 0.299R+0.587G+0.114B, rounded to uint8).
+
+The packing does NOT require the fold -- see `fold_channels` for the claim that
+was wrong here for a long time.  An RGB 28x28 convolution fits one ciphertext at
+one multiplication per output channel.  The fold stays the default only because
+every other weight file in the repo was measured with it.
+
+Folding is a real change to the task -- colour carries diagnostic signal in
+dermatoscopy and histology, measured at AUC 0.8519 against 0.7667 on DermaMNIST
+-- so the generated file records which was used, and a folded accuracy must be
+read against a grayscale baseline rather than the published RGB ResNet-18.
 
 Usage: python3 tools/train_medmnist.py <npz|mnist-dir> <rust-out>
          [--epochs N] [--n-test N] [--test-order first|random] [--linear]
@@ -99,6 +105,10 @@ K, POOL, SHIFT = 3, 2, 8
 DEFAULT_CONV, DEFAULT_FC = [8, 16], [128]
 # The gain ladder swept on validation; `None` is "no rescale at all".
 DEFAULT_GAINS = (None, 64.0, 128.0, 256.0, 512.0)
+# Bits a candidate gain must leave spare below the 2^30 plaintext modulus, measured
+# on validation. See `pick_gain` for the DermaMNIST run that calibrated it: the
+# validation maximum underestimated the test maximum by three bits.
+HEADROOM_BITS = 4
 # BT.601 luminance, the fold applied to the four RGB MedMNIST sets.
 LUMA = np.array([0.299, 0.587, 0.114])
 # The BFV ring dimension the hybrid pipeline runs at (n=4096, q=2^100).
@@ -119,37 +129,53 @@ def packing_degree(in_c, h, w):
 
 
 def check_packing(shapes):
-    """Refuse a conv stack the *encrypted* pipeline could not run.
+    """Report how each conv will be packed, and refuse only the impossible.
 
-    A third limit, independent of the other two: it binds on input channels
-    times spatial extent, so it bites hardest at the second conv, where the
-    channel count has grown but the image has only been pooled once.  Checked
-    up front rather than after training, because otherwise the refusal arrives
-    twenty minutes late and from the middle of the FHE code."""
+    A third limit, independent of the other two: it binds on input channels times
+    spatial extent, so it bites hardest at the second conv, where the channel count
+    has grown but the image has only been pooled once.  Checked up front rather than
+    after training, because otherwise the refusal arrives twenty minutes late and
+    from the middle of the FHE code.
+
+    Since 2026-08-04 the Rust side can **split channel groups** (`conv_pack::
+    channel_groups`): convolution is linear in the input channels, so a layer too
+    wide for one ciphertext is evaluated as equal groups whose products are added,
+    which is free homomorphically.  So a wide layer is no longer refused -- it costs
+    one ciphertext multiplication per group per output channel, and this prints that
+    cost so the choice is informed.  Only a layer whose *single* channel overruns the
+    ring is still impossible, and there the remedy is a bigger ring, not splitting.
+    """
+    plan = []
     for i, (in_c, h, w) in enumerate(shapes):
         deg = packing_degree(in_c, h, w)
-        if deg < RING_N:
-            continue
-        room = max((c for c in range(1, in_c) if packing_degree(c, h, w) < RING_N),
-                   default=0)
-        where = ("its input is a single channel, so the spatial extent alone is "
-                 "too large") if room == 0 else (
-                     f"at {h}x{w} the packing admits at most {room} input "
-                     f"channels, so conv {i - 1} must output at most {room}")
-        sys.exit(
-            f"conv {i} cannot be run under FHE: a {in_c}x{h}x{w} input packs to "
-            f"degree {deg}, and the BFV ring dimension is {RING_N}. {where}. "
-            f"(This is the packing limit, not the noise budget -- the model "
-            f"would train and score fine in plaintext.)"
-        )
+        group = max((c for c in range(1, in_c + 1)
+                     if packing_degree(c, h, w) < RING_N), default=0)
+        if group == 0:
+            sys.exit(
+                f"conv {i} cannot be run under FHE at any grouping: a single "
+                f"{h}x{w} channel packs to degree {packing_degree(1, h, w)} against "
+                f"ring dimension {RING_N}. Channel splitting cannot help -- only a "
+                f"larger ring can. (This is the packing limit, not the noise budget "
+                f"-- the model would train and score fine in plaintext.)"
+            )
+        groups = -(-in_c // group)
+        plan.append((i, in_c, h, w, deg, group, groups))
+
+    if any(g > 1 for *_, g in plan):
+        print("  conv packing plan (channel splitting is free: homomorphic adds)")
+        for i, in_c, h, w, deg, group, groups in plan:
+            note = "one ciphertext" if groups == 1 else (
+                f"{groups} groups of {group} -> {groups}x the multiplications")
+            print(f"    conv {i}: {in_c}x{h}x{w}, degree {deg} vs n={RING_N} -- {note}")
 
 
-def conv_shapes(d, convs):
+def conv_shapes(d, convs, in_c=1):
     """Spatial shape entering each conv, and the flattened feature width.
 
     Returns `([(in_c, in_h, in_w), ...], flat)`.  Mirrors `CnnModel::forward`
-    exactly: 3x3 valid convolution then floor max-pool by 2, per layer."""
-    shapes, c, h, w = [], 1, d, d
+    exactly: 3x3 valid convolution then floor max-pool by 2, per layer.
+    `in_c` is 3 for an `--rgb` run and 1 otherwise."""
+    shapes, c, h, w = [], in_c, d, d
     for oc in convs:
         if h < K or w < K:
             sys.exit(
@@ -209,25 +235,39 @@ def load_dataset(path, val_frac=1 / 12):
     }
 
 
-def to_grayscale(d):
-    """Fold any (N,h,w,3) split to (N,h,w) luminance.  Returns `(d, folded)`.
+def fold_channels(d, keep_rgb):
+    """Normalise every split to `(N,h,w)` or, with `keep_rgb`, `(N,h,w,3)`.
 
-    Four of the twelve MedMNIST v2 2D sets ship RGB, and the FHE conv packing
-    assumes a single input channel, so colour has to go before anything else
-    looks at the data.  BT.601, rounded back to uint8 so the integer net still
-    sees raw 0..255 pixels.  `folded` propagates into the generated file: an
-    accuracy measured after this fold is not comparable to a published RGB
-    number, and the file has to say so."""
+    Four of the twelve MedMNIST v2 2D sets ship RGB (Path, Derma, Blood, Retina).
+
+    **This used to say the FHE conv packing "assumes a single input channel", and
+    that was wrong.**  `fhe::conv_pack` has always been multi-channel -- channels
+    summing on a shared coefficient is the whole point of its reversed offset -- and
+    what was single-channel was the Rust plumbing, which hardcoded `in_c = 1`.  Since
+    that was fixed an RGB 28x28 convolution runs directly, needing degree 3977 against
+    a ring dimension of 4096, at one ciphertext multiplication per output channel: the
+    three channels do **not** cost three times the work.
+
+    So folding to luminance is now a choice rather than a requirement.  It is still the
+    default, because every embedded weight file and every accuracy figure in the repo
+    was measured that way and flipping the default would silently redefine them.
+    `--rgb` keeps the colour.  `folded` propagates into the generated file: an accuracy
+    measured after the fold is not comparable to a published RGB number, and the file
+    has to say which it is."""
     folded = False
     for k in ("train_images", "val_images", "test_images"):
         a = d[k]
         if a.ndim == 4 and a.shape[-1] == 3:
+            if keep_rgb:
+                continue  # left as (N,h,w,3); `flatten` lays it out channel-major
             d[k] = np.rint(a.astype(np.float64) @ LUMA).clip(0, 255).astype(np.uint8)
             folded = True
         elif a.ndim == 4 and a.shape[-1] == 1:
             d[k] = a[..., 0]
         elif a.ndim != 3:
             sys.exit(f"{k}: expected (N,h,w), (N,h,w,1) or (N,h,w,3), got {a.shape}")
+    if keep_rgb and not any(d[k].ndim == 4 for k in ("train_images",)):
+        sys.exit("--rgb given but the dataset is not RGB: images are already single-channel")
     return d, folded
 
 
@@ -285,11 +325,11 @@ class Net(nn.Module):
     valid padding, floor pooling), at whatever depth/width `convs` and `fcs`
     ask for."""
 
-    def __init__(self, nclasses, convs=None, fcs=None, d=28):
+    def __init__(self, nclasses, convs=None, fcs=None, d=28, in_c=1):
         super().__init__()
         convs = list(convs or DEFAULT_CONV)
         fcs = list(fcs or DEFAULT_FC)
-        shapes, flat = conv_shapes(d, convs)
+        shapes, flat = conv_shapes(d, convs, in_c)
         self.convs = nn.ModuleList(
             nn.Conv2d(in_c, oc, K) for (in_c, _, _), oc in zip(shapes, convs)
         )
@@ -353,7 +393,10 @@ def int_logits(img, q, want_max=False):
         out = a[:, : oh * POOL, : ow * POOL].reshape(c, oh, POOL, ow, POOL)
         return out.max(axis=(2, 4))
 
-    a = x[None, :, :]
+    # `(d,d)` for a grayscale image, `(C,d,d)` for an RGB one. `conv` below is
+    # already multi-channel -- it has to be, since every conv after the first takes
+    # many channels -- so RGB needs no other change here.
+    a = x[None, :, :] if x.ndim == 2 else x
     for w, b in q["conv"]:
         a = pool(conv(a, w, b))
     h = a.reshape(-1)
@@ -542,25 +585,46 @@ def report_metrics(m, names):
 
 def pick_gain(net, xva_u8, yva, targets=DEFAULT_GAINS):
     """Choose the quantisation gain on the VALIDATION split (never on test),
-    rejecting any candidate whose activations pass the 2^28 the depth-1 noise
-    budget allows.
+    rejecting any candidate whose activations come within `HEADROOM_BITS` of the
+    2^30 the depth-1 plaintext modulus allows.
 
     Wider nets sum more terms per accumulator and so overflow at gains the
     default sweep never goes below; `--gains` extends the ladder downwards for
-    them.  The default is left exactly as it was, so the weight files already
-    in the repo still regenerate to the same bytes."""
+    them.
+
+    # Why the headroom, and it is not conservatism for its own sake
+
+    The validation split's largest activation is an *estimate* of the largest any
+    input will produce, and it underestimates.  Measured on DermaMNIST in RGB: gain
+    512 showed 2^28 on validation, was accepted, and then needed **2^31** on the test
+    split -- a three-bit gap that made the chosen model unusable and only surfaced in
+    the final check.  A model that overflows for some inputs and not others is worse
+    than one that is slightly less precise, because the failure is data-dependent.
+
+    So a candidate must leave `HEADROOM_BITS` spare on validation.  Four, from that
+    three-bit observation plus one.  This is a *safety* criterion and deliberately not
+    informed by the test split, which would be selection on test data; the final check
+    against the test split remains as the backstop it already was."""
     best = None
     for t in targets:
         q = quantise(net, t)
         acc, max_abs, _ = score_int(q, xva_u8, yva)
         needed = int(max_abs).bit_length() + 2
-        flag = "" if needed <= 30 else "  <- OVERFLOWS, rejected"
+        if needed > 30:
+            flag = "  <- OVERFLOWS, rejected"
+        elif needed > 30 - HEADROOM_BITS:
+            flag = f"  <- within {HEADROOM_BITS}b of the ceiling, rejected"
+        else:
+            flag = ""
         print(f"  gain {str(t):>6}: val-int {acc * 100:6.2f}%  "
               f"max|act| = 2^{needed - 2}{flag}", flush=True)
-        if needed <= 30 and (best is None or acc > best[1]):
+        if needed <= 30 - HEADROOM_BITS and (best is None or acc > best[1]):
             best = (t, acc, q)
     if best is None:
-        sys.exit("every candidate gain overflows the FHE plaintext modulus")
+        sys.exit(
+            f"every candidate gain comes within {HEADROOM_BITS} bits of the FHE "
+            f"plaintext modulus; extend the ladder downwards with --gains"
+        )
     print(f"chosen gain {best[0]} (val-int {best[1] * 100:.2f}%)", flush=True)
     return best[2], best[0]
 
@@ -916,6 +980,16 @@ def main():
                          "validation (default 64,128,256,512 plus the "
                          "no-rescale case). Wider nets overflow the depth-1 "
                          "plaintext modulus at those, and want smaller ones.")
+    ap.add_argument(
+        "--rgb",
+        action="store_true",
+        help="keep the three colour channels instead of folding to luminance. "
+        "Only meaningful for the RGB MedMNIST sets (Path, Derma, Blood, Retina). "
+        "The FHE packing handles this at one ciphertext multiply per output "
+        "channel -- three channels do NOT cost three times the work -- but every "
+        "figure in the repo was measured on the grayscale fold, so the fold "
+        "stays the default and an --rgb result is a different experiment.",
+    )
     ap.add_argument("--device", default="auto", choices=("auto", "cpu", "mps"),
                     help="training device; scoring the integer net is numpy on "
                          "CPU either way")
@@ -925,7 +999,13 @@ def main():
     np.random.seed(args.seed)
 
     d = load_dataset(args.npz)
-    d, folded = to_grayscale(d)
+    d, folded = fold_channels(d, args.rgb)
+    if args.rgb:
+        # MedMNIST ships RGB as (N,h,w,3); torch wants NCHW and the Rust side reads
+        # an image as `[in_c][h][w]` row-major, so one transpose here makes both
+        # layouts right and every later reshape channel-major by construction.
+        for k in ("train_images", "val_images", "test_images"):
+            d[k] = np.ascontiguousarray(d[k].transpose(0, 3, 1, 2))
     xtr = d["train_images"].astype(np.float32) / 255.0
     ytr = d["train_labels"].ravel().astype(np.int64)
     xva = d["val_images"].astype(np.float32) / 255.0
@@ -933,9 +1013,10 @@ def main():
     xte_u8 = d["test_images"].astype(np.int64)
     yte = d["test_labels"].ravel().astype(np.int64)
     nclasses = int(ytr.max()) + 1
-    side = xtr.shape[1]
-    if xtr.shape[1] != xtr.shape[2]:
-        sys.exit(f"expected square images, got {xtr.shape[1]}x{xtr.shape[2]}")
+    in_c = xtr.shape[1] if args.rgb else 1
+    side = xtr.shape[-1]
+    if xtr.shape[-2] != xtr.shape[-1]:
+        sys.exit(f"expected square images, got {xtr.shape[-2]}x{xtr.shape[-1]}")
     print(f"{args.npz}: train {xtr.shape} val {xva.shape} test {xte_u8.shape}, "
           f"{nclasses} classes", flush=True)
     if folded:
@@ -952,16 +1033,18 @@ def main():
     fcs = parse_widths(args.fc, "--fc", allow_empty=True)
     gains = parse_gains(args.gains, DEFAULT_GAINS)
     device = pick_device(args.device)
-    shapes, flat = conv_shapes(side, convs)
+    shapes, flat = conv_shapes(side, convs, in_c)
     check_packing(shapes)
-    net = Net(nclasses, convs, fcs, side).to(device)
+    net = Net(nclasses, convs, fcs, side, in_c).to(device)
     print(f"model: conv {convs} -> flat {flat} -> fc {fcs} -> {nclasses}  "
           f"({net.n_params()} parameters, training on {device.type})", flush=True)
     opt = torch.optim.Adam(net.parameters(), lr=1e-3)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, args.epochs)
-    Xtr = torch.from_numpy(xtr).unsqueeze(1).to(device)
+    chan = (lambda a: torch.from_numpy(a)) if args.rgb else (
+        lambda a: torch.from_numpy(a).unsqueeze(1))
+    Xtr = chan(xtr).to(device)
     Ytr = torch.from_numpy(ytr).to(device)
-    Xva = torch.from_numpy(xva).unsqueeze(1).to(device)
+    Xva = chan(xva).to(device)
     Yva = torch.from_numpy(yva).to(device)
 
     best, best_state = -1.0, None
@@ -988,7 +1071,7 @@ def main():
     net.load_state_dict(best_state)
     net.eval()
     with torch.no_grad():
-        Xte = torch.from_numpy(xte_u8.astype(np.float32) / 255.0).unsqueeze(1).to(device)
+        Xte = chan(xte_u8.astype(np.float32) / 255.0).to(device)
         float_acc = (
             (net(Xte).argmax(1).cpu() == torch.from_numpy(yte)).float().mean().item()
         )

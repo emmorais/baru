@@ -864,30 +864,59 @@ makes.
 \subsection{Positioning against prior inference systems}
 
 \Cref{tab:sota} places the result against representative two-party inference
-systems. The residual $\sim\!1\%$ accuracy gap is model size, a training
-question the construction is indifferent to. The distinguishing axis is the
-last column: prior systems are client/server protocols in which the server
-evaluates on \emph{plaintext} weights, so the model is not hidden; here every
-linear layer is ciphertext$\times$ciphertext, so the weights are encrypted
-too, and only the class index leaves the cryptographic domain.
+systems on two axes at once, because either alone misleads. The residual
+${\sim}1\%$ accuracy gap is model size, a training question the construction is
+indifferent to. The distinguishing axis is \emph{what is hidden}: prior systems
+are client/server protocols in which the server evaluates on \emph{plaintext}
+weights, so the model is not hidden; here every linear layer is
+ciphertext$\times$ciphertext, so the weights are encrypted too, and only the class
+index leaves the cryptographic domain.
+
+\paragraph{And they are faster.} That belongs in the table rather than in prose a
+reader can skip. Three things make a single latency column dishonest, so the table
+carries them as columns of their own:
+
+\begin{itemize}
+  \item \textbf{Party count and threat model.} Two-party protocols in the
+    client/server model and three-party honest-majority protocols are not
+    substitutable deployments; the second needs a third
+    non-colluding host, the first does not.
+  \item \textbf{Hardware and network.} Published figures are LAN numbers on
+    server-class machines; ours are a single laptop core with a modelled network
+    (\cref{sec:eval}).
+  \item \textbf{What was measured.} Online latency, end-to-end latency and
+    amortized throughput differ by more than the effects being compared, and
+    preprocessing is sometimes excluded.
+\end{itemize}
 
 \begin{table}[t]
 \centering
-\caption{Positioning on MNIST. The comparison axis is \emph{what is hidden},
-not accuracy.}
+\caption{Positioning on MNIST-scale inference. \textbf{Both} axes are load-bearing:
+prior systems are faster \emph{and} hide less. Latency cells marked
+\texttt{[cite]} are to be filled from each paper's own table with its hardware and
+network stated in the caption --- deliberately not reproduced from memory, since a
+recalled latency is exactly the kind of number this work argues should not travel.}
 \label{tab:sota}
-\begin{tabular}{@{}lll@{}}
+\small
+\begin{tabular}{@{}lllll@{}}
 \toprule
-system & MNIST acc & what is hidden \\
+system & parties & acc & latency & hidden \\
 \midrule
-\textbf{this work} & $\mathbf{98.0\%}$ & \textbf{image \emph{and} weights} (ct$\times$ct) \\
-Gazelle~\cite{Gazelle} & ${\sim}99\%$ & image only (plaintext weights) \\
-Delphi~\cite{Delphi} & ${\sim}99\%$ & image only \\
-CrypTFlow2~\cite{CrypTFlow2} & ${\sim}99\%$ & image only \\
-MiniONN~\cite{MiniONN}/Cheetah~\cite{Cheetah} & ${\sim}99\%$ & image only \\
+\textbf{this work} & 3, hon.\ maj. & $\mathbf{98.9\%}$ & \texttt{[ours]} & \textbf{image \emph{and} weights} \\
+Gazelle~\cite{Gazelle} & 2, cl./srv. & ${\sim}99\%$ & \texttt{[cite]} & image only \\
+Delphi~\cite{Delphi} & 2, cl./srv. & ${\sim}99\%$ & \texttt{[cite]} & image only \\
+CrypTFlow2~\cite{CrypTFlow2} & 2, cl./srv. & ${\sim}99\%$ & \texttt{[cite]} & image only \\
+MiniONN~\cite{MiniONN}, Cheetah~\cite{Cheetah} & 2, cl./srv. & ${\sim}99\%$ & \texttt{[cite]} & image only \\
+Falcon~\cite{Falcon} & 3, hon.\ maj. & --- & 47\,ms (LeNet, LAN) & image only \\
 \bottomrule
 \end{tabular}
 \end{table}
+
+Falcon is the closest comparison and the most useful one: it shares this work's
+party count and threat model, so the latency difference is not confounded by the
+deployment. It is also where the gap is starkest --- 47\,ms for LeNet against our seconds ---
+and reproducing its nonlinearity inside this artifact, rather than citing it, is
+what \texttt{docs/falcon-reproduction.md} records.
 
 \section{Related Work}\label{sec:related}
 

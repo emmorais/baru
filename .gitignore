@@ -7,3 +7,10 @@ state2.json
 state3.json
 paper/main.fdb_latexmk
 paper/main.fls
+
+# Python env for tools/train_medmnist.py (torch + numpy). Regenerable; see tools/README.md.
+/.venv
+# MedMNIST source archives, fetched from Zenodo by the training workflow. ~50 MB+
+# each and redistributable only under their own CC BY licence, so not vendored.
+*.npz
+__pycache__/

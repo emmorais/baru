@@ -359,6 +359,8 @@ pub enum CVal {
 
 /// Maps variable names to compile-time values.
 type Env = HashMap<String, CVal>;
+/// A stored lambda: its parameter names and its body.
+type Lambda = (Vec<String>, Expr);
 
 /// Maps lambda names to their parameter lists and body, for inlining
 /// named functions bound in let/letrec.
@@ -648,13 +650,25 @@ impl CircuitCompiler {
         private_vars: &[String],
     ) -> Result<CompiledCircuit, String> {
         // Classify user-named variables as witnesses or public inputs.
+        //
+        // The membership tests go through sets rather than `Vec::contains`. The
+        // vectors have to stay vectors — witness *order* is the witness index, so
+        // it is part of the ABI — but scanning them per variable made this
+        // quadratic, and a private-inference program has one variable per weight:
+        // a 784x32 layer alone declares 25 088 of them. Measured on `784x256x10`,
+        // flattening took **36.7 s**, and this loop was most of it.
         let all_vars = self.extract_variables(expr);
+        let private: std::collections::HashSet<&String> = private_vars.iter().collect();
+        let mut known_witnesses: std::collections::HashSet<Wire> =
+            self.witnesses.iter().cloned().collect();
+        let mut known_public: std::collections::HashSet<Wire> =
+            self.public_inputs.iter().cloned().collect();
         for var in &all_vars {
-            if private_vars.contains(var) {
-                if !self.witnesses.contains(var) {
+            if private.contains(var) {
+                if known_witnesses.insert(var.clone()) {
                     self.witnesses.push(var.clone());
                 }
-            } else if !self.public_inputs.contains(var) {
+            } else if known_public.insert(var.clone()) {
                 self.public_inputs.push(var.clone());
             }
         }
@@ -715,8 +729,14 @@ impl CircuitCompiler {
         let all_vars = self.extract_variables(expr);
         // All variables are potential inputs; classification is deferred to
         // the caller (fhe-eval supplies them as plain or cipher maps).
+        //
+        // Deduped through a set, not `Vec::contains` — see the note in `compile`.
+        // This is the path `mpcc::compile` takes, so it is the one a private
+        // network with a variable per weight actually hits.
+        let mut known: std::collections::HashSet<Wire> =
+            self.public_inputs.iter().cloned().collect();
         for v in &all_vars {
-            if !self.public_inputs.contains(v) {
+            if known.insert(v.clone()) {
                 self.public_inputs.push(v.clone());
             }
         }
@@ -773,6 +793,329 @@ impl CircuitCompiler {
 
     // ── Phase 1 – flatten ────────────────────────────────────
 
+    /// A quoted literal data list, or a sentinel for quoted code.
+    #[inline(never)]
+    fn flatten_quote(
+        &mut self,
+        inner: &Expr,
+        env: &mut Env,
+        lambdas: &mut LambdaStore,
+        flat: &mut Vec<FlatOp>,
+    ) -> Result<CVal, String> {
+        let _ = env;
+        let _ = lambdas;
+        if let Some(list) = self.quote_to_cval(inner, flat) {
+            Ok(list)
+        } else {
+            // Quoted code is not evaluatable in a circuit — sentinel 0.
+            Ok(CVal::Wire(self.emit_const(0, flat)))
+        }
+    }
+
+    /// `let` and `letrec`: bindings are inlined into a child environment. Letrec
+    /// lambdas may call themselves — the recursion is unrolled at inlining time
+    /// and terminated by static `if` resolution.
+    #[inline(never)]
+    fn flatten_let(
+        &mut self,
+        bindings: &[(String, Expr)],
+        body: &[Expr],
+        env: &mut Env,
+        lambdas: &mut LambdaStore,
+        flat: &mut Vec<FlatOp>,
+    ) -> Result<CVal, String> {
+        // **Scoped, not cloned.** This used to `env.clone()` and `lambdas.clone()`
+        // per `let`, which is quadratic on the shape that matters: the parser
+        // desugars `let*` into one *nested* `let` per binding, so a program with
+        // `n` bindings performed `n` full clones of an environment holding every
+        // variable in scope. A private network has one variable per weight, so
+        // `784x256x10` cloned a ~203 000-entry map about 530 times — ~10^8 inserts,
+        // and most of the flattening time.
+        //
+        // Instead, shadow in place and restore on the way out. Bindings are still
+        // evaluated in the environment that already contains the earlier ones, so
+        // the `let*` semantics this always had are unchanged; saves are replayed in
+        // reverse so that binding the same name twice restores the pre-`let` value.
+        let mut saved_env: Vec<(String, Option<CVal>)> = Vec::with_capacity(bindings.len());
+        let mut saved_lam: Vec<(String, Option<Lambda>)> = Vec::new();
+
+        let mut run = |me: &mut Self| -> Result<CVal, String> {
+            for (name, rhs) in bindings {
+                // If the RHS is a lambda, store it for later inlining
+                // instead of collapsing it to a sentinel wire.
+                // Only fixed-arity lambdas can be inlined; a variadic one is
+                // left to `flatten`, which refuses it with a reason.
+                if let Expr::Lambda(params, None, lam_body) = rhs {
+                    let prev = lambdas.insert(name.clone(), (params.clone(), *lam_body.clone()));
+                    saved_lam.push((name.clone(), prev));
+                } else {
+                    let val = me.flatten(rhs, env, lambdas, flat)?;
+                    let prev = env.insert(name.clone(), val);
+                    saved_env.push((name.clone(), prev));
+                }
+            }
+            let mut result = CVal::Wire(me.emit_const(0, flat));
+            for e in body {
+                result = me.flatten(e, env, lambdas, flat)?;
+            }
+            Ok(result)
+        };
+        let result = run(self);
+
+        // Restore on every path, including the error one — a `let` that failed
+        // half-way must not leave its bindings visible to an outer scope.
+        for (name, prev) in saved_env.into_iter().rev() {
+            match prev {
+                Some(v) => env.insert(name, v),
+                None => env.remove(&name),
+            };
+        }
+        for (name, prev) in saved_lam.into_iter().rev() {
+            match prev {
+                Some(v) => lambdas.insert(name, v),
+                None => lambdas.remove(&name),
+            };
+        }
+        result
+    }
+
+    /// A sequence: every subexpression flattened, the last one's value returned.
+    #[inline(never)]
+    fn flatten_seq(
+        &mut self,
+        exprs: &[Expr],
+        env: &mut Env,
+        lambdas: &mut LambdaStore,
+        flat: &mut Vec<FlatOp>,
+    ) -> Result<CVal, String> {
+        let mut result = CVal::Wire(self.emit_const(0, flat));
+        for e in exprs {
+            result = self.flatten(e, env, lambdas, flat)?;
+        }
+        Ok(result)
+    }
+
+    /// A binary operator, with the Q16.16 interception.
+    ///
+    /// # This is the deep-recursion path
+    ///
+    /// A nested `(+ (+ … ) x)` chain recurses through here once per term, so
+    /// this arm's locals are held at every level. It is a method rather than an
+    /// inline `match` arm so that [`Self::flatten`] can stay a thin dispatcher:
+    /// a debug build gives every arm of a `match` its own stack slots, and with
+    /// all of them inline `flatten` carried a 10 KiB frame, which overflowed a
+    /// 2 MiB test thread at ~200 terms.
+    #[inline(never)]
+    fn flatten_binop_expr(
+        &mut self,
+        op: &BinOp,
+        left: &Expr,
+        right: &Expr,
+        env: &mut Env,
+        lambdas: &mut LambdaStore,
+        flat: &mut Vec<FlatOp>,
+    ) -> Result<CVal, String> {
+        // Special case: extract static shift amounts directly from AST
+        // so the Shl/Shr opcodes carry the correct literal amount.
+        if matches!(op, BinOp::AshLeft | BinOp::AshRight) {
+            let src = Self::expect_wire(self.flatten(left, env, lambdas, flat)?, "shift operand")?;
+            let amount = if let Expr::Num(n) = right {
+                *n as u32
+            } else {
+                0
+            };
+            let dst = self.fresh("t");
+            if matches!(op, BinOp::AshLeft) {
+                flat.push(FlatOp::Shl {
+                    dst: dst.clone(),
+                    src,
+                    amount,
+                });
+            } else {
+                flat.push(FlatOp::Shr {
+                    dst: dst.clone(),
+                    src,
+                    amount,
+                });
+            }
+            return Ok(CVal::Wire(dst));
+        }
+        let l = Self::expect_wire(self.flatten(left, env, lambdas, flat)?, "left operand")?;
+        let r = Self::expect_wire(self.flatten(right, env, lambdas, flat)?, "right operand")?;
+
+        // Q16.16 interception: when either operand is fixed-point,
+        // mirror the interpreter — coerce the int side (<<16), rescale
+        // after multiply, pre-shift the dividend, and mark results.
+        let lf = self.is_fixed(&l);
+        let rf = self.is_fixed(&r);
+        if lf || rf {
+            match op {
+                BinOp::Mul => return Ok(CVal::Wire(self.emit_mul_typed(l, r, flat))),
+                BinOp::Add | BinOp::Sub | BinOp::Mod => {
+                    let l = if lf { l } else { self.make_fixed_wire(l, flat) };
+                    let r = if rf { r } else { self.make_fixed_wire(r, flat) };
+                    let dst = self.flatten_binop(*op, l, r, flat)?;
+                    self.fixed_wires.insert(dst.clone());
+                    return Ok(CVal::Wire(dst));
+                }
+                BinOp::DivExact => {
+                    // (a << 16) / b, both operands scaled.  Real mode
+                    // divides true values — no pre-shift.
+                    let l = if lf { l } else { self.make_fixed_wire(l, flat) };
+                    let r = if rf { r } else { self.make_fixed_wire(r, flat) };
+                    let num = if self.real_arith {
+                        l
+                    } else {
+                        let num = self.fresh("t");
+                        flat.push(FlatOp::Shl {
+                            dst: num.clone(),
+                            src: l,
+                            amount: 16,
+                        });
+                        num
+                    };
+                    let dst = self.flatten_binop(BinOp::DivExact, num, r, flat)?;
+                    self.fixed_wires.insert(dst.clone());
+                    return Ok(CVal::Wire(dst));
+                }
+                BinOp::Eq | BinOp::Lt | BinOp::Gt | BinOp::Le | BinOp::Ge => {
+                    // Compare in the scaled domain; result is a plain bit.
+                    let l = if lf { l } else { self.make_fixed_wire(l, flat) };
+                    let r = if rf { r } else { self.make_fixed_wire(r, flat) };
+                    return Ok(CVal::Wire(self.flatten_binop(*op, l, r, flat)?));
+                }
+                // Bitwise / shift ops stay in the raw integer domain.
+                _ => {}
+            }
+        }
+        Ok(CVal::Wire(self.flatten_binop(*op, l, r, flat)?))
+    }
+
+    /// A unary operator, including the compile-time `null?` fold.
+    #[inline(never)]
+    fn flatten_unop_expr(
+        &mut self,
+        op: &UnOp,
+        inner: &Expr,
+        env: &mut Env,
+        lambdas: &mut LambdaStore,
+        flat: &mut Vec<FlatOp>,
+    ) -> Result<CVal, String> {
+        // null? is a compile-time predicate on lists: it folds to a
+        // constant, which is what lets static `if` resolution stop
+        // recursion over compile-time lists.
+        if matches!(op, UnOp::IsNull) {
+            return match self.flatten(inner, env, lambdas, flat)? {
+                CVal::List(items) => Ok(CVal::Wire(
+                    self.emit_const(if items.is_empty() { 1 } else { 0 }, flat),
+                )),
+                CVal::Wire(_) => Err(
+                    "null? expects a compile-time list (lists exist only at compile time in circuits)"
+                        .to_string(),
+                ),
+            };
+        }
+        let src = Self::expect_wire(self.flatten(inner, env, lambdas, flat)?, "unary operand")?;
+        Ok(CVal::Wire(self.flatten_unop(*op, src, flat)?))
+    }
+
+    /// `if`: a compile-time-known condition flattens only the taken branch, which
+    /// is what terminates unrolled list recursion; otherwise a `Mux`.
+    #[inline(never)]
+    fn flatten_if(
+        &mut self,
+        cond: &Expr,
+        then_e: &Expr,
+        else_e: &Expr,
+        env: &mut Env,
+        lambdas: &mut LambdaStore,
+        flat: &mut Vec<FlatOp>,
+    ) -> Result<CVal, String> {
+        let cond_wire = Self::expect_wire(self.flatten(cond, env, lambdas, flat)?, "if condition")?;
+        if let Some(&cv) = self.flat_known.get(&cond_wire) {
+            let taken = if cv != 0 { then_e } else { else_e };
+            return self.flatten(taken, env, lambdas, flat);
+        }
+        let then_wire =
+            Self::expect_wire(self.flatten(then_e, env, lambdas, flat)?, "then branch")?;
+        let else_wire =
+            Self::expect_wire(self.flatten(else_e, env, lambdas, flat)?, "else branch")?;
+        // If exactly one branch is fixed-point, coerce the other so
+        // the mux output lives in a single domain.
+        let tf = self.is_fixed(&then_wire);
+        let ef = self.is_fixed(&else_wire);
+        let then_wire = if ef && !tf {
+            self.make_fixed_wire(then_wire, flat)
+        } else {
+            then_wire
+        };
+        let else_wire = if tf && !ef {
+            self.make_fixed_wire(else_wire, flat)
+        } else {
+            else_wire
+        };
+        let dst = self.fresh("mux");
+        flat.push(FlatOp::Mux {
+            dst: dst.clone(),
+            cond: cond_wire,
+            t_val: then_wire,
+            e_val: else_wire,
+        });
+        if tf || ef {
+            self.fixed_wires.insert(dst.clone());
+        }
+        Ok(CVal::Wire(dst))
+    }
+
+    /// A bare `lambda`: a sentinel wire, meaningful only inside a `Call`.
+    #[inline(never)]
+    fn flatten_lambda(
+        &mut self,
+        params: &[String],
+        rest: &Option<String>,
+        body: &Expr,
+        env: &mut Env,
+        lambdas: &mut LambdaStore,
+        flat: &mut Vec<FlatOp>,
+    ) -> Result<CVal, String> {
+        let _ = env;
+        let _ = lambdas;
+        if rest.is_some() {
+            return Err("cannot compile a variadic `(lambda (a . rest) ...)` to a \
+                        circuit: the argument count must be fixed when the circuit \
+                        is built"
+                .to_string());
+        }
+        // Bare lambda — emit sentinel; meaningful only inside Call.
+        let dst = self.fresh("lam");
+        flat.push(FlatOp::Const {
+            dst: dst.clone(),
+            value: 0,
+        });
+        let _ = (params, rest, body);
+        Ok(CVal::Wire(dst))
+    }
+
+    /// `(cons x xs)` — compile-time list construction.
+    #[inline(never)]
+    fn flatten_cons(
+        &mut self,
+        left: &Expr,
+        right: &Expr,
+        env: &mut Env,
+        lambdas: &mut LambdaStore,
+        flat: &mut Vec<FlatOp>,
+    ) -> Result<CVal, String> {
+        let head = self.flatten(left, env, lambdas, flat)?;
+        match self.flatten(right, env, lambdas, flat)? {
+            CVal::List(mut items) => {
+                items.insert(0, head);
+                Ok(CVal::List(items))
+            }
+            CVal::Wire(_) => Err("cons: second argument must be a compile-time list".to_string()),
+        }
+    }
+
     fn flatten(
         &mut self,
         expr: &Expr,
@@ -781,6 +1124,26 @@ impl CircuitCompiler {
         flat: &mut Vec<FlatOp>,
     ) -> Result<CVal, String> {
         match expr {
+            // ── Forms a circuit cannot host ───────────────────
+            // Refused explicitly rather than approximated. A circuit is a fixed
+            // set of gates with no environment and no runtime control flow, so
+            // `define` has nothing to extend, `set!` has nothing to mutate, and
+            // `apply` needs an argument count that only exists at run time.
+            // Silently mis-lowering any of them would produce a circuit that is
+            // perfectly sound about the wrong function.
+            Expr::Guard(..) => Err(
+                "cannot compile `guard` to a circuit: a circuit has no control flow \
+                 to unwind, so there is nothing for a handler to intercept"
+                    .to_string(),
+            ),
+            Expr::Define(name, _) => Err(format!(
+                "cannot compile `(define {name} ...)` to a circuit: a circuit has \
+                 no environment to extend. Use `let` instead."
+            )),
+            Expr::Set(name, _) => Err(format!(
+                "cannot compile `(set! {name} ...)` to a circuit: circuits are \
+                 single-assignment. Thread the value through `let` instead."
+            )),
             // ── Literals ─────────────────────────────────────
             Expr::Num(n) => Ok(CVal::Wire(self.emit_const(*n, flat))),
             // Fixed-point literal: the circuit works on the scaled integer
@@ -800,220 +1163,34 @@ impl CircuitCompiler {
             Expr::Private(inner) => self.flatten(inner, env, lambdas, flat),
 
             // ── Quote: literal data lists become compile-time lists ──
-            Expr::Quote(inner) => {
-                if let Some(list) = self.quote_to_cval(inner, flat) {
-                    Ok(list)
-                } else {
-                    // Quoted code is not evaluatable in a circuit — sentinel 0.
-                    Ok(CVal::Wire(self.emit_const(0, flat)))
-                }
-            }
+            Expr::Quote(inner) => self.flatten_quote(inner, env, lambdas, flat),
 
             // ── Let / Letrec: inline bindings, then compile body ──
             // (Letrec lambdas may call themselves — the recursion is unrolled
             // at inlining time and terminated by static `if` resolution.)
-            Expr::Let(bindings, body) | Expr::LetRec(bindings, body) => {
-                let mut child_env = env.clone();
-                let mut child_lam = lambdas.clone();
-                for (name, rhs) in bindings {
-                    // If the RHS is a lambda, store it for later inlining
-                    // instead of collapsing it to a sentinel wire.
-                    if let Expr::Lambda(params, lam_body) = rhs {
-                        child_lam.insert(name.clone(), (params.clone(), *lam_body.clone()));
-                    } else {
-                        let val = self.flatten(rhs, &mut child_env, &mut child_lam, flat)?;
-                        child_env.insert(name.clone(), val);
-                    }
-                }
-                let mut result = CVal::Wire(self.emit_const(0, flat));
-                for e in body {
-                    result = self.flatten(e, &mut child_env, &mut child_lam, flat)?;
-                }
-                Ok(result)
-            }
+            Expr::Let(bindings, body) | Expr::LetRec(bindings, body) => self.flatten_let(bindings, body, env, lambdas, flat),
 
             // ── Seq ───────────────────────────────────────────
-            Expr::Seq(exprs) => {
-                let mut result = CVal::Wire(self.emit_const(0, flat));
-                for e in exprs {
-                    result = self.flatten(e, env, lambdas, flat)?;
-                }
-                Ok(result)
-            }
+            Expr::Seq(exprs) => self.flatten_seq(exprs, env, lambdas, flat),
 
             // ── Binary operations ─────────────────────────────
-            Expr::BinOp(op, left, right) => {
-                // Special case: extract static shift amounts directly from AST
-                // so the Shl/Shr opcodes carry the correct literal amount.
-                if matches!(op, BinOp::AshLeft | BinOp::AshRight) {
-                    let src = Self::expect_wire(
-                        self.flatten(left, env, lambdas, flat)?,
-                        "shift operand",
-                    )?;
-                    let amount = if let Expr::Num(n) = right.as_ref() {
-                        *n as u32
-                    } else {
-                        0
-                    };
-                    let dst = self.fresh("t");
-                    if matches!(op, BinOp::AshLeft) {
-                        flat.push(FlatOp::Shl {
-                            dst: dst.clone(),
-                            src,
-                            amount,
-                        });
-                    } else {
-                        flat.push(FlatOp::Shr {
-                            dst: dst.clone(),
-                            src,
-                            amount,
-                        });
-                    }
-                    return Ok(CVal::Wire(dst));
-                }
-                let l = Self::expect_wire(self.flatten(left, env, lambdas, flat)?, "left operand")?;
-                let r =
-                    Self::expect_wire(self.flatten(right, env, lambdas, flat)?, "right operand")?;
-
-                // Q16.16 interception: when either operand is fixed-point,
-                // mirror the interpreter — coerce the int side (<<16), rescale
-                // after multiply, pre-shift the dividend, and mark results.
-                let lf = self.is_fixed(&l);
-                let rf = self.is_fixed(&r);
-                if lf || rf {
-                    match op {
-                        BinOp::Mul => return Ok(CVal::Wire(self.emit_mul_typed(l, r, flat))),
-                        BinOp::Add | BinOp::Sub | BinOp::Mod => {
-                            let l = if lf { l } else { self.make_fixed_wire(l, flat) };
-                            let r = if rf { r } else { self.make_fixed_wire(r, flat) };
-                            let dst = self.flatten_binop(*op, l, r, flat)?;
-                            self.fixed_wires.insert(dst.clone());
-                            return Ok(CVal::Wire(dst));
-                        }
-                        BinOp::DivExact => {
-                            // (a << 16) / b, both operands scaled.  Real mode
-                            // divides true values — no pre-shift.
-                            let l = if lf { l } else { self.make_fixed_wire(l, flat) };
-                            let r = if rf { r } else { self.make_fixed_wire(r, flat) };
-                            let num = if self.real_arith {
-                                l
-                            } else {
-                                let num = self.fresh("t");
-                                flat.push(FlatOp::Shl {
-                                    dst: num.clone(),
-                                    src: l,
-                                    amount: 16,
-                                });
-                                num
-                            };
-                            let dst = self.flatten_binop(BinOp::DivExact, num, r, flat)?;
-                            self.fixed_wires.insert(dst.clone());
-                            return Ok(CVal::Wire(dst));
-                        }
-                        BinOp::Eq | BinOp::Lt | BinOp::Gt | BinOp::Le | BinOp::Ge => {
-                            // Compare in the scaled domain; result is a plain bit.
-                            let l = if lf { l } else { self.make_fixed_wire(l, flat) };
-                            let r = if rf { r } else { self.make_fixed_wire(r, flat) };
-                            return Ok(CVal::Wire(self.flatten_binop(*op, l, r, flat)?));
-                        }
-                        // Bitwise / shift ops stay in the raw integer domain.
-                        _ => {}
-                    }
-                }
-                Ok(CVal::Wire(self.flatten_binop(*op, l, r, flat)?))
-            }
+            Expr::BinOp(op, left, right) => self.flatten_binop_expr(op, left, right, env, lambdas, flat),
 
             // ── Unary operations ──────────────────────────────
-            Expr::UnOp(op, inner) => {
-                // null? is a compile-time predicate on lists: it folds to a
-                // constant, which is what lets static `if` resolution stop
-                // recursion over compile-time lists.
-                if matches!(op, UnOp::IsNull) {
-                    return match self.flatten(inner, env, lambdas, flat)? {
-                        CVal::List(items) => Ok(CVal::Wire(
-                            self.emit_const(if items.is_empty() { 1 } else { 0 }, flat),
-                        )),
-                        CVal::Wire(_) => Err(
-                            "null? expects a compile-time list (lists exist only at compile time in circuits)"
-                                .to_string(),
-                        ),
-                    };
-                }
-                let src = Self::expect_wire(
-                    self.flatten(inner, env, lambdas, flat)?,
-                    "unary operand",
-                )?;
-                Ok(CVal::Wire(self.flatten_unop(*op, src, flat)?))
-            }
+            Expr::UnOp(op, inner) => self.flatten_unop_expr(op, inner, env, lambdas, flat),
 
             // ── If ────────────────────────────────────────────
             // Compile-time-known condition → flatten only the taken branch
             // (essential: this is what terminates unrolled list recursion).
             // Unknown condition → Mux over both branches.
-            Expr::If(cond, then_e, else_e) => {
-                let cond_wire =
-                    Self::expect_wire(self.flatten(cond, env, lambdas, flat)?, "if condition")?;
-                if let Some(&cv) = self.flat_known.get(&cond_wire) {
-                    let taken = if cv != 0 { then_e } else { else_e };
-                    return self.flatten(taken, env, lambdas, flat);
-                }
-                let then_wire =
-                    Self::expect_wire(self.flatten(then_e, env, lambdas, flat)?, "then branch")?;
-                let else_wire =
-                    Self::expect_wire(self.flatten(else_e, env, lambdas, flat)?, "else branch")?;
-                // If exactly one branch is fixed-point, coerce the other so
-                // the mux output lives in a single domain.
-                let tf = self.is_fixed(&then_wire);
-                let ef = self.is_fixed(&else_wire);
-                let then_wire = if ef && !tf {
-                    self.make_fixed_wire(then_wire, flat)
-                } else {
-                    then_wire
-                };
-                let else_wire = if tf && !ef {
-                    self.make_fixed_wire(else_wire, flat)
-                } else {
-                    else_wire
-                };
-                let dst = self.fresh("mux");
-                flat.push(FlatOp::Mux {
-                    dst: dst.clone(),
-                    cond: cond_wire,
-                    t_val: then_wire,
-                    e_val: else_wire,
-                });
-                if tf || ef {
-                    self.fixed_wires.insert(dst.clone());
-                }
-                Ok(CVal::Wire(dst))
-            }
+            Expr::If(cond, then_e, else_e) => self.flatten_if(cond, then_e, else_e, env, lambdas, flat),
 
             // ── Lambda / Call ─────────────────────────────────
-            Expr::Lambda(params, body) => {
-                // Bare lambda — emit sentinel; meaningful only inside Call.
-                let dst = self.fresh("lam");
-                flat.push(FlatOp::Const {
-                    dst: dst.clone(),
-                    value: 0,
-                });
-                let _ = (params, body);
-                Ok(CVal::Wire(dst))
-            }
+            Expr::Lambda(params, rest, body) => self.flatten_lambda(params, rest, body, env, lambdas, flat),
             Expr::Call(func, args) => self.flatten_call(func, args, env, lambdas, flat),
 
             // ── List operations (compile-time only) ───────────
-            Expr::Cons(left, right) => {
-                let head = self.flatten(left, env, lambdas, flat)?;
-                match self.flatten(right, env, lambdas, flat)? {
-                    CVal::List(mut items) => {
-                        items.insert(0, head);
-                        Ok(CVal::List(items))
-                    }
-                    CVal::Wire(_) => {
-                        Err("cons: second argument must be a compile-time list".to_string())
-                    }
-                }
-            }
+            Expr::Cons(left, right) => self.flatten_cons(left, right, env, lambdas, flat),
             Expr::Car(inner) => match self.flatten(inner, env, lambdas, flat)? {
                 CVal::List(items) => items
                     .first()
@@ -1284,7 +1461,13 @@ impl CircuitCompiler {
     ) -> Result<CVal, String> {
         match func {
             // Direct lambda application — beta-reduce immediately.
-            Expr::Lambda(params, body) => {
+            Expr::Lambda(params, rest, body) => {
+                if rest.is_some() {
+                    return Err("cannot compile a variadic `(lambda (a . rest) ...)` to a \
+                                circuit: the argument count must be fixed when the circuit \
+                                is built"
+                        .to_string());
+                }
                 if params.len() != args.len() {
                     return Err(format!(
                         "arity mismatch: lambda expects {}, got {}",
@@ -1754,6 +1937,18 @@ impl CircuitCompiler {
     fn extract_vars_helper(&self, expr: &Expr, vars: &mut Vec<String>) {
         match expr {
             Expr::Var(name) => vars.push(name.clone()),
+            // These cannot reach a circuit (`flatten` refuses them), but variable
+            // extraction runs before flattening, so they are walked rather than
+            // ignored — otherwise a diagnostic could omit the very name at fault.
+            Expr::Guard(_, handler, body) => {
+                for e in handler.iter().chain(body) {
+                    self.extract_vars_helper(e, vars);
+                }
+            }
+            Expr::Define(name, value) | Expr::Set(name, value) => {
+                vars.push(name.clone());
+                self.extract_vars_helper(value, vars);
+            }
             Expr::Let(bindings, body) | Expr::LetRec(bindings, body) => {
                 for (name, e) in bindings {
                     vars.push(name.clone());
@@ -1795,7 +1990,7 @@ impl CircuitCompiler {
             | Expr::Str(_)
             | Expr::Char(_)
             | Expr::Bool(_)
-            | Expr::Lambda(_, _) => {}
+            | Expr::Lambda(_, _, _) => {}
         }
     }
 }
@@ -2111,6 +2306,7 @@ mod tests {
         // ((lambda (x) (* x x)) 5)  — constant folds to Const(25)
         let lam = Expr::Lambda(
             vec!["x".to_string()],
+            None,
             Box::new(mul_expr(Expr::Var("x".into()), Expr::Var("x".into()))),
         );
         let expr = Expr::Call(Box::new(lam), vec![Expr::Num(5)]);
@@ -2139,6 +2335,7 @@ mod tests {
         // After inlining and constant folding: Const(14)
         let lam = Expr::Lambda(
             vec!["x".to_string()],
+            None,
             Box::new(add_expr(Expr::Var("x".into()), Expr::Var("x".into()))),
         );
         let call = Expr::Call(Box::new(Expr::Var("double".into())), vec![Expr::Num(7)]);

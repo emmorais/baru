@@ -79,13 +79,18 @@
 //!
 //! # What it costs, measured
 //!
-//! `baru bench-fhe-innerprod --poly all --reps 15`, packed 8×4 matvec, both
+//! `baru bench-fhe-innerprod --reps 15`, packed 8×4 matvec, both
 //! operands encrypted (this machine):
 //!
-//! | scheme | n | multiply (NTT) | multiply (NTL) | ct bytes |
-//! |---|---|---|---|---|
-//! | BFV | 4096 | 5.4 ms | 11.2 ms | 131072 |
-//! | **BGV** | 4096 | **5.3 ms** | **11.1 ms** | 131072 |
+//! | scheme | n | multiply | ct bytes |
+//! |---|---|---|---|
+//! | BFV | 4096 | 5.4 ms | 131072 |
+//! | **BGV** | 4096 | **5.3 ms** | 131072 |
+//!
+//! (This table carried a second column for the NTL+GMP backend — 11.2 and
+//! 11.1 ms — until that backend was removed on 2026-08-03. Those figures are no
+//! longer reproducible in-tree; the record is in `docs/experiments.md` §II.2.
+//! They never affected the comparison below, which is BGV against BFV.)
 //!
 //! **BGV's multiply is indistinguishable from BFV's.** Across repeated runs
 //! the gap is +0.5%, +0.5%, −0.1% — inside the ~1–2% run-to-run spread. The
@@ -95,13 +100,13 @@
 //! multiplication; the ratio between the two schemes did not move.)
 //! *The encoding is not where the money is*, and this module is the evidence
 //! for that rather than a speedup. The way to make the depth-1 product cheaper
-//! is faster ring arithmetic ([`crate::fhe::poly`]), not a different RLWE
+//! is faster ring arithmetic ([`crate::fhe::ntt`]), not a different RLWE
 //! encoding.
 
 use rand::Rng;
 
+use crate::fhe::ntt;
 use crate::fhe::ntt::I256;
-use crate::fhe::poly;
 
 // ─── Parameters ───────────────────────────────────────────────────────────────
 
@@ -177,7 +182,7 @@ fn poly_mul_mod(a: &[u128], b: &[u128], p: &BgvParams) -> Poly {
     let mask = p.q_mask();
     let ac: Vec<i128> = a.iter().map(|&c| center(c, p)).collect();
     let bc: Vec<i128> = b.iter().map(|&c| center(c, p)).collect();
-    poly::negacyclic_product(&ac, &bc, p.n)
+    ntt::exact_negacyclic_product(&ac, &bc, p.n)
         .into_iter()
         .map(|c| c.low_u128() & mask)
         .collect()
@@ -249,7 +254,7 @@ impl BgvCt {
 /// A fresh ciphertext held in the NTT domain, ready to be multiplied against
 /// many others without re-transforming (the chunked-matvec saving).
 pub struct BgvCtNtt {
-    pre: poly::PreparedPair,
+    pre: (Box<ntt::Transformed>, Box<ntt::Transformed>),
 }
 
 pub struct Bgv {
@@ -470,7 +475,10 @@ impl Bgv {
         let p = &self.params;
         let cen = |v: &[u128]| -> Vec<i128> { v.iter().map(|&c| center(c, p)).collect() };
         BgvCtNtt {
-            pre: poly::prepare_pair(&cen(&ct.c[0]), &cen(&ct.c[1]), p.n),
+            pre: (
+                Box::new(ntt::forward_transform(&cen(&ct.c[0]), p.n)),
+                Box::new(ntt::forward_transform(&cen(&ct.c[1]), p.n)),
+            ),
         }
     }
 
@@ -481,7 +489,7 @@ impl Bgv {
         let p = &self.params;
         let cen = |v: &[u128]| -> Vec<i128> { v.iter().map(|&c| center(c, p)).collect() };
         let (b0, b1) = (cen(&b.c[0]), cen(&b.c[1]));
-        let (t0, t1, t2) = poly::rlwe_tensor_pre(&a.pre, &b0, &b1, p.n);
+        let (t0, t1, t2) = ntt::exact_bfv_tensor_pre(&a.pre.0, &a.pre.1, &b0, &b1, p.n);
         BgvCt {
             c: vec![reduce_q(t0, p), reduce_q(t1, p), reduce_q(t2, p)],
         }

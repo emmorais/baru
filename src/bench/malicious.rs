@@ -92,7 +92,7 @@ where
     let mut joins = Vec::with_capacity(3);
     let mut comm = None;
     for (me, h) in handles.into_iter().enumerate() {
-        let counted = CountingTransport::new(LatencyTransport::new(h, profile), 3);
+        let counted = CountingTransport::new(LatencyTransport::new(h, profile, 3), 3);
         if me == 0 {
             comm = Some(counted.handle());
         }
@@ -125,7 +125,7 @@ where
     let mut joins = Vec::with_capacity(3);
     let mut comm = None;
     for (me, h) in handles.into_iter().enumerate() {
-        let counted = CountingTransport::new(LatencyTransport::new(h, profile), 3);
+        let counted = CountingTransport::new(LatencyTransport::new(h, profile, 3), 3);
         if me == 0 {
             comm = Some(counted.handle());
         }
@@ -151,6 +151,15 @@ fn dot_product(profile: NetworkProfile, n: usize, nbits: usize) -> Comparison {
     let t0 = Instant::now();
     let (semi_out, semi_comm) = run_semi(profile, move |_me| {
         move |be: &mut TransportBackend<_>| {
+            // Default 128, so the headline ratio stays an **equal-width** comparison
+            // against the verified leg — which cannot narrow, because
+            // `aby3_verify::headroom_bits` is `128 − used_bits` and its statistical
+            // security *is* that slack. `BARU_WIRE_BITS=auto` narrows this leg only,
+            // giving the other meaningful ratio: active security measured against a
+            // baseline that packs, which is what a deployment would actually run.
+            if let Some(w) = crate::bench::cnn::wire_bits_override(nbits) {
+                be.set_wire_bits(w);
+            }
             // Batched input sharing, as every real workload in this repo does:
             // the scalar path costs one synchronisation per element and would
             // measure the loop rather than the protocol.
@@ -226,6 +235,15 @@ fn comparisons(profile: NetworkProfile, n: usize, nbits: usize) -> Comparison {
     let t0 = Instant::now();
     let (semi_out, semi_comm) = run_semi(profile, move |_me| {
         move |be: &mut TransportBackend<_>| {
+            // Default 128, so the headline ratio stays an **equal-width** comparison
+            // against the verified leg — which cannot narrow, because
+            // `aby3_verify::headroom_bits` is `128 − used_bits` and its statistical
+            // security *is* that slack. `BARU_WIRE_BITS=auto` narrows this leg only,
+            // giving the other meaningful ratio: active security measured against a
+            // baseline that packs, which is what a deployment would actually run.
+            if let Some(w) = crate::bench::cnn::wire_bits_override(nbits) {
+                be.set_wire_bits(w);
+            }
             let xv: Vec<u128> = (0..n).map(|i| (i % 17) as u128).collect();
             let yv: Vec<u128> = (0..n).map(|i| (i % 11) as u128).collect();
             let xs = be.share_secret_batch(&xv, nbits, 0);

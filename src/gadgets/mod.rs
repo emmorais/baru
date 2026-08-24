@@ -327,9 +327,11 @@ pub fn dense_ref(x: &[i64], weights: &[Vec<i64>], bias: &[i64]) -> Vec<i64> {
         .collect()
 }
 
+pub mod winograd;
+
 /// A CHW tensor described by its dimensions; data is a flat row-major
 /// `[channel][row][col]` vector.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Chw {
     pub c: usize,
     pub h: usize,

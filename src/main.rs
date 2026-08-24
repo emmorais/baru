@@ -33,9 +33,6 @@ fn main() -> Result<(), Box<dyn Error>> {
     if args.first().map(String::as_str) == Some("quantize") {
         return baru::ml::run_cli(&args[1..]).map_err(|e| e.into());
     }
-    if args.first().map(String::as_str) == Some("bench-ckks-compare") {
-        return baru::bench::ckks_compare::run_cli(&args[1..]).map_err(|e| e.into());
-    }
     if args.first().map(String::as_str) == Some("bench-hybrid-nn") {
         return baru::bench::hybrid_nn::run_cli(&args[1..]).map_err(|e| e.into());
     }
@@ -57,14 +54,20 @@ fn main() -> Result<(), Box<dyn Error>> {
     if args.first().map(String::as_str) == Some("bench-layer") {
         return baru::bench::layer::run_cli(&args[1..]).map_err(|e| e.into());
     }
+    if args.first().map(String::as_str) == Some("bench-2pc-nn") {
+        return baru::bench::two_party_nn::run_cli(&args[1..]).map_err(|e| e.into());
+    }
+    if args.first().map(String::as_str) == Some("bench-2pc-cnn") {
+        return baru::bench::conv_nn::run_cli(&args[1..]).map_err(|e| e.into());
+    }
+    if args.first().map(String::as_str) == Some("bench-heir") {
+        return baru::bench::heir::run_cli(&args[1..]).map_err(|e| e.into());
+    }
     if args.first().map(String::as_str) == Some("bench-ot") {
         return baru::bench::ot::run_cli(&args[1..]).map_err(|e| e.into());
     }
     if args.first().map(String::as_str) == Some("bench-psi") {
         return baru::bench::psi::run_cli(&args[1..]).map_err(|e| e.into());
-    }
-    if args.first().map(String::as_str) == Some("bench-pir") {
-        return baru::bench::pir::run_cli(&args[1..]).map_err(|e| e.into());
     }
     if args.first().map(String::as_str) == Some("bench-medmnist") {
         return baru::bench::medmnist::run_cli(&args[1..]).map_err(|e| e.into());
@@ -80,6 +83,9 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
     if args.first().map(String::as_str) == Some("bench-compiled-nn") {
         return baru::bench::compiled_nn::run_cli(&args[1..]).map_err(|e| e.into());
+    }
+    if args.first().map(String::as_str) == Some("bench-conv") {
+        return baru::bench::conv_route::run_cli(&args[1..]).map_err(|e| e.into());
     }
     if args.first().map(String::as_str) == Some("bench-backend-aware") {
         return baru::bench::backend_aware::run_cli(&args[1..]).map_err(|e| e.into());

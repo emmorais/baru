@@ -54,7 +54,7 @@ use crate::crypto::types::Fr;
 use crate::fhe::backend::FheBackend;
 use crate::fhe::mock_backend::MockFheBackend;
 use crate::fhe::tfhe_backend::TfheBackend;
-use crate::fhe::{CkksBackend, MockCkksBackend, RealFheBackend};
+use crate::fhe::{MockCkksBackend, RealFheBackend};
 use crate::interpreter::backend::{Backend, ShareRef};
 use crate::interpreter::transport_backend::TransportBackend;
 
@@ -277,6 +277,15 @@ fn mpc_party_run(
 ) -> (Vec<i64>, Vec<Phase>) {
     const OWNER: usize = 0;
     let mut be = TransportBackend::new(me, transport);
+    // Ring shares carry `NBITS` on the wire rather than 128, matching the CNN path
+    // so byte figures from the two benchmarks are comparable. Values here are
+    // interpreted modulo `2^NBITS` (`fr_to_signed`), so arithmetic modulo the same is
+    // the semantics rather than a truncation of it. The plaintext reference above is
+    // the oracle: a width that is too narrow shows up as a wrong result, not a slow
+    // one. See `TransportBackend::wire_bits`.
+    if let Some(w) = crate::bench::cnn::wire_bits_for(NBITS) {
+        be.set_wire_bits(w);
+    }
     let mut t = Timer::new();
 
     let share_vec = |be: &mut TransportBackend<MpcTransport>, vals: &[i64]| -> Vec<ShareRef> {
@@ -398,7 +407,7 @@ pub fn run_mpc_as(
     let overall_start = Instant::now();
 
     for (me, h) in handles.into_iter().enumerate() {
-        let lat = LatencyTransport::new(h, profile);
+        let lat = LatencyTransport::new(h, profile, 3);
         let counted = CountingTransport::new(lat, 3);
         comm_handles.push(counted.handle());
         let x = x.clone();
@@ -734,7 +743,6 @@ pub enum NnBackend {
     Mpc,
     FheMock,
     FheTfhe,
-    FheCkks,
     FheCkksMock,
 }
 
@@ -744,16 +752,15 @@ impl NnBackend {
             "mpc" => Ok(NnBackend::Mpc),
             "fhe-mock" | "mock" => Ok(NnBackend::FheMock),
             "fhe-tfhe" | "tfhe" => Ok(NnBackend::FheTfhe),
-            "fhe-ckks" | "ckks" => Ok(NnBackend::FheCkks),
             "fhe-ckks-mock" | "ckks-mock" => Ok(NnBackend::FheCkksMock),
             other => Err(format!(
-                "unknown backend '{other}' (expected mpc, fhe-mock, fhe-tfhe, fhe-ckks, fhe-ckks-mock)"
+                "unknown backend '{other}' (expected mpc, fhe-mock, fhe-tfhe, fhe-ckks-mock)"
             )),
         }
     }
 
     pub fn default_set() -> Vec<NnBackend> {
-        vec![NnBackend::Mpc, NnBackend::FheMock, NnBackend::FheCkks]
+        vec![NnBackend::Mpc, NnBackend::FheMock, NnBackend::FheCkksMock]
     }
 }
 
@@ -770,17 +777,6 @@ pub fn run_one(workload: Workload, backend: NnBackend, profile: NetworkProfile) 
             vec![run_fhe("fhe-tfhe", &be, workload, |sk| {
                 TfheBackend::install_server_key(sk)
             })]
-        }
-        NnBackend::FheCkks => {
-            if workload.needs_comparison() {
-                return vec![];
-            }
-            run_ckks(
-                "fhe-ckks",
-                &CkksBackend::new(),
-                CkksBackend::with_server_keys,
-                workload,
-            )
         }
         NnBackend::FheCkksMock => {
             if workload.needs_comparison() {
@@ -1168,7 +1164,11 @@ mod tests {
     #[test]
     fn backend_parse_roundtrip() {
         assert_eq!(NnBackend::parse("mpc"), Ok(NnBackend::Mpc));
-        assert_eq!(NnBackend::parse("ckks"), Ok(NnBackend::FheCkks));
+        assert_eq!(NnBackend::parse("ckks-mock"), Ok(NnBackend::FheCkksMock));
         assert!(NnBackend::parse("nonsense").is_err());
+        // The SEAL-backed CKKS row was removed on 2026-08-03; its name must not
+        // silently resolve to something else.
+        assert!(NnBackend::parse("ckks").is_err());
+        assert!(NnBackend::parse("fhe-ckks").is_err());
     }
 }

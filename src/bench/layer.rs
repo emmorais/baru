@@ -601,6 +601,10 @@ mod tests {
     /// FHE packing bound changed, and E25's boundary needs restating again.
     #[test]
     fn the_crossover_depends_on_which_preprocessing_mpc_is_priced_with() {
+        on_a_deep_stack(crossover_preprocessing_body);
+    }
+
+    fn crossover_preprocessing_body() {
         let mut dep = Deployment::wan(2);
         dep.allow_dealer = true;
         let r = run(&[64, 1024], &dep, 32).unwrap();
@@ -651,36 +655,106 @@ mod tests {
         );
     }
 
+    /// Run a wide-layer test body on a stack sized for the workload.
+    ///
+    /// A width-`w` layer is a `w`-term expression, and both the parser and the
+    /// circuit compiler recurse once per term. A debug build gives every block in
+    /// a function its own stack slots, so one level of that recursion costs a few
+    /// KiB however tightly the code is written — 1024 of them do not fit in the
+    /// 2 MiB a libtest thread gets, while the 8 MiB main thread the CLI runs on is
+    /// comfortable (`bench-layer --widths 8,1024` succeeds).
+    ///
+    /// Narrowing the widths instead would delete the measurement these tests exist
+    /// to make: the crossover only appears once the layer is wide.
+    fn on_a_deep_stack(body: fn()) {
+        std::thread::Builder::new()
+            .stack_size(32 << 20)
+            .spawn(body)
+            .expect("spawn a deep-recursion thread")
+            .join()
+            .expect("test body panicked");
+    }
+
     #[test]
     fn the_hybrid_overtakes_semi2k_as_the_layer_widens() {
+        on_a_deep_stack(hybrid_overtakes_body);
+    }
+
+    /// **This test asserted the opposite at width 8 until random bits became
+    /// real.** It required "at width 8 Semi2k should still win", which held while
+    /// `ShareEngine::random_bits` drew bits locally and charged nothing for them.
+    /// Once `vm::random_bits_batch` generates them — one Beaver triple per bit —
+    /// the ReLU's `nb + KAPPA = 59` bits are 59 real OT-generated triples, and at
+    /// a narrow width that is most of the triple bill: Semi2k's count goes from
+    /// 311 to 370 at width 8, which is 1.1 MiB of OT and 695.2 ms against the
+    /// hybrid's 692.1.
+    ///
+    /// So the crossover against **OT-preprocessed** MPC moved from width 64 down
+    /// to the narrowest width measured, and the honest reading of the narrow rows
+    /// is a *tie* rather than a win for either side: 0.2% apart at width 1 and
+    /// 0.4% at width 8, well inside the run-to-run spread §7.3 records. What the
+    /// widths still separate cleanly is the wide end, so that is what this
+    /// asserts, plus the mechanism (the bit triples) and the fact that
+    /// SHE-preprocessed MPC is untouched by any of it.
+    fn hybrid_overtakes_body() {
         let mut dep = Deployment::wan(2);
         dep.allow_dealer = true;
         let r = run(&[8, 1024], &dep, 32).unwrap();
-        let pick = |proto: &str, w: usize| -> f64 {
+        let get = |proto: &str, w: usize| -> LayerPoint {
             r.mpc
                 .iter()
                 .find(|p| p.protocol == proto && p.width == w)
-                .map(|p| p.secs)
+                .cloned()
                 .unwrap_or_else(|| panic!("no {proto} at {w}"))
         };
+        let pick = |proto: &str, w: usize| -> f64 { get(proto, w).secs };
         let hybrid =
             |w: usize| -> f64 { r.fhe.iter().find(|p| p.width == w).map(|p| p.secs).unwrap() };
 
-        // Narrow: Semi2k still wins.
+        // Narrow: a tie, not a win. Assert it as one, so a drift in either
+        // direction that is still within noise does not read as a result.
+        let narrow_gap = (pick("semi2k", 8) - hybrid(8)).abs() / hybrid(8);
         assert!(
-            pick("semi2k", 8) < hybrid(8),
-            "at width 8 Semi2k should still win: {:.1} vs {:.1} ms",
+            narrow_gap < 0.02,
+            "at width 8 OT-preprocessed MPC and the hybrid should be within 2%: \
+             {:.1} vs {:.1} ms ({:.1}%)",
             pick("semi2k", 8) * 1e3,
-            hybrid(8) * 1e3
+            hybrid(8) * 1e3,
+            narrow_gap * 100.0
         );
-        // Wide: the triple bill has overtaken the ciphertext.
+        // Wide: the triple bill has overtaken the ciphertext, decisively.
         assert!(
-            hybrid(1024) < pick("semi2k", 1024),
-            "at width 1024 the hybrid should win: {:.1} vs {:.1} ms",
+            hybrid(1024) < pick("semi2k", 1024) * 0.9,
+            "at width 1024 the hybrid should win by >10%: {:.1} vs {:.1} ms",
             hybrid(1024) * 1e3,
             pick("semi2k", 1024) * 1e3
         );
         assert!(r.crossover.is_some(), "a crossover should have been found");
+
+        // The mechanism: exactly the ReLU's random bits separate Semi2k's triple
+        // count from the dealer's, at *every* width. That is what moved the
+        // boundary, and pinning the constant is what stops the cause being
+        // reattributed later.
+        for w in [8usize, 1024] {
+            let extra = get("semi2k", w).triples - get("dealer", w).triples;
+            assert_eq!(
+                extra, 59,
+                "at width {w} Semi2k should consume 59 more triples than the dealer \
+                 — the ReLU's `nb + KAPPA` random bits, one triple each"
+            );
+        }
+
+        // And none of it touches SHE preprocessing: LowGear still wins outright at
+        // both ends, which is why the claim has to name its baseline.
+        for w in [8usize, 1024] {
+            assert!(
+                pick("lowgear", w) < hybrid(w),
+                "SHE-preprocessed MPC should still beat the hybrid at width {w}: \
+                 {:.1} vs {:.1} ms",
+                pick("lowgear", w) * 1e3,
+                hybrid(w) * 1e3
+            );
+        }
 
         // Dealer is a lower bound and must stay flat — that is what shows the
         // whole effect comes from preprocessing rather than computation.

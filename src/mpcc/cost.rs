@@ -561,8 +561,30 @@ pub fn estimate(
         Some(ot) => ot.triple_bytes(share_bits),
         None => spec.cost.offline_elems_per_triple * elem_bytes,
     };
-    let offline_bytes = (acc.triples + acc.and_triples) * triple_bytes
-        + (acc.edabits + acc.dabits + acc.random_bits) * elem_bytes;
+    // A random bit is **generated**, not dealt.  `vm::random_bits_batch` has each
+    // party contribute a private bit and XOR-reduces them as a balanced tree, and
+    // `x ⊕ y = x + y − 2xy`, so one bit costs `⌈log₂(parties)⌉` multiplications —
+    // and therefore that many Beaver triples — plus the input sharing.
+    //
+    // This term used to be `acc.random_bits * elem_bytes`: one ring element per
+    // bit.  That under-charged it by ~400× at two parties, where a bit really
+    // costs one triple (≈3.2 kB of OT at 64-bit shares) rather than 8 bytes —
+    // and it under-charged *exactly* the phase that decides a comparison-heavy
+    // workload, since a 32-bit comparison draws `nb + KAPPA = 59` of them. The
+    // measurement it is now fitted to is `the_cost_of_a_random_bit_is_a_triple`
+    // in `mpcc::vm`.
+    let bit_levels = f64::from(ceil_log2(dep.parties as u32).max(1));
+    let random_bit_triples = acc.random_bits * bit_levels * spec.cost.triples_per_mul;
+    let random_bit_bytes = acc.random_bits
+        * (dep.parties as f64 * spec.cost.open_elems.total(dep.parties) * elem_bytes
+            + bit_levels
+                * spec.cost.mul_elems.total(dep.parties)
+                * elem_bytes
+                * spec.cost.auth_overhead);
+
+    let offline_bytes = (acc.triples + acc.and_triples + random_bit_triples) * triple_bytes
+        + (acc.edabits + acc.dabits) * elem_bytes
+        + random_bit_bytes;
 
     let latency_secs = rounds as f64 * dep.latency_us / 1e6;
     let bandwidth_secs = acc.bytes / dep.bandwidth_bytes_per_sec;
@@ -778,6 +800,159 @@ mod tests {
             "shifting is wire relabelling in a garbled circuit"
         );
         assert_eq!(yao_shift.rounds, 3, "Yao is constant-round");
+    }
+
+    /// **Fitting `local_ns_per_lane`, the one term `baru mpcc calibrate` never checked.**
+    ///
+    /// `calibrate` validates predicted rounds and predicted online bytes against a measured run,
+    /// and reports 0% error on both. It does not touch the compute term, whose constants have
+    /// carried the comment "an estimate; calibrated in P1" since they were written. That gap
+    /// stopped being academic when a network-only model picked a comparison backend that measured
+    /// 1.24x slower than the alternative, because the two differed by 6x in local work
+    /// (`precompile::mpc_compare`).
+    ///
+    /// The method matters more than the number. Wall clock at
+    /// `NetworkProfile::INSTANT` is per-lane work *plus* a fixed cost — thread spawn, share
+    /// setup, the timing call itself — and dividing a single measurement by its width charges the
+    /// fixed part to every lane. So this measures several widths and fits the **slope**, which is
+    /// the per-lane cost, and reports the intercept separately rather than smearing it.
+    #[test]
+    #[ignore] // three-party transport, large batches
+    fn the_local_work_per_multiplication_is_what_the_spec_says() {
+        use crate::bench::comm::NetworkProfile;
+        use crate::bench::hybrid_nn::{run_parties, MpcTransport};
+        use crate::crypto::types::Fr;
+        use crate::interpreter::backend::Backend;
+        use crate::interpreter::transport_backend::TransportBackend;
+        use std::time::Instant;
+
+        const NBITS: usize = 32;
+        let widths = [1024usize, 4096, 16384, 65536];
+
+        let mut points: Vec<(f64, f64)> = Vec::new(); // (lanes, secs)
+        for w in widths {
+            let (times, _comm) = run_parties(NetworkProfile::INSTANT, move |me| {
+                move |be: &mut TransportBackend<MpcTransport>| {
+                    let vals: Vec<Fr> = (0..w)
+                        .map(|i| if me == 0 { (i as Fr) & 0xffff } else { 0 })
+                        .collect();
+                    let xs = be.share_secret_batch(&vals, NBITS, 0);
+                    let ys = be.share_secret_batch(&vals, NBITS, 0);
+                    let pairs: Vec<_> = xs.iter().cloned().zip(ys.iter().cloned()).collect();
+                    // Time only the multiplication, so share setup is not in the slope.
+                    let t = Instant::now();
+                    let out = be.mul_batch(&pairs);
+                    let ns = t.elapsed().as_nanos() as u64;
+                    (be.reveal(&out[0], None), ns)
+                }
+            });
+            // Party 0's clock; all three do the same work.
+            let ns = times[0].1 as f64;
+            points.push((w as f64, ns / 1e9));
+            println!("    {w:6} lanes: {:9.3} ms", ns / 1e6);
+        }
+
+        // Least squares on secs = a + b * lanes.
+        let n = points.len() as f64;
+        let sx: f64 = points.iter().map(|p| p.0).sum();
+        let sy: f64 = points.iter().map(|p| p.1).sum();
+        let sxx: f64 = points.iter().map(|p| p.0 * p.0).sum();
+        let sxy: f64 = points.iter().map(|p| p.0 * p.1).sum();
+        let slope = (n * sxy - sx * sy) / (n * sxx - sx * sx);
+        let intercept = (sy - slope * sx) / n;
+        let measured_ns_per_lane = slope * 1e9;
+        let spec = find("aby3")
+            .expect("aby3 is registered")
+            .cost
+            .local_ns_per_lane;
+        println!(
+            "  fitted {measured_ns_per_lane:.1} ns/lane (fixed cost {:.3} ms), spec says {spec:.1}",
+            intercept * 1000.0
+        );
+        println!(
+            "  ratio measured/spec = {:.2}x",
+            measured_ns_per_lane / spec
+        );
+
+        assert!(
+            measured_ns_per_lane > 0.0,
+            "a per-lane cost must be positive; the fit found {measured_ns_per_lane:.1} ns, which \
+             means the widths swept are all inside the fixed-cost regime"
+        );
+
+        // ── What the per-lane figure is actually made of ──
+        //
+        // The fit above times `mul_batch` over a real transport, so it contains serialization, a
+        // channel round and a blocking receive as well as the field arithmetic the spec constant
+        // is nominally about. To say whether 5 ns/lane is a wrong constant or a different
+        // quantity, we need the arithmetic on its own, so we fit a purely local operation on the
+        // same backend: `add` communicates nothing, and its per-lane cost is share bookkeeping
+        // plus a ring addition — a floor on what any interactive lane must also pay.
+        //
+        // (`Aby3Simulator` is *not* the instrument for this, which is worth recording because it
+        // looks like it should be: it has no batched multiply, and `sim::mul_ab3_concurrent`
+        // spawns three OS threads and three inproc handles per multiplication, so it measures
+        // \SI{58}{\micro\second} per lane — 54x the real backend. It is a correctness aid.)
+        let add_ns: f64 = {
+            let mut pts: Vec<(f64, f64)> = Vec::new();
+            for w in widths {
+                let (times, _c) = run_parties(NetworkProfile::INSTANT, move |me| {
+                    move |be: &mut TransportBackend<MpcTransport>| {
+                        let vals: Vec<Fr> = (0..w)
+                            .map(|i| if me == 0 { (i as Fr) & 0xffff } else { 0 })
+                            .collect();
+                        let xs = be.share_secret_batch(&vals, NBITS, 0);
+                        let ys = be.share_secret_batch(&vals, NBITS, 0);
+                        let t = Instant::now();
+                        let mut last = xs[0].clone();
+                        for (a, b) in xs.iter().zip(&ys) {
+                            last = be.add(a, b);
+                        }
+                        let ns = t.elapsed().as_nanos() as u64;
+                        (be.reveal(&last, None), ns)
+                    }
+                });
+                pts.push((w as f64, times[0].1 as f64 / 1e9));
+            }
+            let syl: f64 = pts.iter().map(|p| p.1).sum();
+            let sxyl: f64 = pts.iter().map(|p| p.0 * p.1).sum();
+            let sl = (n * sxyl - sx * syl) / (n * sxx - sx * sx);
+            sl * 1e9
+        };
+        // 5.0 ns was the estimate this field carried before it was fitted. Quoted here because
+        // the interesting fact is not the new number but that the arithmetic floor alone already
+        // exceeded the old one by 29x, before any communication was counted at all.
+        const PRE_FIT_ESTIMATE_NS: f64 = 5.0;
+        println!(
+            "  local-only `add`: {add_ns:.1} ns/lane — share bookkeeping plus a ring addition, \
+             no communication at all, already {:.0}x the {PRE_FIT_ESTIMATE_NS:.0} ns this field \
+             assumed before it was fitted",
+            add_ns / PRE_FIT_ESTIMATE_NS
+        );
+        println!(
+            "  and a multiply's {measured_ns_per_lane:.0} ns is {:.1}x an add, the rest being \
+             serialization and the channel round",
+            measured_ns_per_lane / add_ns
+        );
+
+        // A wide band, deliberately. This runs on whatever hardware the artifact is built on, so
+        // a tight bound would be a portability bug rather than a calibration. What it does catch
+        // is the thing that was actually wrong: an order-of-magnitude error in a constant nobody
+        // had ever checked. The spec said 5 ns; the fit said 1072; the spec now says 1072.
+        let ratio = measured_ns_per_lane / spec;
+        assert!(
+            (0.25..=4.0).contains(&ratio),
+            "measured {measured_ns_per_lane:.1} ns/lane against a spec of {spec:.1} ({ratio:.2}x) \
+             — the compute term of every prediction naming `aby3` rides on this, and on a batched \
+             program it decides both the total and the reported bottleneck"
+        );
+        // The arithmetic floor must stay below the full lane cost, or the decomposition above is
+        // measuring something other than it claims.
+        assert!(
+            add_ns < measured_ns_per_lane,
+            "a local-only add ({add_ns:.0} ns) cannot cost more than a multiply \
+             ({measured_ns_per_lane:.0} ns); the two fits are not measuring what they say"
+        );
     }
 
     #[test]

@@ -453,7 +453,6 @@ pub enum Backend {
     Mpc,
     FheMock,
     FheTfhe,
-    FheCkks,
     FheCkksMock,
     Zkp,
 }
@@ -465,11 +464,10 @@ impl Backend {
             "mpc" | "mpc-aby3" => Ok(Backend::Mpc),
             "fhe-mock" | "mock" => Ok(Backend::FheMock),
             "fhe-tfhe" | "tfhe" | "fhe" => Ok(Backend::FheTfhe),
-            "fhe-ckks" | "ckks" => Ok(Backend::FheCkks),
             "fhe-ckks-mock" | "ckks-mock" => Ok(Backend::FheCkksMock),
             "zkp" | "zkp-binius64" | "binius64" => Ok(Backend::Zkp),
             other => Err(format!(
-                "unknown backend '{}' (expected plain, mpc, fhe-mock, fhe-tfhe, fhe-ckks, \
+                "unknown backend '{}' (expected plain, mpc, fhe-mock, fhe-tfhe, \
                  fhe-ckks-mock, zkp)",
                 other
             )),
@@ -482,7 +480,6 @@ impl Backend {
             Backend::Mpc,
             Backend::FheMock,
             Backend::FheTfhe,
-            Backend::FheCkks,
             Backend::Zkp,
         ]
     }
@@ -559,18 +556,6 @@ pub fn run_case(case: &BenchCase, backends: &[Backend], iters: u32) -> CaseRepor
                     })
                 })
             }),
-            Backend::FheCkks => guarded("fhe-ckks", || {
-                averaged(iters, || {
-                    run_fhe_real(
-                        "fhe-ckks",
-                        &crate::fhe::CkksBackend::new(),
-                        crate::fhe::CkksBackend::with_server_keys,
-                        case.expr,
-                        &inputs,
-                        baseline,
-                    )
-                })
-            }),
             Backend::FheCkksMock => guarded("fhe-ckks-mock", || {
                 averaged(iters, || {
                     run_fhe_real(
@@ -607,7 +592,7 @@ Runs each case on every selected backend and reports per-phase timings.
 With no case names, the built-in suite runs (use --list to see it).
 
 options:
-  --backends LIST   comma-separated: plain,mpc,fhe-mock,fhe-tfhe,fhe-ckks,fhe-ckks-mock,zkp
+  --backends LIST   comma-separated: plain,mpc,fhe-mock,fhe-tfhe,fhe-ckks-mock,zkp
                     (default: all except fhe-ckks-mock)
   --iters N         average timings over N runs (default 1)
   --expr SRC        benchmark a custom expression instead of the suite
@@ -955,16 +940,19 @@ mod tests {
 pub mod abstraction;
 pub mod backend_aware;
 pub mod circuit;
-pub mod ckks_compare;
 pub mod cnn;
 pub mod cohort;
 pub mod cohort_eval;
 pub mod comm;
 pub mod compiled_nn;
+pub mod conv_nn;
+pub mod conv_route;
 pub mod deep_nn;
+pub mod depth;
 pub mod falcon;
 pub mod fhe_innerprod;
 pub mod gc_compare;
+pub mod heir;
 pub mod hybrid_nn;
 pub mod layer;
 pub mod malicious;
@@ -975,9 +963,9 @@ pub mod mnist;
 pub mod net;
 pub mod nn;
 pub mod ot;
-pub mod pir;
 pub mod polymul;
 pub mod psi;
 pub mod train;
 pub mod triples;
+pub mod two_party_nn;
 pub mod zkp_layer;

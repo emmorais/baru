@@ -14,7 +14,24 @@ add another generated file, add its command below in the same breath.
 | `mnist_cnn.rs` | `baru bench-mnist` | `train_medmnist.py mnist/ examples/data/mnist_cnn.rs --epochs 30 --test-order first --classes 0,1,2,3,4,5,6,7,8,9 --dataset MNIST --task "handwritten digit recognition"` |
 | `pneumonia_cnn.rs` | `baru bench-medmnist --dataset pneumonia` | `train_medmnist.py pneumoniamnist.npz examples/data/pneumonia_cnn.rs --epochs 25 --classes normal,pneumonia --dataset PneumoniaMNIST --task "pediatric chest X-ray: pneumonia vs normal"` |
 | `organa_cnn.rs` | `baru bench-medmnist --dataset organa` | `train_medmnist.py organamnist.npz examples/data/organa_cnn.rs --epochs 45 --classes bladder,femur-left,femur-right,heart,kidney-left,kidney-right,liver,lung-left,lung-right,pancreas,spleen --dataset OrganAMNIST --task "abdominal CT: 11-organ classification (axial views)"` |
+| `derma_cnn.rs` | `baru bench-medmnist --dataset derma` | `train_medmnist.py dermamnist.npz examples/data/derma_cnn.rs --epochs 40 --rgb --classes actinic-keratoses,basal-cell-carcinoma,benign-keratosis,dermatofibroma,melanoma,melanocytic-nevi,vascular-lesion --dataset DermaMNIST --task "dermatoscopy: 7-class skin lesion"` |
 | `pneumonia_linear.rs` | `cargo run --example mnist -- --pneumonia` | `train_medmnist.py pneumoniamnist.npz examples/data/pneumonia_linear.rs --linear --epochs 30 --classes normal,pneumonia --dataset PneumoniaMNIST --task "pediatric chest X-ray: pneumonia vs normal"` |
+
+**`derma_cnn.rs` is the RGB one, and `--rgb` is load-bearing.** Without it the
+dataset is folded to luminance and the result is a different experiment: measured at
+40 epochs, colour is worth **AUC 0.8519 against 0.7667** and balanced accuracy
+**30.14% against 23.30%**. Dermatoscopy is where colour should matter, and it does.
+The fold remains the default for every other set because every figure in the repo was
+measured that way.
+
+**`organa_cnn.rs` is `--conv 16,32`, not the default `8,16`.** Its second convolution
+takes 16 channels at 13×13, which needs degree 5266 against a ring dimension of 4096
+and therefore runs as two channel groups — free homomorphically, at two ciphertext
+multiplications per output channel instead of one. That widening is worth **82.93%
+against 81.64%** on 17 778 test images, with disjoint confidence intervals. Pneumonia
+was left at `8,16` because the same widening gained it nothing: 4 708 training images
+overfit the extra capacity, and its validation accuracy rose while its test accuracy
+fell.
 
 `examples/data/mnist_data.rs` is the one exception: its 784 weights are
 hand-written (extracted from `tests/nn.rs`), not trained, so there is nothing
@@ -65,11 +82,20 @@ Going deeper is the way to spend the budget that is left: `--conv 8,12,32` is
 three convs, runs encrypted bit-exactly, and needs no bootstrap.
 
 Four of the twelve MedMNIST v2 2D sets ship RGB (Path, Derma, Blood, Retina).
-The FHE conv packing assumes one input channel, so those are folded to BT.601
-luminance before training. That is a real change to the task — colour carries
-diagnostic signal in dermatoscopy and histology — so the run says so, the
-generated file records it, and the accuracy must be read against a grayscale
-baseline, never against the published RGB ResNet-18.
+**`--rgb` keeps the colour; without it they are folded to BT.601 luminance.**
+
+This used to say the FHE conv packing "assumes one input channel", and that was
+wrong — the fourth place in this repo to say it. `fhe::conv_pack` has always been
+multi-channel, because channels summing on a shared coefficient is the entire point
+of its reversed offset; what was single-channel was the Rust plumbing, which
+hardcoded `in_c = 1`. An RGB 28×28 convolution needs degree 3977 against a ring
+dimension of 4096, so it fits one ciphertext at **one multiplication per output
+channel** — three channels do not cost three times the work.
+
+The fold is therefore a choice, and it stays the default because every other weight
+file and every accuracy figure in the repo was measured with it. When it is applied
+the run says so and the generated file records it, and such an accuracy must be read
+against a grayscale baseline rather than the published RGB ResNet-18.
 
 ## Getting the data
 
@@ -78,7 +104,7 @@ rather than redistributed.
 
 ```sh
 # MedMNIST v2 (CC BY 4.0) — https://medmnist.com
-for d in pneumoniamnist organamnist; do
+for d in pneumoniamnist organamnist dermamnist; do
   curl -sLo $d.npz "https://zenodo.org/records/10519652/files/$d.npz?download=1"
 done
 
@@ -150,3 +176,163 @@ encrypted pipeline ever reveals.
 `bench-medmnist` reports the same quantities on the embedded subset. The two
 implementations were cross-checked by embedding a whole test set and confirming
 they agree to the digit.
+
+---
+
+## `heir_baseline.py` — the FHE baseline driver (not a generator)
+
+The other script here is different in kind: it generates nothing and is not
+consumed by a committed file. It is a **driver** that `baru bench-heir` invokes as
+a subprocess, reading one request JSON on stdin and writing one report JSON on
+stdout. The contract is documented in its own header; `src/bench/heir.rs` is the
+other end of it.
+
+| what | value |
+|---|---|
+| consumed by | `baru bench-heir` |
+| path override | `BARU_HEIR_PY` (defaults to `tools/heir_baseline.py`) |
+| exercise the contract, no HEIR needed | `baru bench-heir --shape 6x4x3 --self-test` |
+| real measurement | see the setup below, then `baru bench-heir --shape 16x8x4 --activation square` |
+| interpreter override | `BARU_PYTHON` (must be >= 3.10) |
+| OpenFHE install | `BARU_OPENFHE_PREFIX` — the driver derives the four `OPENFHE_*` variables from it |
+
+**Python ≥ 3.10 is required for the real path** — `heir-py` publishes
+`cp310-abi3` wheels only. This script itself runs on 3.9 so that `--self-test`
+works anywhere.
+
+### Setting up the real path
+
+`heir-py` alone cannot evaluate anything: `heir.compile()` needs an OpenFHE **C++
+install** (it emits C++ and compiles it per program) and otherwise dies with
+*"Could not build development config. Did you run bazel?"*. The PyPI `openfhe`
+wheel does not satisfy it — that is Python bindings, not a toolchain — and there
+is no Homebrew formula.
+
+```sh
+brew install python@3.12 libomp        # Apple clang ships no omp.h
+python3.12 -m venv venv && ./venv/bin/pip install "heir-py[python,openfhe]" "numpy<2.4"
+
+git clone --depth 1 https://github.com/openfheorg/openfhe-development.git ofhe
+cmake -S ofhe -B ofhe/build -DCMAKE_INSTALL_PREFIX=$PWD/ofhe-install \
+  -DBUILD_UNITTESTS=OFF -DBUILD_EXAMPLES=OFF -DBUILD_BENCHMARKS=OFF \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_CXX_FLAGS=-I/opt/homebrew/opt/libomp/include \
+  -DCMAKE_C_FLAGS=-I/opt/homebrew/opt/libomp/include
+cmake --build ofhe/build -j8 && cmake --install ofhe/build
+
+export BARU_PYTHON=$PWD/venv/bin/python
+export BARU_OPENFHE_PREFIX=$PWD/ofhe-install
+```
+
+The driver derives `OPENFHE_INCLUDE_DIR`, `OPENFHE_LIB_DIR`, `OPENFHE_LINK_LIBS`
+and `DYLD_LIBRARY_PATH` from the prefix, and symlinks libomp into the OpenFHE lib
+dir — the emitted C++ is linked with `-L$OPENFHE_LIB_DIR` only, so `-lomp` has to
+resolve from there.
+
+**`numpy<2.4` is load-bearing**: numba 0.62 refuses newer numpy, and the frontend
+imports numba even on the MLIR path.
+
+### It emits MLIR, not a decorated function
+
+HEIR's Python decorator runs the function through numba, and a dense layer is not
+expressible there — measured on 2026.8.1, `x[0]` is "Unsupported IR Element:
+getitem", `@` is "Extension handling for non-integer types is not yet supported",
+and `np.sum`/`np.matmul` are unsupported. Elementwise tensor ops do work. So the
+driver emits **`linalg` MLIR** and calls `compile(mlir_str=...)`, which is the
+level HEIR's ML pipeline actually targets (the Torch route reaches it via
+torch-mlir; going direct skips torch entirely).
+
+### Why it refuses things
+
+Two gates, both in `src/bench/heir.rs`, and both there because the failure mode
+is documented rather than hypothetical.
+
+**Security parameters.** [google/heir#1232](https://github.com/google/heir/issues/1232)
+reports an MNIST MLP at ~30 s and 3 GB with `HEStd_NotSet` — OpenFHE's "do not
+check" mode — and **~6 min and 26 GB** at the secure ring dimension. A 12×
+factor sits between the insecure and the secure baseline, and the insecure one is
+what a casual run produces. So a latency is refused unless the run reports one of
+`HEStd_128_classic` / `HEStd_192_classic` / `HEStd_256_classic`. An insecure
+baseline is worse than no baseline: it manufactures a speedup out of a parameter
+choice.
+
+**The activation, and it is a modelling decision.** CKKS cannot compare, so an
+exact ReLU is not expressible on the FHE arm at all, while Baru's MPC arm computes
+it exactly. The two arms therefore cannot be made to compute the same function by
+tuning a parameter, and the driver refuses to choose:
+
+* `activation: "square"` gives **both** arms `x²` — exact on each side, and what
+  Orion does for its MNIST networks. This is the route taken. It costs the MPC arm
+  *nothing*: measured identical to ReLU on rounds, multiplications,
+  decompositions and bytes, because squaring doubles the fixed-point scale and the
+  rescale that fixes that is the same decomposition the comparison was.
+* `activation: "relu_poly"` keeps the MPC arm's exact ReLU and approximates it on
+  the FHE arm. Not implemented: it needs a minimax polynomial over a justified
+  input range, which is a decision and not a default.
+
+Underneath that, a latency is still refused unless the FHE arm reproduces the
+plaintext classification — otherwise a too-coarse approximation looks fast.
+
+`--self-test` evaluates in plaintext and honestly reports `HEStd_NotSet`, so it
+round-trips the contract *and* is rejected. That is deliberate: it is the fixture
+that proves the security gate fires.
+
+## `ckks_cnn.cpp` — the homomorphic arm of the convolutional benchmark
+
+A CKKS implementation of the same convolutional network the secret-sharing arm
+evaluates, written directly against OpenFHE. It exists because comparing our measured
+latency against a figure published for other hardware, another library and — as
+`docs/experiments.md` §VI.8 records having got wrong once — another network under the
+same name, is not a comparison.
+
+It reads the fixture written by `bench::conv_nn::export`, so both arms evaluate one
+definition of the network on one input, and it prints the class it decided beside the
+plaintext reference class so a caller can refuse a latency figure when the two
+disagree.
+
+Build and run (the OpenFHE prefix is the one built for `heir_baseline.py` above):
+
+```sh
+clang++ -std=c++17 -O3 -o ckks_cnn tools/ckks_cnn.cpp \
+  -I$BARU_OPENFHE_PREFIX/include/openfhe \
+  -I$BARU_OPENFHE_PREFIX/include/openfhe/core \
+  -I$BARU_OPENFHE_PREFIX/include/openfhe/pke \
+  -I$BARU_OPENFHE_PREFIX/include/openfhe/binfhe \
+  -I/opt/homebrew/opt/libomp/include \
+  -L$BARU_OPENFHE_PREFIX/lib -lOPENFHEpke -lOPENFHEcore -lOPENFHEbinfhe \
+  -L/opt/homebrew/opt/libomp/lib -lomp -Xpreprocessor -fopenmp
+
+cargo run --release --example export_cnn -- lenet5.txt 0
+DYLD_LIBRARY_PATH=$BARU_OPENFHE_PREFIX/lib:/opt/homebrew/opt/libomp/lib \
+  ./ckks_cnn lenet5.txt            # add --bootstrap for networks that exceed the budget
+```
+
+**The security level is never pinned and never relaxed.** The parameters are set from
+`HEStd_128_classic` and the ring dimension is whatever OpenFHE derives from it; the
+only published HEIR ML datapoint was fast because it ran at `HEStd_NotSet`, and an
+insecure baseline is worse than none.
+
+### Two evaluators, and why both are kept
+
+`--lt` selects a second, independent evaluator following Orion (ASPLOS'25): every layer —
+convolution, average pooling and dense alike — is one linear transform, evaluated by its
+generalized diagonals with baby-step/giant-step. The default evaluator instead applies a
+convolution tap by tap with one ciphertext per channel.
+
+Neither dominates, which is why both are kept and reported. The linear-transform evaluator
+is **3x faster on single-inference latency** because it performs far fewer operations. The
+tap-by-tap evaluator is **2.6x better on throughput**, because its per-channel ciphertexts
+need only a 1024-slot block and so admit a batch of 16, where the multiplexed layout needs
+8192 slots and admits 2. A deployment would pick per workload; a comparison should quote
+the better of the two per regime and say which.
+
+They also check each other. Two independent implementations of the same network that agree
+on the class is a stronger statement than either agreeing with a plaintext reference alone,
+and `tools/ckks_bsgs.cpp` separately verifies the diagonal/BSGS transform against a
+plaintext matrix-vector product before anything is built on it.
+
+**It refuses max pooling**, which is a comparison and which CKKS cannot evaluate
+without a polynomial approximation whose depth would dominate everything else. Export
+the average-pooling variant (`Cnn::lenet5_fhe_friendly`), which is what the homomorphic
+deep-learning literature benchmarks and the only variant on which a same-function
+comparison is possible.

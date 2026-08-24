@@ -83,6 +83,12 @@ fn measure_a2b(n: usize, b: usize) -> (f64, usize, bool) {
         let av = av2.clone();
         let bv = bv2.clone();
         move |be: &mut crate::interpreter::transport_backend::TransportBackend<_>| {
+            // Same derived wire width as the CNN path, so the a2b figure here is
+            // comparable with the ones the rest of the repo quotes rather than
+            // inflated by `u128` padding. `b` is this experiment's value width.
+            if let Some(w) = crate::bench::cnn::wire_bits_for(b) {
+                be.set_wire_bits(w);
+            }
             let pairs: Vec<_> = (0..n)
                 .map(|i| {
                     let a = be.share_secret(
@@ -182,7 +188,7 @@ fn measure_gc_transport(n: usize, b: usize, profile: NetworkProfile) -> (f64, us
     let handles = InprocHandle::create(2);
     let mut wrapped: Vec<CountingTransport<LatencyTransport<InprocHandle>>> = handles
         .into_iter()
-        .map(|h| CountingTransport::new(LatencyTransport::new(h, profile), 2))
+        .map(|h| CountingTransport::new(LatencyTransport::new(h, profile, 2), 2))
         .collect();
     let comm = wrapped[0].handle();
     let evaluator = wrapped.pop().unwrap();
@@ -304,7 +310,7 @@ fn measure_gc_relu_transport(
     let handles = InprocHandle::create(2);
     let mut wrapped: Vec<CountingTransport<LatencyTransport<InprocHandle>>> = handles
         .into_iter()
-        .map(|h| CountingTransport::new(LatencyTransport::new(h, profile), 2))
+        .map(|h| CountingTransport::new(LatencyTransport::new(h, profile, 2), 2))
         .collect();
     let comm = wrapped[0].handle();
     let evaluator = wrapped.pop().unwrap();
@@ -443,6 +449,12 @@ fn measure_a2b_relu_profile(
     let (results, comm) = run_parties(profile, move |me| {
         let vals = vals.clone();
         move |be: &mut crate::interpreter::transport_backend::TransportBackend<_>| {
+            // Same derived wire width as the CNN path, so the a2b figure here is
+            // comparable with the ones the rest of the repo quotes rather than
+            // inflated by `u128` padding. `b` is this experiment's value width.
+            if let Some(w) = crate::bench::cnn::wire_bits_for(b) {
+                be.set_wire_bits(w);
+            }
             let vs: Vec<_> = (0..n)
                 .map(|i| {
                     be.share_secret(
@@ -503,6 +515,12 @@ fn measure_a2b_profile(n: usize, b: usize, profile: NetworkProfile) -> (f64, usi
         let av = av.clone();
         let bv = bv.clone();
         move |be: &mut crate::interpreter::transport_backend::TransportBackend<_>| {
+            // Same derived wire width as the CNN path, so the a2b figure here is
+            // comparable with the ones the rest of the repo quotes rather than
+            // inflated by `u128` padding. `b` is this experiment's value width.
+            if let Some(w) = crate::bench::cnn::wire_bits_for(b) {
+                be.set_wire_bits(w);
+            }
             let pairs: Vec<_> = (0..n)
                 .map(|i| {
                     let a = be.share_secret(
@@ -558,6 +576,12 @@ fn measure_gc_real_lt(n: usize, b: usize, profile: NetworkProfile) -> (f64, usiz
         let av = av.clone();
         let bv = bv.clone();
         move |be: &mut crate::interpreter::transport_backend::TransportBackend<_>| {
+            // Same derived wire width as the CNN path, so the a2b figure here is
+            // comparable with the ones the rest of the repo quotes rather than
+            // inflated by `u128` padding. `b` is this experiment's value width.
+            if let Some(w) = crate::bench::cnn::wire_bits_for(b) {
+                be.set_wire_bits(w);
+            }
             let pairs: Vec<_> = (0..n)
                 .map(|i| {
                     let a = be.share_secret(
@@ -612,6 +636,12 @@ fn measure_gc_real_relu(
     let (results, comm) = run_parties(profile, move |me| {
         let vals = vals.clone();
         move |be: &mut crate::interpreter::transport_backend::TransportBackend<_>| {
+            // Same derived wire width as the CNN path, so the a2b figure here is
+            // comparable with the ones the rest of the repo quotes rather than
+            // inflated by `u128` padding. `b` is this experiment's value width.
+            if let Some(w) = crate::bench::cnn::wire_bits_for(b) {
+                be.set_wire_bits(w);
+            }
             let vs: Vec<_> = (0..n)
                 .map(|i| {
                     be.share_secret(

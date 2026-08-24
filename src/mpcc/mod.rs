@@ -36,6 +36,7 @@
 
 pub mod assign;
 pub mod cost;
+pub mod dist;
 pub mod exec;
 pub mod fhe_cost;
 pub mod ir;
@@ -157,6 +158,24 @@ pub fn run_protocol(
                 }
             };
             let mut e = DealerEngine::new(parties, bits)?;
+            execute(prog, sched, &mut e, id, inputs)
+        }
+        // The dealer engine again, rescaling with truncation pairs rather than a
+        // bit decomposition. Present as a separate protocol id so that the two can
+        // be run over the same program and their answers compared directly, which
+        // is how the accuracy cost of stochastic rounding is measured rather than
+        // assumed. See `vm::ShareEngine::trunc_pair_mode`.
+        "dealer-tp" => {
+            let bits = match prog.domain {
+                Domain::Ring { k } => k,
+                other => {
+                    return Err(format!(
+                        "dealer computes mod 2^k, but the program was lowered for {}",
+                        other
+                    ))
+                }
+            };
+            let mut e = DealerEngine::new(parties, bits)?.with_trunc_pairs(true);
             execute(prog, sched, &mut e, id, inputs)
         }
         "shamir" => {
@@ -527,6 +546,20 @@ pub fn format_comparison(c: &Comparison) -> String {
         seen.push(
             "rows marked `estimate` are analytic only — Baru cannot run those protocols yet \
              (see `baru mpcc protocols` for the roadmap phase)",
+        );
+    }
+    // The compute term is fitted for exactly one protocol. Ranking a fitted total
+    // against estimated ones is not a ranking, and this is the one place a reader
+    // would otherwise take it for one — so say so whenever compute is deciding
+    // any row, which is precisely when the difference matters.
+    if c.ranked.iter().any(|e| e.bottleneck == "compute") {
+        seen.push(
+            "at least one row is COMPUTE-bound, and only `aby3`/`rep-field`'s compute constant \
+             has been fitted to a measurement (1072 ns/lane, from mul_batch at four widths on a \
+             free network); every other protocol still carries a 5-80 ns literature estimate and \
+             is therefore optimistic on this term by an unknown factor. Do not read a \
+             cross-protocol ordering off a compute-bound table: compare the fitted rows with each \
+             other, or the latency/bandwidth-bound rows with each other",
         );
     }
     if !seen.is_empty() {
@@ -1382,6 +1415,20 @@ mod tests {
             ("(== x y)", &[("x", 5), ("y", 5)]),
             ("(== x y)", &[("x", 5), ("y", 6)]),
             ("(ash-right x 3)", &[("x", 1000)]),
+            // Negative shifts, which this list carried only a positive case for
+            // until 2026-08-17 — and that omission hid a real bug: the VM
+            // recomposed the bits above the shift *without the sign term*, so
+            // `-1 >> 3` returned `2^29 - 1`. Positive inputs were unaffected,
+            // which is exactly why one positive case passed for so long. Half of
+            // a fixed-point network's pre-activations are negative, so this is
+            // the difference between a working private inference and a wrong one.
+            ("(ash-right x 3)", &[("x", -1000)]),
+            ("(ash-right x 3)", &[("x", -1)]),
+            // Floor, not truncation-toward-zero: `-9 >> 3 == -2`.
+            ("(ash-right x 3)", &[("x", -9)]),
+            // A rescale of a *computed* negative value, which is the shape a
+            // fixed-point layer actually produces.
+            ("(ash-right (* x y) 8)", &[("x", -300), ("y", 7)]),
         ];
         for (src, ins) in cases {
             for parties in [3usize, 5] {

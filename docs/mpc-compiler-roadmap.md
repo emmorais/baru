@@ -14,7 +14,31 @@ a question MP-SPDZ structurally cannot ask.
 
 ---
 
-## 1. Where we are today
+## 1. Where we started
+
+**This section is the state the roadmap was written against, kept because the
+gap table below is what the design was aimed at — not a description of the tree
+today.** What has since landed, so the table is not read as current fact:
+
+* **The bytecode, the scheduler and the cost model all exist** (`mpcc::ir`,
+  `mpcc::schedule`, `mpcc::cost`), and the scheduler's ASAP levelling *is* the
+  round-merging optimizer the third row asks for: a batch of independent
+  multiplications or comparisons at one dependence level costs one round.
+* **P2 is done** (2026-07-27). `mpcc::vm::bit_decompose_batch` — masked opening
+  plus a Kogge–Stone prefix-borrow chain, `log₂(nbits)` rounds — is generic over
+  `ShareEngine`, so `LtS`, `LtU`, `EqZ` and `TruncPr` execute on *every*
+  protocol rather than a chosen one. Secret `Div` is still refused by name (P3).
+* **Three engines run**, not 1.5: `aby3` (3-party honest majority), and
+  `semi2k` and `lowgear` (both 2-party dishonest majority, with triples from
+  real IKNP correlated OT and real BGV slot-OLE respectively). `spdz2k`'s
+  malicious online phase runs but is not in `RUNNABLE`.
+* **Offline and online are measured separately** in bytes: `Counters` splits
+  `online_bytes` from `offline_bytes`, and `bench-layer` charges preprocessing
+  per triple *consumed*. Offline **time** is still not measured.
+
+Still genuinely open from the table: SIMD-vectorized instructions (`mpcc::lower`
+is scalar), and any executed arithmetic↔binary conversion — every binary row in
+`mpcc::protocols` is still `Planned`, so `Op::Convert` is priced but never run.
 
 ```
 Lisp source

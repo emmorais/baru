@@ -13,18 +13,21 @@
 //! of every FHE number in the repo. This benchmark measures the choice instead
 //! of assuming it.
 //!
-//! # The three implementations
+//! # The two implementations
 //!
 //! | | where | complexity | notes |
 //! |---|---|---|---|
 //! | schoolbook | this file | O(n²) 256-bit MACs | the original; the thing that was replaced |
 //! | multi-modular NTT | [`crate::fhe::ntt`] | O(n log n) word ops × 4 primes | hand-written, ~200 lines we maintain |
-//! | NTL + GMP | `crate::fhe::ntl` | NTL's own choice | mature C++; needs `--features ntl` |
 //!
-//! Timings are **total wall clock per product**, marshalling included — the
-//! NTL column pays for converting `2n` limbs into GMP integers and `4n` limbs
-//! back, because a caller pays for that too. Reporting only NTL's internal
-//! multiply time would flatter it in a way no call site can realise.
+//! An NTL+GMP column sat beside these until 2026-08-03. It was removed with the
+//! backend itself, once the hand-written NTT beat it by ~1.8× at every size and
+//! keeping a C++ dependency bought nothing — see `docs/experiments.md` §II.2 for
+//! the measurement and what profiling NTL taught us (Shoup-preconditioned
+//! butterflies, which is *why* the NTT now wins).
+//!
+//! Timings are **total wall clock per product**, marshalling included, because a
+//! caller pays for marshalling too.
 //!
 //! Correctness is checked, not assumed: at every size the benchmark asserts
 //! that the implementations produce **identical** coefficient vectors before it
@@ -34,13 +37,11 @@
 //!
 //! Schoolbook is only run below `--schoolbook-max` (default `n = 512`); above
 //! that it is quadratic and pointless to wait for. Its column is the
-//! justification for having done any of this. The NTT-vs-NTL ratio is the
-//! interesting one: it says whether the hand-written transform is earning its
-//! maintenance cost against an off-the-shelf library.
+//! justification for having done any of this, and the agreement check beside it
+//! is what makes the NTT trustworthy at sizes the reference cannot reach.
 //!
 //! ```text
-//! cargo run --release --features ntl -- bench-polymul
-//! cargo run --release -- bench-polymul            # NTT + schoolbook only
+//! cargo run --release -- bench-polymul
 //! ```
 
 use std::time::{Duration, Instant};
@@ -140,20 +141,14 @@ pub struct Point {
     /// `None` when skipped as too slow (see `--schoolbook-max`).
     pub schoolbook_ms: Option<f64>,
     pub ntt_ms: f64,
-    /// `None` when the crate was built without `--features ntl`.
-    pub ntl_ms: Option<f64>,
+
     /// All implementations that ran produced identical coefficients.
     pub agree: bool,
     pub ntt_vs_schoolbook: Option<f64>,
-    pub ntl_vs_schoolbook: Option<f64>,
-    /// `> 1` means the hand-written NTT is faster than NTL.
-    pub ntl_ms_over_ntt_ms: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
 pub struct Report {
-    /// `"NTL x.y.z / GMP a.b.c"`, or `None` without the feature.
-    pub ntl_version: Option<String>,
     pub points: Vec<Point>,
 }
 
@@ -182,18 +177,6 @@ pub fn run_one(
         None
     };
 
-    #[cfg(feature = "ntl")]
-    let ntl_ms = {
-        let (t, out) = time(
-            || crate::fhe::ntl::exact_negacyclic_product(&a, &b, n),
-            reps,
-        );
-        agree &= out == ntt_out;
-        Some(t)
-    };
-    #[cfg(not(feature = "ntl"))]
-    let ntl_ms: Option<f64> = None;
-
     if !agree {
         return Err(format!(
             "implementations disagree at n={n}, {coeff_bits}-bit coefficients — \
@@ -207,14 +190,8 @@ pub fn run_one(
         reps,
         schoolbook_ms,
         ntt_ms,
-        ntl_ms,
         agree,
         ntt_vs_schoolbook: schoolbook_ms.map(|s| s / ntt_ms),
-        ntl_vs_schoolbook: match (schoolbook_ms, ntl_ms) {
-            (Some(s), Some(l)) => Some(s / l),
-            _ => None,
-        },
-        ntl_ms_over_ntt_ms: ntl_ms.map(|l| l / ntt_ms),
     })
 }
 
@@ -229,15 +206,7 @@ pub fn run(
         .map(|&n| run_one(n, coeff_bits, reps, schoolbook_max))
         .collect::<Result<Vec<_>, _>>()?;
 
-    #[cfg(feature = "ntl")]
-    let ntl_version = Some(crate::fhe::ntl::version());
-    #[cfg(not(feature = "ntl"))]
-    let ntl_version: Option<String> = None;
-
-    Ok(Report {
-        ntl_version,
-        points,
-    })
+    Ok(Report { points })
 }
 
 // ─── CLI ─────────────────────────────────────────────────────────────────────
@@ -245,10 +214,7 @@ pub fn run(
 const USAGE: &str = "usage: baru bench-polymul [options]
 
 Exact negacyclic polynomial product — schoolbook vs the hand-written
-multi-modular NTT vs NTL+GMP.  Correctness is checked before anything is timed.
-
-The NTL column requires building with `--features ntl` (needs NTL and GMP:
-`brew install ntl gmp`, or `apt install libntl-dev libgmp-dev`).
+multi-modular NTT.  Correctness is checked before anything is timed.
 
 options:
   --sizes N,N,...      ring dimensions to sweep    (default 256,512,1024,2048,4096)
@@ -332,14 +298,10 @@ pub fn run_cli(args: &[String]) -> Result<(), String> {
     }
 
     println!("Exact negacyclic product in Z[X]/(X^n+1), {coeff_bits}-bit centered coefficients");
-    match &r.ntl_version {
-        Some(v) => println!("NTL path: {v}"),
-        None => println!("NTL path: not built (rebuild with --features ntl to include it)"),
-    }
     println!();
     println!(
-        "{:>6} {:>12} {:>10} {:>10} {:>12} {:>12} {:>10}",
-        "n", "schoolbook", "NTT", "NTL", "NTT speedup", "NTL speedup", "NTL/NTT"
+        "{:>6} {:>12} {:>10} {:>12}",
+        "n", "schoolbook", "NTT", "NTT speedup"
     );
     let cell = |v: Option<f64>, unit: &str| match v {
         Some(x) if unit == "x" => format!("{x:.1}x"),
@@ -348,25 +310,17 @@ pub fn run_cli(args: &[String]) -> Result<(), String> {
     };
     for p in &r.points {
         println!(
-            "{:>6} {:>12} {:>10} {:>10} {:>12} {:>12} {:>10}",
+            "{:>6} {:>12} {:>10} {:>12}",
             p.n,
             cell(p.schoolbook_ms, "ms"),
             format!("{:.3} ms", p.ntt_ms),
-            cell(p.ntl_ms, "ms"),
             cell(p.ntt_vs_schoolbook, "x"),
-            cell(p.ntl_vs_schoolbook, "x"),
-            cell(p.ntl_ms_over_ntt_ms, "x"),
         );
     }
     println!();
-    println!("All implementations shown produced identical coefficients at every size.");
+    println!("Both implementations produced identical coefficients at every size.");
     println!("Times are per product over {reps} reps, marshalling included, after one warm-up.");
-    println!("Speedup columns are schoolbook/impl.  NTL/NTT > 1 means the hand-written NTT wins.");
-    if r.ntl_version.is_some() {
-        println!();
-        println!("NTL pays an O(n) conversion per operand (i128 limbs -> GMP integers and back)");
-        println!("that the NTT does not; that cost is inside its column, where a caller pays it.");
-    }
+    println!("Speedup is schoolbook/NTT, so above 1 the NTT is faster.");
     Ok(())
 }
 

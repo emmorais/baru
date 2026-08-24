@@ -10,14 +10,35 @@
 //! datasets at 28×28 — *exactly* MNIST's shape — so the existing 784-pixel
 //! pipeline runs on them unchanged and the artifact stops being about digits.
 //!
-//! Two datasets are embedded, chosen because they are grayscale (the conv
-//! packing assumes one input channel) and because they stress different ends
-//! of the classifier:
+//! Two datasets are embedded, chosen because they stress different ends of the
+//! classifier:
 //!
-//! | dataset | task | classes | test set |
-//! |---|---|---|---|
-//! | `pneumonia` | pediatric chest X-ray, pneumonia vs normal | 2 | 624 |
-//! | `organa` | abdominal CT, which organ (axial views) | 11 | 17 778 |
+//! Both happen to be grayscale, and this module used to say that was *required*
+//! because "the conv packing assumes one input channel". **That was wrong.** The
+//! reversed channel offset in [`crate::fhe::conv_pack`] has always been
+//! multi-channel — channels summing on a shared coefficient is the point of it,
+//! and it carries `in_c = 2` and `in_c = 3` unit tests. What was single-channel
+//! was the plumbing: `CnnModel` hardcoded `in_c = 1` at three `ConvShape` sites,
+//! so no RGB image ever reached the hybrid. It does now
+//! (`cnn::tests::rgb_input_classifies_exactly_under_encryption`), at one
+//! ciphertext multiplication per output channel, because an RGB 28×28 conv needs
+//! degree 3977 against `n = 4096`.
+//!
+//! So an RGB MedMNIST set (PathMNIST, DermaMNIST) is a *training and embedding*
+//! task now, not a packing one. The wide **intermediate** layer used to be the limit
+//! that still bit — 16 channels at 13×13 needs degree 5266, which is what capped the
+//! first conv at 12 channels — and **channel splitting removed it** on 2026-08-04
+//! ([`crate::fhe::conv_pack::channel_groups`], wired through `hybrid_conv_open`).
+//! A layer too wide for one ciphertext is evaluated as equal channel groups whose
+//! products are added, which is free homomorphically: it costs one multiplication per
+//! group per output channel and still no evaluation key and no bootstrap. Both limits
+//! are now training problems rather than packing ones.
+//!
+//! | dataset | task | classes | channels | test set |
+//! |---|---|---|---|---|
+//! | `pneumonia` | pediatric chest X-ray, pneumonia vs normal | 2 | 1 | 624 |
+//! | `organa` | abdominal CT, which organ (axial views) | 11 | 1 | 17 778 |
+//! | `derma` | dermatoscopy, 7-class skin lesion | 7 | **3 (RGB)** | 2 005 |
 //!
 //! # What is measured
 //!
@@ -44,12 +65,31 @@
 //!
 //! # Results (2026-08-01, Apple M1 Pro / 8 cores, 20 images per config)
 //!
-//! | | pneumonia | organa |
-//! |---|---|---|
-//! | integer accuracy, 300 embedded images | **85.00%** | **84.00%** |
-//! | integer accuracy, full test set | 84.78% (624) | 81.18% (17 778) |
-//! | 95% CI on the full-test figure | [81.7, 87.4] | [80.6, 81.8] |
-//! | balanced accuracy / AUC, **full test** | 80.64% / **0.9314** | 80.49% / **0.9590** |
+//! Two changes landed 2026-08-04: organa was retrained wider (`conv(16,32)`, its
+//! second conv split across two channel groups) and `derma` was added as the first
+//! **RGB** set. Pneumonia is unchanged at `conv(8,16)`.
+//!
+//! | | pneumonia | organa | derma (RGB) |
+//! |---|---|---|---|
+//! | architecture | conv(8,16) | **conv(16,32)**, conv2 split 2×12 | conv(8,16), 3 channels |
+//! | integer accuracy, 300 embedded images | **85.00%** | **85.00%** | 69.33% |
+//! | integer accuracy, full test set | 84.78% (624) | **82.93%** (17 778) | **72.12%** (2 005) |
+//! | 95% CI on the full-test figure | [81.7, 87.4] | **[82.4, 83.5]** | [70.1, 74.0] |
+//! | balanced accuracy / AUC, **full test** | 80.64% / **0.9314** | **82.21%** / **0.9605** | **30.14%** / **0.8519** |
+//! | majority-class baseline | 62.50% | 18.48% | 66.88% |
+//!
+//! **Read derma on balanced accuracy and AUC, not accuracy.** Its largest class is
+//! 66.88% of the test set, and published ResNet-18 reaches 0.735 — beating the
+//! majority by under seven points. Accuracy is nearly uninformative at that skew,
+//! which is why `embedded_accuracy_is_reasonable` checks balanced accuracy against
+//! chance rather than accuracy against the majority.
+//!
+//! **Colour is worth having, and costs nothing in ciphertext multiplications.**
+//! Against a grayscale-folded control trained identically, RGB gives AUC **0.8519 vs
+//! 0.7667** and balanced accuracy **30.14% vs 23.30%** — dermatoscopy is where colour
+//! should carry signal, and it does. An RGB 28×28 convolution needs degree 3977
+//! against `n = 4096`, so it fits one ciphertext at **one multiplication per output
+//! channel**: three channels do not triple the work, they sum on shared coefficients.
 //! | sensitivity / specificity, full test | 97.18% / **64.10%** | — |
 //! | published ResNet-18 (28×28), ACC / AUC | 0.854 / 0.944 | 0.935 / 0.997 |
 //! | majority-class baseline | 62.50% | 18.48% |
@@ -70,6 +110,15 @@
 //! party-to-party traffic. At RTT 20 ms / 1 Gbit/s it is 2.65 s. Garbling is
 //! worth 2.0× on the MPC segment at that latency — a constant-round protocol
 //! pays where rounds cost.
+//!
+//! **The 10.1 MB is unchanged by the 2026-08-03 encoding change and the other byte
+//! figures are not.** Ring shares used to go on the wire as `u128` whatever their
+//! width; they now carry the model's own width
+//! ([`crate::bench::cnn::wire_bits_for`]). That leaves this configuration alone
+//! because it is garbled-dominated — ring traffic is 5% of it — but `a2b` fell
+//! **29.9 → 5.3 MB** and Falcon **10.1 → 3.5 MB**, both of which were mostly
+//! padding. Any byte figure elsewhere in the repo dated before that change is at the
+//! old encoding; `BARU_WIRE_BITS=128` reproduces it.
 //!
 //! The threading lives in the multi-modular NTT (independent primes, plus a
 //! pure-map CRT reconstruction), is bit-identical to the serial path, and is
@@ -163,7 +212,7 @@ pub struct TrainedCnn {
     pub dataset: &'static str,
     pub task: &'static str,
     pub class_names: Vec<&'static str>,
-    /// Side length of the square, single-channel input the model expects.
+    /// Side length of the square input the model expects.
     pub d: usize,
     pub kernels: Vec<Vec<i64>>,
     pub cbias: Vec<i64>,
@@ -197,12 +246,39 @@ pub struct TrainedCnn {
 }
 
 impl TrainedCnn {
+    /// Input channels, **derived from the embedded images** rather than stored.
+    ///
+    /// An image is a flat `in_c · d · d`, so the channel count falls out of its
+    /// length. Deriving it avoids adding a field to the generated files, which are
+    /// marked "do not edit" and would otherwise all need regenerating — and
+    /// regenerating them would churn their weights and every accuracy figure quoted
+    /// against them, as a side effect of a format change. It is also impossible to
+    /// get out of step with the data, which a stored field would not be.
+    pub fn in_c(&self) -> usize {
+        let per_channel = self.d * self.d;
+        self.images
+            .first()
+            .map(|img| {
+                assert_eq!(
+                    img.len() % per_channel,
+                    0,
+                    "embedded image of {} values is not a whole number of {}x{} channels",
+                    img.len(),
+                    self.d,
+                    self.d
+                );
+                img.len() / per_channel
+            })
+            .unwrap_or(1)
+    }
+
     /// Build the runnable model. `nbits` is calibrated from the observed
     /// activation range over the embedded images, exactly as the synthetic
     /// model does, so it fits the depth-1 noise budget.
     pub fn model(&self) -> CnnModel {
         CnnModel::from_trained(
             self.d,
+            self.in_c(),
             self.kernels.clone(),
             self.cbias.clone(),
             self.extra_conv
@@ -213,6 +289,9 @@ impl TrainedCnn {
                     in_c: *in_c,
                     in_h: *in_h,
                     in_w: *in_w,
+                    // The shipped weights are 3×3; the trainer would have to emit a
+                    // kernel size for anything else, and `check_packing` would need it too.
+                    k: crate::bench::cnn::DEFAULT_K,
                 })
                 .collect(),
             self.hidden.clone(),
@@ -232,6 +311,13 @@ mod pneumonia;
 #[allow(dead_code)]
 mod organa;
 
+/// The RGB set: three input channels, which the conv packing takes at one
+/// ciphertext multiplication per output channel — colour does *not* triple the
+/// work. `TrainedCnn::in_c` derives the channel count from the image length.
+#[path = "../../examples/data/derma_cnn.rs"]
+#[allow(dead_code)]
+mod derma;
+
 /// A dataset's `--dataset` name paired with the loader its generated weight
 /// file exports.
 pub type Embedded = (&'static str, fn() -> TrainedCnn);
@@ -240,6 +326,7 @@ pub type Embedded = (&'static str, fn() -> TrainedCnn);
 pub const DATASETS: &[Embedded] = &[
     ("pneumonia", pneumonia::trained),
     ("organa", organa::trained),
+    ("derma", derma::trained),
 ];
 
 pub fn load(name: &str) -> Result<TrainedCnn, String> {
@@ -302,6 +389,9 @@ pub struct MedMnistReport {
     pub per_image_argmax_ms: f64,
     /// Party-to-party messages and bytes for one encrypted diagnosis.
     pub per_image_messages: f64,
+    /// Falcon comparison elements one diagnosis requests — the per-diagnosis pool size,
+    /// counted by the backend rather than derived from the layer shapes.
+    pub per_image_falcon_comparisons: usize,
     pub per_image_bytes: f64,
     /// Of `per_image_bytes`, the ABY3 ring resharing — encoded `Vec<u128>`, so
     /// 16 B per element whatever `nbits` is. See `CommStats::ring_bytes`.
@@ -365,6 +455,7 @@ pub fn run(
     // as the batch grows. The mask pool is still rebuilt inside each run,
     // because masks must be fresh per query.
     let session = CnnSession::new(&model, precompute);
+    let mut last_falcon_comparisons = 0usize;
     for ((img, &plain), &label) in data
         .images
         .iter()
@@ -373,6 +464,8 @@ pub fn run(
         .take(hybrid_n)
     {
         let run = run_cnn_hybrid_in_session(&session, &model, img, profile, nonlin, precompute);
+        // Identical for every image of a given model, so the last one is the figure.
+        last_falcon_comparisons = run.falcon_comparisons;
         if run.class == plain {
             matches += 1;
         }
@@ -415,6 +508,7 @@ pub fn run(
         per_image_pool_ms: per.pool_ms,
         per_image_argmax_ms: per.argmax_ms,
         per_image_messages: per.messages,
+        per_image_falcon_comparisons: last_falcon_comparisons,
         per_image_bytes: per.bytes,
         per_image_ring_bytes: per.ring_bytes,
         per_image_gc_bytes: per.gc_bytes,
@@ -439,10 +533,40 @@ pub struct SweepCell {
     pub ms: f64,
     pub messages: f64,
     pub bytes: f64,
+    /// Of `bytes`, the ABY3 ring resharing — 16 B per element whatever the ring
+    /// width is. Carried because it decides whether the byte comparison between
+    /// two protocols means anything: a route whose traffic is mostly padding is
+    /// being charged for this crate's serialisation, not for its protocol, and
+    /// this repo has already drawn one wrong conclusion that way.
+    pub ring_bytes: f64,
+    /// Evaluator-link bytes (FHE ciphertexts, scheme-switch payloads). Not part of
+    /// `bytes`: they never cross the counted party transport, but `ms` pays their
+    /// bandwidth cost. Reporting only `bytes` understated what a diagnosis moves.
+    pub link_bytes: f64,
     /// Every cell recomputes the same diagnosis; if one disagrees with the
     /// plaintext argmax the whole row is meaningless, so it is carried here
     /// rather than assumed.
     pub matches_plaintext: bool,
+    /// Fastest and slowest of the `repeats` observations behind [`SweepCell::ms`]
+    /// (which is their **median**). Carried because a crossover is a claim that one
+    /// route is faster than another, and two cells whose ranges overlap do not
+    /// support it however far apart their point estimates sit.
+    ///
+    /// The need is measured, not hypothetical: re-running an *unchanged* `gc`
+    /// configuration moved one 60 Mbps cell by 13%, which is larger than the gap
+    /// across a whole grid step near the boundary. Four of this experiment's
+    /// withdrawn crossover claims were single-run numbers.
+    ///
+    /// **This range is within-session and so understates the real spread** — see
+    /// the `separable` helper. It bounds jitter between back-to-back repeats sharing one
+    /// `CnnSession`, not reproducibility across invocations.
+    pub ms_lo: f64,
+    pub ms_hi: f64,
+    pub repeats: usize,
+    /// Whether this cell's Falcon preprocessing was pre-generated, making `ms` an online
+    /// cost rather than a total. Carried on the cell so a table can never be printed
+    /// without its label.
+    pub warm: bool,
 }
 
 /// Sweep network conditions across nonlinearity protocols to find where the
@@ -455,12 +579,34 @@ pub struct SweepCell {
 /// vary. The plaintext reference is computed once and every cell is checked
 /// against it — a latency comparison between routes computing different things
 /// would be worthless.
+/// `repeats` re-runs each cell and reports the **median**, with the observed range
+/// kept in [`SweepCell::ms_lo`]/[`SweepCell::ms_hi`] so the sweep printer can refuse to
+/// call a winner where the ranges overlap. One repeat is allowed and is the default,
+/// because most uses of this grid are checking correctness or orders of magnitude
+/// rather than resolving a boundary — but a boundary quoted from `repeats == 1` is a
+/// point estimate with no error bar, and this experiment has already published four
+/// wrong ones.
+/// `warm` pre-generates each MPC segment's Falcon preprocessing from a plan measured by
+/// one cold run, and reports the **online** cost (total minus that offline phase).
+///
+/// This is the second of two honest boundaries, not a replacement for the first. A cold
+/// server pays the total; a warm one, which has generated query-independent preprocessing
+/// in advance, pays only the online phase. Both are real deployments, and quoting one
+/// protocol's online cost against another's total is precisely how this experiment's first
+/// crossover went wrong — so the flag is explicit and the column is labelled.
+///
+/// `gc` is unaffected: garbled circuits have no query-independent phase to hoist here, so
+/// its column is identical warm and cold. That asymmetry is the point of the comparison
+/// rather than a flaw in it, but it is why the warm boundary must never be presented as
+/// *the* boundary.
 pub fn sweep_crossover(
     name: &str,
     hybrid_n: usize,
     rtts: &[u64],
     bws: &[f64],
     protocols: &[Nonlin],
+    repeats: usize,
+    warm: bool,
 ) -> Result<Vec<SweepCell>, String> {
     let data = load(name)?;
     let model = data.model();
@@ -473,6 +619,23 @@ pub fn sweep_crossover(
         .collect();
     let session = CnnSession::new(&model, true);
 
+    // The plan depends on the model's shapes, not on the network, so one cold run at an
+    // instant profile suffices for the whole grid. Measured rather than derived — see
+    // `cnn::FalconPoolPlan`.
+    let plan = if warm {
+        let probe = run_cnn_hybrid_in_session(
+            &session,
+            &model,
+            &data.images[0],
+            NetworkProfile::INSTANT,
+            Nonlin::Falcon,
+            true,
+        );
+        probe.falcon_plan
+    } else {
+        crate::bench::cnn::FalconPoolPlan::new()
+    };
+
     let mut cells = Vec::new();
     for &rtt in rtts {
         for &bw in bws {
@@ -480,22 +643,44 @@ pub fn sweep_crossover(
                 NetworkProfile::fixed_latency(std::time::Duration::from_micros(rtt * 500))
                     .with_bandwidth(bw * 1e6 / 8.0);
             for &p in protocols {
-                let mut tot = CnnTotals::default();
+                let reps = repeats.max(1);
                 let mut ok = true;
-                for (img, &want) in data.images.iter().take(hybrid_n).zip(&plain) {
-                    let run = run_cnn_hybrid_in_session(&session, &model, img, profile, p, true);
-                    ok &= run.class == want;
-                    tot.add(&run);
+                let mut observed: Vec<f64> = Vec::with_capacity(reps);
+                // The last repeat's traffic stands for all of them: bytes and
+                // messages are determined by the protocol and the shapes, so they
+                // are identical across repeats. Only the timing varies.
+                let mut last = CnnTotals::default().mean(1);
+                for _ in 0..reps {
+                    let mut tot = CnnTotals::default();
+                    for (img, &want) in data.images.iter().take(hybrid_n).zip(&plain) {
+                        let run = crate::bench::cnn::run_cnn_hybrid_in_session_pooled(
+                            &session, &model, img, profile, p, true, &plan,
+                        );
+                        ok &= run.class == want;
+                        tot.add(&run);
+                    }
+                    let per = tot.mean(hybrid_n);
+                    // The online cost: the pool fill happens inside the timed region, so a
+                    // warm cell must have it subtracted or it is a total wearing an online
+                    // label. Cold runs have no offline phase and are unaffected.
+                    observed.push(per.total_ms - per.falcon_offline_ms);
+                    last = per;
                 }
-                let per = tot.mean(hybrid_n);
+                observed.sort_by(f64::total_cmp);
                 cells.push(SweepCell {
                     rtt_ms: rtt,
                     bandwidth_mbps: bw,
                     nonlin: p,
-                    ms: per.total_ms,
-                    messages: per.messages,
-                    bytes: per.bytes,
+                    ms: observed[observed.len() / 2],
+                    messages: last.messages,
+                    bytes: last.bytes,
+                    ring_bytes: last.ring_bytes,
+                    link_bytes: last.link_bytes,
                     matches_plaintext: ok,
+                    ms_lo: observed[0],
+                    ms_hi: observed[observed.len() - 1],
+                    repeats: reps,
+                    warm,
                 });
             }
         }
@@ -505,17 +690,92 @@ pub fn sweep_crossover(
 
 /// Print the sweep as a latency grid, then name the bandwidth at which the
 /// winner changes for each RTT — the number the whole experiment is for.
+/// Bandwidth label that survives sub-1 Mbps.
+///
+/// `{:.0}` printed the 0.5 Mbps row as `0`, which matters because that is exactly
+/// where the crossover turned out to be at the default wire encoding.
+fn fmt_bw(mbps: f64) -> String {
+    if mbps.fract() == 0.0 {
+        format!("{mbps:.0}")
+    } else {
+        format!("{mbps:.2}")
+    }
+}
+
+/// Whether the faster cell is *distinguishably* faster **within one session**: its
+/// slowest observation still beat the other's fastest.
+///
+/// # This captures the smaller of the two variance components
+///
+/// Measured on pneumonia at RTT 0: repeats *inside* one `sweep_crossover` call spread
+/// under 2%, while an unchanged `gc` configuration re-run as a separate **process** moved
+/// one 60 Mbps cell by **13%**. The repeats share a `CnnSession`, run back to back, and
+/// hit warm caches, so they are not independent draws — they bound jitter, not run-to-run
+/// reproducibility.
+///
+/// So a `*` here means "separable given this session", which is weaker than "separable".
+/// Cells within ~13% of each other should be read as unresolved however many repeats say
+/// otherwise, and a boundary read off the grid is resolved to about ±1 step. Capturing the
+/// larger component would mean re-running the whole binary and comparing, which the CLI
+/// does not do because each cell already costs seconds to minutes at low bandwidth.
+///
+/// The comparison is a strict range test rather than a t-test on the medians because with
+/// three observations a range is what the data supports, and the failure mode guarded
+/// against — quoting a boundary the next run moves — comes from over-claiming, so erring
+/// toward "tie" is right. With `repeats == 1` both ranges are points and this reduces to
+/// `<`, which is why the printer warns rather than pretending to have an error bar.
+fn separable(win: &SweepCell, lose: &SweepCell) -> bool {
+    win.ms_hi < lose.ms_lo
+}
+
 fn print_sweep(cells: &[SweepCell], rtts: &[u64], bws: &[f64], protocols: &[Nonlin]) {
-    println!("crossover sweep — ms per encrypted diagnosis, * marks the winner\n");
+    let reps = cells.first().map(|c| c.repeats).unwrap_or(1);
+    let warm = cells.iter().any(|c| c.warm);
+    if warm {
+        println!(
+            "  ⚙  WARM: falcon's per-segment preprocessing was generated offline; the \
+             latency column is an ONLINE cost.\n     gc has no query-independent phase to \
+             hoist, so its column is unchanged — quote alongside the cold boundary, never \
+             instead.\n     NOTE the traffic table below is still a TOTAL (offline + \
+             online): the transport counts bytes for the whole run, so the two tables are \
+             not on the same footing."
+        );
+    }
+    if reps > 1 {
+        println!(
+            "crossover sweep — median ms per encrypted diagnosis over {reps} repeats, \
+             * marks a winner, ~ a tie (ranges overlap)\n  \
+             (repeats share one session, so the spread bounds jitter, NOT run-to-run \
+             reproducibility — an unchanged config has moved 13% between invocations, \
+             so read cells within ~13% as unresolved and the boundary as ±1 step)\n"
+        );
+    } else {
+        println!(
+            "crossover sweep — ms per encrypted diagnosis, * marks the winner\n  \
+             (single run: no error bar, so a boundary read off this grid is \
+             unresolved to ±1 step — pass --repeat 3 to resolve it)\n"
+        );
+    }
     let mismatched = cells.iter().filter(|c| !c.matches_plaintext).count();
     if mismatched > 0 {
         println!("  ⚠️  {mismatched} cell(s) disagreed with the plaintext argmax — DO NOT quote\n");
     }
-    let at = |r: u64, b: f64, p: Nonlin| {
+    let cell = |r: u64, b: f64, p: Nonlin| {
         cells
             .iter()
             .find(|c| c.rtt_ms == r && c.bandwidth_mbps == b && c.nonlin == p)
-            .map(|c| c.ms)
+    };
+    let at = |r: u64, b: f64, p: Nonlin| cell(r, b, p).map(|c| c.ms);
+    // A winner only where the ranges are disjoint. With one repeat the range is a
+    // point, so this degrades to the old strict comparison — which is exactly the
+    // situation the header warns about rather than hides.
+    let decisive = |r: u64, b: f64| -> Option<(Nonlin, bool)> {
+        if protocols.len() != 2 {
+            return None;
+        }
+        let (a, b_) = (cell(r, b, protocols[0])?, cell(r, b, protocols[1])?);
+        let (win, lose) = if a.ms <= b_.ms { (a, b_) } else { (b_, a) };
+        Some((win.nonlin, separable(win, lose)))
     };
     for &rtt in rtts {
         println!("  RTT {rtt} ms");
@@ -525,14 +785,18 @@ fn print_sweep(cells: &[SweepCell], rtts: &[u64], bws: &[f64], protocols: &[Nonl
         }
         println!();
         for &bw in bws {
-            print!("    {bw:<10.0}");
+            print!("    {:<10}", fmt_bw(bw));
             let best = protocols
                 .iter()
                 .filter_map(|&p| at(rtt, bw, p))
                 .fold(f64::INFINITY, f64::min);
+            let mark = match decisive(rtt, bw) {
+                Some((_, true)) | None => '*',
+                Some((_, false)) => '~',
+            };
             for &p in protocols {
                 match at(rtt, bw, p) {
-                    Some(ms) if ms == best => print!("{:>12}", format!("*{ms:.0}")),
+                    Some(ms) if ms == best => print!("{:>12}", format!("{mark}{ms:.0}")),
                     Some(ms) => print!("{ms:>12.0}"),
                     None => print!("{:>12}", "-"),
                 }
@@ -543,10 +807,7 @@ fn print_sweep(cells: &[SweepCell], rtts: &[u64], bws: &[f64], protocols: &[Nonl
         // Reported as the grid interval actually measured, not interpolated
         // into a false-precision single number.
         if protocols.len() == 2 {
-            let winner = |bw: f64| match (at(rtt, bw, protocols[0]), at(rtt, bw, protocols[1])) {
-                (Some(a), Some(b)) => Some(if a <= b { protocols[0] } else { protocols[1] }),
-                _ => None,
-            };
+            let winner = |bw: f64| decisive(rtt, bw).map(|(p, _)| p);
             let mut sorted: Vec<f64> = bws.to_vec();
             sorted.sort_by(|a, b| b.total_cmp(a));
             let flip = sorted
@@ -554,21 +815,154 @@ fn print_sweep(cells: &[SweepCell], rtts: &[u64], bws: &[f64], protocols: &[Nonl
                 .find(|w| winner(w[0]) != winner(w[1]) && winner(w[1]).is_some());
             match flip {
                 Some(w) => println!(
-                    "    → crossover between {:.0} and {:.0} Mbps: {} wins above, {} below\n",
-                    w[1],
-                    w[0],
+                    "    → crossover between {} and {} Mbps: {} wins above, {} below",
+                    fmt_bw(w[1]),
+                    fmt_bw(w[0]),
                     winner(w[0]).map(|p| p.short()).unwrap_or("?"),
                     winner(w[1]).map(|p| p.short()).unwrap_or("?"),
                 ),
                 None => println!(
-                    "    → no crossover in this range: {} wins throughout\n",
+                    "    → no crossover in this range: {} wins throughout",
                     winner(sorted[0]).map(|p| p.short()).unwrap_or("?")
                 ),
             }
+            // The tie band is the honest width of the boundary: every bandwidth at
+            // which the two routes are not separable. Quoting a crossover narrower
+            // than this band claims resolution the measurement does not have.
+            let ties: Vec<f64> = sorted
+                .iter()
+                .copied()
+                .filter(|&b| matches!(decisive(rtt, b), Some((_, false))))
+                .collect();
+            if reps > 1 && !ties.is_empty() {
+                println!(
+                    "      not separable at {} Mbps — the boundary is a band, not a point",
+                    ties.iter()
+                        .map(|&b| fmt_bw(b))
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                );
+            }
+            println!();
         } else {
             println!();
         }
     }
+
+    // ── The two terms behind every cell above ────────────────────────────────
+    //
+    // Printed because a crossover is a claim about *trading* one term against the
+    // other, and the latencies alone do not show whether a trade is even on offer.
+    // A protocol can only win somewhere if it is cheaper in one term and dearer in
+    // the other; when one route is cheaper in **both**, no (rtt, bandwidth) pair
+    // favours the other and extending the grid cannot find one. That is the check
+    // the withdrawn crossover needed and did not have.
+    //
+    // These are counts, not the latency model's inputs: `ms` is measured wall-clock
+    // under a simulator with concurrent links, so a byte ratio does *not* predict
+    // the low-bandwidth limit of the columns — messages spread over links overlap.
+    // Read them as the two terms' relative size, not as a formula for the table.
+    //
+    // Query-independent for a given protocol, so one row each rather than per cell.
+    println!("  traffic per diagnosis (identical across the grid — only the link varies)");
+    println!(
+        "    {:<10}{:>10}{:>10}{:>15}{:>13}{:>11}",
+        "protocol", "messages", "MB party", "of which ring", "MB eval link", "MB total"
+    );
+    for &p in protocols {
+        if let Some(c) = cells.iter().find(|c| c.nonlin == p) {
+            println!(
+                "    {:<10}{:>10.0}{:>10.1}{:>15.1}{:>13.1}{:>11.1}",
+                p.short(),
+                c.messages,
+                c.bytes / 1e6,
+                c.ring_bytes / 1e6,
+                c.link_bytes / 1e6,
+                (c.bytes + c.link_bytes) / 1e6,
+            );
+        }
+    }
+    println!(
+        "    NOTE `MB party` is the party-to-party transport only, which is what this table\n    \
+         used to report as `MB wire`. `MB eval link` is the FHE ciphertext and scheme-switch\n    \
+         traffic: it never crosses that transport, so no counter saw it, but the latency\n    \
+         columns above have always paid its bandwidth cost. Fitting a diagnosis against 1/bw\n    \
+         gives a slope near the TOTAL, not the party column. The eval-link term is common to\n    \
+         both nonlinearity protocols, so the crossover BETWEEN them is unaffected — but an\n    \
+         absolute traffic figure taken from the party column alone understates the deployment."
+    );
+    if protocols.len() == 2 {
+        let get = |p: Nonlin| cells.iter().find(|c| c.nonlin == p);
+        if let (Some(x), Some(y)) = (get(protocols[0]), get(protocols[1])) {
+            let (a, b) = (protocols[0], protocols[1]);
+            // The ring term is broken out because it is where a protocol
+            // comparison can quietly stop being about protocols. Ring shares are
+            // packed at whatever width the caller declares, so a route that asks
+            // for 128 bits to carry 20-bit values pays 6.4x for nothing — and
+            // since the two comparison protocols differ in how much of their
+            // traffic is ring shares, that overhead does not cancel between them.
+            // It once made this very comparison read 3.2x the wrong way; see
+            // `docs/falcon-reproduction.md`. A large `of which ring` next to a
+            // large total is the signal to go and check the declared widths.
+            // Ratios on the TOTAL, because the bandwidth term charges the total. The
+            // party column alone is the protocol-attributable part, and it is the
+            // more flattering one: the evaluator-link traffic is identical for both
+            // routes, so including it shrinks whatever byte advantage either has.
+            // Quoting the party ratio as "the" byte ratio overstated falcon's
+            // advantage by 2.2x (2.94x on party bytes, 1.32x on the total), which
+            // is the difference between a decisive axis and a mild one.
+            let xb = x.bytes + x.link_bytes;
+            let yb = y.bytes + y.link_bytes;
+            let cheaper_bytes = if xb <= yb { a } else { b };
+            let cheaper_msgs = if x.messages <= y.messages { a } else { b };
+            let bratio = xb.max(yb) / xb.min(yb).max(1.0);
+            let party_ratio = x.bytes.max(y.bytes) / x.bytes.min(y.bytes).max(1.0);
+            let mratio = x.messages.max(y.messages) / x.messages.min(y.messages).max(1.0);
+            if (party_ratio / bratio.max(1e-9)) > 1.10 {
+                println!(
+                    "    → NOTE the byte ratio below is on the TOTAL ({bratio:.2}x). On the party \n\
+                     \x20     transport alone it reads {party_ratio:.2}x, because the \n\
+                     \x20     {:.1} MB evaluator link is common to both routes and dilutes it. \n\
+                     \x20     The crossover LOCATION is unaffected (a common additive term \n\
+                     \x20     shifts both curves equally) but the advantage is {:.1}x smaller \n\
+                     \x20     than the party column suggests",
+                    x.link_bytes / 1e6,
+                    party_ratio / bratio.max(1e-9),
+                );
+            }
+            // A 1.01x byte ratio is a tie, not an advantage, and calling it a
+            // trade would license predicting a crossover from what is really
+            // noise. Below this margin the byte axis carries no signal and the
+            // boundary — if there is one — is set by the compute intercept
+            // instead, which is far outside any bandwidth worth quoting.
+            const TIE: f64 = 1.05;
+            if bratio < TIE {
+                println!(
+                    "    → the two routes send the SAME bytes to within {:.0}% ({bratio:.2}x), so \n\
+                     \x20     the byte axis cannot decide between them; {} wins on messages \n\
+                     \x20     ({mratio:.1}x) and any boundary is set by the compute intercept",
+                    (TIE - 1.0) * 100.0,
+                    cheaper_msgs.short(),
+                );
+            } else if cheaper_bytes == cheaper_msgs {
+                println!(
+                    "    → {} is cheaper in BOTH terms ({mratio:.1}x messages, {bratio:.2}x \n\
+                     \x20     bytes) — no (rtt, bandwidth) pair favours the other, so no crossover \n\
+                     \x20     exists however far the grid is widened",
+                    cheaper_bytes.short(),
+                );
+            } else {
+                println!(
+                    "    → the terms trade: {} is cheaper in bytes ({bratio:.2}x) and {} in \n\
+                     \x20     messages ({mratio:.1}x), so a crossover exists — low bandwidth \n\
+                     \x20     favours the byte-cheaper route, high RTT the message-cheaper one",
+                    cheaper_bytes.short(),
+                    cheaper_msgs.short(),
+                );
+            }
+        }
+    }
+    println!();
 }
 
 /// Running totals over the encrypted runs, so the report can quote a mean
@@ -586,12 +980,20 @@ struct CnnTotals {
     bytes: f64,
     ring_bytes: f64,
     gc_bytes: f64,
+    /// Evaluator-link bytes: FHE ciphertexts and scheme-switch payloads that never
+    /// cross the party-to-party transport, so `bytes` above excludes them while the
+    /// latency columns pay for them. See `FhePhases::link_bytes`.
+    link_bytes: f64,
     offline_query_ms: f64,
     weights_ms: f64,
     mul_ms: f64,
     maskenc_ms: f64,
     decrypt_ms: f64,
     reencrypt_ms: f64,
+    /// Offline Falcon preprocessing, tracked so the online figure can exclude it. A warm
+    /// run's `total_ms` contains its own pool fill, because the fill happens inside the
+    /// `run_parties` call that is timed.
+    falcon_offline_ms: f64,
 }
 
 impl CnnTotals {
@@ -603,10 +1005,12 @@ impl CnnTotals {
         self.relu_ms += r.phases.relu_ms;
         self.pool_ms += r.phases.pool_ms;
         self.argmax_ms += r.phases.argmax_ms;
+        self.falcon_offline_ms += r.phases.falcon_offline_ms;
         self.messages += r.comm.messages as f64;
         self.ring_bytes += r.comm.ring_bytes as f64;
         self.gc_bytes += r.comm.gc_bytes as f64;
         self.bytes += r.comm.bytes as f64;
+        self.link_bytes += r.fhe_phases.link_bytes as f64;
         self.offline_query_ms += r.offline_query_ms;
         self.weights_ms += r.fhe_phases.weights_ms;
         self.mul_ms += r.fhe_phases.mul_ms;
@@ -632,12 +1036,14 @@ impl CnnTotals {
             bytes: self.bytes / d,
             ring_bytes: self.ring_bytes / d,
             gc_bytes: self.gc_bytes / d,
+            link_bytes: self.link_bytes / d,
             offline_query_ms: self.offline_query_ms / d,
             weights_ms: self.weights_ms / d,
             mul_ms: self.mul_ms / d,
             maskenc_ms: self.maskenc_ms / d,
             decrypt_ms: self.decrypt_ms / d,
             reencrypt_ms: self.reencrypt_ms / d,
+            falcon_offline_ms: self.falcon_offline_ms / d,
         }
     }
 }
@@ -666,6 +1072,16 @@ options:
                   report which wins where. Add --both to include a2b.
   --rtt-list A,B        sweep grid, ms          (default 0,20)
   --bw-list A,B         sweep grid, Mbit/s      (default 1000,100,60,40,30,20,15,10)
+  --warm          pre-generate each MPC segment's Falcon preprocessing from a plan
+                  measured by one cold run, and report the ONLINE cost. gc is
+                  unaffected (it has no query-independent phase to hoist), so the
+                  warm boundary must be quoted alongside the cold one, never
+                  instead of it.
+  --repeat N      re-run every sweep cell N times and report the MEDIAN, marking
+                  cells whose ranges overlap as ties rather than wins (default 1).
+                  Needed to resolve a crossover: an unchanged configuration has
+                  been seen to vary 13% between runs, which is wider than one
+                  grid step near the boundary.
   --json          machine-readable output
   -h, --help      this message
 ";
@@ -838,14 +1254,20 @@ fn print_report(r: &MedMnistReport) {
         r.per_image_bytes / 1e6
     );
     // The split matters because the two halves are encoded very differently:
-    // ring shares go out as `Vec<u128>` (16 B per element regardless of
-    // `nbits`), garbled material as packed bytes. A traffic figure that does not
-    // separate them cannot be compared against a bit-packed system.
+    // ring shares are packed at whatever width the backend declares, garbled
+    // material as compact bytes. A traffic figure that does not separate them
+    // cannot be compared against a bit-packed system — and the padding line below
+    // is why: at the 128-bit default a 20-bit value travels in 128 bits, so 84% of
+    // the ring half is nothing. `BARU_WIRE_BITS` narrows it (see `cnn`), which is
+    // worth 5.6x on this route, so the figure is computed from the width actually
+    // in force rather than hardcoded.
+    let wire = crate::bench::cnn::wire_bits_for(r.log2_t as usize).unwrap_or(128);
     println!(
-        "      of which : ring(ABY3) {:.1} MB [16 B/elem, ~{:.0}% padding], \
+        "      of which : ring(ABY3) {:.1} MB [{} b/elem on the wire, ~{:.0}% padding], \
          garbled {:.1} MB, other {:.1} MB",
         r.per_image_ring_bytes / 1e6,
-        100.0 * (1.0 - r.log2_t as f64 / 128.0),
+        wire,
+        100.0 * (1.0 - (r.log2_t as f64 / wire as f64)).max(0.0),
         r.per_image_gc_bytes / 1e6,
         (r.per_image_bytes - r.per_image_ring_bytes - r.per_image_gc_bytes) / 1e6
     );
@@ -878,6 +1300,8 @@ pub fn run_cli(args: &[String]) -> Result<(), String> {
     let mut sweep = false;
     let mut rtt_list: Vec<u64> = vec![0, 20];
     let mut bw_list: Vec<f64> = vec![1000.0, 100.0, 60.0, 40.0, 30.0, 20.0, 15.0, 10.0];
+    let mut repeats = 1usize;
+    let mut warm = false;
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -888,6 +1312,14 @@ pub fn run_cli(args: &[String]) -> Result<(), String> {
             }
             "--bw-list" => {
                 bw_list = parse_list(it.next().ok_or("--bw-list needs a value")?)?;
+            }
+            "--warm" => warm = true,
+            "--repeat" => {
+                repeats = it
+                    .next()
+                    .ok_or("--repeat needs a value")?
+                    .parse()
+                    .map_err(|_| "bad --repeat")?;
             }
             "--hybrid" => {
                 hybrid_n = it
@@ -941,7 +1373,8 @@ pub fn run_cli(args: &[String]) -> Result<(), String> {
         };
         for n in &names {
             println!("=== {n} ===");
-            let cells = sweep_crossover(n, hybrid_n, &rtt_list, &bw_list, &protocols)?;
+            let cells =
+                sweep_crossover(n, hybrid_n, &rtt_list, &bw_list, &protocols, repeats, warm)?;
             print_sweep(&cells, &rtt_list, &bw_list, &protocols);
         }
         return Ok(());
@@ -987,6 +1420,310 @@ mod tests {
     /// accuracy, and must beat its majority-class baseline — the check that
     /// catches a quantisation or flatten-order regression, which shows up as
     /// a classifier collapsed onto one class.
+    /// **A boundary is only as sharp as the runs behind it.**
+    ///
+    /// `separable` is what stops the sweep naming a winner it cannot distinguish. The
+    /// cases below are the ones that matter: a clear win, a clear loss, an overlap
+    /// where the medians differ (the dangerous case — a point estimate would call it),
+    /// and the degenerate single-run case where the ranges are points.
+    #[test]
+    fn a_sweep_winner_needs_disjoint_ranges() {
+        let cell = |ms: f64, lo: f64, hi: f64, reps: usize| SweepCell {
+            rtt_ms: 0,
+            bandwidth_mbps: 30.0,
+            nonlin: Nonlin::Gc,
+            ms,
+            messages: 0.0,
+            bytes: 0.0,
+            ring_bytes: 0.0,
+            link_bytes: 0.0,
+            matches_plaintext: true,
+            ms_lo: lo,
+            ms_hi: hi,
+            repeats: reps,
+            warm: false,
+        };
+
+        // Disjoint: 100..110 entirely below 200..210.
+        assert!(separable(
+            &cell(105.0, 100.0, 110.0, 3),
+            &cell(205.0, 200.0, 210.0, 3)
+        ));
+
+        // Overlapping, and the medians are 5% apart — exactly the situation that
+        // produced this repo's withdrawn crossover claims.
+        assert!(
+            !separable(&cell(100.0, 90.0, 115.0, 3), &cell(105.0, 95.0, 120.0, 3)),
+            "overlapping ranges must not yield a winner however far apart the medians"
+        );
+
+        // Touching but not overlapping is still not separable: `<` is strict on
+        // purpose, so a shared endpoint reads as a tie.
+        assert!(!separable(
+            &cell(100.0, 90.0, 110.0, 3),
+            &cell(120.0, 110.0, 130.0, 3)
+        ));
+
+        // Single run: ranges are points, so this degrades to a bare comparison.
+        // Pinned so the degradation is a decision on record, not an accident.
+        assert!(separable(
+            &cell(100.0, 100.0, 100.0, 1),
+            &cell(101.0, 101.0, 101.0, 1)
+        ));
+    }
+
+    /// **The Falcon pool sizes a real diagnosis needs**, measured rather than derived.
+    ///
+    /// This records the **total**, and pins that the counter reports something rather than
+    /// silently zero — which is how a pool sized from it would end up serving nothing while
+    /// a benchmark reported an "online" latency that was really a total.
+    ///
+    /// A pool cannot use a total, though: the pipeline runs one `run_parties` call per MPC
+    /// segment, each with a fresh backend, so the sizes have to be *per segment*. That
+    /// wiring exists (`--warm`, `cnn::FalconPoolPlan`) and
+    /// `the_per_segment_pool_sizes_and_what_pooling_buys` is where the split and the
+    /// warm/cold gap are measured. This test remains the cheap guard on the counter itself.
+    ///
+    /// The count is deliberately *not* asserted against a fixed number, and 2026-08-04
+    /// is why: wiring `Π_ReLU` into `fused_relu_rescale` routed every ReLU gate through
+    /// the same `falcon_drelu_ring`, so the counter grew from the max-pool comparisons
+    /// alone to those plus the activations. A hard-coded expectation would have failed
+    /// and read as a regression, when the number changing *was* the change.
+    #[test]
+    #[ignore] // full encrypted pipeline
+    fn the_falcon_pool_size_a_diagnosis_needs_is_counted() {
+        for name in ["pneumonia", "organa", "derma"] {
+            let r = run(name, 1, NetworkProfile::INSTANT, Nonlin::Falcon, false)
+                .unwrap_or_else(|e| panic!("{name}: {e}"));
+            println!(
+                "  {name:<10} falcon comparisons per diagnosis: {}",
+                r.per_image_falcon_comparisons
+            );
+            assert!(
+                r.per_image_falcon_comparisons > 0,
+                "{name}: the Falcon path must report the comparisons it requested — a \
+                 zero here would size a pool at nothing and quietly fall back to \
+                 generating preprocessing on the critical path"
+            );
+        }
+
+        // The other modes must report zero, or the counter is measuring the wrong thing.
+        let gc = run("pneumonia", 1, NetworkProfile::INSTANT, Nonlin::Gc, false).unwrap();
+        assert_eq!(
+            gc.per_image_falcon_comparisons, 0,
+            "the garbled route must not report Falcon comparisons"
+        );
+    }
+
+    /// **Warming Falcon must not change what `gc` costs.**
+    ///
+    /// `gc` is the control: it has no query-independent phase to hoist, so a `--warm` sweep
+    /// must leave its traffic bit-for-bit identical to a cold one. This is the test for
+    /// that, and it exists because the first warm sweep failed it — the plan was applied to
+    /// every route, so `gc` filled Falcon pools it never read and its traffic moved from
+    /// **61 messages / 10.1 MB to 154 / 12.2**. The latency table looked entirely plausible;
+    /// what gave it away was an unchanged control moving.
+    ///
+    /// Traffic rather than time, deliberately: bytes and messages are deterministic, so
+    /// this can assert equality instead of a tolerance, and it fails loudly rather than
+    /// blending into timing noise.
+    #[test]
+    #[ignore] // two full sweeps
+    fn warming_falcon_leaves_the_gc_control_untouched() {
+        let protocols = [Nonlin::Gc, Nonlin::Falcon];
+        let grid = (&[0u64][..], &[1000.0f64][..]);
+        let cold = sweep_crossover("pneumonia", 1, grid.0, grid.1, &protocols, 1, false).unwrap();
+        let warm = sweep_crossover("pneumonia", 1, grid.0, grid.1, &protocols, 1, true).unwrap();
+
+        let find = |cs: &[SweepCell], p: Nonlin| {
+            cs.iter()
+                .find(|c| c.nonlin == p)
+                .map(|c| (c.messages, c.bytes, c.ring_bytes, c.matches_plaintext))
+                .expect("cell present")
+        };
+
+        let (cm, cb, cr, cok) = find(&cold, Nonlin::Gc);
+        let (wm, wb, wr, wok) = find(&warm, Nonlin::Gc);
+        println!("  gc cold: {cm} msgs / {cb:.0} B ({cr:.0} ring)");
+        println!("  gc warm: {wm} msgs / {wb:.0} B ({wr:.0} ring)");
+        assert!(cok && wok, "both gc cells must match the plaintext argmax");
+        assert_eq!(cm, wm, "warming Falcon changed gc's message count");
+        assert_eq!(cb, wb, "warming Falcon changed gc's byte count");
+        assert_eq!(cr, wr, "warming Falcon changed gc's ring bytes");
+
+        // And the warm flag must actually be set, or this passes because nothing warmed.
+        assert!(
+            warm.iter().any(|c| c.warm) && !cold.iter().any(|c| c.warm),
+            "the warm sweep must be marked warm and the cold one not"
+        );
+        // Falcon *should* differ — otherwise the plan reached nothing.
+        let (fcm, _, _, _) = find(&cold, Nonlin::Falcon);
+        let (fwm, _, _, _) = find(&warm, Nonlin::Falcon);
+        assert_ne!(
+            fcm, fwm,
+            "falcon's traffic should change when its preprocessing is pooled ({fcm} vs {fwm})"
+        );
+    }
+
+    /// **The per-segment Falcon pool sizes a real diagnosis needs, and what pooling buys.**
+    ///
+    /// `the_falcon_pool_size_a_diagnosis_needs_is_counted` records the *total*; a pool
+    /// cannot use a total, because the CNN runs one `run_parties` call per MPC segment with
+    /// a fresh backend. This prints the split and measures the warm/cold gap it unlocks.
+    ///
+    /// The online figure is `online_mpc_ms()`, not `mpc_ms`: the pool fill happens inside
+    /// the call `mpc_ms` brackets, so a warm run's `mpc_ms` contains its own offline phase.
+    #[test]
+    #[ignore] // full encrypted pipeline, per dataset
+    fn the_per_segment_pool_sizes_and_what_pooling_buys() {
+        use crate::bench::cnn::run_cnn_hybrid_in_session_pooled;
+        for name in ["pneumonia", "organa", "derma"] {
+            let data = load(name).unwrap_or_else(|e| panic!("{name}: {e}"));
+            let model = data.model();
+            let img = &data.images[0];
+            let session = CnnSession::new(&model, true);
+            let profile = NetworkProfile::INSTANT;
+
+            let cold =
+                run_cnn_hybrid_in_session(&session, &model, img, profile, Nonlin::Falcon, true);
+            let warm = run_cnn_hybrid_in_session_pooled(
+                &session,
+                &model,
+                img,
+                profile,
+                Nonlin::Falcon,
+                true,
+                &cold.falcon_plan,
+            );
+
+            let total: usize = cold.falcon_plan.values().map(|p| p.comparisons).sum();
+            let truncs: usize = cold.falcon_plan.values().map(|p| p.truncations).sum();
+            println!(
+                "\n  {name}: {total} comparisons + {truncs} truncations over {} segments",
+                cold.falcon_plan.len()
+            );
+            for (seg, p) in &cold.falcon_plan {
+                println!(
+                    "    {seg:?}: {} cmp, {} trunc",
+                    p.comparisons, p.truncations
+                );
+            }
+            println!(
+                "    online MPC {:.1} → {:.1} ms ({:.2}x), offline {:.1} ms",
+                cold.online_mpc_ms(),
+                warm.online_mpc_ms(),
+                cold.online_mpc_ms() / warm.online_mpc_ms().max(1e-9),
+                warm.phases.falcon_offline_ms,
+            );
+
+            assert_eq!(
+                warm.class, cold.class,
+                "{name}: pooling changed the diagnosis"
+            );
+            assert_eq!(
+                warm.phases.falcon_pool_missed, 0,
+                "{name}: {} misses — the online figure would include preprocessing",
+                warm.phases.falcon_pool_missed
+            );
+            assert_eq!(
+                total, cold.falcon_comparisons,
+                "{name}: the per-segment sizes must sum to the counted total"
+            );
+            assert!(
+                warm.online_mpc_ms() < cold.online_mpc_ms(),
+                "{name}: pooling must shorten the online segment"
+            );
+        }
+    }
+
+    /// **The shipped derma model is genuinely RGB**, and this is the fast guard for it.
+    ///
+    /// The slow guard — `encrypted_matches_plaintext_on_real_scans` — takes twenty
+    /// minutes across three datasets and five protocol configurations, so it is not
+    /// the thing that should be relied on to notice a three-channel model quietly
+    /// becoming a one-channel one. That failure has a specific shape worth naming: the
+    /// trainer folds RGB to luminance unless `--rgb` is passed, and a regenerated
+    /// weight file missing that flag would still load, still train, still score
+    /// plausibly, and silently be a different experiment. A `--rgb` flag that fails to
+    /// reach the trainer is not hypothetical — it happened, via shell word-splitting,
+    /// and produced two "RGB vs grayscale" arms that were both grayscale.
+    ///
+    /// So this checks the property that distinguishes them: the channel count, derived
+    /// from the embedded image length rather than declared, and the packing cost that
+    /// follows from it.
+    #[test]
+    fn the_shipped_derma_model_is_rgb_and_costs_one_multiply_per_channel() {
+        let data = load("derma").expect("derma must be embedded");
+        assert_eq!(
+            data.in_c(),
+            3,
+            "derma must be RGB — a grayscale fold means --rgb never reached the trainer"
+        );
+        assert_eq!(
+            data.images[0].len(),
+            3 * data.d * data.d,
+            "an RGB image is three channels of d×d, laid out channel-major"
+        );
+
+        let model = data.model();
+        let n = crate::fhe::bfv::BfvParams::DEFAULT.n;
+        let plan = crate::bench::cnn::packing_plan(&model, n);
+        let (c1, _, ng1) = plan[0];
+        assert_eq!(c1.in_c, 3, "the first conv sees three channels");
+        assert_eq!(
+            ng1,
+            1,
+            "RGB 28×28 must fit ONE ciphertext (degree {} against n={n}) — three \
+             channels sum on shared coefficients rather than costing three multiplies",
+            c1.required_degree()
+        );
+        assert_eq!(c1.required_degree(), 3977, "the degree this rests on");
+    }
+
+    /// **The shipped organa model exercises channel splitting**, and this pins that
+    /// the capability is actually in use rather than merely available.
+    ///
+    /// Retrained 2026-08-04 at `--conv 16,32`, which the trainer used to refuse: its
+    /// second convolution takes 16 channels at 13×13, degree 5266 against `n = 4096`,
+    /// so it runs as two groups of 12 whose products are added. That widening is what
+    /// took organa from 81.64% to **82.93%** on 17 778 test images — disjoint
+    /// confidence intervals, so a real gain rather than seed noise.
+    ///
+    /// The cost is visible and worth stating: conv2 goes from 32 ciphertext
+    /// multiplications to 64, because each output channel now multiplies two input
+    /// groups. Still no evaluation key, still no bootstrap — group results combine by
+    /// homomorphic addition.
+    #[test]
+    fn the_shipped_organa_model_uses_channel_splitting() {
+        let model = super::DATASETS
+            .iter()
+            .find(|(n, _)| *n == "organa")
+            .expect("organa must be embedded")
+            .1()
+        .model();
+        let plan = crate::bench::cnn::packing_plan(&model, crate::fhe::bfv::BfvParams::DEFAULT.n);
+        assert_eq!(plan.len(), 2, "organa is a two-conv model");
+
+        let (c1, gs1, ng1) = plan[0];
+        assert_eq!((gs1, ng1), (c1.in_c, 1), "conv1 fits one ciphertext");
+
+        let (c2, gs2, ng2) = plan[1];
+        assert_eq!(c2.in_c, 16, "conv2 must take the widened 16 channels");
+        assert_eq!(
+            (gs2, ng2),
+            (12, 2),
+            "conv2 at {}x{} must split into 2 groups of 12 (degree {} vs n={})",
+            c2.h,
+            c2.w,
+            c2.required_degree(),
+            crate::fhe::bfv::BfvParams::DEFAULT.n
+        );
+        assert!(
+            c2.required_degree() > crate::fhe::bfv::BfvParams::DEFAULT.n,
+            "the point of this test is that the layer does NOT fit unsplit"
+        );
+    }
+
     #[test]
     fn embedded_accuracy_is_reasonable() {
         for (name, _) in DATASETS {
@@ -999,11 +1736,29 @@ mod tests {
                 .filter(|(img, &l)| model.forward(img).0 == l as usize)
                 .count();
             let acc = correct as f64 / data.images.len() as f64;
+
+            // **Balanced accuracy against chance, not accuracy against the majority
+            // class.** This assertion exists to catch a wiring error — a wrong
+            // quantisation mapping or flatten order — and plain accuracy cannot do
+            // that on a severely imbalanced multi-class set. DermaMNIST's largest
+            // class is 67% of it, and published ResNet-18 beats that by only ~6.6
+            // points, so "majority + 5" is unreachable there for reasons that have
+            // nothing to do with wiring. Balanced accuracy against `1/nclasses` is
+            // the check that works for every shape of dataset: a misflattened input
+            // scores at chance whatever the class balance is.
+            let nclasses = data.class_names.len();
+            let logits: Vec<Vec<i64>> = data
+                .images
+                .iter()
+                .map(|img| model.forward_logits(img).0)
+                .collect();
+            let m = ClassificationMetrics::compute(&logits, &data.labels, nclasses);
+            let chance = 1.0 / nclasses as f64;
             assert!(
-                acc > data.majority_baseline + 0.05,
-                "{name}: subset accuracy {acc:.3} barely beats the majority baseline \
-                 {:.3} — check the quantisation mapping or the flatten order",
-                data.majority_baseline
+                m.balanced_accuracy > chance * 1.5,
+                "{name}: balanced accuracy {:.3} is near chance {chance:.3} — check the \
+                 quantisation mapping or the flatten order",
+                m.balanced_accuracy
             );
             assert!(
                 (acc - data.full_test_accuracy).abs() < 0.10,
@@ -1052,7 +1807,8 @@ mod tests {
     #[ignore] // runs the real BFV × ABY3 hybrid; slow in debug
     fn sweep_cells_agree_and_respond_to_bandwidth() {
         let protocols = [Nonlin::Gc, Nonlin::Falcon];
-        let cells = sweep_crossover("pneumonia", 1, &[0], &[1000.0, 10.0], &protocols).unwrap();
+        let cells =
+            sweep_crossover("pneumonia", 1, &[0], &[1000.0, 10.0], &protocols, 1, false).unwrap();
         assert_eq!(cells.len(), 4);
         for c in &cells {
             assert!(

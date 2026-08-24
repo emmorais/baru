@@ -114,15 +114,31 @@ fn test_nn_load_model_rejects_non_16_scale_bits() {
     let path = temp_json_path("wrong_scale");
     quantized.save_json(&path).unwrap();
 
-    let src = format!("(nn-load-model \"{}\")", lisp_path_literal(&path));
-    let expr = parse(&src).expect("parse failed");
-    let p = Participant::new_simulated(0);
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| p.eval(&expr)));
-    let _ = std::fs::remove_file(&path);
-    assert!(
-        result.is_err(),
-        "loading a non-16-scale-bit model must panic, not silently misinterpret it"
+    // Since 2026-08-03 this *raises* a condition rather than panicking, so the
+    // check is that the failure is signalled and names the mismatch — not that
+    // the process dies. The property being defended is unchanged: a model
+    // quantized at a different scale must never be silently misinterpreted.
+    let src = format!(
+        "(guard (e (error-message e)) (nn-load-model \"{}\"))",
+        lisp_path_literal(&path)
     );
+    let message = baru::interpreter::eval_plain_string(&src);
+    // And it is catchable, which is the point of the error continuation: a
+    // caller can recover instead of the process aborting. Checked before the
+    // file is removed, or this would fail on a missing path instead.
+    let recovered = format!(
+        "(guard (e 0) (nn-load-model \"{}\"))",
+        lisp_path_literal(&path)
+    );
+    let recovered = eval(&recovered);
+    let _ = std::fs::remove_file(&path);
+
+    assert!(
+        message.contains("scale bits"),
+        "loading a non-16-scale-bit model must raise a condition naming the \
+         mismatch, not silently misinterpret it; got {message:?}"
+    );
+    assert_eq!(recovered, 0, "the condition must be catchable by `guard`");
 }
 
 #[test]

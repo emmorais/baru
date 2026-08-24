@@ -1,7 +1,7 @@
 //! FHE circuit emitter: walks an `FheCircuit`'s `FlatOp` SSA block and
 //! dispatches each gate to an `FheBackend`.
 //!
-//! This is the FHE analogue of `binius64_backend::serialize_constraints`.
+//! This is the FHE analogue of the ZKP backend's constraint serialisation.
 //! Key differences from ZKP emission:
 //!   - There are no witness wires (FHE is fully deterministic from the
 //!     server's perspective).

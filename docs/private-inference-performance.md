@@ -191,7 +191,11 @@ correct and the inference drawn from it was wrong.
    highest-value remaining optimization".
 2. "Garbled circuits are 2.7–3.4× faster" was true of the garbling
    *primitive*, measured in isolation. The deployable three-party protocol
-   including the Y2A return leg is 1.4–1.7×.
+   including the Y2A return leg is 1.4–1.7×. **Stale as of 2026-08-03: 6.1×.** The
+   compression to 1.4–1.7× was itself an artefact of point 1 — with an unbatched
+   import at 94% of the segment, both routes carried the same dominant cost and the
+   ratio collapsed toward 1. Batching the import restored it. A ratio measured over a
+   segment is only as meaningful as the segment's composition.
 3. "FHE is now 84%" was true, and 48% of *that* was encrypting masks — work
    that need not be on the critical path at all.
 

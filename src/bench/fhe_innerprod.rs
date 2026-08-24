@@ -29,7 +29,6 @@ use serde::Serialize;
 
 use crate::fhe::bfv::{Bfv, BfvParams};
 use crate::fhe::bgv::{Bgv, BgvParams};
-use crate::fhe::poly::{self, Backend};
 
 #[derive(Debug, Clone, Serialize)]
 pub struct SchemeReport {
@@ -166,8 +165,6 @@ keygen/encrypt/multiply/decrypt time, ciphertext size, and security status.
 options:
   --in D     input dimension (default 8)
   --out M    output dimension / rows (default 4)
-  --poly B   polynomial backend: ntt (default), ntl, or `all` to sweep every
-             backend this build has (ntl needs `--features ntl`)
   --reps R   repeat each scheme R times and average (default 1). Run-to-run
              spread is ~1-2%, so comparing schemes that differ by less than
              that needs R > 1 to say anything.
@@ -199,7 +196,6 @@ pub fn run_cli(args: &[String]) -> Result<(), String> {
     let mut out_dim = 4usize;
     let mut json = false;
     let mut reps = 1usize;
-    let mut sweep: Vec<Backend> = vec![Backend::Ntt];
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -235,45 +231,20 @@ pub fn run_cli(args: &[String]) -> Result<(), String> {
                     return Err("--reps must be at least 1".into());
                 }
             }
-            "--poly" => {
-                i += 1;
-                let v = args.get(i).ok_or("--poly needs a value")?;
-                sweep = if v == "all" {
-                    poly::available()
-                } else {
-                    let b = Backend::parse(v)?;
-                    if !poly::is_available(b) {
-                        return Err(format!(
-                            "polynomial backend {v:?} is not in this build (rebuild with --features ntl)"
-                        ));
-                    }
-                    vec![b]
-                };
-            }
             other => return Err(format!("unknown option '{other}'\n{USAGE}")),
         }
         i += 1;
     }
 
-    let mut runs: Vec<(Backend, Vec<SchemeReport>)> = Vec::new();
-    for b in sweep {
-        let reports = poly::with_backend(b, || {
-            vec![
-                average((0..reps).map(|_| bench_bfv(in_dim, out_dim)).collect()),
-                average((0..reps).map(|_| bench_bgv(in_dim, out_dim)).collect()),
-            ]
-        })?;
-        runs.push((b, reports));
-    }
+    let reports = vec![
+        average((0..reps).map(|_| bench_bfv(in_dim, out_dim)).collect()),
+        average((0..reps).map(|_| bench_bgv(in_dim, out_dim)).collect()),
+    ];
 
     if json {
-        let payload: Vec<_> = runs
-            .iter()
-            .map(|(b, r)| serde_json::json!({ "poly_backend": b.name(), "schemes": r }))
-            .collect();
         println!(
             "{}",
-            serde_json::to_string_pretty(&payload).map_err(|e| e.to_string())?
+            serde_json::to_string_pretty(&reports).map_err(|e| e.to_string())?
         );
         return Ok(());
     }
@@ -282,27 +253,9 @@ pub fn run_cli(args: &[String]) -> Result<(), String> {
     println!(
         "packed matvec({in_dim}x{out_dim}), both operands encrypted, decrypt under squared key\n"
     );
-    for (b, reports) in &runs {
-        print_table(*b, reports, runs.len() > 1);
-    }
-    let reports = &runs.last().expect("at least one backend").1;
-    for r in reports {
+    print_table(&reports);
+    for r in &reports {
         println!("  {}: {}", r.scheme, r.security_note);
-    }
-
-    // Cross-backend speedup, when more than one was run: the same scheme, the
-    // same parameters, only the polynomial arithmetic swapped.
-    if runs.len() > 1 {
-        let (base_b, base) = &runs[0];
-        println!("\n  multiply speedup vs {}:", base_b.name());
-        for (b, rs) in runs.iter().skip(1) {
-            let line: Vec<String> = rs
-                .iter()
-                .zip(base)
-                .map(|(r, b0)| format!("{} {:.2}x", r.scheme, b0.multiply_ms / r.multiply_ms))
-                .collect();
-            println!("    {:<4} {}", b.name(), line.join("   "));
-        }
     }
 
     println!(
@@ -320,10 +273,7 @@ pub fn run_cli(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-fn print_table(b: Backend, reports: &[SchemeReport], label_backend: bool) {
-    if label_backend {
-        println!("── polynomial backend: {} ──", b.name());
-    }
+fn print_table(reports: &[SchemeReport]) {
     println!(
         "{:<8} {:>6} {:>4} {:>6} {:>9} {:>9} {:>9} {:>9} {:>10} {:>4}",
         "scheme",

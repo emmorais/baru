@@ -146,9 +146,29 @@ pub struct CostParams {
     /// need a large prime for MAC security.  Ignored by ring and binary
     /// protocols.
     pub field_bits: u32,
-    /// Local cryptographic work per interactive lane, in nanoseconds.  Captures
-    /// AES calls for garbling, MAC checks for authenticated protocols, and plain
-    /// field arithmetic otherwise.  An estimate; calibrated in P1.
+    /// Per-lane cost that is **not** latency and **not** bandwidth, in
+    /// nanoseconds: the work a party does per interactive lane with the network
+    /// free.  Captures AES calls for garbling, MAC checks for authenticated
+    /// protocols, field arithmetic, and --- as measurement forced us to admit ---
+    /// share bookkeeping and message serialization, which for Baru's implemented
+    /// backend dominate the cryptography.
+    ///
+    /// **`aby3` is fitted; every other entry is still an estimate.**  The fit is
+    /// `the_local_work_per_multiplication_is_what_the_spec_says` in
+    /// [`crate::mpcc::cost`], which times `mul_batch` at four widths on
+    /// `NetworkProfile::INSTANT` and takes the *slope*, so a fixed per-run cost is
+    /// not charged to every lane.  It measured \SI{1072}{\nano\second} against
+    /// the \SI{5}{\nano\second} that had been assumed here since the field was
+    /// written --- a factor of \num{214} --- and a purely local `add`, which
+    /// communicates nothing at all, already costs \SI{145}{\nano\second}, so
+    /// \SI{5}{\nano\second} was \num{29} times low even for the arithmetic
+    /// alone.  This mattered: it is the term that decides a protocol choice on a
+    /// fast link, and a network-only reading of it mispicked a comparison backend
+    /// (see `precompile::mpc_compare`).
+    ///
+    /// The remaining entries keep their relative ordering, which is what they were
+    /// written for, and are known to be low by a similar factor.  Fitting each one
+    /// requires an implementation of it to time.
     pub local_ns_per_lane: f64,
 }
 
@@ -193,7 +213,10 @@ const SEMI_RING_SHARED: CostParams = CostParams {
     constant_round: false,
     constant_rounds: 0,
     field_bits: 64,
-    local_ns_per_lane: 5.0,
+    // Fitted, not estimated: see the field's documentation. This is the cost of
+    // an ABY3 multiplication lane with the network free, measured as a slope over
+    // four batch widths.
+    local_ns_per_lane: 1072.0,
 };
 
 /// Every protocol Baru knows about, implemented or not.

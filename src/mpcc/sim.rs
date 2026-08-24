@@ -29,6 +29,7 @@ pub struct DealerEngine {
     m: Modulus,
     parties: usize,
     counters: Counters,
+    trunc_pairs: bool,
 }
 
 impl DealerEngine {
@@ -40,7 +41,16 @@ impl DealerEngine {
             m: Modulus::Ring { k: bits },
             parties,
             counters: Counters::default(),
+            trunc_pairs: false,
         })
+    }
+
+    /// Rescale with truncation pairs instead of a bit decomposition, so that the
+    /// accuracy cost of stochastic rounding can be measured in-process across many
+    /// inputs without paying for a distributed run each time.
+    pub fn with_trunc_pairs(mut self, on: bool) -> Self {
+        self.trunc_pairs = on;
+        self
     }
 
     /// Bytes one party sends when every party sends `elems` elements to every
@@ -72,6 +82,10 @@ impl DealerEngine {
 }
 
 impl ShareEngine for DealerEngine {
+    fn trunc_pair_mode(&self) -> bool {
+        self.trunc_pairs
+    }
+
     type Share = Additive;
 
     fn modulus(&self) -> Modulus {
@@ -82,6 +96,9 @@ impl ShareEngine for DealerEngine {
     }
     fn counters(&self) -> &Counters {
         &self.counters
+    }
+    fn counters_mut(&mut self) -> &mut Counters {
+        &mut self.counters
     }
 
     fn input(&mut self, value: u64, _party: usize) -> Additive {
@@ -143,6 +160,11 @@ impl ShareEngine for DealerEngine {
         values.iter().map(|s| self.reconstruct(s)).collect()
     }
 
+    /// Drawn locally, and this is the *definition* rather than a simplification:
+    /// a trusted dealer hands over correlated randomness for free, which is what
+    /// makes this engine the online lower bound. Every other engine generates
+    /// its bits through `vm::random_bits_batch`; the gap between them and this
+    /// one is exactly the price of not having a dealer.
     fn random_bits(&mut self, n: usize) -> Vec<Additive> {
         self.counters.random_bits += n as u64;
         (0..n)
@@ -269,6 +291,9 @@ impl ShareEngine for ShamirEngine {
     fn counters(&self) -> &Counters {
         &self.counters
     }
+    fn counters_mut(&mut self) -> &mut Counters {
+        &mut self.counters
+    }
 
     fn input(&mut self, value: u64, _party: usize) -> Shamir {
         self.charge(1);
@@ -328,11 +353,12 @@ impl ShareEngine for ShamirEngine {
         values.iter().map(|s| self.interpolate(s)).collect()
     }
 
+    /// Generated rather than dealt (`vm::random_bits_batch`) — Shamir has a real
+    /// threat model, so its preprocessing has to cost something. XOR-reducing
+    /// one private bit per party is `⌈log₂(parties)⌉` rounds, so unlike the
+    /// two-party engines this is 2 rounds at `n = 3`.
     fn random_bits(&mut self, n: usize) -> Vec<Shamir> {
-        self.counters.random_bits += n as u64;
-        (0..n)
-            .map(|_| self.share_degree(u64::from(rand::random::<bool>()), self.t))
-            .collect()
+        super::vm::random_bits_batch(self, n)
     }
 }
 
