@@ -115,7 +115,7 @@ the corrections behind each row are in [`docs/experiments.md`](docs/experiments.
 | Private CNN, 28×28, image *and* weights encrypted | **260 ms**, 0 bootstraps, exact | `bench-cnn --img 28 --gc --precompute` |
 | Real MNIST accuracy, deployed integer model | **98.89%**; every encrypted prediction equals the plaintext one | `bench-mnist` |
 | Private *diagnosis* (MedMNIST chest X-ray) | **84.78%**, **268 ms** online per diagnosis (435 ms single-core), 0 bootstraps, encrypted==plaintext on **300/300** | `bench-medmnist` |
-| **The same CNN written *in Baru*** (`examples/medmnist.baru`) | **322 ms** plaintext, **6.4 s** with the image secret, **10.1 s** with image *and* model secret — bit-exact against the Rust model on all 3 datasets. The *encrypted* Rust pipeline (268 ms) is faster than the *plaintext* Lisp one | `run examples/medmnist.baru` |
+| **The same CNN written *in Baru*** (`examples/medmnist.baru`) | **299 ms** plaintext, **911 ms** with the image secret, **4.17 s** with image *and* model secret (`--nonlin gc`) — bit-exact against the Rust model on all 3 datasets. The *encrypted* Rust pipeline (268 ms) is faster than the *plaintext* Lisp one | `run examples/medmnist.baru --mpc --gc` |
 | Private *training* (SGD under MPC, backprop through ReLU) | trained model **bit-identical** to plaintext integer SGD, in **3 643** wire messages | `bench-train --hidden 8` |
 | Convolution packing | 1352 ct×ct multiplications → **8** | `bench-cnn --img 28` |
 | Our NTT vs schoolbook | **40.6× faster** at n=4096 (1.77 ms vs 71.9 ms); it also beat NTL+GMP by 1.8× before that backend was removed | `bench-polymul` |

@@ -919,6 +919,53 @@ impl<T: Transport + 'static> Backend for TransportBackend<T> {
         self.store(id, ps, a.nbits.max(b.nbits), a.owner)
     }
 
+    /// Dispatches the fused nonlinearity on the configured [`NonlinMode`] —
+    /// this is the method that makes `--nonlin gc` mean something to a Baru
+    /// program. The `a2b` arm defers to the trait's default construction.
+    fn relu_rescale_batch(&mut self, vs: &[ShareRef], shift: usize) -> Vec<ShareRef> {
+        if vs.is_empty() {
+            return Vec::new();
+        }
+        let nbits = vs.iter().map(|v| v.nbits).max().unwrap_or(64);
+        match self.nonlin {
+            NonlinMode::Gc => self.relu_gc_batch(vs, nbits, shift),
+            NonlinMode::Falcon => self.relu_falcon_batch(vs, nbits, shift as u32),
+            NonlinMode::A2b => {
+                // The trait default, reached explicitly: `Backend::relu_rescale_batch`
+                // is not callable as `super`, so the construction is spelled out
+                // in one place there and this arm mirrors the dispatch only.
+                let bit_sets = self.a2b_batch(vs, nbits);
+                let one = self.share_public(1, 1);
+                let mut pairs = Vec::with_capacity(vs.len());
+                for bits in &bit_sets {
+                    let mut shifted = self.b2a(&bits[shift.min(nbits)..]);
+                    shifted.nbits = nbits;
+                    let keep = self.sub(&one, &bits[nbits - 1]);
+                    pairs.push((shifted, keep));
+                }
+                self.mul_batch(&pairs)
+                    .into_iter()
+                    .map(|mut a| {
+                        a.nbits = nbits;
+                        a
+                    })
+                    .collect()
+            }
+        }
+    }
+
+    fn set_nonlinearity(&mut self, mode: &str) -> Result<(), String> {
+        match NonlinMode::parse(mode) {
+            Some(m) => {
+                self.set_nonlin(m);
+                Ok(())
+            }
+            None => Err(format!(
+                "unknown nonlinearity {mode:?}; expected \"a2b\", \"gc\" or \"falcon\""
+            )),
+        }
+    }
+
     /// Local: scale both replicated components. Deliberately does **not**
     /// call `note_interactive` — no message is sent, and counting it would
     /// overstate the round count this backend reports.

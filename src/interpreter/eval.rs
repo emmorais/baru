@@ -3817,6 +3817,14 @@ impl Participant {
     }
 
     /// Reveal a shared value to the caller (simulated reveal via backend).
+    /// Choose the protocol backing comparisons and the fused nonlinearity —
+    /// `"a2b"`, `"gc"` or `"falcon"`. Must be called on every party before any
+    /// operation that would diverge, since the modes allocate ids differently.
+    pub fn set_nonlinearity(&self, mode: &str) -> Result<(), String> {
+        let mut be = self.backend.lock().unwrap_or_else(|e| e.into_inner());
+        be.set_nonlinearity(mode)
+    }
+
     pub fn reveal(&self, sref: &crate::interpreter::backend::ShareRef) -> crate::crypto::types::Fr {
         let mut be = self.backend.lock().unwrap_or_else(|e| e.into_inner());
         be.reveal(sref, None)

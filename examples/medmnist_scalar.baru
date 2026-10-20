@@ -1,0 +1,211 @@
+; MedMNIST diagnosis, written the SCALAR way — kept only so the first row of
+; `docs/experiments.md` IV.2b stays reproducible.
+;
+;   baru run examples/medmnist_scalar.baru --dataset pneumonia --images 1
+;   baru run examples/medmnist_scalar.baru --dataset pneumonia --images 1 --mpc
+;
+; This is `examples/medmnist.baru` as it was first written: a loop over sliding
+; windows, with `>` and `ash-right` applied to one activation at a time. The
+; arithmetic is identical to the vector version and so are its answers — the
+; tests assert that. What differs is cost, by three orders of magnitude on the
+; private path:
+;
+;   | | plaintext | private, image secret | messages |
+;   |---|---|---|---|
+;   | this file | 2 783 ms | 1 216 404 ms | 864 361 |
+;   | medmnist.baru, --nonlin gc | 299 ms | 911 ms | 33 106 |
+;
+; The reason is LANGUAGE.md §6.2: cost is rounds, not operations. ~12 600
+; comparisons here each pay their own ~9-round bit decomposition, where the
+; vector version pays one batched round per layer. Nothing about the network
+; changed to fix that — only which primitives it calls.
+;
+; Do not develop against this file. It exists to be measured.
+
+; ─── the model, as ordinary Lisp data ────────────────────────────────────────
+(define (model-d m)        (list-ref m 0))
+(define (model-in-c m)     (list-ref m 1))
+(define (model-shift m)    (list-ref m 2))
+(define (model-nclasses m) (list-ref m 3))
+(define (model-conv1 m)    (list-ref m 4))
+(define (model-extra m)    (list-ref m 5))
+(define (model-hidden m)   (list-ref m 6))
+(define (model-dense-w m)  (list-ref m 7))
+(define (model-dense-b m)  (list-ref m 8))
+(define (model-nbits m)    (list-ref m 9))
+
+(define (conv-kernels c) (list-ref c 0))
+(define (conv-bias c)    (list-ref c 1))
+(define (conv-k c)       (list-ref c 2))
+
+(define (xconv-kernels c) (list-ref c 0))
+(define (xconv-bias c)    (list-ref c 1))
+(define (xconv-in-c c)    (list-ref c 2))
+(define (xconv-in-h c)    (list-ref c 3))
+(define (xconv-in-w c)    (list-ref c 4))
+(define (xconv-k c)       (list-ref c 5))
+
+(define (dense-w l) (list-ref l 0))
+(define (dense-b l) (list-ref l 1))
+
+; ─── oblivious primitives, one element at a time ────────────────────────────
+; Muxes rather than `if`, for the same reason as the vector version: `if` on a
+; share reveals the condition bit (§6.3). These are correct and oblivious; they
+; are simply scalar, and every one of them is its own protocol round.
+(define (mux c a b) (+ (* c a) (* (- 1 c) b)))
+(define (max2 a b) (mux (> a b) a b))
+(define (relu-rescale v s) (* (ash-right v s) (>= v 0)))
+
+(define (argmax xs)
+  (let ((n (length xs)))
+    (let loop ((i 1) (bi 0) (bv (car xs)))
+      (if (== i n)
+          bi
+          (let* ((v (list-ref xs i))
+                 (c (> v bv)))
+            (loop (+ i 1) (mux c i bi) (mux c v bv)))))))
+
+; ─── convolution: a loop over sliding windows ───────────────────────────────
+; `fmap` is a vector (O(1) indexing; a list would make every window O(n)). The
+; window is flattened in (ic, ky, kx) order — the kernel row's own order — so
+; one `dot` computes the whole multiply-accumulate. 5 408 of these are built for
+; the first conv layer alone.
+(define (window fmap in-c ih iw k oy ox)
+  (let ((acc (quote ()))
+        (hw (* ih iw)))
+    (do ((ic (- in-c 1) (- ic 1))) ((< ic 0) acc)
+      (do ((ky (- k 1) (- ky 1))) ((< ky 0))
+        (do ((kx (- k 1) (- kx 1))) ((< kx 0))
+          (set! acc
+                (cons (vector-ref fmap (+ (* ic hw) (+ (* (+ oy ky) iw) (+ ox kx))))
+                      acc)))))))
+
+(define (conv2d fmap in-c ih iw kernels cbias k s)
+  (let* ((oh (+ (- ih k) 1))
+         (ow (+ (- iw k) 1))
+         (oc (length kernels))
+         (out (make-vector (* oc (* oh ow)) 0)))
+    (do ((c 0 (+ c 1))) ((== c oc) (list out oc oh ow))
+      (let ((kern (list-ref kernels c))
+            (b (ash-left (list-ref cbias c) s))
+            (base (* c (* oh ow))))
+        (do ((oy 0 (+ oy 1))) ((== oy oh))
+          (do ((ox 0 (+ ox 1))) ((== ox ow))
+            (vector-set! out (+ base (+ (* oy ow) ox))
+                         (relu-rescale
+                          (+ (dot kern (window fmap in-c ih iw k oy ox)) b)
+                          s))))))))
+
+; ─── 2x2 max-pool, stride 2 ─────────────────────────────────────────────────
+; Three comparisons per output pixel, each its own round.
+(define (maxpool fmap c ih iw)
+  (let* ((oh (+ (ash-right (- ih 2) 1) 1))
+         (ow (+ (ash-right (- iw 2) 1) 1))
+         (out (make-vector (* c (* oh ow)) 0))
+         (hw (* ih iw)))
+    (do ((ch 0 (+ ch 1))) ((== ch c) (list out c oh ow))
+      (do ((oy 0 (+ oy 1))) ((== oy oh))
+        (do ((ox 0 (+ ox 1))) ((== ox ow))
+          (let* ((iy (* oy 2))
+                 (ix (* ox 2))
+                 (o (+ (* ch hw) (+ (* iy iw) ix)))
+                 (a (vector-ref fmap o))
+                 (b (vector-ref fmap (+ o 1)))
+                 (cc (vector-ref fmap (+ o iw)))
+                 (d (vector-ref fmap (+ o (+ iw 1)))))
+            (vector-set! out (+ (* ch (* oh ow)) (+ (* oy ow) ox))
+                         (max2 (max2 a b) (max2 cc d)))))))))
+
+; ─── dense layers ───────────────────────────────────────────────────────────
+(define (add-bias v b)
+  (let loop ((xs v) (bs b) (acc (quote ())))
+    (if (null? xs)
+        (reverse acc)
+        (loop (cdr xs) (cdr bs) (cons (+ (car xs) (car bs)) acc)))))
+
+(define (relu-rescale-list xs s)
+  (let loop ((ys xs) (acc (quote ())))
+    (if (null? ys)
+        (reverse acc)
+        (loop (cdr ys) (cons (relu-rescale (car ys) s) acc)))))
+
+(define (hidden-layer x l s)
+  (relu-rescale-list (add-bias (matvec (dense-w l) x) (dense-b l)) s))
+
+; ─── the forward pass ───────────────────────────────────────────────────────
+(define (forward m img)
+  (let* ((s (model-shift m))
+         (c1 (model-conv1 m))
+         (a (conv2d img (model-in-c m) (model-d m) (model-d m)
+                    (conv-kernels c1) (conv-bias c1) (conv-k c1) s))
+         (p (maxpool (list-ref a 0) (list-ref a 1) (list-ref a 2) (list-ref a 3))))
+    (let loop ((xs (model-extra m)) (f p))
+      (if (null? xs)
+          (let ((flat (vector->list (list-ref f 0))))
+            (let dloop ((hs (model-hidden m)) (x flat))
+              (if (null? hs)
+                  (argmax (add-bias (matvec (model-dense-w m) x) (model-dense-b m)))
+                  (dloop (cdr hs) (hidden-layer x (car hs) s)))))
+          (let* ((cl (car xs))
+                 (a2 (conv2d (list-ref f 0) (xconv-in-c cl) (xconv-in-h cl) (xconv-in-w cl)
+                             (xconv-kernels cl) (xconv-bias cl) (xconv-k cl) s))
+                 (p2 (maxpool (list-ref a2 0) (list-ref a2 1) (list-ref a2 2) (list-ref a2 3))))
+            (loop (cdr xs) p2))))))
+
+; ─── privacy: the only place the backend is chosen ──────────────────────────
+(define WIDTH (model-nbits (medmnist-model DATASET)))
+
+(define (share-list xs)
+  (let loop ((ys xs) (acc (quote ())))
+    (if (null? ys)
+        (reverse acc)
+        (loop (cdr ys) (cons (share (car ys) WIDTH) acc)))))
+
+(define (share-rows rs)
+  (let loop ((ys rs) (acc (quote ())))
+    (if (null? ys)
+        (reverse acc)
+        (loop (cdr ys) (cons (share-list (car ys)) acc)))))
+
+(define (load-input pixels)
+  (list->vector (if (== PRIVATE 0) pixels (share-list pixels))))
+
+(define (load-model name)
+  (let ((m (medmnist-model name)))
+    (if (< PRIVATE 2)
+        m
+        (list (model-d m) (model-in-c m) (model-shift m) (model-nclasses m)
+              (let ((c (model-conv1 m)))
+                (list (share-rows (conv-kernels c)) (share-list (conv-bias c)) (conv-k c)))
+              (let xloop ((xs (model-extra m)) (acc (quote ())))
+                (if (null? xs)
+                    (reverse acc)
+                    (let ((c (car xs)))
+                      (xloop (cdr xs)
+                             (cons (list (share-rows (xconv-kernels c))
+                                         (share-list (xconv-bias c))
+                                         (xconv-in-c c) (xconv-in-h c) (xconv-in-w c)
+                                         (xconv-k c))
+                                   acc)))))
+              (let hloop ((hs (model-hidden m)) (acc (quote ())))
+                (if (null? hs)
+                    (reverse acc)
+                    (let ((l (car hs)))
+                      (hloop (cdr hs)
+                             (cons (list (share-rows (dense-w l)) (share-list (dense-b l)))
+                                   acc)))))
+              (share-rows (model-dense-w m))
+              (share-list (model-dense-b m))
+              (model-nbits m)))))
+
+; ─── driver ─────────────────────────────────────────────────────────────────
+(define MODEL (load-model DATASET))
+
+(let loop ((i 0) (correct 0))
+  (if (== i NIMAGES)
+      (list correct NIMAGES)
+      (let* ((rec (medmnist-image DATASET i))
+             (img (load-input (list-ref rec 0)))
+             (label (list-ref rec 1))
+             (cls (reconstruct (forward MODEL img))))
+        (loop (+ i 1) (+ correct (if (== cls label) 1 0))))))

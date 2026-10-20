@@ -825,6 +825,21 @@ hides, independently of which backend evaluates it (`0` nothing, `1` the input,
 control: it says how much of the cost is protocol rather than interpretation.
 The runner also injects `DATASET`, `NIMAGES` and `NBITS`.
 
+`--nonlin a2b|gc|falcon` (`--gc` is shorthand for the second) chooses the
+protocol behind every *batched* comparison and behind the fused ReLU∘rescale —
+batched bit decomposition, the 3-party garbled route, or Falcon's `wrap3`. All
+three compute the same function; the choice is cost, and on a CNN written over
+the vector primitives it is worth **4.7×**. It is applied to every party before
+the first expression, because the modes allocate operation ids differently and a
+mid-run switch would desynchronise them.
+
+**It only reaches the batched primitives.** `NonlinMode` is dispatched in
+`lt_batch` and `relu_rescale_batch`; scalar `<`/`>`/`>=` decompose
+unconditionally. A program written one element at a time therefore gets *nothing*
+from `--nonlin gc` — measured: byte-for-byte the same traffic and the same
+runtime (`docs/experiments.md` IV.2b). Vectorise first; the flag is not an
+alternative to that.
+
 **Step budget.** The trampoline's per-expression guard (`MAX_FRAMES`, 1 000 000)
 is sized for a REPL line; one 28×28 convolution exceeds it. `baru run` raises the
 budget, and `BARU_MAX_FRAMES` overrides in either direction — set it low to make
@@ -934,17 +949,17 @@ else, so the class index is the only value revealed.
 `--private 2` change no prediction: the oblivious rewrite is exact, not
 approximate.
 
-**Measured** (pneumonia, one diagnosis, M1 Pro): **322 ms** plaintext,
-**6.4 s** with the image secret, **10.1 s** with the image *and* the model
-secret. The Rust hybrid pipeline computes the same network in **268 ms** with
-both hidden — so at a matched threat model the Lisp program is 38× off, and the
-remaining gap is *protocol choice*: the Rust path runs the linear layers under
-FHE and the nonlinearities as garbled circuits, while this one runs everything on
-plain ABY3, where every fused ReLU∘rescale is an `a2b`. Note that the encrypted
-Rust pipeline is *faster than the plaintext Lisp program* — privacy is not what
-makes private inference slow. See
-[`docs/experiments.md` IV.2b](docs/experiments.md) for the full table, including
-what the first, scalar-written version of this file cost (189× more).
+**Measured** (pneumonia, one diagnosis, M1 Pro): **299 ms** plaintext,
+**911 ms** with the image secret and **4.17 s** with the image *and* the model
+secret, both on `--nonlin gc`. The Rust hybrid pipeline computes the same network
+in **268 ms** with both hidden, so at a matched threat model the Lisp program is
+15.6× off — from a starting ratio near 4 500×. What remains is the **FHE half**:
+the Rust path evaluates linear layers as one packed depth-1 ct×ct multiply per
+layer and pays no MPC rounds for them, while this program secret-shares them.
+Note that the encrypted Rust pipeline is *faster than the plaintext Lisp
+program* — privacy is not what makes private inference slow. Full table, and what
+the first scalar-written version of this file cost, in
+[`docs/experiments.md` IV.2b](docs/experiments.md).
 
 ---
 

@@ -186,6 +186,66 @@ pub trait Backend: Send + Sync {
     fn shift_right(&mut self, a: &ShareRef, n: usize) -> ShareRef;
     fn shift_left(&mut self, a: &ShareRef, n: usize) -> ShareRef;
 
+    /// Fused ReLU∘rescale over a whole batch:
+    /// `outᵢ = (vᵢ >= 0) ? (vᵢ >> shift) : 0`.
+    ///
+    /// The single most expensive primitive in a private CNN, and the one whose
+    /// *protocol* matters most: on the garbled route it is **one garble round for
+    /// the entire layer**, against ~`log₂ nbits` rounds of bit decomposition plus
+    /// a batched multiply. It is on the trait — rather than only on
+    /// `TransportBackend`, where the garbled and Falcon implementations live —
+    /// so the language can reach it: a Baru program spelling this out as
+    /// `(vmul (vashr xs s) (vge xs zeros))` is doing the arithmetic correctly and
+    /// paying the decomposition, with no way to ask for the better protocol.
+    ///
+    /// The default is the `a2b` construction, which every backend can run: one
+    /// batched decomposition, then recompose the shifted value and the sign bit
+    /// locally, then one batched multiply for the gate. `shift` must be less than
+    /// the operand width.
+    fn relu_rescale_batch(&mut self, vs: &[ShareRef], shift: usize) -> Vec<ShareRef> {
+        if vs.is_empty() {
+            return Vec::new();
+        }
+        let nbits = vs.iter().map(|v| v.nbits).max().unwrap_or(64);
+        let bit_sets = self.a2b_batch(vs, nbits);
+        let one = self.share_public(1, 1);
+        let mut pairs = Vec::with_capacity(vs.len());
+        for bits in &bit_sets {
+            // The recomposed value spans the full range, so it carries the full
+            // width — `b2a` sizes it from the bit count, which is what makes a
+            // downstream comparison decompose the right number of bits.
+            let mut shifted = self.b2a(&bits[shift.min(nbits)..]);
+            shifted.nbits = nbits;
+            let keep = self.sub(&one, &bits[nbits - 1]);
+            pairs.push((shifted, keep));
+        }
+        self.mul_batch(&pairs)
+            .into_iter()
+            .map(|mut a| {
+                a.nbits = nbits;
+                a
+            })
+            .collect()
+    }
+
+    /// Select the protocol backing every `lt`-derived operation and the fused
+    /// ReLU∘rescale: `"a2b"`, `"gc"` (3-party garbled, constant-round) or
+    /// `"falcon"`.
+    ///
+    /// Must be set identically on every party *before* any operation that would
+    /// diverge — the modes execute different id-allocation sequences. Backends
+    /// with only one protocol accept `"a2b"` and reject the rest, rather than
+    /// silently running something other than what was asked for.
+    fn set_nonlinearity(&mut self, mode: &str) -> Result<(), String> {
+        match mode {
+            "a2b" => Ok(()),
+            other => Err(format!(
+                "this backend has no {other:?} protocol; only \"a2b\" is available \
+                 (the garbled and Falcon routes need the transport backend)"
+            )),
+        }
+    }
+
     /// Multiply a share by a **public** scalar, with no communication.
     ///
     /// `k` is a two's-complement field element at `a.nbits`, as

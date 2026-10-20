@@ -21,8 +21,11 @@ use baru::runner::parse_program;
 /// Evaluate `examples/medmnist.baru` on the plain interpreter for the first
 /// `n` images of `dataset`, returning `(correct, n)` as the program reports it.
 fn run_baru(dataset: &str, n: usize, private: usize) -> (i64, i64) {
-    let src =
-        std::fs::read_to_string("examples/medmnist.baru").expect("the Baru program must exist");
+    run_file("examples/medmnist.baru", dataset, n, private)
+}
+
+fn run_file(path: &str, dataset: &str, n: usize, private: usize) -> (i64, i64) {
+    let src = std::fs::read_to_string(path).expect("the Baru program must exist");
     let preamble = format!(
         "(define DATASET \"{dataset}\")\n(define NIMAGES {n})\n(define PRIVATE {private})\n(define NBITS 64)\n"
     );
@@ -141,4 +144,80 @@ fn secret_sharing_the_model_changes_no_diagnosis() {
         plain, private,
         "PRIVATE=2 disagreed with plaintext — sharing the weights changed a diagnosis"
     );
+}
+
+/// Changing the nonlinearity protocol must not change a single diagnosis.
+///
+/// This is the property the whole `--nonlin` switch rests on: `a2b`, the
+/// 3-party garbled route and Falcon compute the *same function* by different
+/// protocols, and the only reason to prefer one is cost. If they disagreed, the
+/// fast run would be fast and wrong — and on one image the difference is a
+/// coin flip that would pass unnoticed, which is why this compares the routes
+/// over several images rather than one.
+///
+/// Runs on the real 3-party transport (the garbled and Falcon routes do not
+/// exist on the in-process simulator), so it is `#[ignore]`d with the other
+/// pipeline tests.
+#[test]
+#[ignore = "three 3-party MPC runs of a real CNN; a few minutes"]
+fn every_nonlinearity_protocol_gives_the_same_diagnosis() {
+    let n = 3usize;
+    let src = std::fs::read_to_string("examples/medmnist.baru").expect("program");
+    let preamble = format!(
+        "(define DATASET \"pneumonia\")\n(define NIMAGES {n})\n(define PRIVATE 1)\n(define NBITS 64)\n"
+    );
+    let prog = baru::runner::parse_program(&format!("{preamble}{src}")).expect("parses");
+    baru::interpreter::eval::set_max_frames(64_000_000_000);
+
+    // The plaintext answer these must all reproduce.
+    let t = load("pneumonia").expect("dataset embedded");
+    let model = t.model();
+    let expect: i64 = (0..n)
+        .filter(|&i| model.forward(&t.images[i]).0 == t.labels[i] as usize)
+        .count() as i64;
+    let want = format!("({expect} {n})");
+
+    for mode in ["a2b", "gc", "falcon"] {
+        let run = baru::runner::run_mpc(&prog, mode, 0, None)
+            .unwrap_or_else(|e| panic!("--nonlin {mode} failed: {e}"));
+        assert_eq!(
+            run.result, want,
+            "--nonlin {mode} disagreed with the plaintext model"
+        );
+    }
+}
+
+/// An unknown protocol name must be refused, not silently ignored — running
+/// `a2b` while the operator believes they asked for garbled circuits would
+/// misattribute every timing taken afterwards.
+#[test]
+fn an_unknown_nonlinearity_is_refused() {
+    let prog = baru::runner::parse_program("(reconstruct (share 7 32))").expect("parses");
+    let err = baru::runner::run_mpc(&prog, "no-such-protocol", 0, None)
+        .expect_err("must refuse an unknown protocol");
+    assert!(err.contains("no-such-protocol"), "unhelpful error: {err}");
+}
+
+/// `examples/medmnist_scalar.baru` exists only to reproduce the first row of
+/// `docs/experiments.md` IV.2b — the cost of writing the same network one
+/// activation at a time. A measurement whose source has drifted from the one it
+/// is compared against is worse than no measurement, so the two files must agree
+/// on every diagnosis.
+#[test]
+fn the_scalar_version_computes_the_same_diagnoses_as_the_vector_one() {
+    let n = 8usize;
+    let vector = run_baru("pneumonia", n, 0);
+    let scalar = run_file("examples/medmnist_scalar.baru", "pneumonia", n, 0);
+    assert_eq!(
+        scalar, vector,
+        "the scalar and vector programs disagree — the IV.2b comparison is between \
+         two different networks and must not be quoted"
+    );
+    // And both against the Rust reference, so neither can drift together.
+    let t = load("pneumonia").expect("dataset embedded");
+    let model = t.model();
+    let expect: i64 = (0..n)
+        .filter(|&i| model.forward(&t.images[i]).0 == t.labels[i] as usize)
+        .count() as i64;
+    assert_eq!(vector.0, expect, "vector program vs CnnModel::forward");
 }

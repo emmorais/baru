@@ -1296,86 +1296,125 @@ integer path bit-identical.**
 | PyTorch float32, batch of 20 | nothing | **0.06 ms** | — |
 | NumPy, integer | nothing | **1.53 ms** | — |
 | pure Python, integer | nothing | **33.2 ms** | — |
-| **Baru program, plain interpreter** | nothing | **322 ms** | — |
 | **Rust hybrid pipeline** (`bench-medmnist --gc --precompute`) | image **and** model | **268 ms** | 61 |
-| **Baru program, 3-party MPC** | the image | **6 446 ms** | 33 181 |
-| **Baru program, 3-party MPC** | image **and** model | **10 093 ms** | 215 847 |
+| **Baru program, plain interpreter** | nothing | **299 ms** | — |
+| **Baru program, MPC, `--nonlin gc`** | the image | **911 ms** | 33 106 |
+| **Baru program, MPC, `--nonlin gc`** | image **and** model | **4 171 ms** | 215 772 |
+| Baru program, MPC, `--nonlin a2b` | the image | 4 326 ms | 33 154 |
+| Baru program, MPC, `--nonlin a2b` | image **and** model | 7 480 ms | 215 820 |
 
 Organa and derma on the plain interpreter: **2 010 ms** and **398 ms**.
 The float32 row is not bit-exact (17/20 against the integer net's 18/20) and is a
 batched call, so it is a throughput figure; every other row is one image at a
 time.
 
-#### What the first version cost, and why
+#### Three rounds of fixing it, and what each one was
 
-The first draft of this program was written the way one writes a CNN in a
-scalar language — a loop over sliding windows, `>` and `ash-right` per
-activation. It is worth recording what that cost, because the arithmetic was
-identical and the answers were the same:
+The first draft was written the way one writes a CNN in a scalar language — a
+loop over sliding windows, `>` and `ash-right` per activation. It is preserved as
+[`examples/medmnist_scalar.baru`](../examples/medmnist_scalar.baru) so this row
+stays reproducible, and `tests/medmnist_baru.rs` pins it to the vector version
+diagnosis by diagnosis — a comparison between two subtly different networks would
+be worse than no comparison. Every step below leaves the arithmetic and the
+answers identical.
 
-| | scalar Lisp | vector Lisp | change |
-|---|---|---|---|
-| plaintext | 2 783 ms | **322 ms** | 8.6× |
-| private, secret image | 1 216 404 ms | **6 446 ms** | **189×** |
-| — its messages | 864 361 | **33 181** | 26× |
-| — its bytes | 483 MB | **84 MB** | 5.7× |
-| private, image + model | *did not finish* | **10 093 ms** | — |
+**All rows at the model's calibrated 20-bit share width**, so the width is not
+doing any of the work. (At 64-bit shares the scalar private run was 1 216 404 ms;
+reading the width off the model instead of the command line is worth 1.5× on its
+own and is not counted below.)
 
-Three changes got that, none of them to the network:
+| version | plaintext, 10 img | private, image | messages | private, image+model |
+|---|---|---|---|---|
+| scalar Lisp, `a2b` | 3 465 ms | 794 508 ms | 507 920 | — |
+| scalar Lisp, `--nonlin gc` | — | 803 678 ms | **507 920** | — |
+| + batched vector primitives | 322 ms | 6 446 ms | 33 181 | 10 093 ms |
+| + fused `vrelu` primitive | 299 ms | 4 326 ms | 33 154 | 7 480 ms |
+| + `--nonlin gc` | — | **911 ms** | 33 106 | **4 171 ms** |
+| **total** | **11.6×** | **872×** | 15.4× | — |
 
-1. **Batched vector primitives, reachable from the language**
-   (`src/interpreter/vector_builtins.rs`, LANGUAGE.md §5.2c). `lt_batch`,
-   `mul_batch` and `a2b_batch` were already in `Backend`; nothing in the language
-   could call them, so `dot`/`vsum`/`matvec` was the whole vector surface and
-   neither a comparison nor a shift was in it. This is I.3's lesson — *cost is
-   rounds, not operations* — applied to the frontend instead of to Rust code.
-2. **The network rewritten a layer at a time.** A convolution became a **sum of
-   scaled strided views** (`vslice`) rather than a loop over windows: one view
-   per tap, shared across output channels, so conv1 does 9 gathers and 72
-   scale-accumulates instead of building 5 408 nine-element window lists. The
-   nonlinearity applies to a whole layer at once, so it costs three rounds per
-   layer rather than three per element. This is the reshaping NumPy code does,
-   and it is why the plaintext row moved too — most of the 8.6× is *not* crypto.
-3. **`vscale` batches a secret scalar.** With the model shared, a convolution tap
-   is a secret scalar times a vector; doing that per element is one round per
-   activation. One `mul_batch` broadcasting the scalar down the lanes took the
-   shared-weight conv from 48 672 rounds to 72, and `--private 2` from 289 s to
-   10 s.
+**1. Batched vector primitives, reachable from the language**
+(`src/interpreter/vector_builtins.rs`, LANGUAGE.md §5.2c). `lt_batch`,
+`mul_batch` and `a2b_batch` were already in `Backend`; nothing in the language
+could call them, so `dot`/`vsum`/`matvec` was the whole vector surface and
+neither a comparison nor a shift was in it. This is I.3's lesson — *cost is
+rounds, not operations* — applied to the frontend instead of to Rust code. The
+network was rewritten a layer at a time: a convolution became a **sum of scaled
+strided views** (`vslice`), so conv1 does 9 gathers and 72 scale-accumulates
+instead of building 5 408 nine-element window lists. Most of the plaintext gain
+is that reshaping, and none of it is cryptographic.
 
-#### What is left, and what it is not
+**2. The fused nonlinearity as a primitive, not a spelling.** `(vmul (vashr xs s)
+(vge xs zeros))` computes the fused ReLU∘rescale correctly and *fixes its
+protocol* to a bit decomposition plus a multiply. `Backend::relu_rescale_batch`
+— now a trait method, so the language can reach it — leaves the protocol to the
+backend. Worth 1.5× on its own even on the `a2b` route, because it does one
+decomposition where the spelled-out form does two.
+
+**3. Protocol choice from the command line** (`baru run --nonlin a2b|gc|falcon`).
+`TransportBackend` has had `lt_gc_batch`, `relu_gc_batch` and `relu_falcon_batch`
+throughout — `NonlinMode` was reachable from `bench-cnn` and *not* from the
+language. Exposing it is worth **4.7×** and halves the bytes;
+`tests/medmnist_baru.rs::every_nonlinearity_protocol_gives_the_same_diagnosis`
+checks that all three routes return the same diagnosis, since a fast wrong answer
+on one image is a coin flip.
+
+**The three are not independent levers, and the second row above is why.**
+`--nonlin gc` applied to the *scalar* program changes nothing at all — 794 508 ms
+against 803 678 ms, and byte-for-byte the same 507 920 messages. `NonlinMode` is
+dispatched inside `lt_batch` and `relu_*_batch` and nowhere else; scalar `lt`
+decomposes unconditionally. So the garbled route is **unreachable from a program
+written one element at a time**, and "use the better protocol" is not advice that
+can be taken without first vectorising. Anyone reading the 4.7× as a
+free-standing speedup would be measuring something they cannot get.
+
+#### What is left: the FHE half
 
 At a **matched threat model** — image and model both hidden, which is what the
-268 ms pipeline does — the Lisp program is now **10.1 s against 268 ms, 38×**,
-down from a ratio of roughly 4 500×. The residue is *protocol choice*, not
-batching and not interpretation:
+268 ms pipeline does — the Lisp program is now **4.17 s against 268 ms, 15.6×**,
+from a starting ratio of roughly 4 500×. Every factor recovered so far was a
+*frontend* gap: a batched primitive, a fused primitive, or a protocol switch that
+existed in Rust and was unreachable from Baru.
 
-- the Rust pipeline evaluates the linear layers under **FHE** (one packed ct×ct
-  matvec per layer) and the nonlinearities with **garbled circuits** (`--gc`,
-  constant-round). The Lisp program runs everything on plain ABY3, where each
-  fused ReLU∘rescale is an `a2b` — ~9 rounds and `O(nbits · log nbits)` AND
-  gates even when perfectly batched. That is the 215 847 messages against 61.
-- **The share width is the model's, not a flag.** `medmnist-model` now returns
-  the width `CnnModel::from_trained` calibrated from the worst activation it
-  actually observed (20 bits for all three sets). `a2b` cost scales with it, and
-  a hand-picked width is a silent wrong answer on the dataset it does not fit —
-  the same argument `cnn.rs`'s `wire_bits_for` makes. Reading it from the model
-  rather than from `--nbits` took the private run from 22.7 s to 6.4 s at
-  `--private 1` and cut its bytes 4×.
+The residue is not. It is **215 772 messages against 61**, and it is the linear
+layers: with the model shared, every convolution tap is a secret scalar times a
+vector, so `vscale` pays one `mul_batch` per tap (1 224 of them for the two
+convs) plus `matvec` for the dense stack. The Rust pipeline pays *zero MPC rounds*
+for all of that, because it evaluates the linear layers under **FHE** — one
+packed depth-1 ct×ct multiply per layer, then one mask-and-open scheme switch —
+and only the nonlinearities touch MPC.
+
+So closing the last 15× means exposing the FHE half, which is a different kind of
+work from the three above:
+
+- `fhe::bfv`'s packed matvec is *not* a general circuit evaluator (LANGUAGE.md
+  §7.1 says so), so what would be exposed is one primitive:
+  `(fhe-matvec session weights input)` → shares, fusing the ct×ct multiply with
+  the mask-and-open switch that `hybrid_matvec_open` already implements.
+- It needs session state the language has no type for: an encrypted model
+  (encrypted once per session, `§3.1`–`§3.2` of
+  `docs/private-inference-performance.md`), a prepared decryption key, and a
+  **mask pool** whose masks must be consumed in exactly the order the packing
+  plan predicts. `Types` has `FheCiphertext` but no session handle.
+- The switch is three-party and its masks are per-party, so the builtin has to be
+  reached identically by every participant — the same constraint `--nonlin`
+  already has, and the reason that flag must be set before any operation.
+
+That is a session-and-packing problem, not an arithmetic one, and it is the
+concrete next piece of work rather than a mystery.
 
 Two readings that survive all of this.
 
-**The encrypted Rust pipeline is comparable to the *plaintext* Lisp program** —
-268 ms with both the model and the image encrypted, against 322 ms with nothing
+**The encrypted Rust pipeline is faster than the *plaintext* Lisp program** —
+268 ms with both the model and the image encrypted, against 299 ms with nothing
 hidden at all. Privacy is not what makes a private-inference system slow;
 evaluation strategy is. That only became measurable once the same network existed
 on both sides.
 
-**Every factor of the original 4 500× was a frontend gap, not a protocol one.**
-The batched primitives existed; the language could not reach them. Writing the
-network in the language is what made that visible, and it is also what surfaced
-I.2c (`b2a` mistagging its width — a silent wrong diagnosis) and I.2d (public ×
-secret paying a round). All four were invisible to 553 unit tests and to every
-Rust benchmark.
+**Writing the network in the language is what found all of it**, including I.2c
+(`b2a` mistagging its width — a silent wrong diagnosis) and I.2d (public × secret
+paying a round). Six defects and gaps, none visible to 558 unit tests or to any
+Rust benchmark, because every one of them was a property of the *frontend* and
+the frontend had never been asked to compute anything this large.
 
 ### IV.3 A real CNN through the hybrid pipeline
 
@@ -2168,10 +2207,13 @@ tracked as work and not as a prediction.
 
 ### VI.7 The FHE arm: HEIR as a baseline, and two gates (2026-08-17)
 
-`baru bench-heir`. **No FHE latency has been measured yet, and this section says
-so rather than implying otherwise.** What exists is the harness and its gates,
-tested end to end; the measurement needs an environment the development machine
-does not have.
+`baru bench-heir`. **Superseded 2026-10-20 by §VI.15, which has the
+measurements.** When this section was written no FHE latency had been measured
+and it said so; what existed was the harness and its gates, tested end to end.
+The blocker was believed to be memory (~26 GB, per google/heir#1232). That turned
+out not to generalise — the secure baseline runs in 532 MB on the development
+machine — and §VI.15 reports the numbers. The gates below are unchanged and both
+fired in anger.
 
 **Why HEIR is a baseline and not a target.** HEIR is compiler *infrastructure*.
 Its paper (arXiv:2508.11095) claims generality — "support all mainstream
@@ -2194,8 +2236,21 @@ comparable by construction rather than by coincidence.
 **Gate 1 — security parameters.** google/heir#1232 reports an MNIST MLP at
 **~30 s and 3 GB with `HEStd_NotSet`** — OpenFHE's "do not check" mode, i.e. no
 security level at all — and **~6 min and 26 GB** at the secure ring dimension. A
-**12× factor** sits between an insecure and a secure baseline, and the insecure
-one is what a casual run produces. `HeirReport::gate` refuses to let a latency be
+**12× factor** sits between an insecure and a secure baseline.
+
+> **Correction (2026-10-20).** This section originally continued "and the
+> insecure one is what a casual run produces." That is **wrong and unfair to
+> HEIR**, and the correction was verified by reading HEIR's emitted C++ on
+> 2026-08-17 but never made it back into this document. HEIR never calls
+> `SetSecurityLevel`: its generated code sets only `SetMultiplicativeDepth` and
+> `SetPlaintextModulus`, so OpenFHE's *default* applies, and that default is
+> `HEStd_128_classic` (`pke/scheme/gen-cryptocontext-params-defaults.h`). The
+> `HEStd_NotSet` in google/heir#1232 was the **reporter's explicit choice**, not
+> a HEIR default. The gate below is still right, but its justification is not
+> "HEIR defaults to insecure" — it is that a baseline harness must *verify* the
+> parameter it reports rather than assume it, in either direction.
+
+`HeirReport::gate` refuses to let a latency be
 quoted unless the run reports `HEStd_{128,192,256}_classic`. This extends
 `crypto::attestations`' discipline — every engine states what it implements, and
 asking for more is an error — to an *external* baseline. **An insecure baseline is
@@ -3274,6 +3329,137 @@ transform evaluator batch as well as it computes.
 Not ported, and deliberately: their bootstrap placement, which is a shortest-path problem on
 a DAG of `(layer, level)` nodes weighted by latency. LeNet-5 never bootstraps, so it would
 change nothing measured here; it becomes relevant at the depths of §VI.11.
+
+---
+
+### VI.15 HEIR measured at last — and the crossover runs both ways (2026-10-20)
+
+*Commands:* `baru bench-heir --shapes S --activation square`, `baru bench-2pc-nn
+--activation square [--lan]`. *Toolchain:* OpenFHE 1.5.1 built from source to
+`~/.local/openfhe`, `heir-py` 2026.8.1 in a Python 3.12 venv with `numpy<2.4`,
+driven through `BARU_OPENFHE_PREFIX` / `BARU_PYTHON`. Machine: the same M1 Pro
+(16 GB) as every other figure in this document.
+
+**§VI.7 opened with "No FHE latency has been measured yet." That is no longer
+true.** Every HEIR row below reports `HEStd_128_classic` and reproduced the
+plaintext classification, so it passes both gates.
+
+#### The toolchain blocker was smaller than believed
+
+§VI.7 deferred the measurement because google/heir#1232 reported ~26 GB at
+secure parameters. That figure does not generalise: a `784x32x10` classifier at
+multiplicative depth 3 peaks at **532 MB** resident and finishes in 12.6 s
+wall-clock end to end. The memory wall is a property of that issue's
+configuration, not of secure HEIR. The real ceiling on this machine turned out to
+be depth, not memory — see the segfault below.
+
+#### Two HEIR defects found on the way, both reportable
+
+**1. `eval()` cannot be called for some networks.** For certain weights HEIR's
+layout passes promote the `linalg.fill` zero-initializer into a *second*
+ciphertext argument of the emitted C++ —
+`net(CryptoContextT, std::vector<CiphertextT> v0, const std::vector<CiphertextT>& v1)`
+— and emit a companion `net__encrypt__zeros`. But the Python layer still
+registers one argument (`compilation_result.arg_names == ['arg_0']`), so
+`eval()` hands one sequence to a two-sequence binding and pybind raises
+`incompatible function arguments`. The compiled network is fine; only the
+wrapper's view of its arity is wrong. It is weight-dependent, which is why it
+looked like a size threshold at first: `16x8x4` with uniform weights compiles to
+one argument and the same shape with the fixture's weights to two.
+
+`tools/heir_baseline.py` now reads the true arity off the pybind docstring and,
+when it exceeds one, drives the exported entry points directly
+(`_RawRunner`). Argument order was established against the plaintext reference —
+`(arg0, zeros)` reproduces it to the printed precision and `(zeros, arg0)` does
+not — and every run re-checks the classification, so the fallback cannot
+silently compute the wrong thing. The report now carries `driver_path` and
+`ciphertext_arity` so a reader knows which path produced a number.
+
+**2. Segfault in key generation at multiplicative depth 10.** Four hidden layers
+(depth 9) complete; five (depth 10) die with **SIGSEGV**, confirmed from the
+macOS crash report (`EXC_BAD_ACCESS`), at **554 MB** peak resident against the
+564 MB of the run that succeeds. **So it is not an out-of-memory kill**, and it
+is not a clean "cannot find secure parameters" abort either — no message is
+printed. HEIR compiles the network and requests depth 10; the resulting OpenFHE
+context faults during `KeyGen`. We have not isolated whether the fault is in
+HEIR's parameter selection or in OpenFHE 1.5.1, and the honest statement is that
+both are candidates. Either way the practical ceiling for this pipeline on this
+machine is **multiplicative depth 9**, which is four hidden layers.
+
+#### The measurement
+
+Both arms evaluate the same network on the same weights with `x^2` activation,
+so they compute the same function — the §VI.7 gate-2 choice. HEIR is CKKS on one
+server; the MPC arm is 2-party dishonest-majority and exact. `eval` excludes
+keygen; MPC `online` excludes preprocessing. `dealer` is a **lower bound**, not a
+deployable protocol.
+
+| shape | mult. depth | **HEIR eval** | HEIR keygen | **MPC online, LAN** | **MPC online, WAN** | MPC rounds |
+|---|---:|---:|---:|---:|---:|---:|
+| `64x32x10` | 3 | **167.0 ms** | 91.7 ms | **14 ms** | **2113 ms** | 41 |
+| `784x32x10` | 3 | **178.0 ms** | 105.3 ms | **26 ms** | **2167 ms** | 41 |
+| `64x32x32x10` | 5 | 659.3 ms | 271.2 ms | 20 ms | 3044 ms | 59 |
+| `64x32x32x32x10` | 7 | 1051.3 ms | 347.6 ms | 27 ms | 3978 ms | 77 |
+| `64x32x32x32x32x10` | 9 | 1493.4 ms | 436.3 ms | 34 ms | 4909 ms | 95 |
+| `64x32(×5)x10` | 10 | **SIGSEGV** | — | 41 ms | 5842 ms | 113 |
+
+LAN is 0 ms / 10 Gbit/s, WAN is 50 ms one-way / 100 Mbit/s. Deployable totals
+including preprocessing, `lowgear`: `64x32x10` 264 ms LAN / 3264 ms WAN;
+`784x32x10` 388 ms LAN / 3791 ms WAN.
+
+#### What it says, and it is not what we expected
+
+**The same program, the same function, the same machine, the same 128-bit
+security — and the cheapest backend is decided by the link.** On `64x32x10`:
+
+- **LAN: secret sharing wins by 11.9×** (14 ms against 167 ms).
+- **WAN: HEIR wins by 12.7×** (167 ms against 2113 ms).
+
+That is a **151× swing from the network profile alone**, on an identical
+program. Nothing about the cryptography changed between those two rows.
+
+This is the first time this document has recorded **FHE beating the MPC arm**,
+and it should be read as the thesis working rather than against it. §VI.10–VI.12
+measured LeNet-5 at depth 11 and found secret sharing ahead by 32× on latency and
+885× once the level budget was exceeded. §VI.15 measures a shallow MLP at depth 3
+on a wide-area link and finds the opposite by more than an order of magnitude.
+Both are true; "which is faster, MPC or FHE" is not a well-posed question, and a
+compiler that cannot model the difference cannot make the choice.
+
+Two slopes, both measured rather than fitted, say where the crossover goes:
+
+- **Per added hidden layer, HEIR costs ~440 ms** (167 → 659 → 1051 → 1493).
+- **Per added hidden layer, the MPC arm costs ~930 ms on WAN but ~7 ms on LAN**
+  (2113 → 3044 → 3978 → 4909; 14 → 20 → 27 → 34).
+
+So on WAN the MPC arm is *losing ground* with depth at these sizes — it does not
+overtake HEIR anywhere in the range HEIR can run — and then HEIR stops running
+at all, at depth 10, while the MPC curve continues as a straight line. The
+practical boundary is not a crossover in time but a **cliff in capability**.
+
+#### Four things this does not say
+
+1. **It is not LeNet-5.** These are dense MLPs with `x^2`; §VI.10's network has
+   convolutions and far more work per layer. The two sets are not comparable to
+   each other, only each arm to its matched partner.
+2. **`dealer` is a lower bound.** Against the deployable `lowgear` total,
+   `64x32x10` on LAN is 264 ms against HEIR's 167 ms + 92 ms keygen — close to a
+   tie rather than an MPC win. The honest LAN claim is the *online* comparison;
+   the total comparison is roughly even.
+3. **The interaction asymmetry is unchanged** and is not measured away: HEIR's
+   client can go offline, the 2-party protocol needs it present throughout.
+4. **The MPC arm computes the argmax inside the protocol** and reveals only the
+   class; the HEIR arm returns the full logit vector. Our arm does strictly more
+   work and reveals strictly less.
+
+#### What this sets up
+
+The depth-10 segfault is the measurement that matters next: it is the point
+where an FHE-only pipeline needs bootstrapping, and HEIR's paper states BGV/BFV
+bootstrapping is unsupported because no backend supports it. Establishing
+whether CKKS bootstrapping is reachable through HEIR at all — and if not, that
+the ceiling is architectural rather than incidental — is the experiment that
+turns this section's cliff into a result.
 
 ---
 

@@ -113,6 +113,11 @@ pub fn run_cli(args: &[String]) -> Result<(), String> {
     // What the *program* hides, independent of which backend evaluates it:
     // 0 plaintext, 1 secret input, 2 secret input and secret model.
     let mut private: Option<usize> = None;
+    // Which protocol backs comparisons and the fused nonlinearity. "gc" is the
+    // constant-round garbled route the Rust hybrid pipeline uses; it is the
+    // single biggest lever on a private run, and it has to be selected before
+    // any party performs an operation, since the modes allocate ids differently.
+    let mut nonlin = "a2b".to_string();
     let mut nbits = 64usize;
     let mut rtt_ms = 0u64;
     let mut bandwidth_mbps: Option<f64> = None;
@@ -122,6 +127,8 @@ pub fn run_cli(args: &[String]) -> Result<(), String> {
         match a.as_str() {
             "--mpc" => mpc = true,
             "--plain" => mpc = false,
+            "--nonlin" => nonlin = it.next().ok_or("--nonlin needs a value")?.clone(),
+            "--gc" => nonlin = "gc".to_string(),
             "--private" => {
                 private = Some(
                     it.next()
@@ -203,6 +210,9 @@ pub fn run_cli(args: &[String]) -> Result<(), String> {
             _ => "the image AND the model",
         }
     );
+    if mpc {
+        println!("  nonlin   : {nonlin}");
+    }
     if mpc && (rtt_ms > 0 || bandwidth_mbps.is_some()) {
         println!(
             "  network: rtt={rtt_ms}ms, bandwidth={}",
@@ -220,55 +230,13 @@ pub fn run_cli(args: &[String]) -> Result<(), String> {
         return Ok(());
     }
 
-    // Three parties, one thread each, all evaluating the same expressions.
-    let handles = InprocHandle::create(3);
-    let profile = {
-        let base = NetworkProfile::fixed_latency(Duration::from_micros(rtt_ms * 500));
-        match bandwidth_mbps {
-            Some(mbps) => base.with_bandwidth(mbps * 125_000.0),
-            None => base,
-        }
-    };
-    let (tx, rx) = std::sync::mpsc::channel::<(usize, String, Duration, CommStats)>();
-    let mut joins = Vec::new();
-    for (i, h) in handles.into_iter().enumerate() {
-        let prog = prog.clone();
-        let tx = tx.clone();
-        joins.push(thread::spawn(move || {
-            let counting = CountingTransport::new(h, 3);
-            let stats = counting.handle();
-            let transport = LatencyTransport::new(counting, profile, 3);
-            let p = Participant::new_transport(i, transport);
-            let (last, dt) = eval_program(&p, &prog);
-            // `Types` is !Send (it holds `Rc`s), so only the rendering crosses.
-            let _ = tx.send((i, render(&last), dt, stats.stats()));
-        }));
-    }
-    drop(tx);
-    let mut results: Vec<(usize, String, Duration, CommStats)> = rx.iter().collect();
-    for j in joins {
-        j.join().map_err(|_| "a party thread panicked")?;
-    }
-    results.sort_by_key(|r| r.0);
-
-    // Every party must agree on the revealed answer, or the run is meaningless.
-    let p0 = results
-        .iter()
-        .find(|r| r.0 == 0)
-        .ok_or("party 0 produced no result")?;
-    let disagreeing: Vec<&(usize, String, Duration, CommStats)> =
-        results.iter().filter(|r| r.1 != p0.1).collect();
-    if !disagreeing.is_empty() {
-        println!("  ⚠️  parties disagree on the result — DO NOT quote this run:");
-        for r in &results {
-            println!("     party {} => {}", r.0, r.1);
-        }
-        return Err("parties disagreed".to_string());
-    }
-    // The reported latency is the slowest party: the computation is not done
-    // until every party is done, and quoting party 0 alone would undercount.
-    let slowest = results.iter().map(|r| r.2).max().unwrap_or_default();
-    report(&Types::Num(0), slowest, images, Some((&p0.1, &p0.3)));
+    let run = run_mpc(&prog, &nonlin, rtt_ms, bandwidth_mbps)?;
+    report(
+        &Types::Num(0),
+        run.slowest,
+        images,
+        Some((&run.result, &run.stats)),
+    );
     Ok(())
 }
 
@@ -350,4 +318,82 @@ mod tests {
         let (last, _) = eval_program(&p, &prog);
         assert!(matches!(last, Types::Error(..)), "got {last:?}");
     }
+}
+
+/// One 3-party MPC run of an already-parsed program.
+#[derive(Debug)]
+pub struct MpcRun {
+    /// The rendered value of the program's last expression, as every party saw
+    /// it — the run errors rather than returning if they disagreed.
+    pub result: String,
+    /// Wall clock of the **slowest** party: the computation is not finished
+    /// until every party is, and quoting party 0 alone would undercount.
+    pub slowest: Duration,
+    pub stats: CommStats,
+}
+
+/// Evaluate `prog` on three parties over a real in-process transport.
+///
+/// Extracted from `run_cli` so tests can drive it: the property that matters
+/// about `--nonlin` is that changing it does **not** change any answer, and that
+/// is only checkable by running the same program on two protocols and comparing.
+pub fn run_mpc(
+    prog: &[Expr],
+    nonlin: &str,
+    rtt_ms: u64,
+    bandwidth_mbps: Option<f64>,
+) -> Result<MpcRun, String> {
+    let handles = InprocHandle::create(3);
+    let profile = {
+        let base = NetworkProfile::fixed_latency(Duration::from_micros(rtt_ms * 500));
+        match bandwidth_mbps {
+            Some(mbps) => base.with_bandwidth(mbps * 125_000.0),
+            None => base,
+        }
+    };
+    let (tx, rx) = std::sync::mpsc::channel::<(usize, String, Duration, CommStats)>();
+    let mut joins = Vec::new();
+    for (i, h) in handles.into_iter().enumerate() {
+        let prog = prog.to_vec();
+        let tx = tx.clone();
+        let nonlin = nonlin.to_string();
+        joins.push(thread::spawn(move || {
+            let counting = CountingTransport::new(h, 3);
+            let stats = counting.handle();
+            let transport = LatencyTransport::new(counting, profile, 3);
+            let p = Participant::new_transport(i, transport);
+            if let Err(e) = p.set_nonlinearity(&nonlin) {
+                let _ = tx.send((i, format!("ERROR: {e}"), Duration::ZERO, stats.stats()));
+                return;
+            }
+            let (last, dt) = eval_program(&p, &prog);
+            // `Types` is !Send (it holds `Rc`s), so only the rendering crosses.
+            let _ = tx.send((i, render(&last), dt, stats.stats()));
+        }));
+    }
+    drop(tx);
+    let mut results: Vec<(usize, String, Duration, CommStats)> = rx.iter().collect();
+    for j in joins {
+        j.join().map_err(|_| "a party thread panicked")?;
+    }
+    results.sort_by_key(|r| r.0);
+    let p0 = results
+        .iter()
+        .find(|r| r.0 == 0)
+        .ok_or("party 0 produced no result")?
+        .clone();
+    if let Some(bad) = results.iter().find(|r| r.1 != p0.1) {
+        return Err(format!(
+            "parties disagree — party 0 says {:?}, party {} says {:?}; DO NOT quote this run",
+            p0.1, bad.0, bad.1
+        ));
+    }
+    if p0.1.starts_with("ERROR:") {
+        return Err(p0.1.clone());
+    }
+    Ok(MpcRun {
+        result: p0.1,
+        slowest: results.iter().map(|r| r.2).max().unwrap_or_default(),
+        stats: p0.3,
+    })
 }

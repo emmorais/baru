@@ -2,6 +2,9 @@
 name = "baru"
 version = "0.1.0"
 edition = "2021"
+license = "Apache-2.0"
+description = "A Lisp-like language and research engine for privacy-preserving computation (MPC, FHE, ZKP and hybrids)"
+repository = "https://github.com/emmorais/baru"
 default-run = "baru"
 
 [dependencies]

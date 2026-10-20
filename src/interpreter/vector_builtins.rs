@@ -34,6 +34,7 @@
 //! | `vlt` `vge` | 1 (`lt_batch`) |
 //! | `vmax` | 2 (`lt_batch` + `mul_batch`) |
 //! | `vashr` | 1 batched `a2b`, then local recomposition |
+//! | `vrelu` | the fused ReLU∘rescale — **1 garble round** on `--nonlin gc` |
 //! | `vslice` `vrep` | 0 — data movement |
 //!
 //! Every one also has a plain-integer path, so the same source text runs on the
@@ -419,6 +420,45 @@ pub fn vector_builtins(backend: Be) -> Vec<(String, Types)> {
             wrap(vashr_shares(&mut **g, &refs(&xs), n))
         });
         out.push(("vashr".to_string(), Types::NativeFunc(f)));
+    }
+
+    // ── vrelu: the fused ReLU∘rescale, at whatever protocol is configured ───
+    //
+    // `(vrelu xs shift)` == `(vmul (vashr xs shift) (vge xs zeros))` in value,
+    // and not in cost: spelled out, it is a bit decomposition plus a batched
+    // multiply; as one call it can be **one garble round for the whole layer**
+    // (`--nonlin gc`) or Falcon's DReLU+truncation. This is the primitive the
+    // hybrid pipeline's 268 ms rests on, and the reason it is a builtin rather
+    // than a Lisp definition is that the protocol choice is not expressible in
+    // the spelled-out form.
+    {
+        let be = backend.clone();
+        let f = Arc::new(move |args: Vec<Types>| -> Types {
+            let (xs, shift) = match args.as_slice() {
+                [v, Types::Num(n)] if *n >= 0 => match as_list(v, "vrelu") {
+                    Ok(x) => (x, *n as usize),
+                    Err(e) => return e,
+                },
+                _ => return ErrObj::raise("vrelu expects (vrelu vec shift) with shift >= 0"),
+            };
+            if xs.is_empty() {
+                return Types::List(Vec::new());
+            }
+            if all_ints(&xs) {
+                return Types::List(
+                    nums(&xs)
+                        .iter()
+                        .map(|v| Types::Num(if *v >= 0 { v >> shift } else { 0 }))
+                        .collect(),
+                );
+            }
+            if !all_shares(&xs) {
+                return ErrObj::raise("vrelu expects all integers or all shares");
+            }
+            let mut g = be.lock().unwrap_or_else(|e| e.into_inner());
+            wrap(g.relu_rescale_batch(&refs(&xs), shift))
+        });
+        out.push(("vrelu".to_string(), Types::NativeFunc(f)));
     }
 
     // ── vslice: a 2-D strided view, flattened. Pure data movement ───────────

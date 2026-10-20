@@ -308,6 +308,92 @@ def build_mlir(layers, activation, name="net"):
     return "\n".join(lines)
 
 
+def _ct_arity(main_func):
+    """How many ciphertext sequences the emitted entry point actually takes.
+
+    The pybind docstring is the only place this is exposed; `compilation_result`
+    does not carry it.
+    """
+    doc = getattr(main_func, "__doc__", "") or ""
+    return doc.split("->")[0].count("Sequence[")
+
+
+class _HighLevelRunner:
+    """HEIR's supported path: `setup` / `encrypt_arg_0` / `eval` / `decrypt_result`."""
+
+    path = "high-level"
+
+    def __init__(self, fn, _cr):
+        self.fn = fn
+
+    def setup(self):
+        self.fn.setup()
+
+    def encrypt(self, x):
+        return self.fn.encrypt_arg_0(x)
+
+    def evaluate(self, ct):
+        return self.fn.eval(ct)
+
+    def decrypt(self, out):
+        return self.fn.decrypt_result(out)
+
+
+class _RawRunner:
+    """Direct pybind path, for networks whose `eval()` cannot be called at all.
+
+    **Why this exists** (measured against google/heir 2026.8.1 on 2026-10-20).
+    For some networks HEIR's layout passes promote the `linalg.fill`
+    zero-initializer into a *second* ciphertext argument of the emitted C++ --
+
+        std::vector<CiphertextT> net(CryptoContextT cc,
+                                     std::vector<CiphertextT> v0,
+                                     const std::vector<CiphertextT>& v1);
+
+    -- and emit a companion `net__encrypt__zeros` to produce it. But the Python
+    layer still registers a single argument (`compilation_result.arg_names ==
+    ['arg_0']`), so `eval()` passes one sequence to a two-sequence binding and
+    pybind raises `incompatible function arguments`. The network is perfectly
+    compiled; only the Python wrapper's view of its arity is wrong. Whether it
+    triggers depends on the weights: a 16x8x4 net with uniform weights compiles
+    to one argument and the same shape with the fixture's weights to two.
+
+    The emitted module exports every entry point we need, so we drive them
+    directly. Argument order was established against the plaintext reference
+    (`(arg0, zeros)` reproduces it exactly; `(zeros, arg0)` does not), which is
+    also what the report's class check re-verifies on every run.
+
+    The zero ciphertext does not depend on the input, so it is produced once in
+    `setup` and excluded from the per-inference encrypt time.
+    """
+
+    path = "raw-pybind"
+
+    def __init__(self, _fn, cr):
+        mod, name = cr.module, cr.func_name
+        self.main = getattr(mod, name)
+        self._gen = getattr(mod, "%s__generate_crypto_context" % name)
+        self._conf = getattr(mod, "%s__configure_crypto_context" % name)
+        self._enc = getattr(mod, "%s__encrypt__arg0" % name)
+        self._zero_fn = getattr(mod, "%s__encrypt__zeros" % name)
+        self._dec = getattr(mod, "%s__decrypt__result0" % name)
+
+    def setup(self):
+        cc = self._gen()
+        self._kp = cc.KeyGen()
+        self._cc = self._conf(cc, self._kp.secretKey)
+        self._zeros = self._zero_fn(self._cc, self._kp.publicKey)
+
+    def encrypt(self, x):
+        return self._enc(self._cc, [float(v) for v in x], self._kp.publicKey)
+
+    def evaluate(self, ct):
+        return self.main(self._cc, ct, self._zeros)
+
+    def decrypt(self, out):
+        return self._dec(self._cc, out, self._kp.secretKey)
+
+
 def run_heir(req):
     configure_openfhe_env()
     try:
@@ -404,10 +490,22 @@ def run_heir(req):
     compile_ms = (time.perf_counter() - t0) * 1e3
     level, level_source, depth, ptmod = emitted_params(chatter.getvalue())
 
+    cr = fn.compilation_result
+    arity = _ct_arity(cr.main_func)
+    runner_cls = _HighLevelRunner if arity <= 1 else _RawRunner
+    try:
+        runner = runner_cls(fn, cr)
+    except AttributeError as e:
+        return fail(
+            "the emitted module takes %d ciphertext arguments and does not "
+            "export the entry points needed to drive it directly (%r). "
+            "See _RawRunner's docstring." % (arity, e)
+        )
+
     try:
         t0 = time.perf_counter()
         with redirect_stdout(chatter), redirect_stderr(chatter):
-            fn.setup()
+            runner.setup()
         keygen_ms = (time.perf_counter() - t0) * 1e3
     except Exception as e:  # noqa: BLE001
         return fail("key setup failed: %r" % (e,))
@@ -418,19 +516,19 @@ def run_heir(req):
     for x in req["inputs"]:
         try:
             t0 = time.perf_counter()
-            ct = fn.encrypt_arg_0(np.asarray(x, dtype=np.float32))
+            ct = runner.encrypt(np.asarray(x, dtype=np.float32))
             enc_ms.append((time.perf_counter() - t0) * 1e3)
 
             best = None
             for _ in range(repeats):
                 t0 = time.perf_counter()
-                out = fn.eval(ct)
+                out = runner.evaluate(ct)
                 dt = (time.perf_counter() - t0) * 1e3
                 best = dt if best is None else min(best, dt)
             eval_ms.append(best)
 
             t0 = time.perf_counter()
-            logits = fn.decrypt_result(out)
+            logits = runner.decrypt(out)
             dec_ms.append((time.perf_counter() - t0) * 1e3)
         except Exception as e:  # noqa: BLE001
             return fail("homomorphic evaluation failed: %r" % (e,))
@@ -463,6 +561,8 @@ def run_heir(req):
             "activation": activation,
             "activation_degree": 2 if activation == "square" else 0,
             "heir_opt_options": opts,
+            "driver_path": runner.path,
+            "ciphertext_arity": arity,
             "compile_ms": compile_ms,
             "keygen_ms": keygen_ms,
             "encrypt_ms": statistics.median(enc_ms),
@@ -473,7 +573,8 @@ def run_heir(req):
             "logits": all_logits,
             "reference_logits": ref_logits,
             "notes": "eval_ms is the min over %d repeats then the median over "
-            "inputs; keygen excluded. activation=%s" % (repeats, activation),
+            "inputs; keygen excluded. activation=%s; driver=%s"
+            % (repeats, activation, runner.path),
         },
         sys.stdout,
     )

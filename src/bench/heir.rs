@@ -190,6 +190,23 @@ pub struct HeirReport {
     pub activation: String,
     #[serde(default)]
     pub activation_degree: u32,
+    /// Which entry point the driver used: `high-level` (HEIR's own
+    /// `eval`) or `raw-pybind`.
+    ///
+    /// Reported because the two are not equally well-trodden. For some networks
+    /// HEIR's layout passes promote the `linalg.fill` zero-initializer into a
+    /// second ciphertext argument of the emitted C++ while the Python wrapper
+    /// still registers one, so `eval()` raises a pybind arity error and the
+    /// driver falls back to the exported entry points directly. The computation
+    /// is HEIR's either way — but a reader deciding how much to trust a number
+    /// should know we went around the supported API to get it, and the class
+    /// check in [`HeirReport::gate_with`] is what makes the fallback safe.
+    #[serde(default)]
+    pub driver_path: String,
+    /// Ciphertext sequences the emitted entry point takes. `1` is the ordinary
+    /// case; `>1` is what triggers the fallback above.
+    #[serde(default)]
+    pub ciphertext_arity: u32,
     #[serde(default)]
     pub keygen_ms: f64,
     #[serde(default)]
@@ -755,6 +772,8 @@ mod tests {
             security_level_source: "set by HEIR".into(),
             multiplicative_depth: Some(3),
             plaintext_modulus: None,
+            driver_path: "high-level".into(),
+            ciphertext_arity: 1,
             activation: "relu".into(),
             activation_degree: 0,
             keygen_ms: 100.0,

@@ -83,10 +83,16 @@
 ; exactly the same thing with the mask bound to 1 or 0.
 
 ; The fused ReLU∘rescale the hybrid pipeline implements: `v >= 0 ? v >> s : 0`,
-; over a whole layer in three batched rounds. The shift is only valid on the
-; non-negative branch, which is why the mask multiplies the shifted value.
-(define (vrelu-rescale xs s)
-  (vmul (vashr xs s) (vge xs (vrep 0 (length xs)))))
+; over a whole layer. Spelled out it would be
+;
+;   (vmul (vashr xs s) (vge xs (vrep 0 (length xs))))
+;
+; which computes the same thing and is what this file used to say — but it fixes
+; the protocol: a bit decomposition plus a batched multiply. `vrelu` is the same
+; function with the protocol left to the backend, so `--nonlin gc` makes the
+; whole layer's nonlinearity ONE garble round. That is the primitive the 268 ms
+; Rust pipeline rests on, and it is why this is a builtin and not a definition.
+(define (vrelu-rescale xs s) (vrelu xs s))
 
 ; ─── convolution: a sum of scaled strided views ─────────────────────────────
 ; The taps are enumerated in (ic, ky, kx) order — the order a kernel row is
