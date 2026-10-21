@@ -1724,10 +1724,23 @@ pub fn reduce_expression(
                                         stack.push(Apply(*cont, val, env.clone()));
                                     }
                                     Types::Num(n) => {
+                                        // **Widen to hold the value.** `norm_nbits`
+                                        // comes from the *condition*, and a
+                                        // comparison's share is one bit wide, so
+                                        // sharing a numeric branch result at that
+                                        // width silently reduced it modulo 2:
+                                        // `(if (> x 0) 111 222)` returned 1 and 0
+                                        // instead of 111 and 222 (fixed 2026-10-21).
+                                        // Nothing caught it because no benchmark
+                                        // program emits an `if`, and the only
+                                        // secret-conditioned `if` coverage in the
+                                        // tree exercises the FHE path.
+                                        let need = bits_for_signed(n);
+                                        let w = norm_nbits.max(need);
                                         let mut be =
                                             backend.lock().unwrap_or_else(|e| e.into_inner());
-                                        let fr = int_to_fr_signed(n, norm_nbits);
-                                        let sref = be.share_secret(fr, norm_nbits, 0);
+                                        let fr = int_to_fr_signed(n, w);
+                                        let sref = be.share_secret(fr, w, 0);
                                         stack.push(Apply(*cont, Types::Share(sref), env.clone()));
                                     }
                                     Types::Bool(b) => {
@@ -3990,6 +4003,26 @@ impl Participant {
 }
 
 // helpers to convert between SharedValue and PersistValue
+
+/// Signed two's-complement width that holds `n`, at least 1.
+///
+/// Used by `IfResultNormalize` so a numeric branch result is not reduced modulo
+/// the *condition's* width — a comparison share is one bit wide, which turned
+/// `(if (> x 0) 111 222)` into 1 and 0.
+fn bits_for_signed(n: i64) -> usize {
+    // `-2^(k-1) ..= 2^(k-1)-1` fits in k bits.
+    let mut k = 1usize;
+    while k < 64 {
+        let lo = -(1i128 << (k - 1));
+        let hi = (1i128 << (k - 1)) - 1;
+        if (n as i128) >= lo && (n as i128) <= hi {
+            return k;
+        }
+        k += 1;
+    }
+    64
+}
+
 fn to_persist_value(v: &Types) -> Option<PersistValue> {
     match v {
         Types::Num(n) => Some(PersistValue::Num(*n)),

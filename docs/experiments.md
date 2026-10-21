@@ -3642,6 +3642,99 @@ is untrained, and a quantitative accuracy claim needs a trained one.
 
 ---
 
+### VI.17 Tier B: expressiveness, measured — and three correctness bugs it found (2026-10-21)
+
+*Command:* `cargo run --release --example probe_tier_b`.
+
+The proposal asserted three things HEIR cannot express, all cited from its paper
+rather than run. Running them cost one of the three claims and turned up three
+correctness bugs. **This section is the argument for measuring instead of
+citing.**
+
+#### The measurement
+
+Two parties over a transport that really sleeps, 50 ms one-way / 100 Mbit/s.
+
+| program | instrs | rounds | exch | elapsed | result |
+|---|---:|---:|---:|---:|---|
+| exact ReLU | 6 | 3 | 13 | 716 ms | ✓ |
+| exact max of two | 6 | 3 | 13 | 712 ms | ✓ |
+| exact argmax of four | 14 | 4 | 14 | 769 ms | ✓ |
+| branch, oblivious | 9 | 3 | 13 | 716 ms | ✓ |
+
+#### Claim 1 — exact comparison. **Holds.**
+
+ReLU, max and argmax are computed exactly above. None of HEIR's target schemes
+can compare, so its only route is polynomial approximation with user-annotated
+degree and interval, which its paper lists among its limitations. §VI.16
+measured the consequence from our own side: at depth 3 our CKKS arm's logit
+error exceeded the class margin and the run was **refused**, while the exact arm
+returned the reference class at every depth.
+
+#### Claim 2 — "HEIR eliminates secret-dependent control flow, Baru executes it". **Withdrawn.**
+
+Baru lowers a secret-dependent `if` to `Op::Mux`, which evaluates **both** arms —
+exactly what HEIR's `convert-if-to-select` does. Obliviousness forces the same
+shape on both, and there is no advantage here. The distinction was asserted from
+a reading of HEIR's passes without checking our own lowering.
+
+#### Claim 3 — mid-protocol opening. **Refined, and it cuts both ways.**
+
+The interpreter's shared `if` **reveals** its condition — the source says "leaks
+1 bit" — and branches in the clear. That is a declared-leakage branch, and an
+FHE-only compiler cannot express it at any cost, because nothing can be opened
+without the key. So there is a real leakage/cost axis here that HEIR lacks.
+
+But **Baru's circuit path cannot express it either**: `reconstruct` is not
+implemented there, so the two backends disagree on the same program. The honest
+statement is that the axis exists in the language and in one of two backends.
+Closing that is work, not a result.
+
+#### Three bugs, all in secret-conditioned code no benchmark exercises
+
+**1. `Op::Mux` was inverted** (`src/mpcc/vm.rs`). It computed `t + c*(e - t)`,
+which returns the **else** arm when the condition holds and the **then** arm
+when it does not. Every secret-conditioned `if` on the MPC path returned the
+wrong branch. Fixed to `e + c*(t - e)`; regression test
+`mux_polarity_is_not_inverted` asserts **both** polarities, since an inverted mux
+passes any test that only checks the taken branch.
+
+**2. `IfResultNormalize` truncated a numeric branch result to the *condition's*
+width** (`src/interpreter/eval.rs`). A comparison's share is one bit wide, so
+`(if (> x 0) 111 222)` returned **1 and 0** — the branch value reduced modulo 2.
+Fixed by widening to hold the value; regression test
+`shared_if_returns_the_branch_not_the_condition`, which asserts constant arms
+specifically because computed arms arrive already shared and bypass the
+normalize entirely.
+
+**3. The circuit compiler compiled any unsupported or misspelled call to the
+constant zero** (`src/zkp/circuit_compiler.rs`). The arm was reached whenever a
+call's head named a free identifier that is not a lambda — every builtin the
+circuit path does not implement, and every typo, since free identifiers are
+collected as inputs — and it emitted `FlatOp::Const { value: 0 }`. So
+`(reconstruct x)` compiled, ran, and returned 0; `(+ x (frobnicate x))` compiled
+to `x + 0`. **A wrong answer with no diagnostic.** It was deliberate — the
+comment read "emit sentinel" — and it is now an error naming the identifier.
+**All 834 tests pass with it removed**, so nothing in the tree depended on it.
+
+#### Why none of them touched a recorded result, and why they survived
+
+**No benchmark program emits an `if`.** A ReLU is `(* p (> p 0))`, a squaring is
+`(ash-right (* p p) s)`, and an argmax is comparison bits times a product tree
+(`bench::depth::argmax_pairwise`). The generated sources use only known
+operators and are pinned bit-exact against plaintext references — 300/300 images
+on MedMNIST, `every_protocol_classifies_exactly` on the classifier — so every
+figure in this document stands.
+
+They survived because the only secret-conditioned `if` coverage in the tree is
+`tests/fhe_differential.rs`, which exercises the **FHE** path. Neither the MPC
+VM's mux nor the interpreter's share-normalisation was reached by any test. The
+lesson is narrow and worth stating: a feature documented in `LANGUAGE.md` and
+absent from every benchmark had no coverage on two of its three backends, and
+832 green tests said nothing about it.
+
+---
+
 ## Part VIII — The cost of active security
 
 *Command:* `baru bench-malicious --n 64 --bits 32`. Both legs run the same

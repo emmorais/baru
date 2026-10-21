@@ -1107,15 +1107,24 @@ fn exec_round<E: ShareEngine>(
                     },
                 );
             }
-            // `t + c*(e - t)`: the subtraction and the addition are local, so
+            // `e + c*(t - e)`: the subtraction and the addition are local, so
             // the multiplication joins this level's batch like any other.
+            //
+            // **The polarity is the whole content of this instruction and it was
+            // wrong until 2026-10-21.** It read `t + c*(e - t)`, which evaluates
+            // to `e` when the condition holds and to `t` when it does not — a
+            // silently inverted conditional. It survived because no benchmark
+            // program emits an `if`: a ReLU is `(* p (> p 0))` and an argmax is
+            // comparison bits times a product tree, so the only coverage of
+            // secret-conditioned `if` is `tests/fhe_differential.rs`, which
+            // exercises the *FHE* path and never reached this VM.
             Op::Mux => {
                 let c = as_share(engine, shares, clears, instr.src[0])?;
                 let t = as_share(engine, shares, clears, instr.src[1])?;
                 let e = as_share(engine, shares, clears, instr.src[2])?;
-                let diff = engine.sub(&e, &t);
+                let diff = engine.sub(&t, &e);
                 mul_pairs.push((c, diff));
-                mul_dst.push((instr.dst[0], Some(t)));
+                mul_dst.push((instr.dst[0], Some(e)));
                 // The right operand is a freshly computed difference, not a register, so
                 // this cannot join a fused form.
                 mul_ids.push(None);
@@ -1596,6 +1605,58 @@ fn unsupported(op: &Op) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    /// `Op::Mux` polarity, both ways, through the real two-party VM.
+    ///
+    /// Regression for a silently inverted conditional (fixed 2026-10-21): the
+    /// mux computed `t + c*(e - t)`, which returns the *else* arm when the
+    /// condition holds. Nothing caught it because no benchmark program emits an
+    /// `if` — a ReLU is `(* p (> p 0))`, an argmax is comparison bits times a
+    /// product tree — and the only secret-conditioned `if` coverage in the tree
+    /// exercises the FHE path (`tests/fhe_differential.rs`), not this VM.
+    ///
+    /// Asserted on *both* polarities on purpose: an inverted mux passes any test
+    /// that only ever checks the taken branch.
+    #[test]
+    fn mux_polarity_is_not_inverted() {
+        use crate::bench::comm::{LatencyTransport, NetworkProfile};
+        use crate::crypto::net::InprocHandle;
+        use crate::mpcc::dist::{run_two_party, RunConfig};
+        use crate::mpcc::{compile, schedule, LowerConfig};
+        use std::sync::Mutex;
+
+        let eval = |src: &str, x: i64| -> i64 {
+            let cfg = LowerConfig {
+                parties: 2,
+                bit_width: 32,
+                ..Default::default()
+            };
+            let prog = compile(src, &cfg).expect("compile");
+            let sched = schedule(&prog);
+            let ins: std::collections::HashMap<String, i64> =
+                [("x".to_string(), x)].into_iter().collect();
+            let hs = Mutex::new(InprocHandle::create(2));
+            let profile = NetworkProfile::fixed_latency(std::time::Duration::from_millis(0));
+            run_two_party(&prog, &sched, &ins, RunConfig::default(), |i| {
+                LatencyTransport::new(hs.lock().unwrap()[i].clone(), profile, 2)
+            })
+            .expect("run")
+            .outputs
+            .first()
+            .map(|(_, v)| *v)
+            .expect("one output")
+        };
+
+        // Constant arms: isolates selection from any arithmetic in the branches.
+        assert_eq!(eval("(if (> x 0) 111 222)", 7), 111, "true must take `then`");
+        assert_eq!(eval("(if (> x 0) 111 222)", -7), 222, "false must take `else`");
+        // Computed arms, where an inversion also corrupts the value.
+        assert_eq!(eval("(if (> x 0) (* x 2) (- 0 x))", 7), 14);
+        assert_eq!(eval("(if (> x 0) (* x 2) (- 0 x))", -7), 7);
+        // A condition that is not a comparison on the input.
+        assert_eq!(eval("(if (== x 7) 1 0)", 7), 1);
+        assert_eq!(eval("(if (== x 7) 1 0)", 8), 0);
+    }
 
     /// What replacing an exact rescale with a truncation pair actually costs.
     ///

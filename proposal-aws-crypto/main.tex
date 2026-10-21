@@ -43,11 +43,12 @@
 {\Large\bfseries Compiling Across the FHE/MPC Boundary}\\[0.3ex]
 {\large A continuation-based compiler architecture for programs whose cheapest backend changes mid-computation}\\[1.0ex]
 {\normalsize
-\textbf{Principal Investigator:} \TODO{PI full name}, \TODO{title}\\
+\textbf{Principal Investigator:} Thales B. Paiva, Assistant Professor (Professor Doutor)\\
 Departamento de Engenharia de Computação e Sistemas Digitais (PCS),
 Escola Politécnica, USP --- LARC\\
-\TODO{PI institutional e-mail} \quad\textbullet\quad \TODO{PI ORCID / Lattes}\\[0.5ex]
-\textbf{Co-investigator:} Eduardo Morais, \TODO{role and affiliation}\\[0.5ex]
+\texttt{thalespaiva@larc.usp.br} \quad\textbullet\quad
+Lattes \texttt{5406900278440032}\\[0.5ex]
+\textbf{Co-investigator:} Eduardo Morais, Postdoctoral Researcher, LARC / PCS, Escola Politécnica, USP\\[0.5ex]
 \textbf{Topic:} \emph{Compilers and development tools for FHE and MPC}
 \quad\textbullet\quad
 \textbf{Secondary:} \emph{Privacy-preserving AI inference and training on encrypted or distributed data}\\[0.4ex]
@@ -71,11 +72,11 @@ What interests us is the boundary of that domain, which \heir{}'s own paper
 draws precisely. Three consequences of a static, FHE-only lowering pipeline:
 
 \begin{itemize}
-\item \textbf{Secret-dependent control flow is eliminated, not executed.}
-\texttt{convert-if-to-select} rewrites a secret branch into
-\texttt{arith.select}, so both arms are evaluated; secret-dependent loop bounds
-are unsupported, with \texttt{convert-secret-for-to-static-for} requiring a
-user-supplied static bound.
+\item \textbf{Nothing can be opened mid-computation.} A ciphertext cannot be
+inspected without the key, so declared-leakage protocol design --- reveal one
+bit, then branch in the clear --- is not expressible at any cost. (Obliviousness
+is \emph{not} a difference: \texttt{convert-if-to-select} evaluates both arms,
+and so does our own mux. We checked, and withdrew that claim; §4.)
 \item \textbf{Every nonlinearity must be approximated}, and not inferred:
 \heir{} lists polynomial approximation requiring user annotation for degree and
 interval among its stated limitations.
@@ -123,9 +124,9 @@ trampoline over an explicit stack, and a step budget. Two properties follow, and
 we distinguish sharply between what this already delivers and what it enables.
 
 \noindent\textbf{Already delivered.} \emph{(i)} A secret-dependent conditional
-is a continuation frame (\texttt{If}, then \texttt{IfResultNormalize}, which
-reconciles a numeric result into a share of the right width and owner), so it is
-executed under a protocol rather than compiled into a select. \emph{(ii)}
+is a continuation frame, and the interpreter's form \emph{opens} its condition
+--- a declared-leakage branch, which an FHE-only compiler cannot express because
+nothing can be opened without the key. \emph{(ii)}
 Backend choice is per-operation, by dynamic dispatch through a \texttt{Backend}
 trait, rather than fixed by whole-program lowering --- which makes a mid-program
 scheme switch an ordinary operation, not an escape hatch. The flagship result
@@ -295,15 +296,37 @@ stack we have looked at, which is the strongest argument we have that it is
 structural rather than a coincidence of one comparison.
 
 \medskip
-\noindent\textbf{Tier B --- Expressiveness.} Programs \heir{} cannot express,
-each with its mechanism cited rather than asserted: exact ReLU and max-pool (no
-comparison in any target scheme); secret-dependent loop bounds
-(\texttt{convert-secret-for-to-static-for} requires static bounds); any
-mid-program FHE$\leftrightarrow$MPC transition (no interactive dialect). We
-report \baru{}'s cost and record \heir{} as \emph{not expressible}, naming the
-pass. This compares against a tool not claiming the capability --- that is the
-point: we quantify what the exclusion costs on the canonical workload, which
-needs a system spanning both sides.
+\noindent\textbf{Tier B --- Expressiveness. \emph{Measured, and it cost us a
+claim.}} We ran the three cases rather than citing them, and report the outcome
+in full because the methodology is part of the contribution.
+\textbf{(a) Exact comparison holds}: ReLU, max and argmax computed exactly
+(measured; §VI.17), against which HEIR's only route is polynomial approximation
+with user-annotated degree and interval --- and §VI.16 measured our own CKKS arm
+being \emph{refused} at depth 3 because its logit error exceeded the class
+margin, while the exact arm was right at every depth.
+\textbf{(b) ``Secret-dependent control flow'' is withdrawn}: Baru lowers such an
+\texttt{if} to a mux that evaluates both arms, exactly as
+\texttt{convert-if-to-select} does. Obliviousness forces the same shape on both,
+and we had asserted a difference that does not exist.
+\textbf{(c) Mid-protocol opening holds but is narrower than claimed}: the
+interpreter reveals the condition and says so, which HEIR cannot do at any
+price --- but \baru{}'s own circuit path has no \texttt{reconstruct} either, so
+our two backends disagree on that program.
+
+\medskip
+\noindent\textbf{Running Tier B also found three correctness bugs}, all in
+secret-conditioned code paths no benchmark exercises: an \textbf{inverted mux}
+in the MPC VM (every secret \texttt{if} took the wrong branch); a branch result
+\textbf{truncated to the condition's one-bit width} (\texttt{(if (> x 0) 111
+222)} returned 1); and a circuit-compiler arm that compiled \textbf{any
+unsupported or misspelled call to the constant zero} without a diagnostic. All
+three are fixed with both-polarity regression tests, and all 834 tests pass. No
+recorded figure moved, because no benchmark program emits an \texttt{if} --- a
+ReLU is \texttt{(* p (> p 0))} and an argmax is comparison bits times a product
+tree --- and the only secret-conditioned \texttt{if} coverage in the tree
+exercised the FHE path. That is the honest case for Tier~B existing: a feature
+documented in the language reference had no coverage on two of three backends,
+and a green suite said nothing about it.
 
 \medskip
 \noindent\textbf{Tier C --- Crossover.} Programs whose optimal assignment is
@@ -363,7 +386,7 @@ a cost model can be written but \emph{how coarse a model suffices}, with
 \noindent\textbf{Deliverables.} The open-source tool; a reproducible
 matched-threat-model benchmark suite spanning MPC and FHE, which the field
 lacks; two publications (compiler/systems on the architecture and backend
-selection; applied-crypto on switch-as-bootstrap); \TODO{N} student theses.
+selection; applied-crypto on switch-as-bootstrap); one doctoral thesis and two undergraduate research projects.
 
 % -------------------------------------------------------------------------
 \section{Required questions}
@@ -419,10 +442,22 @@ our own analysis found it insecure.
 % -------------------------------------------------------------------------
 \section{Community, students, and budget}
 
+\noindent\textbf{The PI's work is on this call's topics already.} Thales
+Paiva's 2024--2026 record includes \emph{Faster amortized bootstrapping using the
+incomplete NTT for free} (TCHES 2025) --- squarely the call's
+\emph{``improved practical FHE bootstrapping algorithms''} topic, and squarely
+the operation whose absence produces §3's depth-10 cliff --- together with
+\emph{Incompleteness in Number-Theoretic Transforms} (EuroS\&P 2025), two
+further TCHES 2025 papers, and side-channel work on Kyber and HQC (TCHES 2024,
+PQCrypto 2025). The NTT results bear directly on \baru{}'s own polynomial
+arithmetic, and the bootstrapping result on the one regime our measurements
+cannot currently reach. The team is not approaching FHE from the outside.
+
+\medskip
 Based at LARC (PCS, Escola Politécnica da USP), which teaches an undergraduate
 cryptography course (\emph{Fundamentos de Criptografia}) and supervises graduate
-work in applied cryptography; the award supports \TODO{N} MSc/PhD students and
-\TODO{N} undergraduate scholars. A compiler project absorbs students unusually
+work in applied cryptography; the award supports one doctoral student and
+two undergraduate research scholars (\emph{iniciação científica}). A compiler project absorbs students unusually
 well --- backends, evaluators, cost models and benchmark suites parallelize into
 defensible individual theses with measurable results --- and the
 matched-threat-model benchmark suite is itself a community contribution whose
@@ -432,11 +467,34 @@ research university, and this trains Brazilian students in a subfield where the
 region is under-represented.
 
 \medskip
-\noindent\textbf{Budget} (unrestricted, excl.\ overhead; \TODO{confirm against
-USP/FUSP rates}): graduate support (\TODO{N}, 12 mo.) \TODO{amt}; undergraduate
-\emph{iniciação científica} (\TODO{N}, 12 mo.) \TODO{amt}; travel, open-access
-and local compute \TODO{amt}. \textbf{Total \TODO{$\leq$ 80{,}000} USD}, plus
-\textbf{AWS credits} \TODO{$\leq$ 40{,}000} for Thrust~2 per §5.
+\noindent\textbf{Budget.} Unrestricted funds, excluding administrative overhead.
+Scholarship lines use FAPESP's published national rates (DR-I R\$5\,790/mo,
+\emph{iniciação científica} R\$1\,140/mo, in force from 2025-08-01), converted at
+R\$5.03/USD as of 2026-10-21.
+
+\begin{center}\footnotesize
+\begin{tabular}{@{}lr@{}}
+\toprule
+Doctoral scholarship, 12 months (FAPESP DR-I) & 13\,810 \\
+Undergraduate research scholarships, 2 $\times$ 12 months (FAPESP IC) & 5\,440 \\
+Doctoral continuation / DR-II differential & 12\,000 \\
+Dedicated high-memory measurement workstation & 15\,000 \\
+International conference travel, 3 person-trips incl.\ registration & 21\,000 \\
+Open-access and publication charges & 6\,000 \\
+Storage, local compute, contingency & 6\,750 \\
+\midrule
+\textbf{Total unrestricted (USD)} & \textbf{80\,000} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\noindent The workstation is requested \emph{alongside} the credits, not instead
+of them, and the distinction is methodological: every figure here was measured
+on one 16\,GB laptop, and the project's discipline depends on year-over-year
+comparability on a machine whose state we control, which cloud instances cannot
+give. \textbf{AWS promotional credits} (40\,000 USD) buy what a single machine
+cannot --- multi-region latency, and the memory for secure bootstrapping (§5,
+T2).
 
 % -------------------------------------------------------------------------
 \vspace{0.6ex}\hrule\vspace{0.6ex}

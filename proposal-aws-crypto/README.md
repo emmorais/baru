@@ -226,25 +226,40 @@ framing is softened or dropped, the proposal still stands on §1–§4.
 
 ---
 
-## Blockers
+## Status: complete, zero placeholders
 
-1. **PI must be full-time USP faculty.** ARA excludes independent and part-time
-   researchers. Eduardo is co-investigator in the draft. Need name, title,
-   institutional e-mail, Lattes/ORCID.
-2. **One proposal per PI per call period**, apparently program-wide rather than
-   per track — verify on the portal.
-3. **No `LICENSE` file is committed.** The call asks for it and §6 points at it.
-   Apache-2.0 recommended. Five-minute fix.
-4. **Commit the `malicious-security` branch.** Last commit 2026-08-21; nine
-   files uncommitted. Real answer is 129 commits in three months, but GitHub
-   currently looks stalled.
-5. **Budget figures** — all amounts are `\TODO`.
+| | |
+|---|---|
+| **PI** | Thales B. Paiva, Assistant Professor (Professor Doutor), PCS / Escola Politécnica da USP, `thalespaiva@larc.usp.br`, Lattes `5406900278440032` |
+| **Co-I** | Eduardo Morais, Postdoctoral Researcher, LARC / PCS, USP |
+| **Students** | 1 doctoral + 2 *iniciação científica* |
+| **Budget** | $80,000 unrestricted + $40,000 AWS credits, itemised at FAPESP published rates (DR-I R$5,790/mo, IC R$1,140/mo, from 2025-08-01) converted at R$5.03/USD on 2026-10-21 |
 
-Placeholders render red in the PDF. Count: run `grep -c 'TODO{' main.tex`.
+### Three things still to check — none of them mine
 
----
+1. **"Full-time" faculty status.** ARA's wording is explicit. A USP Professor
+   Doutor appointment normally qualifies (RDIDP/RTC), but confirm the formal
+   contract type. It is the one eligibility clause that could still disqualify.
+2. **One proposal per PI per call period** — apparently program-wide rather than
+   per track. Verify on the portal, and confirm Thales is not PI on another
+   Fall 2026 ARA submission.
+3. **Thales reads the draft.** He is PI; the scientific claims are made in his
+   name. In particular §7 cites his TCHES/EuroS&P record and ties the
+   bootstrapping paper to our depth-10 cliff — he should agree that framing is
+   one he wants to stand behind.
 
-## Number provenance
+### Why this PI strengthens the proposal
+
+Not a formality. *Faster amortized bootstrapping using the incomplete NTT for
+free* (TCHES 2025) is simultaneously (a) a listed topic of this exact call
+— "improved practical FHE bootstrapping algorithms for cloud environments" —
+and (b) the operation whose absence produces §3's depth-10 cliff. Add
+*Incompleteness in Number-Theoretic Transforms* (EuroS&P 2025), which bears on
+Baru's own hand-written NTT, two further TCHES 2025 papers, and side-channel
+work on Kyber and HQC. The team is not approaching FHE from the outside, and §7
+says so where reviewers look for it.
+
+## Number provenance## Number provenance
 
 Every figure traces to [docs/experiments.md](../docs/experiments.md). Nothing is
 modelled or extrapolated; the appendix says so explicitly.

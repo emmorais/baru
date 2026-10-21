@@ -50,3 +50,31 @@ fn test_mixed_local_and_shared() {
     let sum = be.add(&s_local, &s_shared);
     assert_eq!(be.reveal(&sum, None), local.wrapping_add(shared_val));
 }
+
+/// A secret-conditioned `if` must return its branch, not the condition.
+///
+/// Regression for a silent truncation fixed 2026-10-21. `IfResultNormalize` took
+/// its share width from the *condition*, and a comparison's share is one bit
+/// wide, so a numeric branch result was reduced modulo 2: `(if (> x 0) 111 222)`
+/// returned 1 and 0. It survived because no benchmark program emits an `if` —
+/// ReLU is `(* p (> p 0))`, argmax is comparison bits times a product tree — and
+/// the only secret-conditioned `if` coverage in the tree (`fhe_differential.rs`)
+/// exercises the FHE path, not the share path.
+///
+/// Both polarities and both branch *kinds* are asserted: constant arms isolate
+/// selection, computed arms (which arrive already shared and bypass the
+/// normalize entirely) would pass even with the bug present.
+#[test]
+fn shared_if_returns_the_branch_not_the_condition() {
+    let cases = [
+        ("(let ((x (share 7 32))) (reconstruct (if (> x 0) 111 222)))", 111),
+        ("(let ((x (share -7 32))) (reconstruct (if (> x 0) 111 222)))", 222),
+        ("(let ((x (share 7 32))) (reconstruct (if (> x 0) (* x 2) 0)))", 14),
+        ("(let ((x (share 5 32))) (reconstruct (if (> x 0) 1000 2000)))", 1000),
+        ("(let ((x (share -5 32))) (reconstruct (if (> x 0) 1000 2000)))", 2000),
+    ];
+    for (src, want) in cases {
+        let got = baru::interpreter::eval::eval_shared(src);
+        assert_eq!(got, want, "{src}");
+    }
+}

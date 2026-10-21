@@ -1547,13 +1547,24 @@ impl CircuitCompiler {
                         }))
                     }
                 } else if env.contains_key(name.as_str()) {
-                    // Variable exists but isn't a lambda — emit sentinel.
-                    let dst = self.fresh("call");
-                    flat.push(FlatOp::Const {
-                        dst: dst.clone(),
-                        value: 0,
-                    });
-                    Ok(CVal::Wire(dst))
+                    // **Was a silent zero until 2026-10-21.** This arm is
+                    // reached when a call's head names a free identifier that is
+                    // not a lambda -- which is the case for every builtin the
+                    // circuit path does not implement (`reconstruct`, `share`,
+                    // `fhe-keygen`) and for every typo, because free identifiers
+                    // are collected as inputs. It emitted `FlatOp::Const { 0 }`,
+                    // so `(reconstruct x)` compiled, ran, and returned 0, and
+                    // `(+ x (frobnicate x))` compiled to `x + 0`: a wrong answer
+                    // with no diagnostic. A program the compiler cannot express
+                    // must say so rather than quietly computing something else.
+                    Err(format!(
+                        "`{}` is not a function the circuit compiler implements: \
+                         it resolves to a value, not a lambda. If it is an \
+                         interpreter builtin, the MPC/FHE circuit path does not \
+                         support it; if it is a typo, note that it previously \
+                         compiled to the constant zero.",
+                        name
+                    ))
                 } else {
                     Err(format!("unbound function: {}", name))
                 }
