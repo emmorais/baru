@@ -294,6 +294,129 @@ fn network_src(net: &QuantizedNetwork) -> String {
     format!("(let* ({}) {idx})", binds.join(" "))
 }
 
+/// The same MLP fixture, in the flat text format `tools/ckks_cnn.cpp` reads.
+///
+/// **Why this exists.** §VI.15 measured HEIR against the two-party arm and found
+/// FHE ahead at shallow depth on a wide-area link. The right response to that is
+/// not to report it and move on: if a homomorphic pipeline is the cheaper way to
+/// evaluate this region, Baru should be able to *emit* one. Baru already has a
+/// CKKS arm on the same OpenFHE build HEIR targets (`tools/ckks_cnn.cpp`, §VI.10,
+/// with Orion's linear-transform evaluator in §VI.14), and it handles `dense`
+/// layers — it had simply never been pointed at an MLP, only at LeNet-5.
+///
+/// Exporting from [`fixture_with`] means **all three arms evaluate one network
+/// definition**: the two-party protocol, HEIR's generated OpenFHE, and our own
+/// CKKS. Any disagreement is then a finding rather than a fixture mismatch.
+///
+/// `k` selects the input, as [`input_for`] numbers them.
+pub fn export_mlp_fixture(shape: &[usize], scale_bits: u32, k: usize) -> String {
+    let net = fixture_with(shape, scale_bits, Activation::Square);
+    let input = input_for(shape[0], scale_bits, k);
+    let logits = net.forward(&input);
+    let join = |v: &[i64]| {
+        v.iter()
+            .map(|x| x.to_string())
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+
+    let mut out = String::new();
+    out.push_str(&format!("scale_bits {scale_bits}\n"));
+    // A dense network's input is a 1x1xN "image"; the loader wants the triple.
+    out.push_str(&format!("input 1 1 {}\n", shape[0]));
+    out.push_str(&format!("values {}\n", join(&input)));
+    for (li, layer) in net.layers.iter().enumerate() {
+        out.push_str(&format!(
+            "dense {li} {} {} ",
+            layer.out_dim(),
+            layer.in_dim()
+        ));
+        // Output-major, matching `conv_nn::export`'s convention and the loader's
+        // `w.resize(out_dim * in_dim)` read order.
+        for o in 0..layer.out_dim() {
+            for i in 0..layer.in_dim() {
+                out.push_str(&format!("{} ", layer.weights[o][i]));
+            }
+        }
+        for o in 0..layer.out_dim() {
+            out.push_str(&format!("{} ", layer.bias[o]));
+        }
+        out.push('\n');
+        // `act` in the fixture is `x*x`, which is what `Activation::Square` is.
+        if matches!(layer.activation, Activation::Square) {
+            out.push_str("act\n");
+        }
+    }
+    out.push_str(&format!("reference {}\n", join(&logits)));
+    out
+}
+
+/// The same network, stopping at the logits instead of computing the argmax.
+///
+/// **What this is for.** Our arm computes the argmax *inside* the protocol and
+/// reveals only the class index; an FHE arm returns the whole logit vector and
+/// lets the client take the maximum in the clear (§VI.10). So the comparison as
+/// it stands charges us for strictly more work *and* credits us with strictly
+/// less disclosure. This source isolates the first by removing the second.
+///
+/// **Why a sum is a faithful stand-in for returning ten logits.** Addition does
+/// not communicate, so `sum_tree` adds no rounds and no bytes; and opening ten
+/// mutually independent values is the same single round as opening one, because
+/// the scheduler batches them. The round count and traffic of this program are
+/// therefore those of a program that returns the whole vector. It is a
+/// round-cost probe, not a deployable classifier — the value it outputs is
+/// meaningless, and `bench-2pc-nn`'s correctness check does not apply to it.
+pub fn debug_src_logits(shape: &[usize], scale_bits: u32) -> String {
+    let net = fixture_with(shape, scale_bits, Activation::Square);
+    network_src_upto_logits(&net)
+}
+
+/// [`network_src`] without its final [`crate::bench::depth::argmax_pairwise`].
+///
+/// The layer loop is duplicated from `network_src` rather than factored out,
+/// because the two must stay *provably* identical up to the last step and a
+/// shared helper that silently changed one would be worse than a copy that
+/// visibly did not. `logits_match_network_src` pins them together.
+fn network_src_upto_logits(net: &QuantizedNetwork) -> String {
+    let mut binds: Vec<String> = Vec::new();
+    let mut cur: Vec<String> = (0..net.layers[0].in_dim())
+        .map(|i| format!("x{i}"))
+        .collect();
+    for (l, layer) in net.layers.iter().enumerate() {
+        let mut next = Vec::new();
+        for o in 0..layer.out_dim() {
+            let dot = crate::bench::depth::sum_tree(
+                cur.iter()
+                    .enumerate()
+                    .map(|(i, x)| format!("(* w{l}_{o}_{i} {x})"))
+                    .collect(),
+            );
+            let pre = format!("(+ (ash-right {dot} {}) b{l}_{o})", net.scale_bits);
+            let name = format!("h{l}_{o}");
+            match layer.activation {
+                Activation::Identity => binds.push(format!("({name} {pre})")),
+                Activation::Relu => {
+                    let p = format!("p{l}_{o}");
+                    binds.push(format!("({p} {pre})"));
+                    binds.push(format!("({name} (* {p} (> {p} 0)))"));
+                }
+                Activation::Square => {
+                    let p = format!("p{l}_{o}");
+                    binds.push(format!("({p} {pre})"));
+                    binds.push(format!(
+                        "({name} (ash-right (* {p} {p}) {}))",
+                        net.scale_bits
+                    ));
+                }
+            }
+            next.push(name);
+        }
+        cur = next;
+    }
+    let sum = crate::bench::depth::sum_tree(cur);
+    format!("(let* ({}) {sum})", binds.join(" "))
+}
+
 /// Every secret input the generated source refers to.
 fn network_inputs(net: &QuantizedNetwork, input: &[i64]) -> HashMap<String, i64> {
     let mut m = HashMap::new();
@@ -604,6 +727,17 @@ pub fn run_cli(args: &[String]) -> Result<(), String> {
          \x20   party hands out correlated randomness for free. Compare against `semi2k`\n\
          \x20   (OT preprocessing) and `lowgear` (SHE preprocessing)."
     );
+    // VI.15 quoted these timings against HEIR as if they were elapsed, and they
+    // were wrong in both directions (2113 ms predicted against 2739 ms measured
+    // on WAN; 14 ms against 5 ms on LAN). The warning is here rather than only in
+    // the docs because the table is what gets copied.
+    println!(
+        "\n  ! `online`/`total` are MODELLED — rounds x RTT + bytes / bandwidth + measured\n\
+         \x20   compute — not elapsed wall clock, and they do not enable truncation pairs\n\
+         \x20   (VI.9) or bilinear fusion (VI.13), which are worth 2.4-3.6x on a WAN link.\n\
+         \x20   NOT quotable as a latency. For measured elapsed time of the optimized arm:\n\
+         \x20       cargo run --release --example probe_heir_match"
+    );
 
     for s in &r.skipped {
         println!("\n  skipped — {s}");
@@ -698,6 +832,45 @@ fn human(b: u64) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    /// The logits probe must be the same program as the real one up to the
+    /// argmax, or it measures a different network and the subtraction is
+    /// meaningless. Compare the binding lists directly.
+    #[test]
+    fn logits_match_network_src() {
+        for shape in [vec![4usize, 3, 2], vec![16, 8, 4], vec![64, 32, 10]] {
+            let net = fixture_with(&shape, 8, Activation::Square);
+            let full = network_src(&net);
+            let upto = network_src_upto_logits(&net);
+            // Both are `(let* (BINDS) TAIL)`. The probe's BINDS must be a
+            // prefix of the real one — the argmax only ever appends.
+            let binds = |s: &str| -> String {
+                let open = s.find("(let* (").expect("let*") + "(let* (".len();
+                let mut depth = 1usize;
+                let b = s[open..].char_indices();
+                let mut end = 0;
+                for (k, c) in b {
+                    match c {
+                        '(' => depth += 1,
+                        ')' => {
+                            depth -= 1;
+                            if depth == 0 {
+                                end = k;
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                s[open..open + end].to_string()
+            };
+            let (bf, bu) = (binds(&full), binds(&upto));
+            assert!(
+                bf.starts_with(&bu),
+                "{shape:?}: the logits probe is not a prefix of the real network"
+            );
+        }
+    }
     use super::*;
 
     /// A width-`n` layer is an `n`-term nested expression and the parser and

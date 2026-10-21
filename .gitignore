@@ -14,3 +14,7 @@ paper/main.fls
 # each and redistributable only under their own CC BY licence, so not vendored.
 *.npz
 __pycache__/
+
+# C++ comparison arms, built per tools/README.md
+ckks_cnn
+ckks_bsgs

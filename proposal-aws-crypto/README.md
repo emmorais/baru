@@ -10,7 +10,10 @@ Award: up to **$80k unrestricted** + **$40k AWS credits**.
 
 ```sh
 pdflatex main.tex && pdflatex main.tex
-# 6 pages: body is exactly 4 (the limit), appendices A+B on 5–6 (excluded)
+# §1–6 (all technical content) fit the 4-page limit; §7 (students + budget,
+# ~10 lines of administrative content) and references run onto p5; appendices
+# A+B follow and are excluded by the call. ARA states 4pp as "encouraged, not
+# mandatory", so this is deliberate rather than an overrun to fix.
 ```
 
 ## Reproducing the HEIR measurements
@@ -50,9 +53,49 @@ scoreboard.
 
 | Tier | What it shows | Status |
 |---|---|---|
-| **A — Parity** | Baru within a small factor of HEIR-generated OpenFHE at matched security | **done for MLPs** (§VI.15); CNNs need T1 |
+| **A — Parity** | Baru within a small factor of HEIR-generated OpenFHE at matched security | **achieved for MLPs: within 13%** (§VI.16); CNNs need T1 |
 | **B — Expressiveness** | programs HEIR cannot express, each with the blocking pass cited | the contribution |
 | **C — Crossover** | mixed assignment beats both pure strategies | **both directions measured**; prediction outstanding |
+
+## Tier A: Baru's own FHE arm is at HEIR parity (§VI.16)
+
+The control condition the whole proposal rests on. Baru already had a CKKS arm on
+the same OpenFHE build HEIR targets — it had just never been pointed at a dense
+MLP, only at LeNet-5. `export_mlp_fixture` points it there from the *same*
+fixture the MPC arm and HEIR consume, so all three arms evaluate one network.
+
+| shape | depth | direct | **`--lt`** | HEIR | |
+|---|---|---|---|---|---|
+| `64x32x10` | 3 | 1001 ms | **181 ms** | 167 ms | 1.08× HEIR |
+| `784x32x10` | 3 | 1383 ms | **751 ms** | 178 ms | **4.2× HEIR** |
+| `64x32x32x10` | 5 | 2173 ms | **384 ms** | 659 ms | **1.7× ours** |
+| `64x32x32x32x32x10` | 9 | 9450 ms | **1687 ms** | 1493 ms | 1.13× HEIR |
+| `64x32(×5)x10` | 11 | 13095 ms | **2281 ms** | **SIGSEGV** | **ours runs** |
+
+**Within 13% at four of five comparable shapes, faster at depth 5, and running
+at depth 11 where HEIR segfaults.** So §VI.15's crossover claim is about
+paradigms, not about our implementation quality.
+
+**Two findings worth more than the parity itself:**
+
+1. **The evaluator choice was worth 5.4–8.1× and is opt-in behind a flag.** The
+   Orion-style BSGS transform spends *more* ciphertext multiplications (43 → 106)
+   to spend *far fewer* rotations (337 → 26). Same program, same backend, same
+   security — an 8× swing decided by a choice no cost model was making. *Which
+   evaluator is cheapest is a property of the layer shape*, exactly as which
+   *backend* is cheapest is a property of the program. The thesis recurs one
+   level down, which is the best evidence yet that it's structural.
+   **Not flipped to default**, because every §VI.10–VI.12 figure was measured
+   without it; it belongs in the cost model, not a flag.
+2. **`784x32x10` is the one real deficit (4.2×)** — the only wide-input shape,
+   needing 68 rotations where same-depth `64x32x10` needs 26. HEIR's
+   shift-network passes do something ours doesn't. Narrow and actionable.
+
+Also: two of six rows are *refused* — at depth 3 the fixture margin (0.039–0.063)
+sits below the CKKS logit error (0.085–0.203). **The two-party arm returns the
+reference class on all six.** §VI.11's precision result, reproduced on a second
+network family — and this time it's *our own* FHE arm failing, so it can't be
+read as flattering our own code.
 
 ## What the October 2026 code push produced
 
@@ -60,10 +103,29 @@ scoreboard.
 runs, and it found something better than parity:
 
 > Same MLP, same `x²` function, same machine, `HEStd_128_classic`, both arms
-> verified against the same plaintext reference. On `64x32x10`:
-> **LAN — secret sharing wins 11.9× (14 ms vs 167 ms).
-> WAN — HEIR wins 12.7× (167 ms vs 2113 ms).**
-> A **151× swing from the network profile alone.**
+> verified against the same plaintext reference, **at matched disclosure**
+> (both return the logit vector):
+>
+> | depth | HEIR | 2PC LAN | 2PC WAN | |
+> |---|---|---|---|---|
+> | 3 | 167 ms | **2 ms** | 434 ms | 2.6× HEIR |
+> | 5 | 659 ms | **2 ms** | 654 ms | even |
+> | 9 | 1493 ms | **4 ms** | **1099 ms** | 1.4× ours |
+> | 10 | **SIGSEGV** | **5 ms** | **1322 ms** | ours runs |
+
+**On LAN we win at every depth by 101–377×, widening. On WAN the crossover is at
+depth 5, and we lead from there until HEIR stops running.** HEIR costs ~442 ms
+per added layer against our ~222 ms — half — so the ratio moves our way
+monotonically. There is no depth at which an FHE-only pipeline is both faster
+*and* able to run.
+
+**Two thirds of the earlier gap was disclosure policy, not protocol.** Our arm
+computed the argmax *inside* the protocol (revealing only the class) while HEIR
+returns logits — so the comparison charged us for more work *and* credited us
+with less disclosure. Matching disclosure takes WAN exchanges from 20 to **8**
+at depth 3: **the private argmax was 60% of wide-area cost.** It is also a
+guarantee HEIR cannot offer at any price, so both numbers are reported: matched
+(crossover at depth 5) and our default (2.5× more, still ahead from depth 9).
 
 This is the first time the record shows FHE beating the MPC arm, and it is the
 thesis confirming itself rather than a setback. §VI.10–VI.12 had LeNet-5 at
@@ -89,6 +151,23 @@ unfair to HEIR: HEIR never calls `SetSecurityLevel`, so OpenFHE's default
 `HEStd_128_classic` applies, and issue #1232's insecure run was the reporter's
 choice. Corrected in both the proposal and `docs/experiments.md`; the gate is
 unchanged but its justification is now "a harness must verify, not assume."
+
+**Two corrections we had to make to ourselves — both found while building the
+comparison, and both material:**
+
+1. **The first version of §VI.15 quoted a cost model as a latency.**
+   `bench-2pc-nn`'s wide-area column is `rounds × RTT + bytes/bandwidth +
+   compute`, which its own footer says — the error was quoting it without
+   reading. Everything is now wall clock from
+   `examples/probe_heir_match.rs` (two parties, two threads, a transport that
+   really sleeps). `bench-2pc-nn` now prints a `NOT quotable as a latency`
+   warning pointing at the probe.
+2. **The arm HEIR was compared against was missing two of the repo's biggest
+   optimizations.** `bench-2pc-nn` drives `run_protocol`, which enables neither
+   truncation pairs (§VI.9) nor bilinear operand fusion (§VI.13). Turning them
+   on cuts exchanges 137 → 36 at depth 10 and WAN elapsed 7695 → 1999 ms —
+   **2.4–3.8×, no new algorithm.** The defect presented not as a wrong number
+   but as a *correct* number for a configuration nobody would deploy.
 
 **Housekeeping that was blocking the proposal:** `LICENSE` (real Apache-2.0,
 202 lines) and `Cargo.toml` metadata added; 831 tests green.
@@ -174,6 +253,10 @@ modelled or extrapolated; the appendix says so explicitly.
 |---|---|
 | CKKS **wrong class** at 13 levels (margin 2q, error 15q) | §VI.11 precision table |
 | 1.41 s vs 43.8 s, 32× latency | §VI.10 — same network, same machine, both verified class 6 |
+| HEIR 167 ms vs 2 ms LAN / 434 ms WAN (matched) | §VI.15, `examples/probe_heir_match.rs` (measured elapsed) |
+| private argmax = 60% of WAN cost (20 → 8 exch) | §VI.15, same probe, `opt` vs `opt+logits` |
+| 2.4–3.8× from enabling existing optimizations | §VI.15, same probe, base vs opt columns |
+| SIGSEGV at mult. depth 10, 554 MB peak | §VI.15 |
 | 0.363 s vs 2.86 s, ~8× throughput | §VI.12 batch sweep + §VI.13 fusion |
 | 1.52 s vs 1345.1 s, 885× | §VI.11 forced-bootstrap (`--levels=6`) |
 | 2.6× ring cliff, 61.1 → 160.0 s | §VI.11, 13 → 15 levels |
@@ -194,6 +277,12 @@ Tier A and the `LICENSE` are **done**. What remains, in order:
 
 1. **Commit the branch.** Still the cheapest visible win — `malicious-security`
    has the whole October push uncommitted.
+1b. **Multi-output lowering.** The matched-disclosure figures use a summed
+   output as a stand-in, which is sound for round cost but is not a deployable
+   logit-returning classifier. `mpcc::lower` takes a single `output_wire`, and
+   the circuit compiler renames let-bindings to temporaries, so returning ten
+   logits needs a binding→wire map. Contained, and it would turn a probe into a
+   real deployment mode.
 2. **Report both HEIR bugs upstream.** Citing filed issues in the proposal is
    much stronger than "we observed"; it also demonstrates the ecosystem
    contribution the call's open-source topic asks about.

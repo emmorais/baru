@@ -3388,64 +3388,163 @@ machine is **multiplicative depth 9**, which is four hidden layers.
 
 #### The measurement
 
-Both arms evaluate the same network on the same weights with `x^2` activation,
-so they compute the same function — the §VI.7 gate-2 choice. HEIR is CKKS on one
-server; the MPC arm is 2-party dishonest-majority and exact. `eval` excludes
-keygen; MPC `online` excludes preprocessing. `dealer` is a **lower bound**, not a
-deployable protocol.
+> **Correction, same day.** The first version of this section quoted
+> `bench-2pc-nn`'s wide-area column against HEIR. That column is
+> `rounds x RTT + bytes / bandwidth + compute` — **a cost model, not an elapsed
+> time** — which is precisely the practice §VI.9 was written to end. The tool
+> says so in its own footer ("Wall clock is COMPUTED from those counts and the
+> profile"); the error was ours, in quoting it as a latency without reading it.
+> Every MPC number below is now wall clock from
+> `examples/probe_heir_match.rs`: two parties on two threads over a transport
+> that really sleeps, elapsed time of the slower party.
+>
+> The two paths do not agree — 2113 ms modelled against 2739 ms measured on WAN,
+> 14 ms against 5 ms on LAN — but that is **not** a clean indictment of the cost
+> model, because they also use different engines (`run_protocol` against
+> `DistEngine`) with different round counts (41 against 49). Reconciling them is
+> its own task. What is certain is that only one of the two is an elapsed time.
+>
+> The same re-run exposed a second problem. `bench-2pc-nn` drives
+> `run_protocol`, which does **not** enable truncation pairs (§VI.9) or bilinear
+> operand fusion (§VI.13). **The arm HEIR was compared against was missing two
+> of this repository's largest measured optimizations.** Both columns are given
+> below, so the gap closed by configuration alone is visible.
 
-| shape | mult. depth | **HEIR eval** | HEIR keygen | **MPC online, LAN** | **MPC online, WAN** | MPC rounds |
-|---|---:|---:|---:|---:|---:|---:|
-| `64x32x10` | 3 | **167.0 ms** | 91.7 ms | **14 ms** | **2113 ms** | 41 |
-| `784x32x10` | 3 | **178.0 ms** | 105.3 ms | **26 ms** | **2167 ms** | 41 |
-| `64x32x32x10` | 5 | 659.3 ms | 271.2 ms | 20 ms | 3044 ms | 59 |
-| `64x32x32x32x10` | 7 | 1051.3 ms | 347.6 ms | 27 ms | 3978 ms | 77 |
-| `64x32x32x32x32x10` | 9 | 1493.4 ms | 436.3 ms | 34 ms | 4909 ms | 95 |
-| `64x32(×5)x10` | 10 | **SIGSEGV** | — | 41 ms | 5842 ms | 113 |
+Both arms compute `x^2` — the only activation on which a same-function
+comparison with CKKS is possible (§VI.7 gate 2). HEIR `eval` and MPC online both
+exclude session setup (keygen; hoisted preprocessing). HEIR figures are from the
+table above.
 
-LAN is 0 ms / 10 Gbit/s, WAN is 50 ms one-way / 100 Mbit/s. Deployable totals
-including preprocessing, `lowgear`: `64x32x10` 264 ms LAN / 3264 ms WAN;
-`784x32x10` 388 ms LAN / 3791 ms WAN.
+**LAN — 0 ms one-way, 10 Gbit/s**
 
-#### What it says, and it is not what we expected
+| shape | depth | exch | exch opt | base | **opt** | **HEIR** | |
+|---|---:|---:|---:|---:|---:|---:|---|
+| `64x32x10` | 3 | 49 | 20 | 6 ms | **3 ms** | 167 ms | **64× ours** |
+| `784x32x10` | 3 | 49 | 20 | 20 ms | **17 ms** | 178 ms | **10.6× ours** |
+| `64x32x32x10` | 5 | 71 | 24 | 7 ms | **3 ms** | 659 ms | **200× ours** |
+| `64x32x32x32x10` | 7 | 93 | 28 | 8 ms | **4 ms** | 1051 ms | **268× ours** |
+| `64x32x32x32x32x10` | 9 | 115 | 32 | 11 ms | **5 ms** | 1493 ms | **300× ours** |
+| `64x32(×5)x10` | 10 | 137 | 36 | 13 ms | **6 ms** | **SIGSEGV** | **runs** |
 
-**The same program, the same function, the same machine, the same 128-bit
-security — and the cheapest backend is decided by the link.** On `64x32x10`:
+**WAN — 50 ms one-way, 100 Mbit/s**
 
-- **LAN: secret sharing wins by 11.9×** (14 ms against 167 ms).
-- **WAN: HEIR wins by 12.7×** (167 ms against 2113 ms).
+| shape | depth | exch | exch opt | base | **opt** | **HEIR** | |
+|---|---:|---:|---:|---:|---:|---:|---|
+| `64x32x10` | 3 | 49 | 20 | 2742 ms | **1117 ms** | 167 ms | 6.7× HEIR |
+| `784x32x10` | 3 | 49 | 20 | 2780 ms | **1168 ms** | 178 ms | 6.6× HEIR |
+| `64x32x32x10` | 5 | 71 | 24 | 3985 ms | **1340 ms** | 659 ms | 2.0× HEIR |
+| `64x32x32x32x10` | 7 | 93 | 28 | 5215 ms | **1548 ms** | 1051 ms | 1.5× HEIR |
+| `64x32x32x32x32x10` | 9 | 115 | 32 | 6447 ms | **1772 ms** | 1493 ms | **1.2× HEIR** |
+| `64x32(×5)x10` | 10 | 137 | 36 | 7695 ms | **1999 ms** | **SIGSEGV** | **runs** |
 
-That is a **151× swing from the network profile alone**, on an identical
-program. Nothing about the cryptography changed between those two rows.
+Single runs, not medians; repeated runs of the same row vary by about 1%.
 
-This is the first time this document has recorded **FHE beating the MPC arm**,
-and it should be read as the thesis working rather than against it. §VI.10–VI.12
-measured LeNet-5 at depth 11 and found secret sharing ahead by 32× on latency and
-885× once the level budget was exceeded. §VI.15 measures a shallow MLP at depth 3
-on a wide-area link and finds the opposite by more than an order of magnitude.
-Both are true; "which is faster, MPC or FHE" is not a well-posed question, and a
-compiler that cannot model the difference cannot make the choice.
+#### Matching the disclosure model, which is where the comparison was really lost
 
-Two slopes, both measured rather than fitted, say where the crossover goes:
+The tables above charge our arm for the **private argmax** — 45 pairwise
+comparisons and a logarithmic product tree, all under the protocol, revealing
+only the class index. HEIR returns the full logit vector and lets the client
+take the maximum in the clear. So the comparison was charging us for strictly
+more work *and* crediting us with strictly less disclosure, which §VI.10 noted
+and then did nothing about.
 
-- **Per added hidden layer, HEIR costs ~440 ms** (167 → 659 → 1051 → 1493).
-- **Per added hidden layer, the MPC arm costs ~930 ms on WAN but ~7 ms on LAN**
-  (2113 → 3044 → 3978 → 4909; 14 → 20 → 27 → 34).
+`two_party_nn::debug_src_logits` stops at the logits. A summed output is a
+faithful stand-in for returning the vector: addition does not communicate, and
+opening ten mutually independent values is the same single round as opening one.
+`logits_match_network_src` pins the two sources together so the probe cannot
+drift from the real network.
 
-So on WAN the MPC arm is *losing ground* with depth at these sizes — it does not
-overtake HEIR anywhere in the range HEIR can run — and then HEIR stops running
-at all, at depth 10, while the MPC curve continues as a straight line. The
-practical boundary is not a crossover in time but a **cliff in capability**.
+**The argmax was 60% of the wide-area cost** — exchanges fall from 20 to **8** at
+depth 3.
+
+| shape | depth | exch | **MPC matched** | **HEIR** | |
+|---|---:|---:|---:|---:|---|
+| `64x32x10` | 3 | 8 | 434 ms | 167 ms | 2.6× HEIR |
+| `784x32x10` | 3 | 8 | 479 ms | 178 ms | 2.7× HEIR |
+| `64x32x32x10` | 5 | 12 | 654 ms | 659 ms | **1.0× — even** |
+| `64x32x32x32x10` | 7 | 16 | 879 ms | 1051 ms | **1.2× ours** |
+| `64x32x32x32x32x10` | 9 | 20 | **1099 ms** | 1493 ms | **1.4× ours** |
+| `64x32(×5)x10` | 10 | 24 | **1322 ms** | **SIGSEGV** | **runs** |
+
+WAN, 50 ms one-way, 100 Mbit/s. On LAN the matched figures are 2–5 ms against
+HEIR's 167–1493 ms: **101× to 377× ours**.
+
+**So on a wide-area link the crossover is at depth 5, and our arm leads from
+there to the point where HEIR stops running.** The earlier 6.7×-to-HEIR figure
+at depth 3 was two-thirds disclosure policy and one-third protocol.
+
+Three readings, and they are different claims:
+
+1. **Matched disclosure** (both return logits): crossover at depth 5; ours ahead
+   at every greater depth; HEIR dead at 10.
+2. **Our default** (private argmax, a guarantee HEIR cannot offer at any price):
+   costs 2.5× on WAN, and is still ahead of HEIR from depth 9.
+3. **LAN, either way**: not close — 64× to 377× ours, widening with depth.
+
+The honest headline is the first, with the second stated beside it. Quoting the
+private-argmax number against HEIR understates us by 2.5×; quoting the matched
+number while implying we reveal only the class overstates us. Both appear above
+for that reason.
+
+#### Configuration alone was worth 2.4–3.6× on the link that matters
+
+Turning on optimizations the repository already had takes exchanges from 49 to
+20 at depth 3 and from 137 to 36 at depth 10 — **3.8× fewer round trips** — and
+wide-area elapsed from 7695 ms to 1999 ms. No new algorithm: the work was done
+in §VI.9 and §VI.13 and simply was not reaching this comparison. It is worth
+recording how the defect presented — not as a wrong number, but as a *correct*
+number for a configuration nobody would deploy.
+
+#### The crossover lands exactly where HEIR stops working
+
+Two slopes, both measured. Per added hidden layer in the `64x32...x10` family:
+
+- **HEIR: ~442 ms** (167 → 659 → 1051 → 1493).
+- **MPC on WAN, optimized: ~220 ms** (1117 → 1340 → 1548 → 1772 → 1999); at
+  matched disclosure **~222 ms** (434 → 654 → 879 → 1099 → 1322), i.e. the
+  argmax costs a constant, not a slope.
+- **MPC on LAN, optimized: under 1 ms** (3 → 3 → 4 → 5 → 6).
+
+HEIR's slope is **twice** ours, so the wide-area ratio collapses monotonically —
+6.7×, 2.0×, 1.5×, **1.2×** — and the lines cross at roughly depth 12. **HEIR
+segfaults at depth 10**, where our arm still returns in 1999 ms on WAN and 6 ms
+on LAN. So on this family the crossover is never reached before
+the capability cliff: there is no depth at which an FHE-only pipeline is both
+faster *and* able to run.
+
+On LAN there is no crossover to look for. The MPC arm is ahead by 10–312× and
+the margin *grows* with depth, because its cost is linear in depth and the
+homomorphic arm's is not.
+
+#### What it says
+
+**Same program, same function, same machine, same 128-bit security — and the
+answer is decided by the link.** On `64x32x10`: **LAN, secret sharing wins by
+64×; WAN, HEIR wins by 6.7×.** The MPC arm's own elapsed time moves **372×**
+between the two links (3 ms → 1117 ms) while the homomorphic arm's does not move
+at all, and that single fact is what flips the verdict — nothing about the
+cryptography changed.
+
+This is the first time this document has recorded FHE beating the MPC arm, and
+it should be read as the thesis working rather than against it. §VI.10–VI.12
+measured LeNet-5 at depth 11 with secret sharing ahead by 32× on latency and
+885× past the level budget; §VI.15 measures shallow MLPs on a wide-area link and
+finds the opposite at depth 3. Both are true. "Which is faster, MPC or FHE" is
+not a well-posed question, and a compiler that cannot model the difference
+cannot make the choice.
 
 #### Four things this does not say
 
 1. **It is not LeNet-5.** These are dense MLPs with `x^2`; §VI.10's network has
    convolutions and far more work per layer. The two sets are not comparable to
    each other, only each arm to its matched partner.
-2. **`dealer` is a lower bound.** Against the deployable `lowgear` total,
-   `64x32x10` on LAN is 264 ms against HEIR's 167 ms + 92 ms keygen — close to a
-   tie rather than an MPC win. The honest LAN claim is the *online* comparison;
-   the total comparison is roughly even.
+2. **It is an online-phase comparison on both sides.** `hoist_bits` takes the
+   MPC arm's shared random bits from preprocessing, and HEIR's `eval` excludes
+   its 92–436 ms of key generation. That is the matched accounting — a warm
+   server on each side — but neither figure is what a cold deployment pays, and
+   the MPC arm's preprocessing is the larger of the two
+   (`bench-2pc-nn` puts `lowgear` at 8.5–12.8 MiB for these shapes). A
+   cold-start comparison is a separate measurement and has not been made.
 3. **The interaction asymmetry is unchanged** and is not measured away: HEIR's
    client can go offline, the 2-party protocol needs it present throughout.
 4. **The MPC arm computes the argmax inside the protocol** and reveals only the
@@ -3454,12 +3553,92 @@ practical boundary is not a crossover in time but a **cliff in capability**.
 
 #### What this sets up
 
-The depth-10 segfault is the measurement that matters next: it is the point
-where an FHE-only pipeline needs bootstrapping, and HEIR's paper states BGV/BFV
-bootstrapping is unsupported because no backend supports it. Establishing
-whether CKKS bootstrapping is reachable through HEIR at all — and if not, that
-the ceiling is architectural rather than incidental — is the experiment that
-turns this section's cliff into a result.
+Two things, in order.
+
+**The depth-10 segfault.** It is the point where an FHE-only pipeline needs
+bootstrapping, and HEIR's paper states BGV/BFV bootstrapping is unsupported
+because no backend supports it. Establishing whether CKKS bootstrapping is
+reachable through HEIR at all — and if not, that the ceiling is architectural
+rather than incidental — is what turns this section's cliff into a result.
+
+**Making `bench-2pc-nn` stop producing quotable-looking predictions.** It cost
+us a wrong table in this document within an hour of writing it. Either its
+wide-area column should be driven by `dist.rs` like
+`examples/probe_heir_match.rs` is, or it should be labelled in its own output as
+modelled. The second is a ten-minute change and has been made; the first is the
+right one.
+
+---
+
+### VI.16 Baru's own CKKS arm reaches HEIR parity — and the evaluator choice was worth 8× (2026-10-21)
+
+*Commands:* `cargo run --release --example export_mlp -- m.txt 64x32x10`, then
+`./ckks_cnn m.txt [--lt]` (built per `tools/README.md`). Same OpenFHE 1.5.1
+build HEIR uses, same machine, same `HEStd_128_classic`.
+
+§VI.15 found HEIR ahead of the two-party arm at shallow depth on a wide-area
+link and left it there. That is the wrong place to stop: if a homomorphic
+pipeline is the cheaper way to evaluate a region, **Baru should be able to emit
+one**, and the comparison should be against our own FHE path rather than only
+our MPC path. We already had a CKKS arm on the same library (§VI.10) with
+Orion's linear-transform evaluator bolted on (§VI.14); it had simply never been
+pointed at a dense MLP, only at LeNet-5. `two_party_nn::export_mlp_fixture`
+points it there, from the **same** `fixture_with` the MPC arm and HEIR consume,
+so all three arms now evaluate one network definition.
+
+| shape | depth | direct | **`--lt`** | **HEIR** | vs HEIR | rots direct / `--lt` | `--lt` verdict |
+|---|---:|---:|---:|---:|---|---:|---|
+| `64x32x10` | 3 | 1001 ms | **181 ms** | 167 ms | 1.08× HEIR | 337 / **26** | margin_below_error |
+| `784x32x10` | 3 | 1383 ms | **751 ms** | 178 ms | **4.2× HEIR** | 465 / **68** | margin_below_error |
+| `64x32x32x10` | 5 | 2173 ms | **384 ms** | 659 ms | **1.7× ours** | 577 / **40** | agrees |
+| `64x32x32x32x10` | 7 | 6601 ms | **1153 ms** | 1051 ms | 1.10× HEIR | 817 / **54** | agrees |
+| `64x32x32x32x32x10` | 9 | 9450 ms | **1687 ms** | 1493 ms | 1.13× HEIR | 1057 / **68** | agrees |
+| `64x32(×5)x10` | 11 | 13095 ms | **2281 ms** | **SIGSEGV** | **ours runs** | 1297 / **82** | agrees |
+
+#### Tier A parity is achieved for MLPs
+
+Within **13%** of HEIR at four of the five shapes HEIR can run, and **1.7×
+faster** at depth 5. This matters out of proportion to its size: the whole
+§VI.15 comparison is only attributable if our FHE arm is not the weak link.
+It is not. When §VI.15 says the cheapest backend depends on the link, that is
+now a statement about paradigms rather than about our implementation quality.
+
+#### The evaluator choice was worth 5.4–8.1×, and it is not the default
+
+The direct evaluator rotates once per output position; the Orion-style
+baby-step/giant-step evaluator restructures each dense layer as one linear
+transform. The trade is visible in the counts: `--lt` spends **more**
+ciphertext multiplications (43 → 106 at depth 3) to spend **far fewer**
+rotations (337 → 26), and a rotation is a key switch. Direct rotations grow
+linearly with depth (337 → 1297) while BSGS stays flat (26 → 82).
+
+**`--lt` is opt-in.** Every §VI.10–VI.12 figure was measured without it, which
+is why it is not being flipped to default here — that would silently move a
+dozen recorded numbers. But the finding is exactly thesis (S) one level down:
+*which evaluator is cheapest is a property of the layer shape*, and a
+backend-aware cost model should be choosing it rather than a command-line flag.
+Dense layers want BSGS; whether LeNet-5's convolutions do is a separate
+measurement and §VI.14 is where it belongs.
+
+#### Where we still lose, and it is specific
+
+`784x32x10` is **4.2× behind HEIR** while every other shape is within 13%. It
+is the only shape with a wide input, and it needs 68 rotations where the
+same-depth `64x32x10` needs 26. HEIR's layout/shift-network passes are doing
+something ours is not for a 784-wide first layer. That is the one concrete
+thing in this section to learn from HEIR, and it is a narrow enough target to
+be actionable rather than a vague "improve packing".
+
+#### Exactness, again, from the other side
+
+Two of six rows are refused: at depth 3 the fixture's class margin (0.039–0.063)
+sits below the CKKS logit error (0.085–0.203), so the arm cannot be quoted even
+though it is fast. **The two-party arm returns the reference class on all six.**
+This is §VI.11's precision result reproduced on a second network family and with
+a second homomorphic implementation — and note that it is *our own* FHE arm
+failing here, not a competitor's, so it cannot be read as us flattering our own
+code. The caveat from §VI.11 stands: the margins are tight because the fixture
+is untrained, and a quantitative accuracy claim needs a trained one.
 
 ---
 

@@ -30,7 +30,7 @@
 \titleformat{\subsection}{\normalfont\normalsize\bfseries}{\thesubsection}{0.6em}{}
 \setlist{nosep,leftmargin=1.3em}
 \setlength{\parskip}{0.15ex}
-\linespread{0.97}\selectfont
+\linespread{0.95}\selectfont
 \pagestyle{plain}
 
 \newcommand{\baru}{\textsc{Baru}}
@@ -72,22 +72,21 @@ draws precisely. Three consequences of a static, FHE-only lowering pipeline:
 
 \begin{itemize}
 \item \textbf{Secret-dependent control flow is eliminated, not executed.}
-\texttt{convert-if-to-select} rewrites a secret-dependent branch into
-\texttt{arith.select} --- so both arms are evaluated. Loops with
-secret-dependent bounds are unsupported; \texttt{convert-secret-for-to-static-for}
-requires a user-supplied static upper bound.
-\item \textbf{Every nonlinearity must be approximated}, and the approximation is
-not inferred: \heir{} lists polynomial approximation requiring user annotation
-for degree and interval among its stated limitations.
-\item \textbf{There is no interactive protocol anywhere in the stack.} No
-dialect models secret sharing, garbled circuits, message rounds, or a party.
+\texttt{convert-if-to-select} rewrites a secret branch into
+\texttt{arith.select}, so both arms are evaluated; secret-dependent loop bounds
+are unsupported, with \texttt{convert-secret-for-to-static-for} requiring a
+user-supplied static bound.
+\item \textbf{Every nonlinearity must be approximated}, and not inferred:
+\heir{} lists polynomial approximation requiring user annotation for degree and
+interval among its stated limitations.
+\item \textbf{No interactive protocol appears anywhere in the stack.} No
+dialect models secret sharing, garbled circuits, rounds, or a party.
 \end{itemize}
 
-None of these is a defect. They are the correct design consequences of targeting
-FHE, where a ciphertext genuinely cannot branch and a comparison genuinely is
-not an arithmetic circuit. But together they fix a boundary, and the boundary
-has a cost that nobody has measured, because measuring it requires a system on
-both sides of it.
+None of these is a defect: they are the correct consequences of targeting FHE,
+where a ciphertext cannot branch and a comparison is not an arithmetic circuit.
+But together they fix a boundary whose cost nobody has measured, because
+measuring it requires a system on both sides of it.
 
 \begin{quote}
 \textbf{Thesis.} For an important class of programs --- machine-learning
@@ -135,52 +134,67 @@ re-randomises the FHE ciphertext, so an arbitrarily deep network runs with
 \textbf{zero FHE bootstraps} on an engine supporting one multiplication.
 
 \noindent\textbf{Enabled, and proposed here (Thrust~3).} Continuations are not
-yet serialized nor used to suspend at a round boundary --- the transport backend
-blocks synchronously. Making the continuation a value turns ``the rest of the
+yet serialized nor used to suspend at a round boundary --- the transport blocks
+synchronously. Making the continuation a value turns ``the rest of the
 protocol'' into data, permitting \emph{dynamic} round scheduling: $k$
 independent subcomputations interleaved on one party, each resumed as its
-message arrives. The static scheduler already shows the prize --- exchange count
-stayed at 32 for every batch size from 1 to 8 --- but only for statically known
-dependency graphs. We propose to generalise it and measure against the scheduler
-it subsumes.
+message arrives. The static scheduler shows the prize --- exchange count stayed
+at 32 for every batch size from 1 to 8 --- but only for statically known
+dependency graphs.
 
 % -------------------------------------------------------------------------
-\section{What the boundary costs: five measured results}
+\section{What the boundary costs: six measured results}
 
 Full tables in Appendix~A. All figures are measured elapsed times on one machine
 with both arms checked against the same plaintext reference.
 
 \medskip
 \noindent\textbf{1. The crossover is measured, and it runs both ways.} In
-October 2026 we completed the \heir{} baseline described in §4, and it produced
-the result this proposal is really about. Both arms evaluate the same MLP on the
+October 2026 we completed the \heir{} baseline described in §4 --- including the
+Tier~A control, which confirms our own FHE arm is within 13\% of
+\heir{}-generated OpenFHE, so what follows is about paradigms and not about our
+implementation quality. Both arms evaluate the same MLP on the
 same weights with $x^2$ activation --- the same function --- at
 \texttt{HEStd\_128\_classic}, on one machine, each verified against the same
 plaintext reference.
 
 \begin{center}\small
-\begin{tabular}{@{}lrrr@{}}
+\begin{tabular}{@{}lrrrl@{}}
 \toprule
-\texttt{64x32x10}, depth 3 & \textbf{\heir{} (CKKS)} & \textbf{2PC, LAN} & \textbf{2PC, WAN} \\
+Matched disclosure (both return logits) & \textbf{\heir{}} & \textbf{2PC LAN} & \textbf{2PC WAN} & \\
 \midrule
-one inference & 167.0\,ms & \textbf{14\,ms} & 2113\,ms \\
+\texttt{64x32x10}, depth 3 & 167\,ms & \textbf{2\,ms} & 434\,ms & $2.6\times$ \heir{} \\
+\texttt{64x32x32x10}, depth 5 & 659\,ms & \textbf{2\,ms} & 654\,ms & even \\
+\texttt{64x32x32x32x32x10}, depth 9 & 1493\,ms & \textbf{4\,ms} & \textbf{1099\,ms} & $1.4\times$ ours \\
+\texttt{64x32($\times$5)x10}, depth 10 & \textbf{SIGSEGV} & \textbf{5\,ms} & \textbf{1322\,ms} & ours runs \\
 \bottomrule
 \end{tabular}
 \end{center}
 
-\noindent\textbf{On LAN secret sharing wins by $11.9\times$; on WAN \heir{}
-wins by $12.7\times$} --- a $\mathbf{151\times}$ \textbf{swing from the network
-profile alone}, on an identical program with nothing about the cryptography
-changed. Appendix~A.1 has the full depth sweep. This is the first time our record
-has shown FHE beating the MPC arm, and it is the thesis working rather than
-against it: §VI.10--VI.12 measured LeNet-5 at depth 11 with secret sharing ahead
-by $32\times$ on latency and $885\times$ past the level budget. Both are true.
-\emph{``Is MPC or FHE faster''} is not well-posed, and a compiler that cannot
-model the difference cannot make the choice.
+\noindent\textbf{On LAN secret sharing wins at every depth, by $101\times$ to
+$377\times$, and the margin widens. On WAN \heir{} leads at depth 3 by
+$2.6\times$, the two are even at depth 5, and ours leads from there until \heir{}
+stops running.} Our arm's own elapsed time moves $\mathbf{217\times}$ between
+the two links (2\,ms to 434\,ms) while the homomorphic arm's does not move at
+all --- that single fact decides the verdict, with nothing about the
+cryptography changed. \emph{``Is MPC or FHE faster''} is not well-posed, and a
+compiler that cannot model the difference cannot make the choice.
 
 \medskip
-\noindent\textbf{2. The boundary is a capability cliff, not a crossover in
-time.} At multiplicative depth 10 the \heir{} pipeline dies with \textbf{SIGSEGV
+\noindent\textbf{2. Two thirds of the gap was disclosure policy, not protocol.}
+Our arm computes the \textbf{argmax inside the protocol} and reveals only the
+class index; \heir{} returns the whole logit vector and lets the client take the
+maximum in the clear. The comparison had been charging us for strictly more work
+\emph{and} crediting us with strictly less disclosure. Removing the private
+argmax --- matching \heir{}'s disclosure --- takes wide-area exchanges from 20 to
+\textbf{8} at depth 3: \textbf{the private argmax was 60\% of wide-area cost.}
+It is also a guarantee \heir{} cannot offer at any price, since CKKS cannot
+compare. So the defensible statement is two-sided, and we give both: at matched
+disclosure the crossover is at depth 5; with the stronger guarantee it costs
+$2.5\times$ and still leads \heir{} from depth 9.
+
+\medskip
+\noindent\textbf{3. The boundary is a capability cliff.} At multiplicative depth 10 the \heir{} pipeline dies with \textbf{SIGSEGV
 during key generation} --- at 554\,MB peak resident against the 564\,MB of the
 depth-9 run that succeeds, so \emph{not} an out-of-memory kill, and with no
 ``cannot find secure parameters'' message either. Depth 9 completes; depth 10
@@ -190,7 +204,7 @@ does not run at all, while the secret-sharing curve continues as a straight line
 are being reported upstream.
 
 \medskip
-\noindent\textbf{3. Approximation returns the wrong answer, at depths that occur.}
+\noindent\textbf{4. Approximation returns the wrong answer, at depths that occur.}
 This is the result that makes the thesis more than a performance argument. On a
 depth sweep of LeNet-5, \textbf{the CKKS arm returned the wrong class at 13
 levels} --- the reference top-two margin was 2 quanta and the worst logit error
@@ -203,38 +217,23 @@ systematically add. Since polynomial approximation of the nonlinearity is the
 consequence of the architectural boundary, not a tuning issue.
 
 \medskip
-\noindent\textbf{4. The performance margin is a choice of regime --- so a
-compiler must model the regime.}
-
-\begin{center}\small
-\begin{tabular}{@{}lrrl@{}}
-\toprule
-\textbf{Regime (LeNet-5, same network, same machine)} & \textbf{2-party SS} & \textbf{CKKS} & \textbf{Margin} \\
-\midrule
-Latency, one inference (50\,ms RTT, 100\,Mbps) & 1.41\,s & 43.8\,s & $32\times$ \\
-Throughput, batch 8 (after operand fusion) & 0.363\,s & 2.86\,s & ${\sim}8\times$ \\
-Level budget exceeded (forced to bootstrap) & 1.52\,s & 1345.1\,s & $885\times$ \\
-\bottomrule
-\end{tabular}
-\end{center}
-
-\noindent There is also a discontinuity \emph{below} the bootstrap cliff: 13 to
-15 levels forces ring $2^{15}\!\to\!2^{16}$ and cost $61.1 \to 160.0$\,s ---
-$2.6\times$ for two levels, while multiplication count moves 1.9\%. Security
-parameters, not work. Over the same sweep the secret-sharing curve is a straight
-line. A line against a staircase: that shape is the compiler's decision surface.
+\noindent\textbf{5. The same regime-dependence holds for CNNs.} On LeNet-5 the
+margin is $32\times$ to secret sharing on latency, ${\sim}8\times$ on throughput
+at batch 8, and $885\times$ past the level budget (Appendix~A.2--A.3). A
+discontinuity sits even \emph{below} the bootstrap cliff: 13 to 15 levels forces
+ring $2^{15}\!\to\!2^{16}$ and cost $61.1 \to 160.0$\,s, $2.6\times$ for two
+levels while multiplication count moves 1.9\% --- security parameters, not work.
+A line against a staircase: that is the compiler's decision surface.
 
 \medskip
-\noindent\textbf{5. The language surface determines round complexity.} Writing
-the same CNN in \baru{} the way one writes a CNN in a scalar language --- a loop
-over sliding windows, comparison per activation --- costs \textbf{507\,920
-messages}. Exposing already-existing batched primitives (\texttt{lt\_batch},
-\texttt{mul\_batch}, \texttt{a2b\_batch}) to the \emph{language}, then fusing
-ReLU with rescale, takes the identical computation to \textbf{33\,106 messages}
-and the private diagnosis from 794\,508\,ms to \textbf{911\,ms} --- $872\times$,
-with every integer path bit-identical throughout. The frontend, not the
-protocol, was the cost. This is the clearest evidence we have that the
-language/IR design is the object of study here.
+\noindent\textbf{6. The language surface determines round complexity.} The same
+CNN written in \baru{} as one writes a CNN in a scalar language --- a loop over
+sliding windows, a comparison per activation --- costs \textbf{507\,920
+messages}. Exposing already-existing batched primitives to the \emph{language}
+and fusing ReLU with rescale takes the identical computation to \textbf{33\,106
+messages} and a private diagnosis from 794\,508\,ms to \textbf{911\,ms} ---
+$872\times$, every integer path bit-identical. The frontend, not the protocol,
+was the cost.
 
 \medskip
 \noindent\textbf{What this does not establish.} The CNN margins (result 4) come
@@ -252,15 +251,48 @@ from implementation quality on either side. We propose three tiers, and we
 regard Tier~A as a precondition for reporting B or C at all.
 
 \medskip
-\noindent\textbf{Tier A --- Parity, as a control condition. \emph{Done for
-MLPs; outstanding for CNNs.}} The control is that \baru{} must be within a small
-constant factor of \heir{}-generated OpenFHE code at matched security:
-\textbf{if our FHE arm is slow, then ``switching to MPC helps'' is an artifact of
-a weak baseline rather than a property of the architecture}, and no Tier~B or C
-number is attributable. For dense MLPs this is now measured, and §3 reports what
-it found --- including \heir{} beating us outright on wide-area MLPs, which is
-the control doing its job. Extending it to the convolutional networks of
-§VI.10 requires the multi-channel packing of Thrust~1.
+\noindent\textbf{Tier A --- Parity. \emph{Achieved for MLPs.}} The control is
+that \baru{} must be within a small constant factor of \heir{}-generated OpenFHE
+at matched security: \textbf{if our FHE arm is the weak link, then ``switching to
+MPC helps'' is an artifact of a weak baseline rather than a property of the
+architecture}, and nothing in §3 is attributable. We built it and it holds.
+
+\begin{center}\small
+\begin{tabular}{@{}lrrrl@{}}
+\toprule
+\textbf{Network} & \textbf{Depth} & \textbf{\baru{} CKKS} & \textbf{\heir{}} & \\
+\midrule
+\texttt{64x32x10}            & 3  & 181\,ms & 167\,ms & $1.08\times$ \heir{} \\
+\texttt{784x32x10}           & 3  & 751\,ms & 178\,ms & $4.2\times$ \heir{} \\
+\texttt{64x32x32x10}         & 5  & \textbf{384\,ms} & 659\,ms & $\mathbf{1.7\times}$ \textbf{ours} \\
+\texttt{64x32x32x32x32x10}   & 9  & 1687\,ms & 1493\,ms & $1.13\times$ \heir{} \\
+\texttt{64x32($\times$5)x10} & 11 & \textbf{2281\,ms} & \textbf{SIGSEGV} & \textbf{ours runs} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\noindent Same OpenFHE build \heir{} targets, same machine, same
+\texttt{HEStd\_128\_classic}, and all three arms now evaluate \emph{one} fixture.
+Within \textbf{13\%} at four of the five shapes \heir{} can run, faster at depth
+5, and running at depth 11 where \heir{} segfaults. \texttt{784x32x10} is the one
+real deficit at $4.2\times$ --- the only wide-input shape, needing 68 rotations
+where same-depth \texttt{64x32x10} needs 26, so \heir{}'s shift-network passes
+are doing something ours is not. That is a narrow, actionable target rather than
+a vague call to improve packing, and it is Thrust~1.
+
+\medskip
+\noindent\textbf{Tier A also produced the sharpest evidence for the thesis so
+far}, one level below where we expected it. Our CKKS arm has two dense-layer
+evaluators: a direct one that rotates per output position, and an Orion-style
+baby-step/giant-step transform. BSGS spends \emph{more} ciphertext
+multiplications (43 to 106) to spend \emph{far fewer} rotations (337 to 26), and
+it is worth $\mathbf{5.4\text{--}8.1\times}$. \textbf{It is also opt-in, behind a
+flag.} So the same program, the same backend, the same security --- and an $8\times$
+swing decided by a choice no cost model was making. \emph{Which evaluator is
+cheapest is a property of the layer shape}, exactly as which \emph{backend} is
+cheapest is a property of the program. The claim recurs at every level of the
+stack we have looked at, which is the strongest argument we have that it is
+structural rather than a coincidence of one comparison.
 
 \medskip
 \noindent\textbf{Tier B --- Expressiveness.} Programs \heir{} cannot express,
@@ -268,11 +300,10 @@ each with its mechanism cited rather than asserted: exact ReLU and max-pool (no
 comparison in any target scheme); secret-dependent loop bounds
 (\texttt{convert-secret-for-to-static-for} requires static bounds); any
 mid-program FHE$\leftrightarrow$MPC transition (no interactive dialect). We
-report \baru{}'s measured cost and record \heir{} as \emph{not expressible},
-naming the pass. A reviewer will object that this compares against a tool not
-claiming the capability --- that is the point, stated that way: we quantify what
-the exclusion costs on the canonical workload, which needs a system spanning
-both sides.
+report \baru{}'s cost and record \heir{} as \emph{not expressible}, naming the
+pass. This compares against a tool not claiming the capability --- that is the
+point: we quantify what the exclusion costs on the canonical workload, which
+needs a system spanning both sides.
 
 \medskip
 \noindent\textbf{Tier C --- Crossover.} Programs whose optimal assignment is
@@ -298,10 +329,10 @@ classification.
 % -------------------------------------------------------------------------
 \section{Thrusts, and what the award buys}
 
-\noindent\textbf{T1 --- Multi-channel packing for the FHE arm.} Reach
-Orion-class slot utilisation so Tier~A extends to CNNs and all margins are over
-the state of the art. Adversarial to our own prior numbers; we will report the
-shrunken figures.
+\noindent\textbf{T1 --- Close the two packing deficits Tier~A localised}: the
+wide-input layout that costs us $4.2\times$ on \texttt{784x32x10}, and
+multi-channel slot packing so Tier~A extends from MLPs to CNNs. Adversarial to
+our own prior numbers; we will report the shrunken figures.
 
 \noindent\textbf{T2 --- Extending the \heir{} comparison (where the AWS
 credits go).} The baseline now runs, and building it corrected our own estimate
@@ -324,10 +355,10 @@ subcomputation's message arrives; measure against the static scheduler it
 generalises, on programs whose dependency graph is not statically known.
 Secondary objective: close the interpreter overhead reported in §3.
 
-\noindent\textbf{T4 --- The per-region backend selector}, validated by
-exhaustive comparison against measured runs of every assignment on small
-programs. The research question is not whether a cost model can be written but
-\emph{how coarse a model suffices}, with ``suffices'' defined by measurement.
+\noindent\textbf{T4 --- The per-region backend selector}, validated against
+measured runs of every assignment on small programs. The question is not whether
+a cost model can be written but \emph{how coarse a model suffices}, with
+``suffices'' defined by measurement.
 
 \noindent\textbf{Deliverables.} The open-source tool; a reproducible
 matched-threat-model benchmark suite spanning MPC and FHE, which the field
@@ -337,10 +368,9 @@ selection; applied-crypto on switch-as-bootstrap); \TODO{N} student theses.
 % -------------------------------------------------------------------------
 \section{Required questions}
 
-\noindent\textbf{Theoretical or applied; domain.} Applied, with a
-compiler-architecture contribution and a measurement-methodology contribution.
-Domain: compilers and tooling for privacy-preserving computation, evaluated on
-private ML inference.
+\noindent\textbf{Theoretical or applied; domain.} Applied, contributing a
+compiler architecture and a measurement methodology. Domain: compilers and
+tooling for privacy-preserving computation, evaluated on private ML inference.
 
 \noindent\textbf{Applications, including for Amazon.} Multi-organization
 collaboration on data that cannot be pooled --- an AWS Clean Rooms-shaped
@@ -354,14 +384,13 @@ demand for private analytics in Latin America is served from
 
 \noindent\textbf{Assumptions and factors that could undermine the results.}
 \begin{itemize}
-\item \emph{Our own FHE arm is not state of the art} ($15\times$ off Orion,
-3.5\% slot utilisation), so every CNN margin in §VI.10 is a margin over our
-implementation. The MLP results in §3 do not have this problem --- that arm is
-\heir{}-generated OpenFHE, not ours --- which is exactly why Tier~A matters. T1
-extends the same footing to CNNs and will reduce our headline margins.
+\item \emph{Our FHE arm is at \heir{} parity on MLPs but not on CNNs}
+($15\times$ off Orion there, 3.5\% slot utilisation), so §VI.10's CNN margins
+are over our own implementation while §3's MLP results are not. T1 extends the
+Tier~A footing to CNNs and will reduce our headline margins.
 \item \emph{Single-machine provenance.} Wide-area latency is injected by a
 sleeping transport, not a real link --- and §3 shows the profile is worth
-$151\times$. T2 replaces it; it is the largest uncontrolled variable we have.
+$217\times$. T2 replaces it: the largest uncontrolled variable we have.
 \item \emph{The depth/precision sweep uses an untrained fixture}, whose tight
 class margins are a fixture property. The \emph{mechanism} is supported; a
 quantitative accuracy claim for trained networks needs a trained fixture.
@@ -378,15 +407,14 @@ release, report its commit, and treat Tier~A as a control, not a scoreboard.
 \noindent\textbf{Tool: license, materials, maintenance.} License:
 \textbf{Apache-2.0} (\texttt{LICENSE}, and declared in \texttt{Cargo.toml}).
 Materials: a language reference, a complete experimental record including
-negative and withdrawn results (\texttt{docs/experiments.md}), a cross-paradigm
-survey with methodology, and a performance handoff written to be read cold.
-Maintenance: 129 commits in three months; three contributors, one from USP; 831
-tests green; CI on every push.
+negative and withdrawn results, a cross-paradigm survey with methodology, and a
+performance handoff written to be read cold. Maintenance: 129 commits in three
+months; three contributors, one from USP; 832 tests green; CI on every push.
 \emph{Discipline:} every engine \emph{attests} what it implements, and asking
-for more is an error, not a silent downgrade. We have exercised it: all ZKP
-results predating 2026-07-31 were withdrawn when the shipped verifier proved not
-to check constraint satisfaction, and an FHE scheme was deleted rather than
-caveated when our own analysis found it insecure at the needed parameters.
+for more is an error. We have exercised it: every ZKP result predating
+2026-07-31 was withdrawn when the shipped verifier proved not to check
+constraint satisfaction, and an FHE scheme was deleted rather than caveated when
+our own analysis found it insecure.
 
 % -------------------------------------------------------------------------
 \section{Community, students, and budget}
@@ -395,30 +423,27 @@ Based at LARC (PCS, Escola Politécnica da USP), which teaches an undergraduate
 cryptography course (\emph{Fundamentos de Criptografia}) and supervises graduate
 work in applied cryptography; the award supports \TODO{N} MSc/PhD students and
 \TODO{N} undergraduate scholars. A compiler project absorbs students unusually
-well --- backends, cost models, gadget libraries and benchmark suites
-parallelize into defensible individual theses with measurable results --- and
-the matched-threat-model benchmark suite is itself a community contribution
-whose absence caused a comparison we had to withdraw. Applied-cryptography
-funding concentrates in North America, Europe and Israel; USP is Latin America's
-leading research university, and this supports a group training Brazilian
-students in a subfield where the region is under-represented.
+well --- backends, evaluators, cost models and benchmark suites parallelize into
+defensible individual theses with measurable results --- and the
+matched-threat-model benchmark suite is itself a community contribution whose
+absence caused a comparison we had to withdraw. Applied-cryptography funding
+concentrates in North America, Europe and Israel; USP is Latin America's leading
+research university, and this trains Brazilian students in a subfield where the
+region is under-represented.
 
 \medskip
-\noindent\textbf{Budget} (unrestricted, excluding overhead; \TODO{confirm
-amounts against USP/FUSP scholarship rates}). Graduate student support
-(\TODO{N}, 12 mo.) \TODO{amt}; undergraduate \emph{iniciação científica}
-scholarships (\TODO{N}, 12 mo.) \TODO{amt}; conference travel, open-access
-charges and local compute \TODO{amt}. \textbf{Total unrestricted
-\TODO{$\leq$ 80{,}000} USD.} \textbf{AWS promotional credits}
-(\TODO{$\leq$ 40{,}000}) are requested for Thrust~2 specifically, per §5.
+\noindent\textbf{Budget} (unrestricted, excl.\ overhead; \TODO{confirm against
+USP/FUSP rates}): graduate support (\TODO{N}, 12 mo.) \TODO{amt}; undergraduate
+\emph{iniciação científica} (\TODO{N}, 12 mo.) \TODO{amt}; travel, open-access
+and local compute \TODO{amt}. \textbf{Total \TODO{$\leq$ 80{,}000} USD}, plus
+\textbf{AWS credits} \TODO{$\leq$ 40{,}000} for Thrust~2 per §5.
 
 % -------------------------------------------------------------------------
 \vspace{0.6ex}\hrule\vspace{0.6ex}
-{\footnotesize\noindent\textbf{References.}
-[1]~\heir{} Contributors. \emph{HEIR: A Compiler Infrastructure for Homomorphic
-Encryption}. arXiv:2508.11095, 2025.\quad
-[2]~A.~Ebel, G.~Garimella, B.~Reagen. \emph{Orion: A Fully Homomorphic
-Encryption Framework for Deep Learning}. ASPLOS, 2025.\par}
+{\scriptsize\noindent\textbf{References.} [1]~\heir{} Contributors,
+\emph{HEIR: A Compiler Infrastructure for Homomorphic Encryption},
+arXiv:2508.11095, 2025. \quad [2]~A.~Ebel, G.~Garimella, B.~Reagen,
+\emph{Orion: A FHE Framework for Deep Learning}, ASPLOS 2025.\par}
 
 \clearpage
 % =========================================================================
@@ -444,22 +469,27 @@ below. LAN is 0\,ms / 10\,Gbit/s, WAN 50\,ms one-way / 100\,Mbit/s.
 \begin{center}\small
 \begin{tabular}{@{}lrrrrrr@{}}
 \toprule
-\textbf{Network} & \textbf{Depth} & \textbf{\heir{} eval} & \textbf{keygen} & \textbf{MPC LAN} & \textbf{MPC WAN} & \textbf{Rounds} \\
+\textbf{Network} & \textbf{Depth} & \textbf{\heir{}} & \textbf{2PC LAN} & \textbf{2PC WAN} & \textbf{exch} & \textbf{WAN, argmax} \\
 \midrule
-\texttt{64x32x10}            & 3  & 167.0\,ms & 91.7\,ms  & 14\,ms & 2113\,ms & 41 \\
-\texttt{784x32x10}           & 3  & 178.0\,ms & 105.3\,ms & 26\,ms & 2167\,ms & 41 \\
-\texttt{64x32x32x10}         & 5  & 659.3\,ms & 271.2\,ms & 20\,ms & 3044\,ms & 59 \\
-\texttt{64x32x32x32x10}      & 7  & 1051.3\,ms & 347.6\,ms & 27\,ms & 3978\,ms & 77 \\
-\texttt{64x32x32x32x32x10}   & 9  & 1493.4\,ms & 436.3\,ms & 34\,ms & 4909\,ms & 95 \\
-\texttt{64x32($\times$5)x10} & 10 & \textbf{SIGSEGV} & --- & 41\,ms & 5842\,ms & 113 \\
+\texttt{64x32x10}            & 3  & 167\,ms & 2\,ms & 434\,ms & 8  & 1117\,ms \\
+\texttt{784x32x10}           & 3  & 178\,ms & 16\,ms & 479\,ms & 8  & 1168\,ms \\
+\texttt{64x32x32x10}         & 5  & 659\,ms & 2\,ms & 654\,ms & 12 & 1340\,ms \\
+\texttt{64x32x32x32x10}      & 7  & 1051\,ms & 3\,ms & 879\,ms & 16 & 1548\,ms \\
+\texttt{64x32x32x32x32x10}   & 9  & 1493\,ms & 4\,ms & 1099\,ms & 20 & 1772\,ms \\
+\texttt{64x32($\times$5)x10} & 10 & \textbf{SIGSEGV} & 5\,ms & 1322\,ms & 24 & 1999\,ms \\
 \bottomrule
 \end{tabular}
 \end{center}
 
-\noindent Deployable \texttt{lowgear} totals including preprocessing:
-\texttt{64x32x10} 264\,ms LAN / 3264\,ms WAN; \texttt{784x32x10} 388\,ms LAN /
-3791\,ms WAN. Measured slopes per added hidden layer: \heir{}
-${\approx}440$\,ms, MPC ${\approx}930$\,ms on WAN but ${\approx}7$\,ms on LAN.
+\noindent The 2PC columns are at \emph{matched disclosure} --- both arms return
+the logit vector. The last column is our default, which computes the argmax
+inside the protocol and reveals only the class: a guarantee \heir{} cannot offer
+at any price, costing ${\approx}2.5\times$ on WAN. Single runs, ${\approx}1\%$
+jitter.
+
+\noindent Measured slopes per added hidden layer: \heir{}
+${\approx}442$\,ms, ours ${\approx}222$\,ms on WAN and under 1\,ms on LAN ---
+half \heir{}'s, which is why the ratio moves monotonically our way with depth.
 
 \medskip
 \noindent\textbf{Four things this does not say.} \emph{(i)} These are dense
@@ -468,9 +498,23 @@ within themselves. \emph{(ii)} \texttt{dealer} is a lower bound --- against
 \texttt{lowgear} totals the LAN comparison is roughly a tie
 (264\,ms vs.\ $167+92$\,ms), and the defensible LAN claim is the \emph{online}
 one. \emph{(iii)} The interaction asymmetry is unchanged: \heir{}'s client can
-go offline, ours cannot. \emph{(iv)} Our arm computes the argmax inside the
-protocol and reveals only the class, while \heir{} returns the full logit
-vector --- strictly more work, strictly less disclosure.
+go offline, ours cannot. \emph{(iv)} The disclosure asymmetry is now
+measured rather than noted: see the last column.
+
+\medskip
+\noindent\textbf{Configuration alone was worth $2.4\text{--}3.8\times$.} The
+optimized column enables truncation pairs (§VI.9) and bilinear operand fusion
+(§VI.13); the base column is how \baru{}'s own \texttt{bench-2pc-nn} runs, which
+enables neither. Turning them on cuts exchanges from 137 to 36 at depth 10 and
+wide-area elapsed from 7695\,ms to 1999\,ms --- no new algorithm, work already
+in the repository that was not reaching the comparison. The defect is
+instructive: it presented not as a wrong number but as a \emph{correct} number
+for a configuration nobody would deploy, which is the failure mode a
+backend-aware cost model exists to prevent. A second finding from the same
+re-run: \texttt{bench-2pc-nn}'s wide-area column is
+\texttt{rounds}\,$\times$\,RTT\,$+$\,bytes/bandwidth\,$+$\,compute --- a cost
+model, not elapsed time --- and the figures above replace it with wall clock
+from two parties over a transport that really sleeps.
 
 \subsection{Depth sweep: a line against a staircase}
 
